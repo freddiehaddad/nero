@@ -11,8 +11,8 @@
 //! [`func_line_exec`]/[`script_line_exec`] are now translated because
 //! their function/script records have real fields.
 //! [`script_prof_save`]/[`script_prof_restore`] record nested-child
-//! timing state, and [`prof_child_enter`] starts the paired
-//! function/script child measurement.
+//! timing state, and [`prof_child_enter`]/[`prof_child_exit`] perform
+//! the paired function/script child measurement.
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -214,6 +214,30 @@ pub unsafe fn prof_child_enter(tm: &mut ProftimeT) {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { script_prof_save(tm) };
+}
+
+/// Finish profiling after a nested operation (`prof_child_exit`).
+///
+/// # Safety
+/// The current funccall, when non-null, and its `fc_func` must be live.
+/// Forwarded from [`script_prof_restore`].
+pub unsafe fn prof_child_exit(tm: &ProftimeT) {
+    let fc = crate::eval::userfunc::get_current_funccal();
+    // SAFETY: forwarded from this function's own safety doc.
+    if !fc.is_null() && unsafe { (*(*fc).fc_func).uf_profiling != 0 } {
+        // SAFETY: forwarded from this function's own safety doc.
+        let child = unsafe { profile_end((*fc).fc_prof_child) };
+        let child = profile_sub_wait(*tm, child);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*fc).fc_prof_child = child;
+            let fp = (*fc).fc_func;
+            (*fp).uf_tm_children = profile_add((*fp).uf_tm_children, child);
+            (*fp).uf_tml_children = profile_add((*fp).uf_tml_children, child);
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { script_prof_restore(tm) };
 }
 
 /// Stands in for `os_hrtime()` until `os/time.c` is translated - see module
@@ -625,6 +649,31 @@ mod tests {
 
         assert!(unsafe { (*call_ptr).fc_prof_child } >= before);
         assert_eq!(wait, profile_get_wait());
+    }
+
+    #[test]
+    fn prof_child_exit_accumulates_time_in_the_current_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut func = crate::eval::typval_defs::UfuncT {
+            uf_profiling: 1,
+            ..Default::default()
+        };
+        let func_ptr = std::ptr::addr_of_mut!(func);
+        let mut call = crate::eval::typval_defs::FunccallT {
+            fc_func: func_ptr,
+            fc_prof_child: profile_start().wrapping_sub(1_000_000),
+            ..Default::default()
+        };
+        let call_ptr = std::ptr::addr_of_mut!(call);
+        let _call = CurrentFunccallGuard::install(call_ptr);
+        let wait = profile_get_wait();
+
+        unsafe { prof_child_exit(&wait) };
+
+        let child = unsafe { (*call_ptr).fc_prof_child };
+        assert!(child > 0);
+        assert_eq!(unsafe { (*func_ptr).uf_tm_children }, child);
+        assert_eq!(unsafe { (*func_ptr).uf_tml_children }, child);
     }
 
     struct PrevTimeGuard(ProftimeT);
