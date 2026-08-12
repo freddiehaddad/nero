@@ -56,6 +56,21 @@ use crate::runtime_defs::ScriptitemT;
 
 static RUNTIME_SEARCH_PATH_VALID: GlobalCell<bool> = GlobalCell::new(false);
 
+/// One cached `'runtimepath'` entry (`SearchPathItem`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchPathItem {
+    path: Vec<u8>,
+    after: bool,
+    pack_inserted: bool,
+    has_lua: crate::types_defs::TriState,
+    pos_in_rtp: usize,
+}
+
+/// Cached runtime search path (`RuntimeSearchPath`).
+#[allow(dead_code)]
+type RuntimeSearchPath = Vec<SearchPathItem>;
+
 /// Invalidates the cached runtime search path after `'runtimepath'`
 /// changes (`did_set_runtimepackpath`).
 pub fn did_set_runtimepackpath() {
@@ -902,6 +917,19 @@ mod tests {
         let end = strcpy_comma_escaped(&mut destination, b"plain");
         assert_eq!(end, destination.len());
         assert!(destination.ends_with(b"plain"));
+    }
+
+    #[test]
+    fn search_path_item_preserves_all_runtime_cache_metadata() {
+        let item = SearchPathItem {
+            path: b"runtime/after".to_vec(),
+            after: true,
+            pack_inserted: false,
+            has_lua: crate::types_defs::TriState::None,
+            pos_in_rtp: 17,
+        };
+        let path: RuntimeSearchPath = vec![item.clone()];
+        assert_eq!(path[0], item);
     }
 
     #[test]
