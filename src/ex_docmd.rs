@@ -25,8 +25,9 @@
 //! `spec_str[]` table lookup (`%`/`#`/`<cword>`/`<sfile>`/etc.), needed
 //! by `strings.c`'s `vim_strsave_shellescape()` (`shellescape()`).
 //!
-//! Also translated: `set_ref_in_findfunc`/`free_findfunc_option` -
-//! mark or release the global `'findfunc'` callback (`ffu_cb`).
+//! Also translated: `get_findfunc_callback`/
+//! `set_ref_in_findfunc`/`free_findfunc_option` - select, mark or
+//! release the local/global `'findfunc'` callback (`ffu_cb`).
 //! `ffu_cb` stays `Callback::None` forever today (see `FFU_CB`'s own
 //! doc comment) - matches every real, unconfigured session.
 //!
@@ -737,6 +738,25 @@ pub fn checkforcmd(p: &[u8], cmd: &[u8], len: usize) -> Option<usize> {
 /// `option_set_callback_func`, not translated).
 static FFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Select the buffer-local or global `'findfunc'` callback
+/// (`get_findfunc_callback`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer.
+#[must_use]
+#[allow(dead_code)]
+unsafe fn get_findfunc_callback() -> *mut crate::eval::typval_defs::Callback {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*curbuf).b_p_ffu.as_deref().is_some_and(|value| !value.is_empty()) } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { std::ptr::addr_of_mut!((*curbuf).b_ffu_cb) }
+    } else {
+        FFU_CB.as_ptr()
+    }
+}
 
 /// Release the global `'findfunc'` callback (`free_findfunc_option`).
 ///
@@ -2139,6 +2159,26 @@ mod tests {
         assert_eq!(
             unsafe { &*FFU_CB.as_ptr() },
             &crate::eval::typval_defs::Callback::None
+        );
+    }
+
+    #[test]
+    fn get_findfunc_callback_uses_local_only_for_a_nonempty_local_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+
+        assert_eq!(unsafe { get_findfunc_callback() }, FFU_CB.as_ptr());
+
+        unsafe { (*buf_ptr).b_p_ffu = Some(Vec::new()) };
+        assert_eq!(unsafe { get_findfunc_callback() }, FFU_CB.as_ptr());
+
+        unsafe { (*buf_ptr).b_p_ffu = Some(b"FindFiles".to_vec()) };
+        assert_eq!(
+            unsafe { get_findfunc_callback() },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_ffu_cb) }
         );
     }
 
