@@ -12,6 +12,7 @@
 //!   `has_non_ascii_len`, `concat_str`; and now that `mbyte.c`'s
 //!   `mb_toupper`/`mb_tolower`/`utf_ptr2char_info`/`utf_char2bytes` all
 //!   exist: `vim_strup`, `vim_strsave_up`, `vim_strcpy_up`,
+//!   `vim_strncpy_up`,
 //!   `mb_strup_buf`, `strcase_save`; `vim_strchr` (re-examined:
 //!   an earlier note claimed this needed `charset.c`'s real `g_chartab`/
 //!   `option.c`, but re-reading the actual body shows it only needs
@@ -379,6 +380,24 @@ pub fn vim_strup(p: &mut [u8]) {
 pub fn vim_strcpy_up(destination: &mut [u8], source: &[u8]) {
     let mut length = 0;
     for &byte in source {
+        if byte == NUL {
+            break;
+        }
+        destination[length] = byte.to_ascii_uppercase();
+        length += 1;
+    }
+    destination[length] = NUL;
+}
+
+/// Copy at most `count` bytes while uppercasing ASCII letters, then
+/// NUL-terminate (`vim_strncpy_up`).
+pub fn vim_strncpy_up(
+    destination: &mut [u8],
+    source: &[u8],
+    count: usize,
+) {
+    let mut length = 0;
+    for &byte in source.iter().take(count) {
         if byte == NUL {
             break;
         }
@@ -897,6 +916,17 @@ mod tests {
         vim_strcpy_up(&mut destination, b"abC\0ignored");
         assert_eq!(&destination[..4], b"ABC\0");
         assert_eq!(&destination[4..], &[0xaa; 4]);
+    }
+
+    #[test]
+    fn vim_strncpy_up_bounds_the_copy_and_always_terminates() {
+        let mut destination = [0xaa; 8];
+        vim_strncpy_up(&mut destination, b"abcdef", 3);
+        assert_eq!(&destination[..4], b"ABC\0");
+        assert_eq!(destination[4], 0xaa);
+
+        vim_strncpy_up(&mut destination, b"xY\0ignored", 7);
+        assert_eq!(&destination[..3], b"XY\0");
     }
 
     #[test]
