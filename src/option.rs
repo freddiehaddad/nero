@@ -6758,6 +6758,39 @@ pub unsafe fn did_set_previewwindow(
     None
 }
 
+/// Process the updated `'buflisted'` option value (`did_set_buflisted`).
+///
+/// # Safety
+/// `args.os_buf` must point to a live `BufT`. Also forwarded from the
+/// global-state requirements of [`crate::autocmd::apply_autocmds`].
+pub unsafe fn did_set_buflisted(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf as *mut crate::buffer_defs::BufT;
+    let old_value = match args.os_oldval {
+        crate::option_defs::OptVal::Boolean(value) => value as i32,
+        _ => return None,
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let listed = unsafe { (*buf).b_p_bl };
+    if old_value != listed {
+        let event = if listed != 0 {
+            crate::autocmd_defs::EventT::BufAdd
+        } else {
+            crate::autocmd_defs::EventT::BufDelete
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = crate::autocmd::apply_autocmds(
+            event,
+            None,
+            None,
+            true,
+            Some(unsafe { &*buf }),
+        );
+    }
+    None
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7606,6 +7639,40 @@ mod did_set_title_tests {
 
         assert_eq!(unsafe { did_set_previewwindow(&mut args) }, None);
         assert_eq!(unsafe { (*existing_ptr).w_onebuf_opt.wo_pvw }, 1);
+    }
+
+    #[test]
+    fn did_set_buflisted_handles_add_delete_and_unchanged_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bl: 1,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_oldval: crate::option_defs::OptVal::Boolean(
+                crate::types_defs::TriState::False,
+            ),
+            ..Default::default()
+        };
+
+        // BufAdd. The autocmd registry is empty today, so the real
+        // apply_autocmds fast path returns without running commands.
+        assert_eq!(unsafe { did_set_buflisted(&mut args) }, None);
+
+        unsafe { (*buf_ptr).b_p_bl = 0 };
+        args.os_oldval = crate::option_defs::OptVal::Boolean(
+            crate::types_defs::TriState::True,
+        );
+        // BufDelete.
+        assert_eq!(unsafe { did_set_buflisted(&mut args) }, None);
+
+        // No change: no event is dispatched.
+        args.os_oldval = crate::option_defs::OptVal::Boolean(
+            crate::types_defs::TriState::False,
+        );
+        assert_eq!(unsafe { did_set_buflisted(&mut args) }, None);
     }
 
     #[test]
