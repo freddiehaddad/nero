@@ -111,7 +111,8 @@
 //!
 //! Also translated: [`ins_compl_arm_autocomplete_delay`]/
 //! [`ins_compl_clear_autocomplete_delay`]/
-//! [`ins_compl_autocomplete_pending`] and their pending/start-time
+//! [`ins_compl_autocomplete_pending`]/
+//! [`ins_compl_autocomplete_elapsed`] and their pending/start-time
 //! state.
 //!
 //! Deferred: everything else in the file.
@@ -912,6 +913,18 @@ pub unsafe fn ins_compl_autocomplete_pending() -> bool {
     unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() }
 }
 
+/// Milliseconds elapsed since the `'autocompletedelay'` timer was
+/// armed (`ins_compl_autocomplete_elapsed`).
+///
+/// # Safety
+/// Must not run concurrently with another completion-delay operation.
+#[must_use]
+pub unsafe fn ins_compl_autocomplete_elapsed() -> i64 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
+    (crate::os::time::os_hrtime().wrapping_sub(start) / 1_000_000) as i64
+}
+
 /// Get the local or global value of `'completeopt'` flags
 /// (`get_cot_flags`).
 ///
@@ -1687,6 +1700,14 @@ mod tests {
         assert!(unsafe { ins_compl_autocomplete_pending() });
         unsafe { ins_compl_clear_autocomplete_delay() };
         assert!(!unsafe { ins_compl_autocomplete_pending() });
+    }
+
+    #[test]
+    fn autocomplete_delay_elapsed_reports_milliseconds_since_arming() {
+        let _guard = AutocompleteDelayGuard::set(25);
+        let now = crate::os::time::os_hrtime();
+        unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() = now.wrapping_sub(7_000_000) };
+        assert!(unsafe { ins_compl_autocomplete_elapsed() } >= 7);
     }
 
     /// Installs a buffer as `curbuf` for the test's duration and
