@@ -4,6 +4,8 @@
 //! `ex_docmd.c` (~8600 lines) is the ex-command line parser/dispatcher
 //! (`:` command execution, `do_cmdline`, the `ex_*` handler table) - a
 //! whole separate, substantial phase-6 undertaking, not attempted here.
+//! `ex_wrongmodifier` is translated in full: it installs the exact
+//! invalid-command error on its `ExargT`.
 //!
 //! Translated: `expr_map_locked` - needed as a dependency by
 //! `undo.c`'s `undo_allowed`, `insert.c`, `ex_getln.c`, and
@@ -98,6 +100,12 @@
 //! `redraw_later`-omission precedent).
 
 use crate::buffer_defs::b_flags;
+
+/// Report a command modifier used in an invalid position
+/// (`ex_wrongmodifier`).
+pub fn ex_wrongmodifier(eap: &mut crate::ex_cmds_defs::ExargT) {
+    eap.errmsg = Some(crate::errors::e_invcmd.as_bytes().to_vec());
+}
 
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
 ///
@@ -1068,6 +1076,16 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    #[test]
+    fn ex_wrongmodifier_sets_the_invalid_command_error() {
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            errmsg: Some(b"old error".to_vec()),
+            ..Default::default()
+        };
+        ex_wrongmodifier(&mut eap);
+        assert_eq!(eap.errmsg.as_deref(), Some(crate::errors::e_invcmd.as_bytes()));
+    }
 
     struct FfuGuard {
         saved: Option<crate::eval::typval_defs::Callback>,
