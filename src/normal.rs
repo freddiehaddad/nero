@@ -20,6 +20,35 @@
 /// Operator state currently being processed (`current_oap`).
 static CURRENT_OAP: crate::globals::GlobalCell<*mut crate::normal_defs::OpargT> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
+/// Partially typed command shown to the user (`showcmd_buf`).
+static SHOWCMD_BUF: crate::globals::GlobalCell<
+    [u8; crate::normal_defs::SHOWCMD_BUFLEN],
+> = crate::globals::GlobalCell::new([0; crate::normal_defs::SHOWCMD_BUFLEN]);
+/// Saved show-command text while waiting through a partial mapping
+/// (`old_showcmd_buf`).
+static OLD_SHOWCMD_BUF: crate::globals::GlobalCell<
+    [u8; crate::normal_defs::SHOWCMD_BUFLEN],
+> = crate::globals::GlobalCell::new([0; crate::normal_defs::SHOWCMD_BUFLEN]);
+
+/// Save the partially typed command while waiting for mapping input
+/// (`push_showcmd`).
+///
+/// # Safety
+/// Reads option state and mutates show-command file statics.
+pub unsafe fn push_showcmd() {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc == 0 {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let current = unsafe { SHOWCMD_BUF.get_mut() };
+    let end = current
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(current.len() - 1);
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { OLD_SHOWCMD_BUF.get_mut() })[..=end].copy_from_slice(&current[..=end]);
+}
 
 /// Whether an operator, count, or register name is pending
 /// (`op_pending`).
@@ -678,6 +707,30 @@ mod tests {
 
     struct CurrentOapGuard(*mut crate::normal_defs::OpargT);
 
+    struct ShowcmdGuard {
+        option: i32,
+        current: [u8; crate::normal_defs::SHOWCMD_BUFLEN],
+        old: [u8; crate::normal_defs::SHOWCMD_BUFLEN],
+    }
+
+    impl ShowcmdGuard {
+        fn capture() -> Self {
+            Self {
+                option: unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc,
+                current: *unsafe { SHOWCMD_BUF.get_mut() },
+                old: *unsafe { OLD_SHOWCMD_BUF.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for ShowcmdGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc = self.option;
+            *unsafe { SHOWCMD_BUF.get_mut() } = self.current;
+            *unsafe { OLD_SHOWCMD_BUF.get_mut() } = self.old;
+        }
+    }
+
     impl CurrentOapGuard {
         fn install(value: *mut crate::normal_defs::OpargT) -> Self {
             let saved = unsafe { *CURRENT_OAP.get_mut() };
@@ -717,6 +770,25 @@ mod tests {
         assert!(unsafe { op_pending() });
         unsafe { *CURRENT_OAP.get_mut() = std::ptr::null_mut() };
         assert!(unsafe { op_pending() });
+    }
+
+    #[test]
+    fn push_showcmd_copies_through_nul_only_when_showcmd_is_enabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShowcmdGuard::capture();
+        let current = unsafe { SHOWCMD_BUF.get_mut() };
+        current.fill(0x44);
+        current[..4].copy_from_slice(b"12d\0");
+        unsafe { OLD_SHOWCMD_BUF.get_mut() }.fill(0xaa);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc = 0;
+        unsafe { push_showcmd() };
+        assert_eq!((unsafe { OLD_SHOWCMD_BUF.get_mut() })[0], 0xaa);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc = 1;
+        unsafe { push_showcmd() };
+        assert_eq!(&(unsafe { OLD_SHOWCMD_BUF.get_mut() })[..4], b"12d\0");
+        assert_eq!((unsafe { OLD_SHOWCMD_BUF.get_mut() })[4], 0xaa);
     }
 
     #[test]
