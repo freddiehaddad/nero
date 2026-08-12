@@ -41,6 +41,15 @@
 //! `wildescape`/`ExpandEscape` (need `vim_strsave_fnameescape`/
 //! `escape_fname`/`tilde_replace`, not translated).
 
+static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Clears the command line saved while completion is active
+/// (`clear_cmdline_orig`).
+pub fn clear_cmdline_orig() {
+    unsafe { *CMDLINE_ORIG.get_mut() = None };
+}
+
 /// Whether the popup menu should be used for cmdline completion
 /// wildmenu (`cmdline_compl_use_pum`).
 ///
@@ -510,6 +519,14 @@ pub fn sort_func_compare(s1: &[u8], s2: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_cmdline_orig_releases_the_saved_command_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CMDLINE_ORIG.get_mut() = Some(b":set nu".to_vec()) };
+        clear_cmdline_orig();
+        assert!(unsafe { CMDLINE_ORIG.get_mut() }.is_none());
+    }
 
     /// Saves and restores `'wildoptions'` flags across a test.
     struct WopFlagsGuard {
