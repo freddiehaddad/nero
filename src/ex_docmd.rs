@@ -103,6 +103,30 @@
 
 use crate::buffer_defs::b_flags;
 
+/// Recursive Ex command-line execution depth (`cmdline_call_depth`).
+static CMDLINE_CALL_DEPTH: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Begin executing an Ex command line (`do_cmdline_start`).
+///
+/// # Safety
+/// Reads global option state and mutates command-line/clipboard batch
+/// state; it must run on the editor thread.
+#[allow(dead_code)]
+unsafe fn do_cmdline_start() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let depth = unsafe { *CMDLINE_CALL_DEPTH.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let maxfuncdepth = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mfd;
+    if depth >= 200 && i64::from(depth) >= maxfuncdepth {
+        return crate::vim_defs::FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CMDLINE_CALL_DEPTH.get_mut() += 1 };
+    crate::clipboard::start_batch_changes();
+    crate::vim_defs::OK
+}
+
 /// Report a command modifier used in an invalid position
 /// (`ex_wrongmodifier`).
 pub fn ex_wrongmodifier(eap: &mut crate::ex_cmds_defs::ExargT) {
@@ -1102,6 +1126,48 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    struct CmdlineStartGuard {
+        saved_depth: i32,
+        saved_mfd: crate::types_defs::OptInt,
+        started: bool,
+    }
+
+    impl CmdlineStartGuard {
+        fn install(depth: i32, maxfuncdepth: crate::types_defs::OptInt) -> Self {
+            let saved_depth = unsafe {
+                std::mem::replace(CMDLINE_CALL_DEPTH.get_mut(), depth)
+            };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved_mfd = std::mem::replace(&mut opts.p_mfd, maxfuncdepth);
+            Self { saved_depth, saved_mfd, started: false }
+        }
+    }
+
+    impl Drop for CmdlineStartGuard {
+        fn drop(&mut self) {
+            if self.started {
+                crate::clipboard::end_batch_changes();
+            }
+            unsafe { *CMDLINE_CALL_DEPTH.get_mut() = self.saved_depth };
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mfd = self.saved_mfd;
+        }
+    }
+
+    #[test]
+    fn do_cmdline_start_enforces_depth_and_starts_a_batch() {
+        let _lock = crate::globals::global_state_test_lock();
+        {
+            let _guard = CmdlineStartGuard::install(200, 100);
+            assert_eq!(unsafe { do_cmdline_start() }, crate::vim_defs::FAIL);
+            assert_eq!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() }, 200);
+        }
+
+        let mut guard = CmdlineStartGuard::install(199, 100);
+        assert_eq!(unsafe { do_cmdline_start() }, crate::vim_defs::OK);
+        guard.started = true;
+        assert_eq!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() }, 200);
+    }
 
     #[test]
     fn ex_wrongmodifier_sets_the_invalid_command_error() {
