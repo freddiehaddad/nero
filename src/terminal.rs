@@ -14,7 +14,8 @@
 //! state at all; [`terminal_buf`] - the terminal's owning buffer
 //! handle; [`terminal_running`] - whether the terminal is still open;
 //! [`terminal_suspended`] - whether the child process is suspended;
-//! `row_to_linenr` - terminal-row to buffer-line conversion.
+//! `row_to_linenr`/`linenr_to_row` - terminal-row/buffer-line
+//! conversion.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -54,6 +55,14 @@ fn row_to_linenr(term: &TerminalT, row: i32) -> i32 {
     } else {
         row.wrapping_add(term.sb_current as i32).wrapping_add(1)
     }
+}
+
+/// Converts a buffer line number to its terminal screen row
+/// (`linenr_to_row`).
+#[allow(dead_code)]
+#[must_use]
+fn linenr_to_row(term: &TerminalT, linenr: i32) -> i32 {
+    linenr.wrapping_sub(term.sb_current as i32).wrapping_sub(1)
 }
 
 /// Whether character `c` should be filtered out of a terminal paste,
@@ -153,6 +162,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(row_to_linenr(&term, i32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn linenr_to_row_removes_scrollback_and_one() {
+        let term = TerminalT {
+            sb_current: 7,
+            ..Default::default()
+        };
+        assert_eq!(linenr_to_row(&term, 8), 0);
+        assert_eq!(linenr_to_row(&term, 11), 3);
+        assert_eq!(linenr_to_row(&term, 6), -2);
+    }
+
+    #[test]
+    fn linenr_to_row_inverts_ordinary_row_conversion() {
+        let term = TerminalT {
+            sb_current: 1024,
+            ..Default::default()
+        };
+        for row in [-10, 0, 1, 80, 10_000] {
+            assert_eq!(linenr_to_row(&term, row_to_linenr(&term, row)), row);
+        }
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
