@@ -11,11 +11,8 @@
 //!   `vim_strnicmp_asc`, `sort_strings`, `has_non_ascii`,
 //!   `has_non_ascii_len`, `concat_str`; and now that `mbyte.c`'s
 //!   `mb_toupper`/`mb_tolower`/`utf_ptr2char_info`/`utf_char2bytes` all
-//!   exist: `vim_strup`, `vim_strsave_up` (also serving
-//!   `vim_strnsave_up`/`vim_strcpy_up`/`vim_strncpy_up`/`vim_memcpy_up`'s
-//!   role - a Rust `&[u8]` slice already knows its own exact length, so
-//!   there's no separate "whole string" vs. "first `n` bytes" variant to
-//!   keep apart), `mb_strup_buf`, `strcase_save`; `vim_strchr` (re-examined:
+//!   exist: `vim_strup`, `vim_strsave_up`, `vim_strcpy_up`,
+//!   `mb_strup_buf`, `strcase_save`; `vim_strchr` (re-examined:
 //!   an earlier note claimed this needed `charset.c`'s real `g_chartab`/
 //!   `option.c`, but re-reading the actual body shows it only needs
 //!   `strchr`/`strstr`-equivalent byte/substring search plus the
@@ -377,13 +374,23 @@ pub fn vim_strup(p: &mut [u8]) {
     }
 }
 
+/// Copy a NUL-terminated string while uppercasing ASCII letters
+/// (`vim_strcpy_up`).
+pub fn vim_strcpy_up(destination: &mut [u8], source: &[u8]) {
+    let mut length = 0;
+    for &byte in source {
+        if byte == NUL {
+            break;
+        }
+        destination[length] = byte.to_ascii_uppercase();
+        length += 1;
+    }
+    destination[length] = NUL;
+}
+
 /// Like [`xstrnsave`], but make all characters uppercase using ASCII
 /// lower-to-upper case translation, language independent
-/// (`vim_strsave_up`; also serves the role of the original's
-/// `vim_strnsave_up`/`vim_strcpy_up`/`vim_strncpy_up`/`vim_memcpy_up`,
-/// since a Rust `&[u8]` slice already knows its own exact length -
-/// there's no separate "whole NUL-terminated string" vs. "first `n`
-/// bytes" variant to keep apart from the length-taking one).
+/// (`vim_strsave_up`).
 ///
 /// Unlike [`xstrnsave`] (a lower-level "copy exactly N bytes, embedded
 /// NULs included" primitive taking an explicit length), this - like
@@ -882,6 +889,14 @@ mod tests {
         let mut s = b"ab\0cd".to_vec(); // 'c'/'d' come after an embedded NUL
         vim_strup(&mut s);
         assert_eq!(&s, b"AB\0cd"); // untouched past the NUL
+    }
+
+    #[test]
+    fn vim_strcpy_up_copies_uppercase_through_the_first_nul() {
+        let mut destination = [0xaa; 8];
+        vim_strcpy_up(&mut destination, b"abC\0ignored");
+        assert_eq!(&destination[..4], b"ABC\0");
+        assert_eq!(&destination[4..], &[0xaa; 4]);
     }
 
     #[test]
