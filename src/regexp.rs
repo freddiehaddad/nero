@@ -18,6 +18,25 @@ static NFA_TIME_LIMIT: crate::globals::GlobalCell<*mut crate::types_defs::Profti
 /// Optional caller-owned timeout result (`nfa_timed_out`).
 static NFA_TIMED_OUT: crate::globals::GlobalCell<*mut bool> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
+/// Maximum recursive substitution-expression depth
+/// (`MAX_REGSUB_NESTING`).
+const MAX_REGSUB_NESTING: usize = 4;
+/// Cached expression results for nested substitutions (`eval_result`).
+static EVAL_RESULT: crate::globals::GlobalCell<[Option<Vec<u8>>; MAX_REGSUB_NESTING]> =
+    crate::globals::GlobalCell::new([const { None }; MAX_REGSUB_NESTING]);
+
+/// Free all cached nested substitution-expression results
+/// (`free_resub_eval_result`).
+///
+/// # Safety
+/// Must not run concurrently with regexp substitution evaluation.
+pub unsafe fn free_resub_eval_result() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let results = unsafe { EVAL_RESULT.get_mut() };
+    for result in results {
+        *result = None;
+    }
+}
 
 /// Refresh regexp-specific `'cpoptions'` flags (`get_cpo_flags`).
 ///
@@ -212,6 +231,21 @@ mod tests {
         timed_out: *mut bool,
     }
 
+    struct EvalResultGuard([Option<Vec<u8>>; MAX_REGSUB_NESTING]);
+
+    impl EvalResultGuard {
+        fn install(values: [Option<Vec<u8>>; MAX_REGSUB_NESTING]) -> Self {
+            Self(std::mem::replace(unsafe { EVAL_RESULT.get_mut() }, values))
+        }
+    }
+
+    impl Drop for EvalResultGuard {
+        fn drop(&mut self) {
+            *unsafe { EVAL_RESULT.get_mut() } =
+                std::mem::replace(&mut self.0, [const { None }; MAX_REGSUB_NESTING]);
+        }
+    }
+
     impl NfaTimeoutGuard {
         fn install(
             limit: *mut crate::types_defs::ProftimeT,
@@ -378,6 +412,23 @@ mod tests {
         unsafe { *timed_out_ptr = false };
         assert!(!unsafe { nfa_did_time_out() });
         assert!(!unsafe { *timed_out_ptr });
+    }
+
+    #[test]
+    fn free_resub_eval_result_clears_all_nesting_slots() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = EvalResultGuard::install([
+            Some(b"outer".to_vec()),
+            None,
+            Some(b"inner".to_vec()),
+            Some(Vec::new()),
+        ]);
+        unsafe { free_resub_eval_result() };
+        assert!(
+            unsafe { EVAL_RESULT.get_mut() }
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]
