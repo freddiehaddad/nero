@@ -2,12 +2,9 @@
 //! needed by `globals.h`'s `magic_overruled`, plus `NSUBEXP` and the
 //! multi-line match result [`RegmmatchT`]).
 //!
-//! The compiled-regexp *program* representation and the engine that
-//! builds and runs it belong together as a unit (phase 7) - deferred,
-//! not started. [`crate::types_defs::RegprogT`] stays an opaque
-//! placeholder for it, and [`RegmmatchT`] holds it only as a pointer
-//! it never dereferences, so the match RESULT is translatable well
-//! ahead of the engine that produces it.
+//! The engine that builds and runs compiled regexps remains deferred.
+//! Its `regengine_T` stays opaque, while `regprog_T`'s small common
+//! header is now translated in [`crate::types_defs::RegprogT`].
 //!
 //! `regmatch_T` (the single-line form) is deliberately NOT translated
 //! here. Its `startp`/`endp` are `char *` pointing INTO the line being
@@ -21,6 +18,11 @@
 /// index 0 (`NSUBEXP`).
 pub const NSUBEXP: usize = 10;
 
+/// Opaque regular-expression engine dispatch table (`regengine_T`).
+pub struct RegengineT {
+    _private: (),
+}
+
 /// The result of a multi-line regexp match (`regmmatch_T`).
 ///
 /// Sub-match `no` starts at `startpos[no]` and ends just before
@@ -29,10 +31,8 @@ pub const NSUBEXP: usize = 10;
 /// not participate is marked by a negative `lnum`, which is what
 /// [`crate::search::first_submatch`] scans for.
 ///
-/// `regprog` is kept as a raw pointer to the still-opaque
-/// [`crate::types_defs::RegprogT`]: nothing translated dereferences
-/// it, it is only carried alongside the result, exactly as the
-/// original does.
+/// `regprog` is kept as a raw pointer to
+/// [`crate::types_defs::RegprogT`], exactly as the original does.
 #[derive(Debug, Clone, Copy)]
 pub struct RegmmatchT {
     /// the compiled regexp program (`regprog`).

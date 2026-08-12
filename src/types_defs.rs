@@ -139,9 +139,29 @@ pub struct LoopT {
 pub struct VimconvT {
     _private: (),
 }
-/// Placeholder for `regprog_T` (`struct regprog`) - see `src/nvim/regexp_defs.h` (phase 7).
+/// Common compiled-regexp header (`struct regprog`, `regexp.c`).
+#[derive(Debug)]
 pub struct RegprogT {
-    _private: (),
+    pub engine: *mut crate::regexp_defs::RegengineT,
+    pub regflags: u32,
+    /// Automatic, backtracking or NFA engine (`re_engine`).
+    pub re_engine: u32,
+    /// Second argument passed to `vim_regcomp()` (`re_flags`).
+    pub re_flags: u32,
+    /// Whether the program is currently executing (`re_in_use`).
+    pub re_in_use: bool,
+}
+
+impl Default for RegprogT {
+    fn default() -> Self {
+        Self {
+            engine: std::ptr::null_mut(),
+            regflags: 0,
+            re_engine: 0,
+            re_flags: 0,
+            re_in_use: false,
+        }
+    }
 }
 /// Placeholder for `synstate_T` (`struct syn_state`) - see `src/nvim/syntax_defs.h` (phase 8).
 pub struct SynstateT {
@@ -267,5 +287,15 @@ mod tests {
         assert_eq!(tristate_from_int(1), TriState::True);
         assert_eq!(tristate_from_int(5), TriState::True);
         assert_eq!(tristate_from_int(-1), TriState::None);
+    }
+
+    #[test]
+    fn regprog_default_matches_a_zeroed_compiled_program_header() {
+        let prog = RegprogT::default();
+        assert!(prog.engine.is_null());
+        assert_eq!(prog.regflags, 0);
+        assert_eq!(prog.re_engine, 0);
+        assert_eq!(prog.re_flags, 0);
+        assert!(!prog.re_in_use);
     }
 }
