@@ -7,10 +7,9 @@
 //! `profile_sub`/`profile_self`/`profile_get_wait`/`profile_set_wait`/
 //! `profile_sub_wait`/`profile_equal`/`profile_signed`/`profile_cmp`.
 //!
-//! Deferred: everything from `profile_reset` onward, which operates on
-//! `scriptitem_T`/`script_items` (`eval/userfunc.h`, not yet translated) to
-//! track per-script/per-function/per-line profiling data - a real forward
-//! dependency, not started.
+//! Per-function/per-script profiling remains mostly deferred, but
+//! [`func_line_exec`] is now translated because `FunccallT`/`UfuncT`
+//! have real fields.
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -102,6 +101,23 @@ pub unsafe fn prof_def_func() -> bool {
         return unsafe { (*item).sn_pr_force };
     }
     false
+}
+
+/// Mark the current profiled function line as executed
+/// (`func_line_exec`).
+///
+/// # Safety
+/// `cookie` must point to a live `FunccallT` whose `fc_func` points to
+/// a live `UfuncT`.
+pub unsafe fn func_line_exec(cookie: *mut std::ffi::c_void) {
+    let fcp = cookie.cast::<crate::eval::typval_defs::FunccallT>();
+    // SAFETY: forwarded from this function's own safety doc.
+    let fp = unsafe { (*fcp).fc_func };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*fp).uf_profiling != 0 && (*fp).uf_tml_idx >= 0 } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*fp).uf_tml_execed = 1 };
+    }
 }
 
 /// Stands in for `os_hrtime()` until `os/time.c` is translated - see module
@@ -343,6 +359,38 @@ pub fn profile_cmp(tm1: ProftimeT, tm2: ProftimeT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn func_line_exec_marks_only_an_active_profiled_line() {
+        let mut func = crate::eval::typval_defs::UfuncT {
+            uf_profiling: 1,
+            uf_tml_idx: 3,
+            ..Default::default()
+        };
+        let func_ptr = std::ptr::addr_of_mut!(func);
+        let mut call = crate::eval::typval_defs::FunccallT {
+            fc_func: func_ptr,
+            ..Default::default()
+        };
+        let call_ptr = std::ptr::addr_of_mut!(call);
+
+        unsafe { func_line_exec(call_ptr.cast()) };
+        assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 1);
+
+        unsafe {
+            (*func_ptr).uf_tml_execed = 0;
+            (*func_ptr).uf_tml_idx = -1;
+        }
+        unsafe { func_line_exec(call_ptr.cast()) };
+        assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
+
+        unsafe {
+            (*func_ptr).uf_tml_idx = 0;
+            (*func_ptr).uf_profiling = 0;
+        }
+        unsafe { func_line_exec(call_ptr.cast()) };
+        assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
+    }
 
     struct PrevTimeGuard(ProftimeT);
 
