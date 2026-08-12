@@ -2423,7 +2423,7 @@ unsafe fn func_clear_items(fp: *mut UfuncT) {
     // ga_clear_strings degrades to when there's nothing to free.
     fp_ref.uf_args.ga_clear();
     fp_ref.uf_def_args.ga_clear();
-    fp_ref.uf_lines.ga_clear();
+    fp_ref.uf_lines.clear();
 
     if fp_ref.uf_flags & fc_flags::LUAREF != 0 {
         unimplemented!(

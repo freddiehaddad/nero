@@ -432,8 +432,8 @@ pub struct UfuncT {
     pub uf_args: crate::garray_defs::GarrayT,
     /// default argument expressions (`uf_def_args`).
     pub uf_def_args: crate::garray_defs::GarrayT,
-    /// function lines (`uf_lines`).
-    pub uf_lines: crate::garray_defs::GarrayT,
+    /// Function lines (`uf_lines`); `None` marks a continuation line.
+    pub uf_lines: Vec<Option<Vec<u8>>>,
     /// `true` when func is being profiled (`uf_profiling`).
     pub uf_profiling: i32,
     pub uf_prof_initialized: i32,
@@ -1006,7 +1006,7 @@ mod tests {
         assert!(!uf.uf_cleared);
         assert_eq!(uf.uf_args.ga_len, 0);
         assert_eq!(uf.uf_def_args.ga_len, 0);
-        assert_eq!(uf.uf_lines.ga_len, 0);
+        assert!(uf.uf_lines.is_empty());
         assert_eq!(uf.uf_profiling, 0);
         assert_eq!(uf.uf_luaref, 0);
         assert_eq!(uf.uf_tm_count, 0);
