@@ -34,6 +34,22 @@ unsafe fn get_cpo_flags() {
         });
 }
 
+/// Compare an NFA numeric position operand (`nfa_re_num_cmp`).
+///
+/// `op == 1` means position greater than value, `op == 2` means
+/// position less than value, and every other value means equality.
+#[allow(dead_code)]
+#[must_use]
+fn nfa_re_num_cmp(value: u64, op: i32, position: u64) -> bool {
+    if op == 1 {
+        position > value
+    } else if op == 2 {
+        position < value
+    } else {
+        value == position
+    }
+}
+
 /// Whether the compiled program can match a line break
 /// (`re_multiline`).
 ///
@@ -194,5 +210,16 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = None;
         unsafe { get_cpo_flags() };
         assert!(!unsafe { *REG_CPO_LIT.get_mut() });
+    }
+
+    #[test]
+    fn nfa_re_num_cmp_handles_greater_less_and_equal_modes() {
+        assert!(nfa_re_num_cmp(4, 1, 5));
+        assert!(!nfa_re_num_cmp(5, 1, 4));
+        assert!(nfa_re_num_cmp(5, 2, 4));
+        assert!(!nfa_re_num_cmp(4, 2, 5));
+        assert!(nfa_re_num_cmp(7, 0, 7));
+        assert!(nfa_re_num_cmp(u64::MAX, 99, u64::MAX));
+        assert!(!nfa_re_num_cmp(7, 0, 8));
     }
 }
