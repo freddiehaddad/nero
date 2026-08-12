@@ -148,8 +148,16 @@ pub struct SynstateT {
     _private: (),
 }
 /// Placeholder for `Terminal` (`struct terminal`) - see `src/nvim/terminal.h` (phase 14).
+#[derive(Debug, Default)]
 pub struct TerminalT {
-    _private: (),
+    /// Lines currently stored in scrollback (`sb_current`).
+    pub sb_current: usize,
+    /// Buffer handle owning this terminal (`buf_handle`).
+    pub buf_handle: HandleT,
+    /// Whether the child process is suspended (`suspended`).
+    pub suspended: bool,
+    /// Whether the terminal has closed (`closed`).
+    pub closed: bool,
 }
 /// Quickfix/location list stack (`qf_info_T`, `struct qf_info_S`) -
 /// a stack of quickfix/location lists.
