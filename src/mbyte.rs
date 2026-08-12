@@ -53,6 +53,8 @@
 //! that (potentially out-of-bounds, on a Rust slice) extra read - see
 //! its own doc comment for the full reasoning. It reuses the same
 //! `wrapping_*` discipline as [`utf_ptr2char`] for the reassembly
+//! arithmetic. `tv_nr_compare` also translates the small numeric-list
+//! comparator used by the deferred `setcellwidths()` builtin.
 //! arithmetic itself, for the same overflow reason (see that
 //! function's own doc comment): **translating this function's sibling
 //! surfaced a genuine, pre-existing overflow-panic bug in
@@ -2497,9 +2499,66 @@ pub fn enc_canon_props(name: &[u8]) -> i32 {
     0
 }
 
+/// Compare two lists by the number in their first item
+/// (`tv_nr_compare`).
+///
+/// # Safety
+/// Both pointers must identify live, nonempty lists whose first items
+/// contain numbers.
+#[allow(dead_code)]
+unsafe fn tv_nr_compare(
+    l1: *const crate::eval::typval_defs::ListT,
+    l2: *const crate::eval::typval_defs::ListT,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let i1 = unsafe { crate::eval::typval::tv_list_first(l1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let i2 = unsafe { crate::eval::typval::tv_list_first(l2) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let n1 = match unsafe { &(*i1).li_tv.value } {
+        crate::eval::typval_defs::TypvalValue::Number(n) => *n,
+        _ => unreachable!("tv_nr_compare requires numeric list items"),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let n2 = match unsafe { &(*i2).li_tv.value } {
+        crate::eval::typval_defs::TypvalValue::Number(n) => *n,
+        _ => unreachable!("tv_nr_compare requires numeric list items"),
+    };
+    if n1 == n2 {
+        0
+    } else if n1 > n2 {
+        1
+    } else {
+        -1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tv_nr_compare_orders_lists_by_their_first_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe fn number_list(n: i64) -> *mut crate::eval::typval_defs::ListT {
+            let list = crate::eval::typval::tv_list_alloc(1);
+            unsafe { crate::eval::typval::tv_list_append_number(list, n) };
+            list
+        }
+        let low = unsafe { number_list(i64::MIN) };
+        let same = unsafe { number_list(i64::MIN) };
+        let high = unsafe { number_list(i64::MAX) };
+
+        assert_eq!(unsafe { tv_nr_compare(low, same) }, 0);
+        assert_eq!(unsafe { tv_nr_compare(low, high) }, -1);
+        assert_eq!(unsafe { tv_nr_compare(high, low) }, 1);
+
+        unsafe {
+            crate::eval::typval::tv_list_unref(low);
+            crate::eval::typval::tv_list_unref(same);
+            crate::eval::typval::tv_list_unref(high);
+        }
+    }
 
     #[test]
     fn mb_unescape_returns_none_for_ascii() {
