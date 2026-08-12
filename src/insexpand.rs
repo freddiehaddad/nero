@@ -71,8 +71,8 @@
 //! Also translated: the completion-state accessors
 //! [`ins_compl_used_match`]/[`ins_compl_init_get_longest`]/
 //! [`ins_compl_interrupted`]/[`ins_compl_enter_selects`]/
-//! [`ins_compl_col`]/[`ins_compl_len`]/[`ins_compl_win_active`] and
-//! their backing statics.
+//! [`ins_compl_col`]/[`ins_compl_len`]/[`ins_compl_win_active`]/
+//! [`ins_compl_is_match_selected`] and their backing statics.
 //! Note `ins_compl_interrupted` is an OR of two separate conditions -
 //! an explicit interruption AND the current source running out of its
 //! time budget - so it is not a plain accessor.
@@ -363,6 +363,18 @@ pub fn match_at_original_text(m: &ComplT) -> bool {
 unsafe fn is_first_match(m: *const ComplT) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     m == unsafe { *COMPL_FIRST_MATCH.get_mut() }
+}
+
+/// Whether a completion match is selected, even if it has not yet
+/// been inserted (`ins_compl_is_match_selected`).
+///
+/// # Safety
+/// Must not run concurrently with a completion-list mutation.
+#[must_use]
+pub unsafe fn ins_compl_is_match_selected() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let shown = unsafe { *COMPL_SHOWN_MATCH.get_mut() };
+    !shown.is_null() && !unsafe { is_first_match(shown) }
 }
 
 /// The next match in the list (`cp_get_next`).
@@ -1570,6 +1582,23 @@ mod tests {
         assert!(unsafe { is_first_match(first_ptr) });
         assert!(!unsafe { is_first_match(other_ptr) });
         assert!(!unsafe { is_first_match(std::ptr::null()) });
+    }
+
+    #[test]
+    fn ins_compl_is_match_selected_excludes_null_and_the_original_entry() {
+        let _lock = global_state_test_lock();
+        let mut first = ComplT::default();
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let mut selected = ComplT::default();
+        let selected_ptr = std::ptr::addr_of_mut!(selected);
+        let _first = FirstMatchGuard::install(first_ptr);
+        let _shown = ShownMatchGuard::install(std::ptr::null_mut());
+
+        assert!(!unsafe { ins_compl_is_match_selected() });
+        unsafe { *COMPL_SHOWN_MATCH.get_mut() = first_ptr };
+        assert!(!unsafe { ins_compl_is_match_selected() });
+        unsafe { *COMPL_SHOWN_MATCH.get_mut() = selected_ptr };
+        assert!(unsafe { ins_compl_is_match_selected() });
     }
 
     #[test]
