@@ -71,6 +71,13 @@ struct SearchPathItem {
 #[allow(dead_code)]
 type RuntimeSearchPath = Vec<SearchPathItem>;
 
+/// Deep-copy a cached runtime search path
+/// (`copy_runtime_search_path`).
+#[allow(dead_code)]
+fn copy_runtime_search_path(source: &RuntimeSearchPath) -> RuntimeSearchPath {
+    source.clone()
+}
+
 /// Invalidates the cached runtime search path after `'runtimepath'`
 /// changes (`did_set_runtimepackpath`).
 pub fn did_set_runtimepackpath() {
@@ -930,6 +937,27 @@ mod tests {
         };
         let path: RuntimeSearchPath = vec![item.clone()];
         assert_eq!(path[0], item);
+    }
+
+    #[test]
+    fn copy_runtime_search_path_duplicates_owned_paths_and_metadata() {
+        let mut source = vec![SearchPathItem {
+            path: b"runtime".to_vec(),
+            after: false,
+            pack_inserted: true,
+            has_lua: crate::types_defs::TriState::True,
+            pos_in_rtp: 3,
+        }];
+        let copy = copy_runtime_search_path(&source);
+        assert_eq!(copy, source);
+
+        source[0].path[0] = b'R';
+        source[0].after = true;
+        assert_eq!(copy[0].path, b"runtime");
+        assert!(!copy[0].after);
+        assert!(copy[0].pack_inserted);
+        assert_eq!(copy[0].has_lua, crate::types_defs::TriState::True);
+        assert_eq!(copy[0].pos_in_rtp, 3);
     }
 
     #[test]
