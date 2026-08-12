@@ -284,6 +284,13 @@ pub unsafe fn find_script_by_name(name: &[u8]) -> ScidT {
     -1
 }
 
+#[must_use]
+pub fn source_breakpoint(
+    cookie: &mut crate::runtime_defs::SourceCookieT,
+) -> &mut crate::pos_defs::LinenrT {
+    &mut cookie.breakpoint
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -779,6 +786,13 @@ mod tests {
         assert_ne!(first, newest);
         assert_eq!(unsafe { find_script_by_name(b"same.vim") }, newest);
         assert_eq!(unsafe { find_script_by_name(b"missing.vim") }, -1);
+    }
+
+    #[test]
+    fn source_breakpoint_returns_writable_breakpoint_storage() {
+        let mut cookie = crate::runtime_defs::SourceCookieT::default();
+        *source_breakpoint(&mut cookie) = 42;
+        assert_eq!(cookie.breakpoint, 42);
     }
 
     #[test]
