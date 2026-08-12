@@ -13,7 +13,8 @@
 //! `opt_tpf_flag` constants, with no dependency on any terminal
 //! state at all; [`terminal_buf`] - the terminal's owning buffer
 //! handle; [`terminal_running`] - whether the terminal is still open;
-//! [`terminal_suspended`] - whether the child process is suspended.
+//! [`terminal_suspended`] - whether the child process is suspended;
+//! `row_to_linenr` - terminal-row to buffer-line conversion.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -41,6 +42,18 @@ pub fn terminal_running(term: &TerminalT) -> bool {
 #[must_use]
 pub fn terminal_suspended(term: &TerminalT) -> bool {
     term.suspended
+}
+
+/// Converts a terminal screen row to its buffer line number
+/// (`row_to_linenr`).
+#[allow(dead_code)]
+#[must_use]
+fn row_to_linenr(term: &TerminalT, row: i32) -> i32 {
+    if row == i32::MAX {
+        i32::MAX
+    } else {
+        row.wrapping_add(term.sb_current as i32).wrapping_add(1)
+    }
 }
 
 /// Whether character `c` should be filtered out of a terminal paste,
@@ -120,6 +133,26 @@ mod tests {
         assert!(!terminal_suspended(&term));
         term.suspended = true;
         assert!(terminal_suspended(&term));
+    }
+
+    #[test]
+    fn row_to_linenr_offsets_rows_by_scrollback_and_one() {
+        let term = TerminalT {
+            sb_current: 7,
+            ..Default::default()
+        };
+        assert_eq!(row_to_linenr(&term, 0), 8);
+        assert_eq!(row_to_linenr(&term, 3), 11);
+        assert_eq!(row_to_linenr(&term, -2), 6);
+    }
+
+    #[test]
+    fn row_to_linenr_preserves_the_int_max_sentinel() {
+        let term = TerminalT {
+            sb_current: 7,
+            ..Default::default()
+        };
+        assert_eq!(row_to_linenr(&term, i32::MAX), i32::MAX);
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
