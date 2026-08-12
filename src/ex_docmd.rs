@@ -25,11 +25,10 @@
 //! `spec_str[]` table lookup (`%`/`#`/`<cword>`/`<sfile>`/etc.), needed
 //! by `strings.c`'s `vim_strsave_shellescape()` (`shellescape()`).
 //!
-//! Also translated: `set_ref_in_findfunc` - marks the global
-//! `'findfunc'` callback (`ffu_cb`) with a GC `copy_id` so it survives
-//! garbage collection. `ffu_cb` stays `Callback::None` forever today
-//! (see `FFU_CB`'s own doc comment) - matches every real,
-//! unconfigured session.
+//! Also translated: `set_ref_in_findfunc`/`free_findfunc_option` -
+//! mark or release the global `'findfunc'` callback (`ffu_cb`).
+//! `ffu_cb` stays `Callback::None` forever today (see `FFU_CB`'s own
+//! doc comment) - matches every real, unconfigured session.
 //!
 //! Also translated: `modifier_len` - the length of a command modifier
 //! (e.g. `silent`/`vertical`/`3tab`) at the start of a `:` command
@@ -739,6 +738,15 @@ pub fn checkforcmd(p: &[u8], cmd: &[u8], len: usize) -> Option<usize> {
 static FFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
 
+/// Release the global `'findfunc'` callback (`free_findfunc_option`).
+///
+/// # Safety
+/// Must not run concurrently with another access to `FFU_CB`.
+pub unsafe fn free_findfunc_option() {
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::eval::typval::callback_free(unsafe { &mut *FFU_CB.as_ptr() });
+}
+
 /// Mark the global `'findfunc'` callback with `copy_id` so that it is
 /// not garbage collected (`set_ref_in_findfunc`).
 ///
@@ -1040,6 +1048,25 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    struct FfuGuard {
+        saved: Option<crate::eval::typval_defs::Callback>,
+    }
+
+    impl FfuGuard {
+        fn install(value: crate::eval::typval_defs::Callback) -> Self {
+            let slot = unsafe { &mut *FFU_CB.as_ptr() };
+            Self { saved: Some(std::mem::replace(slot, value)) }
+        }
+    }
+
+    impl Drop for FfuGuard {
+        fn drop(&mut self) {
+            let slot = unsafe { &mut *FFU_CB.as_ptr() };
+            crate::eval::typval::callback_free(slot);
+            *slot = self.saved.take().expect("saved callback");
+        }
+    }
 
     // ---- get_command_name ----
 
@@ -2094,10 +2121,25 @@ mod tests {
 
     #[test]
     fn set_ref_in_findfunc_is_always_false_since_ffu_cb_stays_none() {
+        let _lock = crate::globals::global_state_test_lock();
         // Nothing in this crate can populate FFU_CB with a real
         // callback yet (needs option_set_callback_func) - it always
         // stays Callback::None, matching a real, unconfigured session.
         assert!(!unsafe { set_ref_in_findfunc(1) });
+    }
+
+    #[test]
+    fn free_findfunc_option_releases_and_clears_the_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = FfuGuard::install(crate::eval::typval_defs::Callback::Funcref(
+            b"OrdinaryName".to_vec(),
+        ));
+
+        unsafe { free_findfunc_option() };
+        assert_eq!(
+            unsafe { &*FFU_CB.as_ptr() },
+            &crate::eval::typval_defs::Callback::None
+        );
     }
 
     #[test]
