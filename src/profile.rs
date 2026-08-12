@@ -8,8 +8,8 @@
 //! `profile_sub_wait`/`profile_equal`/`profile_signed`/`profile_cmp`.
 //!
 //! Per-function/per-script profiling remains mostly deferred, but
-//! [`func_line_exec`] is now translated because `FunccallT`/`UfuncT`
-//! have real fields.
+//! [`func_line_exec`]/[`script_line_exec`] are now translated because
+//! their function/script records have real fields.
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -117,6 +117,26 @@ pub unsafe fn func_line_exec(cookie: *mut std::ffi::c_void) {
     if unsafe { (*fp).uf_profiling != 0 && (*fp).uf_tml_idx >= 0 } {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { (*fp).uf_tml_execed = 1 };
+    }
+}
+
+/// Mark the current profiled script line as executed
+/// (`script_line_exec`).
+///
+/// # Safety
+/// Reads `GLOBALS.current_sctx` and mutates the corresponding live
+/// script item.
+pub unsafe fn script_line_exec() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+    if sid <= 0 || sid > crate::runtime::script_item_count() {
+        return;
+    }
+    let item = crate::runtime::script_item(sid);
+    // SAFETY: the script registry owns this live item.
+    if unsafe { (*item).sn_prof_on && (*item).sn_prl_idx >= 0 } {
+        // SAFETY: the script registry owns this live item.
+        unsafe { (*item).sn_prl_execed = 1 };
     }
 }
 
@@ -390,6 +410,41 @@ mod tests {
         }
         unsafe { func_line_exec(call_ptr.cast()) };
         assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
+    }
+
+    #[test]
+    fn script_line_exec_marks_only_an_active_profiled_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (sid, item) = crate::runtime::new_script_item(Some(b"profile.vim".to_vec()));
+        let sctx = crate::eval::typval_defs::SctxT {
+            sc_sid: sid,
+            ..Default::default()
+        };
+        let _sctx = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.current_sctx, sctx)
+        };
+        unsafe {
+            (*item).sn_prof_on = true;
+            (*item).sn_prl_idx = 0;
+            (*item).sn_prl_execed = 0;
+        }
+
+        unsafe { script_line_exec() };
+        assert_eq!(unsafe { (*item).sn_prl_execed }, 1);
+
+        unsafe {
+            (*item).sn_prl_execed = 0;
+            (*item).sn_prl_idx = -1;
+        }
+        unsafe { script_line_exec() };
+        assert_eq!(unsafe { (*item).sn_prl_execed }, 0);
+
+        unsafe {
+            (*item).sn_prl_idx = 0;
+            (*item).sn_prof_on = false;
+        }
+        unsafe { script_line_exec() };
+        assert_eq!(unsafe { (*item).sn_prl_execed }, 0);
     }
 
     struct PrevTimeGuard(ProftimeT);
