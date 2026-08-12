@@ -12,7 +12,7 @@
 //!   `has_non_ascii_len`, `concat_str`; and now that `mbyte.c`'s
 //!   `mb_toupper`/`mb_tolower`/`utf_ptr2char_info`/`utf_char2bytes` all
 //!   exist: `vim_strup`, `vim_strsave_up`, `vim_strcpy_up`,
-//!   `vim_strncpy_up`,
+//!   `vim_strncpy_up`, `vim_memcpy_up`,
 //!   `mb_strup_buf`, `strcase_save`; `vim_strchr` (re-examined:
 //!   an earlier note claimed this needed `charset.c`'s real `g_chartab`/
 //!   `option.c`, but re-reading the actual body shows it only needs
@@ -405,6 +405,21 @@ pub fn vim_strncpy_up(
         length += 1;
     }
     destination[length] = NUL;
+}
+
+/// Copy exactly `count` bytes while uppercasing ASCII letters, without
+/// appending a terminator (`vim_memcpy_up`).
+pub fn vim_memcpy_up(
+    destination: &mut [u8],
+    source: &[u8],
+    count: usize,
+) {
+    for (dst, &src) in destination[..count]
+        .iter_mut()
+        .zip(&source[..count])
+    {
+        *dst = src.to_ascii_uppercase();
+    }
 }
 
 /// Like [`xstrnsave`], but make all characters uppercase using ASCII
@@ -927,6 +942,14 @@ mod tests {
 
         vim_strncpy_up(&mut destination, b"xY\0ignored", 7);
         assert_eq!(&destination[..3], b"XY\0");
+    }
+
+    #[test]
+    fn vim_memcpy_up_copies_exactly_count_without_nul_semantics() {
+        let mut destination = [0xaa; 7];
+        vim_memcpy_up(&mut destination, b"ab\0cd", 5);
+        assert_eq!(&destination[..5], b"AB\0CD");
+        assert_eq!(&destination[5..], &[0xaa; 2]);
     }
 
     #[test]
