@@ -66,6 +66,16 @@ fn make_extmatch() -> *mut crate::types_defs::RegExtmatchT {
     }))
 }
 
+/// Write a four-byte big-endian regexp operand (`re_put_uint32`).
+///
+/// Returns the offset immediately after the written value, replacing
+/// the original's advanced pointer.
+#[allow(dead_code)]
+fn re_put_uint32(dst: &mut [u8], value: u32) -> usize {
+    dst[..4].copy_from_slice(&value.to_be_bytes());
+    4
+}
+
 /// Add a reference to an external-submatch block (`ref_extmatch`).
 ///
 /// # Safety
@@ -373,6 +383,16 @@ mod tests {
         // The final unref helper lands separately; this test still owns
         // the allocation directly.
         drop(unsafe { Box::from_raw(ext) });
+    }
+
+    #[test]
+    fn re_put_uint32_writes_big_endian_and_reports_the_next_offset() {
+        let mut bytes = [0xaa; 6];
+        assert_eq!(re_put_uint32(&mut bytes, 0x1234_abcd), 4);
+        assert_eq!(bytes, [0x12, 0x34, 0xab, 0xcd, 0xaa, 0xaa]);
+
+        assert_eq!(re_put_uint32(&mut bytes, u32::MAX), 4);
+        assert_eq!(&bytes[..4], &[0xff; 4]);
     }
 
     #[test]
