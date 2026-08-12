@@ -422,6 +422,27 @@ pub fn vim_memcpy_up(
     }
 }
 
+/// Select the `printf` representation of infinity (`infinity_str`).
+#[allow(dead_code)]
+#[must_use]
+fn infinity_str(
+    positive: bool,
+    format_specifier: u8,
+    force_sign: bool,
+    space_for_positive: bool,
+) -> &'static str {
+    const TABLE: [&str; 8] = [
+        "-inf", "inf", "+inf", " inf", "-INF", "INF", "+INF", " INF",
+    ];
+    let mut index = usize::from(positive)
+        * (1 + usize::from(force_sign)
+            + usize::from(force_sign) * usize::from(space_for_positive));
+    if format_specifier.is_ascii_uppercase() {
+        index += 4;
+    }
+    TABLE[index]
+}
+
 /// Like [`xstrnsave`], but make all characters uppercase using ASCII
 /// lower-to-upper case translation, language independent
 /// (`vim_strsave_up`).
@@ -965,6 +986,21 @@ mod tests {
         vim_memcpy_up(&mut destination, b"ab\0cd", 5);
         assert_eq!(&destination[..5], b"AB\0CD");
         assert_eq!(&destination[5..], &[0xaa; 2]);
+    }
+
+    #[test]
+    fn infinity_str_selects_sign_spacing_and_case() {
+        for (upper, specifier) in [(false, b'f'), (true, b'F')] {
+            let expected = if upper {
+                ["-INF", "INF", "+INF", " INF"]
+            } else {
+                ["-inf", "inf", "+inf", " inf"]
+            };
+            assert_eq!(infinity_str(false, specifier, false, false), expected[0]);
+            assert_eq!(infinity_str(true, specifier, false, false), expected[1]);
+            assert_eq!(infinity_str(true, specifier, true, false), expected[2]);
+            assert_eq!(infinity_str(true, specifier, true, true), expected[3]);
+        }
     }
 
     #[test]
