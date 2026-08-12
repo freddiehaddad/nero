@@ -124,6 +124,25 @@ unsafe fn incr_quickfix_busy() {
     unsafe { *QUICKFIX_BUSY.get_mut() += 1 };
 }
 
+/// Set `w:quickfix_title` when the quickfix list has a title
+/// (`qf_set_title_var`).
+///
+/// # Safety
+/// `GLOBALS.curwin` must point to a live window with an initialized
+/// `w_vars` dictionary.
+#[allow(dead_code)]
+unsafe fn qf_set_title_var(list: &QfListT) {
+    if let Some(title) = list.qf_title.as_deref() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::eval::vars::set_internal_string_var(
+                b"w:quickfix_title",
+                Some(title),
+            )
+        };
+    }
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2045,6 +2064,39 @@ mod tests {
 
     struct QuickfixBusyGuard(i32);
 
+    struct QuickfixWindowGuard {
+        win: Box<crate::buffer_defs::WinT>,
+        previous: *mut crate::buffer_defs::WinT,
+    }
+
+    impl QuickfixWindowGuard {
+        fn install() -> Self {
+            let mut win = Box::new(crate::buffer_defs::WinT::default());
+            win.w_vars = crate::eval::typval::tv_dict_alloc();
+            unsafe {
+                crate::eval::vars::init_var_dict(
+                    &mut *win.w_vars,
+                    &mut win.w_winvar,
+                    crate::eval::typval_defs::ScopeType::Scope,
+                );
+            }
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin =
+                std::ptr::from_mut(&mut *win);
+            Self { win, previous }
+        }
+    }
+
+    impl Drop for QuickfixWindowGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
+            if !self.win.w_vars.is_null() {
+                unsafe { crate::eval::typval::tv_dict_free(self.win.w_vars) };
+                self.win.w_vars = std::ptr::null_mut();
+            }
+        }
+    }
+
     impl QuickfixBusyGuard {
         fn set(value: i32) -> Self {
             let saved = unsafe { *QUICKFIX_BUSY.get_mut() };
@@ -2068,6 +2120,48 @@ mod tests {
             incr_quickfix_busy();
         }
         assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 2);
+    }
+
+    #[test]
+    fn qf_set_title_var_sets_only_a_present_title() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _window = QuickfixWindowGuard::install();
+        let titled = QfListT {
+            qf_title: Some(b":make all".to_vec()),
+            ..Default::default()
+        };
+        unsafe { qf_set_title_var(&titled) };
+
+        let mut value = crate::eval::typval_defs::TypvalT::default();
+        assert_eq!(
+            unsafe {
+                crate::eval::vars::eval_variable(
+                    b"w:quickfix_title",
+                    Some(&mut value),
+                    true,
+                    false,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            value.value,
+            crate::eval::typval_defs::TypvalValue::String(Some(
+                b":make all".to_vec()
+            ))
+        );
+
+        unsafe { qf_set_title_var(&QfListT::default()) };
+        let mut unchanged = crate::eval::typval_defs::TypvalT::default();
+        let _ = unsafe {
+            crate::eval::vars::eval_variable(
+                b"w:quickfix_title",
+                Some(&mut unchanged),
+                true,
+                false,
+            )
+        };
+        assert_eq!(unchanged.value, value.value);
     }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
