@@ -26,6 +26,20 @@ use crate::ex_eval_defs::ExceptT;
 use crate::pos_defs::LinenrT;
 use crate::types_defs::{AutoPatCmdT, ProftimeT};
 
+/// Source-file state shared with command execution (`source_cookie_T`).
+///
+/// This initial representation carries the fields exposed by
+/// `source_breakpoint`/`source_dbg_tick`/`source_level` plus the
+/// current source line. File I/O, read-ahead and conversion fields
+/// remain with the deferred source-reader implementation.
+#[derive(Debug, Default)]
+pub struct SourceCookieT {
+    pub sourcing_lnum: LinenrT,
+    pub breakpoint: LinenrT,
+    pub dbg_tick: i32,
+    pub level: i32,
+}
+
 /// Discriminant for [`EstackT::es_info`] (`etype_T`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EtypeT {
@@ -171,6 +185,15 @@ pub struct ScriptitemT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_cookie_defaults_all_exposed_source_state_to_zero() {
+        let cookie = SourceCookieT::default();
+        assert_eq!(cookie.sourcing_lnum, 0);
+        assert_eq!(cookie.breakpoint, 0);
+        assert_eq!(cookie.dbg_tick, 0);
+        assert_eq!(cookie.level, 0);
+    }
 
     #[test]
     fn etype_default_is_top() {
