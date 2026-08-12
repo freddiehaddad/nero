@@ -269,6 +269,9 @@ impl Default for ComplT {
     }
 }
 
+/// First match in the circular completion list (`compl_first_match`).
+static COMPL_FIRST_MATCH: GlobalCell<*mut ComplT> = GlobalCell::new(std::ptr::null_mut());
+
 /// The match currently shown in the completion menu
 /// (`compl_shown_match`).
 ///
@@ -348,6 +351,18 @@ pub unsafe fn ins_compl_long_shown_match() -> bool {
 #[must_use]
 pub fn match_at_original_text(m: &ComplT) -> bool {
     m.cp_flags & cp_flags::ORIGINAL_TEXT != 0
+}
+
+/// Whether `m` is the first match in the completion list
+/// (`is_first_match`).
+///
+/// # Safety
+/// Must not run concurrently with a completion-list mutation.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn is_first_match(m: *const ComplT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    m == unsafe { *COMPL_FIRST_MATCH.get_mut() }
 }
 
 /// The next match in the list (`cp_get_next`).
@@ -1401,6 +1416,22 @@ mod tests {
         saved_curwin: *mut crate::buffer_defs::WinT,
     }
 
+    struct FirstMatchGuard(*mut ComplT);
+
+    impl FirstMatchGuard {
+        fn install(value: *mut ComplT) -> Self {
+            let saved = unsafe { *COMPL_FIRST_MATCH.get_mut() };
+            unsafe { *COMPL_FIRST_MATCH.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for FirstMatchGuard {
+        fn drop(&mut self) {
+            unsafe { *COMPL_FIRST_MATCH.get_mut() = self.0 };
+        }
+    }
+
     impl ShownMatchGuard {
         fn install(m: *mut ComplT) -> Self {
             let g = unsafe { crate::globals::GLOBALS.get_mut() };
@@ -1525,6 +1556,20 @@ mod tests {
             ..ComplT::default()
         };
         assert!(match_at_original_text(&both));
+    }
+
+    #[test]
+    fn is_first_match_compares_pointer_identity_with_the_list_head() {
+        let _lock = global_state_test_lock();
+        let mut first = ComplT::default();
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let mut other = ComplT::default();
+        let other_ptr = std::ptr::addr_of_mut!(other);
+        let _guard = FirstMatchGuard::install(first_ptr);
+
+        assert!(unsafe { is_first_match(first_ptr) });
+        assert!(!unsafe { is_first_match(other_ptr) });
+        assert!(!unsafe { is_first_match(std::ptr::null()) });
     }
 
     #[test]
