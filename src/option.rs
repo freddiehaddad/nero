@@ -6828,6 +6828,27 @@ pub unsafe fn did_set_undolevels(
     None
 }
 
+/// Process the updated `'wildchar'`/`'wildcharm'` option value
+/// (`did_set_wildchar`).
+///
+/// # Safety
+/// `args.os_varp` must point to a live numeric option value.
+pub unsafe fn did_set_wildchar(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let c = unsafe { *args.os_varp.cast::<crate::types_defs::OptInt>() };
+    if c == i64::from(crate::ascii_defs::CTRL_C)
+        || c == i64::from(b'\n')
+        || c == i64::from(b'\r')
+        || c == i64::from(crate::keycodes_defs::K_KENTER)
+    {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7761,6 +7782,38 @@ mod did_set_title_tests {
         assert_eq!(unsafe { did_set_undolevels(&mut args) }, None);
         assert_eq!(unsafe { (*buf_ptr).b_p_ul }, 60);
 
+    }
+
+    #[test]
+    fn did_set_wildchar_rejects_control_c_newlines_and_keypad_enter() {
+        for c in [
+            i64::from(crate::ascii_defs::CTRL_C),
+            i64::from(b'\n'),
+            i64::from(b'\r'),
+            i64::from(crate::keycodes_defs::K_KENTER),
+        ] {
+            let mut value = c;
+            let mut args = crate::option_defs::OptsetT {
+                os_varp: std::ptr::addr_of_mut!(value).cast(),
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe { did_set_wildchar(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn did_set_wildchar_accepts_usable_key_values() {
+        for c in [i64::from(b'\t'), i64::from(b'*'), 0x1234] {
+            let mut value = c;
+            let mut args = crate::option_defs::OptsetT {
+                os_varp: std::ptr::addr_of_mut!(value).cast(),
+                ..Default::default()
+            };
+            assert_eq!(unsafe { did_set_wildchar(&mut args) }, None);
+        }
     }
 
     #[test]
