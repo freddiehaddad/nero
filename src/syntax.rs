@@ -53,6 +53,23 @@ unsafe fn validate_current_state() {
     unsafe { *CURRENT_STATE_VALID.get_mut() = true };
 }
 
+/// Clear and invalidate the current syntax state
+/// (`invalidate_current_state`).
+///
+/// # Safety
+/// Forwarded from [`clear_current_state`].
+#[allow(dead_code)]
+unsafe fn invalidate_current_state() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { clear_current_state() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *CURRENT_STATE_VALID.get_mut() = false;
+        *CURRENT_NEXT_LIST.get_mut() = std::ptr::null_mut();
+        *KEEPEND_LEVEL.get_mut() = -1;
+    }
+}
+
 /// Configure completion for `:match`/`:echohl`
 /// (`set_context_in_echohl_cmd`).
 ///
@@ -101,6 +118,9 @@ static CURRENT_STATE: crate::globals::GlobalCell<Vec<StateItemT>> =
 /// Whether `CURRENT_STATE` is valid (`current_state.ga_itemsize != 0`).
 static CURRENT_STATE_VALID: crate::globals::GlobalCell<bool> =
     crate::globals::GlobalCell::new(false);
+/// Current `nextgroup` ID list (`current_next_list`).
+static CURRENT_NEXT_LIST: crate::globals::GlobalCell<*mut i16> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
 
 /// Deep-clear the current syntax stack (`clear_current_state`).
 ///
@@ -1403,6 +1423,23 @@ mod tests {
         assert!(unsafe { *CURRENT_STATE_VALID.get_mut() });
     }
 
+    #[test]
+    fn invalidate_current_state_clears_stack_and_related_sentinels() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stack = CurrentStackGuard::install(vec![StateItemT::default()]);
+        let _valid = CurrentValidityGuard::set(true);
+        let mut ids = [1i16, 0];
+        let _next = CurrentNextListGuard::set(ids.as_mut_ptr());
+        let _keepend = KeependLevelGuard::install(3);
+
+        unsafe { invalidate_current_state() };
+
+        assert!(unsafe { CURRENT_STATE.get_mut() }.is_empty());
+        assert!(!unsafe { *CURRENT_STATE_VALID.get_mut() });
+        assert!(unsafe { *CURRENT_NEXT_LIST.get_mut() }.is_null());
+        assert_eq!(unsafe { *KEEPEND_LEVEL.get_mut() }, -1);
+    }
+
     // ---- get_syntax_info / syn_get_sub_char ----
 
     /// Restores the syntax engine's current-position statics on drop.
@@ -1444,6 +1481,22 @@ mod tests {
     }
 
     struct CurrentValidityGuard(bool);
+
+    struct CurrentNextListGuard(*mut i16);
+
+    impl CurrentNextListGuard {
+        fn set(value: *mut i16) -> Self {
+            let saved = unsafe { *CURRENT_NEXT_LIST.get_mut() };
+            unsafe { *CURRENT_NEXT_LIST.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for CurrentNextListGuard {
+        fn drop(&mut self) {
+            unsafe { *CURRENT_NEXT_LIST.get_mut() = self.0 };
+        }
+    }
 
     impl CurrentValidityGuard {
         fn set(value: bool) -> Self {
