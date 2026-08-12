@@ -76,6 +76,22 @@ fn re_put_uint32(dst: &mut [u8], value: u32) -> usize {
     4
 }
 
+/// Compare a position with an encoded backtracking-regexp operand
+/// (`re_num_cmp`).
+///
+/// `scan[3..7]` is the big-endian operand and `scan[7]` its optional
+/// `>`/`<` comparator; any other byte means equality.
+#[allow(dead_code)]
+#[must_use]
+fn re_num_cmp(value: u32, scan: &[u8]) -> i32 {
+    let operand = u32::from_be_bytes(scan[3..7].try_into().expect("regexp operand"));
+    i32::from(match scan[7] {
+        b'>' => value > operand,
+        b'<' => value < operand,
+        _ => value == operand,
+    })
+}
+
 /// Add a reference to an external-submatch block (`ref_extmatch`).
 ///
 /// # Safety
@@ -393,6 +409,23 @@ mod tests {
 
         assert_eq!(re_put_uint32(&mut bytes, u32::MAX), 4);
         assert_eq!(&bytes[..4], &[0xff; 4]);
+    }
+
+    #[test]
+    fn re_num_cmp_decodes_the_operand_and_comparator_byte() {
+        fn node(value: u32, cmp: u8) -> [u8; 8] {
+            let mut node = [0; 8];
+            re_put_uint32(&mut node[3..], value);
+            node[7] = cmp;
+            node
+        }
+
+        assert_eq!(re_num_cmp(10, &node(9, b'>')), 1);
+        assert_eq!(re_num_cmp(8, &node(9, b'>')), 0);
+        assert_eq!(re_num_cmp(8, &node(9, b'<')), 1);
+        assert_eq!(re_num_cmp(10, &node(9, b'<')), 0);
+        assert_eq!(re_num_cmp(u32::MAX, &node(u32::MAX, 0)), 1);
+        assert_eq!(re_num_cmp(8, &node(9, b'=')), 0);
     }
 
     #[test]
