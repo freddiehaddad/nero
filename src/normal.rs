@@ -29,6 +29,28 @@ static SHOWCMD_BUF: crate::globals::GlobalCell<
 static OLD_SHOWCMD_BUF: crate::globals::GlobalCell<
     [u8; crate::normal_defs::SHOWCMD_BUFLEN],
 > = crate::globals::GlobalCell::new([0; crate::normal_defs::SHOWCMD_BUFLEN]);
+/// Saved Visual mode to restore after a temporary change
+/// (`VIsual_mode_orig`).
+static VISUAL_MODE_ORIG: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Restore the saved Visual mode (`restore_visual_mode`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer whenever a mode is
+/// saved.
+pub unsafe fn restore_visual_mode() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mode = unsafe { *VISUAL_MODE_ORIG.get_mut() };
+    if mode != i32::from(crate::ascii_defs::NUL) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curbuf).b_visual.vi_mode = mode };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *VISUAL_MODE_ORIG.get_mut() = i32::from(crate::ascii_defs::NUL) };
+    }
+}
 
 /// Save the partially typed command while waiting for mapping input
 /// (`push_showcmd`).
@@ -713,6 +735,22 @@ mod tests {
         old: [u8; crate::normal_defs::SHOWCMD_BUFLEN],
     }
 
+    struct VisualModeGuard(i32);
+
+    impl VisualModeGuard {
+        fn set(value: i32) -> Self {
+            let saved = unsafe { *VISUAL_MODE_ORIG.get_mut() };
+            unsafe { *VISUAL_MODE_ORIG.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for VisualModeGuard {
+        fn drop(&mut self) {
+            unsafe { *VISUAL_MODE_ORIG.get_mut() = self.0 };
+        }
+    }
+
     impl ShowcmdGuard {
         fn capture() -> Self {
             Self {
@@ -789,6 +827,26 @@ mod tests {
         unsafe { push_showcmd() };
         assert_eq!(&(unsafe { OLD_SHOWCMD_BUF.get_mut() })[..4], b"12d\0");
         assert_eq!((unsafe { OLD_SHOWCMD_BUF.get_mut() })[4], 0xaa);
+    }
+
+    #[test]
+    fn restore_visual_mode_applies_and_clears_a_saved_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_visual.vi_mode = i32::from(b'v');
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _buf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _mode = VisualModeGuard::set(i32::from(b'V'));
+
+        unsafe { restore_visual_mode() };
+
+        assert_eq!(unsafe { (*buf_ptr).b_visual.vi_mode }, i32::from(b'V'));
+        assert_eq!(unsafe { *VISUAL_MODE_ORIG.get_mut() }, 0);
+
+        unsafe { (*buf_ptr).b_visual.vi_mode = i32::from(b'v') };
+        unsafe { restore_visual_mode() };
+        assert_eq!(unsafe { (*buf_ptr).b_visual.vi_mode }, i32::from(b'v'));
     }
 
     #[test]
