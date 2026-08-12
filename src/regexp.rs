@@ -9,6 +9,30 @@ const RF_HASNL: u32 = 4;
 /// Whether the previous `vim_regcomp()` saw an end-of-line item
 /// (`had_eol`).
 static HAD_EOL: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+/// Whether `'cpoptions'` contains the literal flag (`reg_cpo_lit`).
+static REG_CPO_LIT: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+/// Refresh regexp-specific `'cpoptions'` flags (`get_cpo_flags`).
+///
+/// # Safety
+/// Reads `OPTION_VARS.p_cpo` and mutates `REG_CPO_LIT`.
+#[allow(dead_code)]
+unsafe fn get_cpo_flags() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { REG_CPO_LIT.get_mut() } = opts
+        .p_cpo
+        .as_deref()
+        .is_some_and(|value| {
+            crate::strings::vim_strchr(
+                value,
+                i32::from(crate::option_vars::CPO_LITERAL),
+            )
+            .is_some()
+        });
+}
 
 /// Whether the compiled program can match a line break
 /// (`re_multiline`).
@@ -58,6 +82,28 @@ mod tests {
     struct CasemapGuard(u32);
 
     struct HadEolGuard(bool);
+
+    struct CpoGuard {
+        saved_option: Option<Vec<u8>>,
+        saved_literal: bool,
+    }
+
+    impl CpoGuard {
+        fn set(value: Option<Vec<u8>>) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved_option = std::mem::replace(&mut opts.p_cpo, value);
+            let saved_literal = unsafe { *REG_CPO_LIT.get_mut() };
+            Self { saved_option, saved_literal }
+        }
+    }
+
+    impl Drop for CpoGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo =
+                self.saved_option.take();
+            unsafe { *REG_CPO_LIT.get_mut() = self.saved_literal };
+        }
+    }
 
     impl HadEolGuard {
         fn set(value: bool) -> Self {
@@ -131,5 +177,22 @@ mod tests {
         assert_eq!(unsafe { vim_regcomp_had_eol() }, 0);
         unsafe { *HAD_EOL.get_mut() = true };
         assert_eq!(unsafe { vim_regcomp_had_eol() }, 1);
+    }
+
+    #[test]
+    fn get_cpo_flags_tracks_only_the_literal_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CpoGuard::set(Some(b"aB".to_vec()));
+        unsafe { get_cpo_flags() };
+        assert!(!unsafe { *REG_CPO_LIT.get_mut() });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo =
+            Some(b"al".to_vec());
+        unsafe { get_cpo_flags() };
+        assert!(unsafe { *REG_CPO_LIT.get_mut() });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = None;
+        unsafe { get_cpo_flags() };
+        assert!(!unsafe { *REG_CPO_LIT.get_mut() });
     }
 }
