@@ -4,6 +4,18 @@
 //! translated yet. This module starts with the representation-
 //! independent helpers used around that machinery.
 
+/// Translated core of `struct Channel`.
+///
+/// The process/socket stream union, callbacks, RPC state and event
+/// queue remain deferred. These fields are the complete state needed
+/// by the initial reference-counting helpers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChannelT {
+    pub id: u64,
+    pub refcount: usize,
+    pub did_close_event: bool,
+}
+
 /// Three-way comparison of channel IDs (`int64_t_cmp`).
 ///
 /// Written with comparisons rather than subtraction, so the full
@@ -41,5 +53,17 @@ mod tests {
         let mut ids = [i64::MAX, 7, -3, i64::MIN, 0];
         ids.sort_by(|a, b| int64_t_cmp(*a, *b).cmp(&0));
         assert_eq!(ids, [i64::MIN, -3, 0, 7, i64::MAX]);
+    }
+
+    #[test]
+    fn channel_core_state_preserves_identity_and_lifetime_fields() {
+        let channel = ChannelT {
+            id: 42,
+            refcount: 1,
+            did_close_event: false,
+        };
+        assert_eq!(channel.id, 42);
+        assert_eq!(channel.refcount, 1);
+        assert!(!channel.did_close_event);
     }
 }
