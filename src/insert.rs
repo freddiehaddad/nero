@@ -29,6 +29,26 @@
 use crate::pos_defs::ColnrT;
 use crate::vim_defs::{FAIL, OK};
 
+/// Bytes displaced by Replace mode (`replace_stack`).
+static REPLACE_STACK: crate::globals::GlobalCell<Vec<u8>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
+/// Peek at the replacement stack and pop its top byte only when it is
+/// NUL (`replace_pop_if_nul`).
+///
+/// # Safety
+/// Must not run concurrently with another replacement-stack operation.
+#[allow(dead_code)]
+unsafe fn replace_pop_if_nul() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { REPLACE_STACK.get_mut() };
+    let ch = stack.last().copied().map_or(-1, i32::from);
+    if ch == i32::from(crate::ascii_defs::NUL) {
+        stack.pop();
+    }
+    ch
+}
+
 /// Get the value `w_virtcol` would have if `'list'` were off, unless
 /// `'cpo'` contains the `'L'` flag (`get_nolist_virtcol`).
 ///
@@ -699,6 +719,34 @@ mod tests {
     use crate::buffer_defs::{BufT, WinT};
     use crate::globals::global_state_test_lock;
     use crate::memline_defs::MemlineT;
+
+    struct ReplaceStackGuard(Vec<u8>);
+
+    impl ReplaceStackGuard {
+        fn install(value: Vec<u8>) -> Self {
+            Self(std::mem::replace(unsafe { REPLACE_STACK.get_mut() }, value))
+        }
+    }
+
+    impl Drop for ReplaceStackGuard {
+        fn drop(&mut self) {
+            *unsafe { REPLACE_STACK.get_mut() } = std::mem::take(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn replace_pop_if_nul_only_removes_a_nul_top_byte() {
+        let _lock = global_state_test_lock();
+        let _guard = ReplaceStackGuard::install(Vec::new());
+        assert_eq!(unsafe { replace_pop_if_nul() }, -1);
+
+        unsafe { REPLACE_STACK.get_mut() }.extend_from_slice(&[b'a', 0]);
+        assert_eq!(unsafe { replace_pop_if_nul() }, 0);
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"a");
+
+        assert_eq!(unsafe { replace_pop_if_nul() }, i32::from(b'a'));
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"a");
+    }
 
     struct CurwinGuard {
         previous: *mut WinT,
