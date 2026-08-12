@@ -2,7 +2,20 @@
 //!
 //! The regular-expression compiler and executor are not translated.
 //! This module starts with the independent replacement-text case
-//! conversion helpers.
+//! conversion helpers and compiled-program flag accessors.
+
+/// Compiled program can match a newline (`RF_HASNL`).
+const RF_HASNL: u32 = 4;
+
+/// Whether the compiled program can match a line break
+/// (`re_multiline`).
+///
+/// The original returns the flag bit itself (`0` or `RF_HASNL`), not a
+/// normalized boolean.
+#[must_use]
+pub fn re_multiline(prog: &crate::types_defs::RegprogT) -> i32 {
+    (prog.regflags & RF_HASNL) as i32
+}
 
 /// Uppercase one replacement character (`do_upper`).
 ///
@@ -67,5 +80,17 @@ mod tests {
 
         unsafe { do_lower(&mut dst, i32::from(b'?')) };
         assert_eq!(dst, i32::from(b'?'));
+    }
+
+    #[test]
+    fn re_multiline_returns_the_newline_flag_bit_itself() {
+        let mut prog = crate::types_defs::RegprogT::default();
+        assert_eq!(re_multiline(&prog), 0);
+
+        prog.regflags = RF_HASNL;
+        assert_eq!(re_multiline(&prog), RF_HASNL as i32);
+
+        prog.regflags = RF_HASNL | 0x80;
+        assert_eq!(re_multiline(&prog), RF_HASNL as i32);
     }
 }
