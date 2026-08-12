@@ -15,7 +15,7 @@
 //! handle; [`terminal_running`] - whether the terminal is still open;
 //! [`terminal_suspended`] - whether the child process is suspended;
 //! `row_to_linenr`/`linenr_to_row` - terminal-row/buffer-line
-//! conversion.
+//! conversion; `is_focused` - current terminal focus detection.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -63,6 +63,22 @@ fn row_to_linenr(term: &TerminalT, row: i32) -> i32 {
 #[must_use]
 fn linenr_to_row(term: &TerminalT, linenr: i32) -> i32 {
     linenr.wrapping_sub(term.sb_current as i32).wrapping_sub(1)
+}
+
+/// Whether `term` is the terminal currently focused in Terminal mode
+/// (`is_focused`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer, and global editor
+/// state must not be mutated concurrently.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn is_focused(term: *const TerminalT) -> bool {
+    // SAFETY: forwarded from this function's own safety contract.
+    let g = unsafe { &*crate::globals::GLOBALS.as_ptr() };
+    g.State & crate::state_defs::mode::TERMINAL as i32 != 0
+        // SAFETY: `curbuf` is live by the caller's contract.
+        && unsafe { (*g.curbuf).terminal == term.cast_mut() }
 }
 
 /// Whether character `c` should be filtered out of a terminal paste,
@@ -184,6 +200,35 @@ mod tests {
         for row in [-10, 0, 1, 80, 10_000] {
             assert_eq!(linenr_to_row(&term, row_to_linenr(&term, row)), row);
         }
+    }
+
+    #[test]
+    fn is_focused_requires_terminal_mode_and_the_current_buffers_terminal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut term = TerminalT::default();
+        let term_ptr = std::ptr::addr_of_mut!(term);
+        let mut other = TerminalT::default();
+        let other_ptr = std::ptr::addr_of_mut!(other);
+        let mut buf = crate::buffer_defs::BufT {
+            terminal: term_ptr,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.State,
+                crate::state_defs::mode::TERMINAL as i32,
+            )
+        };
+
+        assert!(unsafe { is_focused(term_ptr) });
+        assert!(!unsafe { is_focused(other_ptr) });
+
+        unsafe { &mut *crate::globals::GLOBALS.as_ptr() }.State =
+            crate::state_defs::mode::NORMAL as i32;
+        assert!(!unsafe { is_focused(term_ptr) });
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
