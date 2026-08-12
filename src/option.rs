@@ -6697,6 +6697,33 @@ pub unsafe fn did_set_winblend(
     None
 }
 
+/// Process the updated `'number'` or `'relativenumber'` option value
+/// (`did_set_number_relativenumber`).
+///
+/// A custom status column needs its cached width recomputed, and the
+/// sign-column bounds are always refreshed.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn did_set_number_relativenumber(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if (*win)
+            .w_onebuf_opt
+            .wo_stc
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            (*win).w_nrwidth_line_count = 0;
+        }
+        let _ = crate::optionstr::check_signcolumn(None, Some(&mut *win));
+    }
+    None
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7436,6 +7463,48 @@ mod did_set_title_tests {
         assert_eq!(unsafe { did_set_winblend(&mut args) }, None);
         assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_winbl }, 0);
         assert!(!unsafe { (*win_ptr).w_grid_alloc.blending });
+    }
+
+    #[test]
+    fn did_set_number_relativenumber_resets_statuscolumn_width_and_sign_bounds() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_stc = Some(b"%l".to_vec());
+        win.w_onebuf_opt.wo_scl = Some(b"yes".to_vec());
+        win.w_nrwidth_line_count = 42;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_number_relativenumber(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_nrwidth_line_count }, 0);
+        assert_eq!(unsafe { (*win_ptr).w_minscwidth }, 1);
+        assert_eq!(unsafe { (*win_ptr).w_maxscwidth }, 1);
+    }
+
+    #[test]
+    fn did_set_number_relativenumber_keeps_width_without_statuscolumn() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_stc = None;
+        win.w_onebuf_opt.wo_scl = Some(b"no".to_vec());
+        win.w_nrwidth_line_count = 42;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_number_relativenumber(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_nrwidth_line_count }, 42);
+        assert_eq!(
+            unsafe { (*win_ptr).w_minscwidth },
+            crate::option_vars::SCL_NO
+        );
+        assert_eq!(
+            unsafe { (*win_ptr).w_maxscwidth },
+            crate::option_vars::SCL_NO
+        );
     }
 
     #[test]
