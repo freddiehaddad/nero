@@ -6660,6 +6660,17 @@ unsafe fn optval_default(
     optval_equal(&current, &get_option(opt_idx).def_val)
 }
 
+/// Copy an owned string option value (`copy_option_val`).
+///
+/// The original avoids allocating for its shared
+/// `empty_string_option` sentinel. Rust's empty `Vec` has no shared
+/// allocation, so `clone` already preserves that optimization's
+/// observable behavior.
+#[allow(dead_code)]
+fn copy_option_val(value: &Option<Vec<u8>>) -> Option<Vec<u8>> {
+    value.clone()
+}
+
 /// This option's own flags, or `0` for an invalid index
 /// (`get_option_flags`).
 #[must_use]
@@ -7568,6 +7579,17 @@ mod did_set_title_tests {
         assert!(unsafe { optval_default(OptIndex::Allowrevins, varp) });
         unsafe { *varp.cast::<i32>() = 1 };
         assert!(!unsafe { optval_default(OptIndex::Allowrevins, varp) });
+    }
+
+    #[test]
+    fn copy_option_val_deep_copies_nonempty_and_preserves_empty_states() {
+        let mut original = Some(b"value".to_vec());
+        let copied = copy_option_val(&original);
+        original.as_mut().expect("value")[0] = b'V';
+        assert_eq!(copied.as_deref(), Some(b"value".as_slice()));
+
+        assert_eq!(copy_option_val(&Some(Vec::new())), Some(Vec::new()));
+        assert_eq!(copy_option_val(&None), None);
     }
 
     #[test]
