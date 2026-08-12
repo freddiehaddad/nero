@@ -329,6 +329,23 @@ fn do_source_str_init(
     cookie.source_from_buf_or_str = true;
 }
 
+/// Append `source` while escaping every comma
+/// (`strcpy_comma_escaped`).
+///
+/// Returns the destination offset immediately after the appended
+/// bytes, replacing the original's advanced pointer.
+#[allow(dead_code)]
+fn strcpy_comma_escaped(destination: &mut Vec<u8>, source: &[u8]) -> usize {
+    destination.reserve(source.len());
+    for &byte in source {
+        if byte == b',' {
+            destination.push(b'\\');
+        }
+        destination.push(byte);
+    }
+    destination.len()
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -871,6 +888,20 @@ mod tests {
 
         do_source_str_init(&mut cookie, b"last\n");
         assert_eq!(cookie.buflines, vec![b"last".to_vec()]);
+    }
+
+    #[test]
+    fn strcpy_comma_escaped_appends_and_returns_the_end_offset() {
+        let mut destination = b"prefix:".to_vec();
+        assert_eq!(
+            strcpy_comma_escaped(&mut destination, b"a,b,,c"),
+            b"prefix:a\\,b\\,\\,c".len()
+        );
+        assert_eq!(destination, b"prefix:a\\,b\\,\\,c");
+
+        let end = strcpy_comma_escaped(&mut destination, b"plain");
+        assert_eq!(end, destination.len());
+        assert!(destination.ends_with(b"plain"));
     }
 
     #[test]
