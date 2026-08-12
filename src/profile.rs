@@ -205,6 +205,38 @@ pub unsafe fn script_line_exec() {
     }
 }
 
+/// Finish timing the current source line (`script_line_end`).
+///
+/// # Safety
+/// Reads `GLOBALS.current_sctx` and mutates its live script item.
+pub unsafe fn script_line_end() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+    if sid <= 0 || sid > crate::runtime::script_item_count() {
+        return;
+    }
+    let item = crate::runtime::script_item(sid);
+    // SAFETY: the script registry owns this live item.
+    let item = unsafe { &mut *item };
+    let Ok(index) = usize::try_from(item.sn_prl_idx) else {
+        return;
+    };
+    if !item.sn_prof_on || index >= item.sn_prl_ga.len() {
+        return;
+    }
+    if item.sn_prl_execed != 0 {
+        let line = &mut item.sn_prl_ga[index];
+        line.snp_count += 1;
+        let elapsed = profile_end(item.sn_prl_start);
+        let elapsed = profile_sub_wait(item.sn_prl_wait, elapsed);
+        item.sn_prl_start = elapsed;
+        line.sn_prl_total = profile_add(line.sn_prl_total, elapsed);
+        line.sn_prl_self =
+            profile_self(line.sn_prl_self, elapsed, item.sn_prl_children);
+    }
+    item.sn_prl_idx = -1;
+}
+
 /// Save timing state before invoking another script or function
 /// (`script_prof_save`).
 ///
@@ -661,6 +693,41 @@ mod tests {
         assert_eq!(item.sn_prl_execed, 0);
         assert_eq!(item.sn_prl_children, 0);
         assert_eq!(item.sn_prl_wait, profile_get_wait());
+    }
+
+    #[test]
+    fn script_line_end_accumulates_an_executed_line_and_clears_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (sid, item) =
+            crate::runtime::new_script_item(Some(b"profile-end.vim".to_vec()));
+        let sctx = crate::eval::typval_defs::SctxT {
+            sc_sid: sid,
+            ..Default::default()
+        };
+        let _sctx = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.current_sctx, sctx)
+        };
+        unsafe {
+            (*item).sn_prof_on = true;
+            (*item).sn_prl_ga = vec![crate::runtime_defs::SnPrlT::default()];
+            (*item).sn_prl_idx = 0;
+            (*item).sn_prl_execed = 1;
+            (*item).sn_prl_start = profile_start().wrapping_sub(1_000_000);
+            (*item).sn_prl_children = 100;
+            (*item).sn_prl_wait = profile_get_wait();
+        }
+
+        unsafe { script_line_end() };
+
+        let item = unsafe { &*item };
+        assert_eq!(item.sn_prl_idx, -1);
+        assert_eq!(item.sn_prl_ga[0].snp_count, 1);
+        assert!(item.sn_prl_start > 0);
+        assert_eq!(item.sn_prl_ga[0].sn_prl_total, item.sn_prl_start);
+        assert_eq!(
+            item.sn_prl_ga[0].sn_prl_self,
+            profile_self(0, item.sn_prl_start, 100)
+        );
     }
 
     #[test]
