@@ -109,6 +109,10 @@
 //! self-contained enum needed by `popupmenu.c`'s `pum_align_order`):
 //! [`CPT_ABBR`]/[`CPT_KIND`]/[`CPT_MENU`]/[`CPT_INFO`]/[`CPT_COUNT`].
 //!
+//! Also translated: [`ins_compl_arm_autocomplete_delay`] and its
+//! pending/start-time state, the timer-arm half of
+//! `'autocompletedelay'`.
+//!
 //! Deferred: everything else in the file.
 
 use crate::globals::GlobalCell;
@@ -861,6 +865,31 @@ pub unsafe fn ins_compl_len() -> i32 {
 /// completion engine that sets it is not translated.
 static COMPL_AUTOCOMPLETE: GlobalCell<bool> = GlobalCell::new(false);
 
+/// Whether the `'autocompletedelay'` timer is pending.
+static COMPL_AUTOCOMPLETE_PENDING: GlobalCell<bool> = GlobalCell::new(false);
+/// Nanosecond timestamp at which the delay was armed.
+static COMPL_AUTOCOMPLETE_START_TV: GlobalCell<u64> = GlobalCell::new(0);
+
+/// Arm the `'autocompletedelay'` timer when a delay is configured
+/// (`ins_compl_arm_autocomplete_delay`).
+///
+/// # Safety
+/// Reads `OPTION_VARS.p_acl` and mutates the completion delay statics.
+#[must_use]
+pub unsafe fn ins_compl_arm_autocomplete_delay() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_acl > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            *COMPL_AUTOCOMPLETE_START_TV.get_mut() = crate::os::time::os_hrtime();
+            *COMPL_AUTOCOMPLETE_PENDING.get_mut() = true;
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Get the local or global value of `'completeopt'` flags
 /// (`get_cot_flags`).
 ///
@@ -1544,6 +1573,38 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    struct AutocompleteDelayGuard {
+        prev_delay: crate::types_defs::OptInt,
+        prev_pending: bool,
+        prev_start: u64,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AutocompleteDelayGuard {
+        fn set(delay: crate::types_defs::OptInt) -> Self {
+            let _lock = global_state_test_lock();
+            let prev_delay = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_acl;
+            let prev_pending = unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() };
+            let prev_start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
+            unsafe {
+                crate::option_vars::OPTION_VARS.get_mut().p_acl = delay;
+                *COMPL_AUTOCOMPLETE_PENDING.get_mut() = false;
+                *COMPL_AUTOCOMPLETE_START_TV.get_mut() = 0;
+            }
+            Self { prev_delay, prev_pending, prev_start, _lock }
+        }
+    }
+
+    impl Drop for AutocompleteDelayGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::option_vars::OPTION_VARS.get_mut().p_acl = self.prev_delay;
+                *COMPL_AUTOCOMPLETE_PENDING.get_mut() = self.prev_pending;
+                *COMPL_AUTOCOMPLETE_START_TV.get_mut() = self.prev_start;
+            }
+        }
+    }
+
     impl ComplStateGuard {
         fn new() -> Self {
             let _lock = global_state_test_lock();
@@ -1564,6 +1625,24 @@ mod tests {
                 *COMPL_SHOWS_DIR.get_mut() = self.prev_shows;
             }
         }
+    }
+
+    #[test]
+    fn autocomplete_delay_is_only_armed_for_a_positive_option_value() {
+        {
+            let _guard = AutocompleteDelayGuard::set(0);
+            assert!(!unsafe { ins_compl_arm_autocomplete_delay() });
+            assert!(!unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
+            assert_eq!(unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() }, 0);
+        }
+
+        let _guard = AutocompleteDelayGuard::set(50);
+        let before = crate::os::time::os_hrtime();
+        assert!(unsafe { ins_compl_arm_autocomplete_delay() });
+        let after = crate::os::time::os_hrtime();
+        let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
+        assert!(unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
+        assert!((before..=after).contains(&start));
     }
 
     /// Installs a buffer as `curbuf` for the test's duration and
