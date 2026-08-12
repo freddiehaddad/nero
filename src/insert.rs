@@ -33,6 +33,26 @@ use crate::vim_defs::{FAIL, OK};
 static REPLACE_STACK: crate::globals::GlobalCell<Vec<u8>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+/// Push replaced bytes onto the Replace-mode stack (`replace_push`).
+///
+/// # Safety
+/// Must not run concurrently with another replacement-stack operation;
+/// reads `GLOBALS.replace_offset`.
+pub unsafe fn replace_push(bytes: &[u8]) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let offset = unsafe { crate::globals::GLOBALS.get_mut() }.replace_offset;
+    let Ok(offset) = usize::try_from(offset) else {
+        return;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { REPLACE_STACK.get_mut() };
+    if stack.len() < offset {
+        return;
+    }
+    let position = stack.len() - offset;
+    stack.splice(position..position, bytes.iter().copied());
+}
+
 /// Peek at the replacement stack and pop its top byte only when it is
 /// NUL (`replace_pop_if_nul`).
 ///
@@ -746,6 +766,26 @@ mod tests {
 
         assert_eq!(unsafe { replace_pop_if_nul() }, i32::from(b'a'));
         assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"a");
+    }
+
+    #[test]
+    fn replace_push_inserts_below_the_configured_top_offset() {
+        let _lock = global_state_test_lock();
+        let _guard = ReplaceStackGuard::install(b"abcd".to_vec());
+        let _offset = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.replace_offset, 0)
+        };
+
+        unsafe { replace_push(b"XY") };
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"abcdXY");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.replace_offset = 2;
+        unsafe { replace_push(b"!") };
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"abcd!XY");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.replace_offset = 99;
+        unsafe { replace_push(b"ignored") };
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"abcd!XY");
     }
 
     struct CurwinGuard {
