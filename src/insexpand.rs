@@ -109,9 +109,9 @@
 //! self-contained enum needed by `popupmenu.c`'s `pum_align_order`):
 //! [`CPT_ABBR`]/[`CPT_KIND`]/[`CPT_MENU`]/[`CPT_INFO`]/[`CPT_COUNT`].
 //!
-//! Also translated: [`ins_compl_arm_autocomplete_delay`] and its
-//! pending/start-time state, the timer-arm half of
-//! `'autocompletedelay'`.
+//! Also translated: [`ins_compl_arm_autocomplete_delay`]/
+//! [`ins_compl_clear_autocomplete_delay`] and their pending/start-time
+//! state.
 //!
 //! Deferred: everything else in the file.
 
@@ -890,6 +890,16 @@ pub unsafe fn ins_compl_arm_autocomplete_delay() -> bool {
     }
 }
 
+/// Clear the pending `'autocompletedelay'` state
+/// (`ins_compl_clear_autocomplete_delay`).
+///
+/// # Safety
+/// Must not run concurrently with another completion-delay operation.
+pub unsafe fn ins_compl_clear_autocomplete_delay() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() = false };
+}
+
 /// Get the local or global value of `'completeopt'` flags
 /// (`get_cot_flags`).
 ///
@@ -1643,6 +1653,18 @@ mod tests {
         let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
         assert!(unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
         assert!((before..=after).contains(&start));
+    }
+
+    #[test]
+    fn autocomplete_delay_clear_only_resets_the_pending_flag() {
+        let _guard = AutocompleteDelayGuard::set(50);
+        assert!(unsafe { ins_compl_arm_autocomplete_delay() });
+        let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
+
+        unsafe { ins_compl_clear_autocomplete_delay() };
+
+        assert!(!unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
+        assert_eq!(unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() }, start);
     }
 
     /// Installs a buffer as `curbuf` for the test's duration and
