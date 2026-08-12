@@ -12,8 +12,38 @@
 //! not translated - needs `find_ident_under_cursor`/`searchit`, the
 //! real regex engine), matching this crate's established "small,
 //! self-contained, no design freedom to get wrong" precedent.
+//! [`op_pending`] also translates the Normal-state pending-operator
+//! predicate.
 //!
-//! Deferred: everything else in the file.
+//! Deferred: the remaining command-dispatch engine.
+
+/// Operator state currently being processed (`current_oap`).
+static CURRENT_OAP: crate::globals::GlobalCell<*mut crate::normal_defs::OpargT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// Whether an operator, count, or register name is pending
+/// (`op_pending`).
+///
+/// # Safety
+/// A non-null `CURRENT_OAP` must point to a live `OpargT`; global state
+/// must not be mutated concurrently.
+#[must_use]
+pub unsafe fn op_pending() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let oap = unsafe { *CURRENT_OAP.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let finish_op = unsafe { crate::globals::GLOBALS.get_mut() }.finish_op;
+    if oap.is_null() {
+        return true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let oap = unsafe { &*oap };
+    !(!finish_op
+        && oap.prev_opcount == 0
+        && oap.prev_count0 == 0
+        && oap.op_type == crate::ops_defs::OpType::Nop as i32
+        && oap.regname == i32::from(crate::ascii_defs::NUL))
+}
 
 /// `|`: move to a specific screen column (`nv_pipe`).
 ///
@@ -645,6 +675,49 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CurrentOapGuard(*mut crate::normal_defs::OpargT);
+
+    impl CurrentOapGuard {
+        fn install(value: *mut crate::normal_defs::OpargT) -> Self {
+            let saved = unsafe { *CURRENT_OAP.get_mut() };
+            unsafe { *CURRENT_OAP.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for CurrentOapGuard {
+        fn drop(&mut self) {
+            unsafe { *CURRENT_OAP.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn op_pending_detects_operator_count_register_and_finish_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut oap = crate::normal_defs::OpargT::default();
+        let oap_ptr = std::ptr::addr_of_mut!(oap);
+        let _oap = CurrentOapGuard::install(oap_ptr);
+        let _finish = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.finish_op, false)
+        };
+
+        assert!(!unsafe { op_pending() });
+        unsafe { (*oap_ptr).prev_count0 = 2 };
+        assert!(unsafe { op_pending() });
+        unsafe {
+            (*oap_ptr).prev_count0 = 0;
+            (*oap_ptr).regname = i32::from(b'a');
+        }
+        assert!(unsafe { op_pending() });
+        unsafe {
+            (*oap_ptr).regname = 0;
+            crate::globals::GLOBALS.get_mut().finish_op = true;
+        }
+        assert!(unsafe { op_pending() });
+        unsafe { *CURRENT_OAP.get_mut() = std::ptr::null_mut() };
+        assert!(unsafe { op_pending() });
+    }
 
     #[test]
     fn nv_pipe_records_the_requested_column_not_the_reached_one() {
