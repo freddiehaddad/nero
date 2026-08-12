@@ -106,6 +106,17 @@ pub unsafe fn prof_def_func() -> bool {
     false
 }
 
+/// Initialize profiling state for a script (`profile_init`).
+pub fn profile_init(script: &mut crate::runtime_defs::ScriptitemT) {
+    script.sn_pr_count = 0;
+    script.sn_pr_total = profile_zero();
+    script.sn_pr_self = profile_zero();
+    script.sn_prl_ga.clear();
+    script.sn_prl_idx = -1;
+    script.sn_prof_on = true;
+    script.sn_pr_nest = 0;
+}
+
 /// Mark the current profiled function line as executed
 /// (`func_line_exec`).
 ///
@@ -541,6 +552,7 @@ mod tests {
             (*func_ptr).uf_tml_execed = 0;
             (*func_ptr).uf_tml_idx = -1;
         }
+
         unsafe { func_line_exec(call_ptr.cast()) };
         assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
 
@@ -550,6 +562,34 @@ mod tests {
         }
         unsafe { func_line_exec(call_ptr.cast()) };
         assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
+    }
+
+    #[test]
+    fn profile_init_resets_script_counters_and_enables_profiling() {
+        let mut script = crate::runtime_defs::ScriptitemT {
+            sn_prof_on: false,
+            sn_pr_nest: 7,
+            sn_pr_count: 9,
+            sn_pr_total: 100,
+            sn_pr_self: 40,
+            sn_prl_ga: vec![crate::runtime_defs::SnPrlT {
+                snp_count: 3,
+                sn_prl_total: 8,
+                sn_prl_self: 5,
+            }],
+            sn_prl_idx: 4,
+            ..Default::default()
+        };
+
+        profile_init(&mut script);
+
+        assert!(script.sn_prof_on);
+        assert_eq!(script.sn_pr_nest, 0);
+        assert_eq!(script.sn_pr_count, 0);
+        assert_eq!(script.sn_pr_total, 0);
+        assert_eq!(script.sn_pr_self, 0);
+        assert!(script.sn_prl_ga.is_empty());
+        assert_eq!(script.sn_prl_idx, -1);
     }
 
     #[test]
