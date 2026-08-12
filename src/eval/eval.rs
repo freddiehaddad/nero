@@ -315,6 +315,17 @@ pub unsafe fn ex_echohl(eap: &crate::ex_cmds_defs::ExargT) {
     unsafe { *ECHO_HL_ID.get_mut() = id };
 }
 
+/// Return the highlight group selected by `:echohl`
+/// (`get_echo_hl_id`).
+///
+/// # Safety
+/// Must not run concurrently with [`ex_echohl`].
+#[must_use]
+pub unsafe fn get_echo_hl_id() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *ECHO_HL_ID.get_mut() }
+}
+
 /// "n1" divided by "n2", taking care of dividing by zero
 /// (`num_divide`).
 #[must_use]
@@ -5878,6 +5889,14 @@ mod tests {
         let empty = crate::ex_cmds_defs::ExargT::default();
         unsafe { ex_echohl(&empty) };
         assert_eq!(unsafe { *ECHO_HL_ID.get_mut() }, 0);
+    }
+
+    #[test]
+    fn get_echo_hl_id_returns_the_stored_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = EchoHighlightGuard::capture();
+        unsafe { *ECHO_HL_ID.get_mut() = 37 };
+        assert_eq!(unsafe { get_echo_hl_id() }, 37);
     }
 
     // --- get_callback_depth ---
