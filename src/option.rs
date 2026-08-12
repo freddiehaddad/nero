@@ -6791,6 +6791,43 @@ pub unsafe fn did_set_buflisted(
     None
 }
 
+/// Process the updated global or buffer-local `'undolevels'` value
+/// (`did_set_undolevels`).
+///
+/// # Safety
+/// `args.os_buf`/`args.os_varp` must identify the live buffer and
+/// option field for this callback. Forwarded from the selected
+/// `did_set_*_undolevels` helper.
+pub unsafe fn did_set_undolevels(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let (value, old_value) = match (&args.os_newval, &args.os_oldval) {
+        (
+            crate::option_defs::OptVal::Number(value),
+            crate::option_defs::OptVal::Number(old_value),
+        ) => (*value, *old_value),
+        _ => return None,
+    };
+    let buf = args.os_buf as *mut crate::buffer_defs::BufT;
+    let varp = args.os_varp.cast::<crate::types_defs::OptInt>();
+    let global_ul =
+        // SAFETY: `as_ptr` provides the stable address of OPTION_VARS.
+        unsafe { std::ptr::addr_of_mut!((*crate::option_vars::OPTION_VARS.as_ptr()).p_ul) };
+    if varp == global_ul {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { did_set_global_undolevels(value, old_value) };
+    } else {
+        let local_ul =
+            // SAFETY: `buf` is live by the caller's contract.
+            unsafe { std::ptr::addr_of_mut!((*buf).b_p_ul) };
+        if varp == local_ul {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { did_set_buflocal_undolevels(buf, value, old_value) };
+        }
+    }
+    None
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7429,6 +7466,20 @@ mod did_set_title_tests {
         }
     }
 
+    struct GlobalUlGuard(crate::types_defs::OptInt);
+
+    impl GlobalUlGuard {
+        fn capture() -> Self {
+            Self(unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ul })
+        }
+    }
+
+    impl Drop for GlobalUlGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ul = self.0 };
+        }
+    }
+
     #[test]
     fn optval_equal_matches_the_originals_per_variant_dispatch() {
         use crate::option_defs::OptVal;
@@ -7673,6 +7724,43 @@ mod did_set_title_tests {
             crate::types_defs::TriState::False,
         );
         assert_eq!(unsafe { did_set_buflisted(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_undolevels_dispatches_by_the_option_field_address() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_ul: 40,
+            b_u_synced: true,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _global_ul = GlobalUlGuard::capture();
+        let global_ptr =
+            unsafe { std::ptr::addr_of_mut!((*crate::option_vars::OPTION_VARS.as_ptr()).p_ul) };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_varp: global_ptr.cast(),
+            os_oldval: crate::option_defs::OptVal::Number(80),
+            os_newval: crate::option_defs::OptVal::Number(100),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_undolevels(&mut args) }, None);
+        assert_eq!(
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ul },
+            100
+        );
+
+        let local_ptr = unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_p_ul) };
+        args.os_varp = local_ptr.cast();
+        args.os_oldval = crate::option_defs::OptVal::Number(40);
+        args.os_newval = crate::option_defs::OptVal::Number(60);
+        assert_eq!(unsafe { did_set_undolevels(&mut args) }, None);
+        assert_eq!(unsafe { (*buf_ptr).b_p_ul }, 60);
+
     }
 
     #[test]
