@@ -298,6 +298,11 @@ pub fn source_dbg_tick(
     &mut cookie.dbg_tick
 }
 
+#[must_use]
+pub fn source_level(cookie: &crate::runtime_defs::SourceCookieT) -> i32 {
+    cookie.level
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -807,6 +812,15 @@ mod tests {
         let mut cookie = crate::runtime_defs::SourceCookieT::default();
         *source_dbg_tick(&mut cookie) = 17;
         assert_eq!(cookie.dbg_tick, 17);
+    }
+
+    #[test]
+    fn source_level_returns_the_cookie_nesting_level() {
+        let cookie = crate::runtime_defs::SourceCookieT {
+            level: 9,
+            ..Default::default()
+        };
+        assert_eq!(source_level(&cookie), 9);
     }
 
     #[test]
