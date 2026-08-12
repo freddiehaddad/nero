@@ -6671,6 +6671,31 @@ fn copy_option_val(value: &Option<Vec<u8>>) -> Option<Vec<u8>> {
     value.clone()
 }
 
+/// Whether `varp` is `'wildchar'`/`'wildcharm'` and its value has a
+/// printable key name (`wc_use_keyname`).
+///
+/// # Safety
+/// `varp` must point to a live `OptInt`.
+#[allow(dead_code)]
+unsafe fn wc_use_keyname(
+    varp: *const crate::types_defs::OptInt,
+    wildchar: &mut crate::types_defs::OptInt,
+) -> bool {
+    let options = crate::option_vars::OPTION_VARS.as_ptr();
+    // SAFETY: `as_ptr` gives the stable option-state address.
+    let wc = unsafe { std::ptr::addr_of!((*options).p_wc) };
+    // SAFETY: `as_ptr` gives the stable option-state address.
+    let wcm = unsafe { std::ptr::addr_of!((*options).p_wcm) };
+    if varp != wc && varp != wcm {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    *wildchar = unsafe { *varp };
+    let key = *wildchar as i32;
+    crate::keycodes_defs::is_special(key)
+        || crate::keycodes::find_special_key_in_table(key) >= 0
+}
+
 /// This option's own flags, or `0` for an invalid index
 /// (`get_option_flags`).
 #[must_use]
@@ -7531,6 +7556,36 @@ mod did_set_title_tests {
         }
     }
 
+    struct WildcharGuard {
+        wc: crate::types_defs::OptInt,
+        wcm: crate::types_defs::OptInt,
+    }
+
+    impl WildcharGuard {
+        fn set(wc: crate::types_defs::OptInt, wcm: crate::types_defs::OptInt) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let saved = Self {
+                wc: unsafe { (*options).p_wc },
+                wcm: unsafe { (*options).p_wcm },
+            };
+            unsafe {
+                (*options).p_wc = wc;
+                (*options).p_wcm = wcm;
+            }
+            saved
+        }
+    }
+
+    impl Drop for WildcharGuard {
+        fn drop(&mut self) {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            unsafe {
+                (*options).p_wc = self.wc;
+                (*options).p_wcm = self.wcm;
+            }
+        }
+    }
+
     #[test]
     fn optval_equal_matches_the_originals_per_variant_dispatch() {
         use crate::option_defs::OptVal;
@@ -7590,6 +7645,33 @@ mod did_set_title_tests {
 
         assert_eq!(copy_option_val(&Some(Vec::new())), Some(Vec::new()));
         assert_eq!(copy_option_val(&None), None);
+    }
+
+    #[test]
+    fn wc_use_keyname_requires_wild_option_identity_and_a_named_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let _guard =
+            WildcharGuard::set(i64::from(crate::keycodes_defs::K_UP), i64::from(b'x'));
+
+        let mut value = -99;
+        assert!(unsafe {
+            wc_use_keyname(std::ptr::addr_of!((*options).p_wc), &mut value)
+        });
+        assert_eq!(value, i64::from(crate::keycodes_defs::K_UP));
+
+        assert!(!unsafe {
+            wc_use_keyname(std::ptr::addr_of!((*options).p_wcm), &mut value)
+        });
+        assert_eq!(value, i64::from(b'x'));
+
+        let unrelated = i64::from(crate::keycodes_defs::K_UP);
+        value = 77;
+        assert!(!unsafe {
+            wc_use_keyname(std::ptr::addr_of!(unrelated), &mut value)
+        });
+        assert_eq!(value, 77);
+
     }
 
     #[test]
