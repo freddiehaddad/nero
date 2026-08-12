@@ -56,6 +56,16 @@ fn nfa_re_num_cmp(value: u64, op: i32, position: u64) -> bool {
     }
 }
 
+/// Allocate an empty external-submatch block with one reference
+/// (`make_extmatch`).
+#[allow(dead_code)]
+fn make_extmatch() -> *mut crate::types_defs::RegExtmatchT {
+    Box::into_raw(Box::new(crate::types_defs::RegExtmatchT {
+        refcnt: 1,
+        ..Default::default()
+    }))
+}
+
 /// Whether NFA matching exceeded its configured deadline
 /// (`nfa_did_time_out`).
 ///
@@ -306,5 +316,14 @@ mod tests {
         unsafe { *timed_out_ptr = false };
         assert!(!unsafe { nfa_did_time_out() });
         assert!(!unsafe { *timed_out_ptr });
+    }
+
+    #[test]
+    fn make_extmatch_starts_with_one_reference_and_empty_captures() {
+        let ext = make_extmatch();
+        assert_eq!(unsafe { (*ext).refcnt }, 1);
+        assert!(unsafe { &(*ext).matches }.iter().all(Option::is_none));
+        // Constructor ownership is still held only by this test.
+        drop(unsafe { Box::from_raw(ext) });
     }
 }

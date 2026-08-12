@@ -4,8 +4,9 @@
 //! the `:syntax` command family, the pattern/keyword/cluster tables,
 //! and the per-line state machine that drives highlighting. Almost
 //! every function depends on `synstate_T`/`stateitem_T`/`synpat_T`
-//! and the regex engine (`regprog_T`/`reg_extmatch_T`), none of which
-//! are translated.
+//! and the regex engine. The common `regprog_T` header and
+//! `reg_extmatch_T` captures are translated, but the compiler/executor
+//! that produces them is not.
 //!
 //! Translated: [`limit_pos`] and [`syn_compare_stub`] - two small,
 //! self-contained helpers with no design freedom of their own,
@@ -1056,8 +1057,8 @@ pub const KEYWORD_IDX: i32 = -1;
 ///
 /// As with [`SynpatT`], the two owned group-ID lists become `Vec<i16>`
 /// instead of the original's zero-terminated `int16_t *`, while
-/// `si_extmatch` stays a raw pointer because `reg_extmatch_T` is still
-/// opaque - the same split [`SynpatT::sp_prog`] makes.
+/// `si_extmatch` stays a raw pointer because `reg_extmatch_T` is
+/// reference-counted - the same split [`SynpatT::sp_prog`] makes.
 #[derive(Debug, Default)]
 pub struct StateItemT {
     /// index of the syntax pattern, or [`KEYWORD_IDX`] (`si_idx`).

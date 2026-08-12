@@ -11,8 +11,8 @@
 //! matched, so modelling it forces a pointer-versus-offset decision
 //! that should be made against its real users, not guessed at now.
 //! `regmmatch_T` has no such problem: its positions are `lpos_T`
-//! values. See `types_defs.rs`'s `RegmatchT`/`RegExtmatchT` opaque
-//! placeholders for the pieces still referenced elsewhere.
+//! values. See `types_defs.rs`'s `RegmatchT` opaque placeholder for
+//! the single-line result still referenced elsewhere.
 
 /// Maximum number of sub-expressions, including the whole match at
 /// index 0 (`NSUBEXP`).
