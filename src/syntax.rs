@@ -15,10 +15,26 @@
 //! translated), matching this crate's established "translate a small,
 //! mechanically-correct piece ahead of the surrounding engine"
 //! precedent (e.g. `drawline.rs`'s `get_lcs_ext`).
+//! [`syn_set_timeout`] also translates the syntax engine's timeout
+//! pointer setter independently of the recognition engine.
 //!
 //! Deferred: everything else in the file.
 
 use crate::pos_defs::LposT;
+
+/// Syntax-recognition timeout (`syn_tm`); null means no timeout.
+static SYN_TM: crate::globals::GlobalCell<*mut crate::types_defs::ProftimeT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// Set or clear the syntax-recognition timeout (`syn_set_timeout`).
+///
+/// # Safety
+/// Must not run concurrently with syntax recognition or another
+/// timeout update.
+pub unsafe fn syn_set_timeout(tm: *mut crate::types_defs::ProftimeT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *SYN_TM.get_mut() = tm };
+}
 
 /// `syn_buf` - the buffer the syntax engine is currently highlighting.
 ///
@@ -1161,6 +1177,34 @@ pub fn syn_compare_stub(s1: i16, s2: i16) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SynTimeoutGuard(*mut crate::types_defs::ProftimeT);
+
+    impl SynTimeoutGuard {
+        fn capture() -> Self {
+            Self(unsafe { *SYN_TM.get_mut() })
+        }
+    }
+
+    impl Drop for SynTimeoutGuard {
+        fn drop(&mut self) {
+            unsafe { *SYN_TM.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn syn_set_timeout_installs_and_clears_the_timeout_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = SynTimeoutGuard::capture();
+        let mut timeout = 123;
+        let timeout_ptr = std::ptr::addr_of_mut!(timeout);
+
+        unsafe { syn_set_timeout(timeout_ptr) };
+        assert_eq!(unsafe { *SYN_TM.get_mut() }, timeout_ptr);
+
+        unsafe { syn_set_timeout(std::ptr::null_mut()) };
+        assert!(unsafe { *SYN_TM.get_mut() }.is_null());
+    }
 
     // ---- syn_getcurline / syn_getcurline_len ----
 
