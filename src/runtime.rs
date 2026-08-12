@@ -303,6 +303,32 @@ pub fn source_level(cookie: &crate::runtime_defs::SourceCookieT) -> i32 {
     cookie.level
 }
 
+/// Initialize a source cookie from in-memory command text
+/// (`do_source_str_init`).
+#[allow(dead_code)]
+fn do_source_str_init(
+    cookie: &mut crate::runtime_defs::SourceCookieT,
+    source: &[u8],
+) {
+    cookie.buflines.clear();
+    let end = source
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(source.len());
+    let mut rest = &source[..end];
+    while !rest.is_empty() {
+        if let Some(newline) = rest.iter().position(|&byte| byte == b'\n') {
+            cookie.buflines.push(rest[..newline].to_vec());
+            rest = &rest[newline + 1..];
+        } else {
+            cookie.buflines.push(rest.to_vec());
+            break;
+        }
+    }
+    cookie.buf_lnum = 0;
+    cookie.source_from_buf_or_str = true;
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -821,6 +847,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(source_level(&cookie), 9);
+    }
+
+    #[test]
+    fn do_source_str_init_splits_lines_without_a_trailing_empty_line() {
+        let mut cookie = crate::runtime_defs::SourceCookieT {
+            buf_lnum: 9,
+            buflines: vec![b"old".to_vec()],
+            ..Default::default()
+        };
+        do_source_str_init(&mut cookie, b"one\n\ntwo\nignored\0tail");
+        assert_eq!(
+            cookie.buflines,
+            vec![
+                b"one".to_vec(),
+                Vec::new(),
+                b"two".to_vec(),
+                b"ignored".to_vec(),
+            ]
+        );
+        assert_eq!(cookie.buf_lnum, 0);
+        assert!(cookie.source_from_buf_or_str);
+
+        do_source_str_init(&mut cookie, b"last\n");
+        assert_eq!(cookie.buflines, vec![b"last".to_vec()]);
     }
 
     #[test]
