@@ -291,6 +291,13 @@ pub fn source_breakpoint(
     &mut cookie.breakpoint
 }
 
+#[must_use]
+pub fn source_dbg_tick(
+    cookie: &mut crate::runtime_defs::SourceCookieT,
+) -> &mut i32 {
+    &mut cookie.dbg_tick
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -793,6 +800,13 @@ mod tests {
         let mut cookie = crate::runtime_defs::SourceCookieT::default();
         *source_breakpoint(&mut cookie) = 42;
         assert_eq!(cookie.breakpoint, 42);
+    }
+
+    #[test]
+    fn source_dbg_tick_returns_writable_debug_tick_storage() {
+        let mut cookie = crate::runtime_defs::SourceCookieT::default();
+        *source_dbg_tick(&mut cookie) = 17;
+        assert_eq!(cookie.dbg_tick, 17);
     }
 
     #[test]
