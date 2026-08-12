@@ -52,6 +52,22 @@ pub unsafe fn restore_visual_mode() {
     }
 }
 
+/// Set `v:count`, `v:count1`, and optionally `v:prevcount` from a
+/// Normal command (`set_vcount_ca`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::set_vcount`].
+#[allow(dead_code)]
+unsafe fn set_vcount_ca(cap: &crate::normal_defs::CmdargT, set_prevcount: &mut bool) {
+    let mut count = i64::from(cap.count0);
+    if cap.opcount != 0 {
+        count = i64::from(cap.opcount) * if count == 0 { 1 } else { count };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::set_vcount(count, if count == 0 { 1 } else { count }, *set_prevcount) };
+    *set_prevcount = false;
+}
+
 /// Save the partially typed command while waiting for mapping input
 /// (`push_showcmd`).
 ///
@@ -737,6 +753,36 @@ mod tests {
 
     struct VisualModeGuard(i32);
 
+    struct VcountGuard {
+        count: i64,
+        count1: i64,
+        prevcount: i64,
+    }
+
+    impl VcountGuard {
+        fn capture() -> Self {
+            use crate::eval::vars::VimVarIndex;
+            Self {
+                count: unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Count) },
+                count1: unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Count1) },
+                prevcount: unsafe {
+                    crate::eval::vars::get_vim_var_nr(VimVarIndex::Prevcount)
+                },
+            }
+        }
+    }
+
+    impl Drop for VcountGuard {
+        fn drop(&mut self) {
+            use crate::eval::vars::VimVarIndex;
+            unsafe {
+                crate::eval::vars::set_vim_var_nr(VimVarIndex::Count, self.count);
+                crate::eval::vars::set_vim_var_nr(VimVarIndex::Count1, self.count1);
+                crate::eval::vars::set_vim_var_nr(VimVarIndex::Prevcount, self.prevcount);
+            }
+        }
+    }
+
     impl VisualModeGuard {
         fn set(value: i32) -> Self {
             let saved = unsafe { *VISUAL_MODE_ORIG.get_mut() };
@@ -847,6 +893,54 @@ mod tests {
         unsafe { (*buf_ptr).b_visual.vi_mode = i32::from(b'v') };
         unsafe { restore_visual_mode() };
         assert_eq!(unsafe { (*buf_ptr).b_visual.vi_mode }, i32::from(b'v'));
+    }
+
+    #[test]
+    fn set_vcount_ca_multiplies_counts_and_sets_prevcount_once() {
+        use crate::eval::vars::VimVarIndex;
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = VcountGuard::capture();
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(VimVarIndex::Count, 5);
+            crate::eval::vars::set_vim_var_nr(VimVarIndex::Count1, 5);
+            crate::eval::vars::set_vim_var_nr(VimVarIndex::Prevcount, 0);
+        }
+        let cap = crate::normal_defs::CmdargT {
+            count0: 3,
+            opcount: 4,
+            ..Default::default()
+        };
+        let mut set_prevcount = true;
+
+        unsafe { set_vcount_ca(&cap, &mut set_prevcount) };
+        assert!(!set_prevcount);
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Count) },
+            12
+        );
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Count1) },
+            12
+        );
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Prevcount) },
+            5
+        );
+
+        let zero = crate::normal_defs::CmdargT::default();
+        unsafe { set_vcount_ca(&zero, &mut set_prevcount) };
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Count) },
+            0
+        );
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Count1) },
+            1
+        );
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(VimVarIndex::Prevcount) },
+            5
+        );
     }
 
     #[test]
