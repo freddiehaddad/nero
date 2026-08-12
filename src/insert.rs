@@ -63,6 +63,29 @@ pub unsafe fn replace_push_nul() {
     unsafe { replace_push(&[crate::ascii_defs::NUL]) };
 }
 
+/// Join two replacement-stack entries by removing the selected NUL
+/// separator (`replace_join`).
+///
+/// `offset == 0` removes the topmost separator, `1` the next one
+/// down, and so on.
+///
+/// # Safety
+/// Must not run concurrently with another replacement-stack operation.
+pub unsafe fn replace_join(mut offset: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { REPLACE_STACK.get_mut() };
+    for index in (0..stack.len()).rev() {
+        if stack[index] == crate::ascii_defs::NUL {
+            let remove = offset <= 0;
+            offset -= 1;
+            if remove {
+                stack.remove(index);
+                return;
+            }
+        }
+    }
+}
+
 /// Peek at the replacement stack and pop its top byte only when it is
 /// NUL (`replace_pop_if_nul`).
 ///
@@ -808,6 +831,23 @@ mod tests {
 
         unsafe { replace_push_nul() };
         assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"a\0b");
+    }
+
+    #[test]
+    fn replace_join_removes_the_requested_separator_from_the_top() {
+        let _lock = global_state_test_lock();
+        let _guard = ReplaceStackGuard::install(b"a\0b\0c".to_vec());
+
+        unsafe { replace_join(0) };
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"a\0bc");
+
+        unsafe { REPLACE_STACK.get_mut() }.splice(.., b"a\0b\0c".iter().copied());
+        unsafe { replace_join(1) };
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"ab\0c");
+
+        let unchanged = unsafe { REPLACE_STACK.get_mut() }.clone();
+        unsafe { replace_join(9) };
+        assert_eq!(*unsafe { REPLACE_STACK.get_mut() }, unchanged);
     }
 
     struct CurwinGuard {
