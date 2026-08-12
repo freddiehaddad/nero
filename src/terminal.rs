@@ -116,6 +116,28 @@ pub unsafe fn is_filter_char(c: i32) -> bool {
     (unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tpf_flags & flag) != 0
 }
 
+/// Convert libvterm underline style to Neovim highlight flags
+/// (`get_underline_hl_flag`).
+#[must_use]
+#[allow(dead_code)]
+fn get_underline_hl_flag(
+    attrs: crate::vterm_defs::VTermScreenCellAttrs,
+) -> u32 {
+    match attrs.underline {
+        crate::vterm_defs::VTERM_UNDERLINE_OFF => 0,
+        crate::vterm_defs::VTERM_UNDERLINE_SINGLE => {
+            crate::highlight_defs::HL_UNDERLINE
+        }
+        crate::vterm_defs::VTERM_UNDERLINE_DOUBLE => {
+            crate::highlight_defs::HL_UNDERDOUBLE
+        }
+        crate::vterm_defs::VTERM_UNDERLINE_CURLY => {
+            crate::highlight_defs::HL_UNDERCURL
+        }
+        _ => crate::highlight_defs::HL_UNDERLINE,
+    }
+}
+
 /// Reports whether the current background theme is dark
 /// (`term_theme`) and returns the libvterm callback success value.
 ///
@@ -142,6 +164,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(terminal_buf(&term), 42);
+    }
+
+    #[test]
+    fn get_underline_hl_flag_maps_all_styles_and_defaults_to_single() {
+        use crate::vterm_defs::{
+            VTERM_UNDERLINE_CURLY, VTERM_UNDERLINE_DOUBLE,
+            VTERM_UNDERLINE_OFF, VTERM_UNDERLINE_SINGLE,
+        };
+        for (underline, expected) in [
+            (VTERM_UNDERLINE_OFF, 0),
+            (VTERM_UNDERLINE_SINGLE, crate::highlight_defs::HL_UNDERLINE),
+            (VTERM_UNDERLINE_DOUBLE, crate::highlight_defs::HL_UNDERDOUBLE),
+            (VTERM_UNDERLINE_CURLY, crate::highlight_defs::HL_UNDERCURL),
+            (u8::MAX, crate::highlight_defs::HL_UNDERLINE),
+        ] {
+            let attrs = crate::vterm_defs::VTermScreenCellAttrs {
+                underline,
+                ..Default::default()
+            };
+            assert_eq!(get_underline_hl_flag(attrs), expected);
+        }
     }
 
     #[test]
