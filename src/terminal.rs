@@ -11,7 +11,8 @@
 //! character against the `'termpastefilter'` option flags, needing
 //! only [`crate::option_vars`]'s already-real `tpf_flags` and
 //! `opt_tpf_flag` constants, with no dependency on any terminal
-//! state at all.
+//! state at all; [`terminal_buf`] - the terminal's owning buffer
+//! handle.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -19,6 +20,13 @@
 //! libvterm screen callbacks, and the redraw/cursor integration.
 
 use crate::option_vars::opt_tpf_flag;
+use crate::types_defs::{HandleT, TerminalT};
+
+/// Returns the handle of the buffer that owns `term` (`terminal_buf`).
+#[must_use]
+pub fn terminal_buf(term: &TerminalT) -> HandleT {
+    term.buf_handle
+}
 
 /// Whether character `c` should be filtered out of a terminal paste,
 /// according to the `'termpastefilter'` option (`is_filter_char`).
@@ -73,6 +81,15 @@ pub unsafe fn term_theme() -> (bool, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_buf_returns_the_owning_buffer_handle() {
+        let term = TerminalT {
+            buf_handle: 42,
+            ..Default::default()
+        };
+        assert_eq!(terminal_buf(&term), 42);
+    }
 
     struct BackgroundGuard(Option<Vec<u8>>);
 
