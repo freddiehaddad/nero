@@ -35,6 +35,15 @@ struct FfVisitedT {
     ffv_fname: Vec<u8>,
 }
 
+/// One named visited-list header (`ff_visited_list_hdr_T`).
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct FfVisitedListHdrT {
+    ffvl_next: Option<Box<FfVisitedListHdrT>>,
+    ffvl_filename: Vec<u8>,
+    ffvl_visited_list: Option<Box<FfVisitedT>>,
+}
+
 /// Free an entire visited-file chain (`ff_free_visited_list`).
 #[allow(dead_code)]
 fn ff_free_visited_list(list: &mut Option<Box<FfVisitedT>>) {
@@ -350,6 +359,36 @@ mod tests {
         assert_eq!(node.file_id.inode, 7);
         assert_eq!(
             node.ffv_next.as_deref().map(|next| next.ffv_fname.as_slice()),
+            Some(b"second".as_slice())
+        );
+    }
+
+    #[test]
+    fn visited_list_header_owns_its_filename_list_and_next_header() {
+        let header = FfVisitedListHdrT {
+            ffvl_next: Some(Box::new(FfVisitedListHdrT {
+                ffvl_filename: b"second".to_vec(),
+                ..Default::default()
+            })),
+            ffvl_filename: b"first".to_vec(),
+            ffvl_visited_list: Some(Box::new(FfVisitedT {
+                ffv_fname: b"visited".to_vec(),
+                ..Default::default()
+            })),
+        };
+        assert_eq!(header.ffvl_filename, b"first");
+        assert_eq!(
+            header
+                .ffvl_visited_list
+                .as_deref()
+                .map(|visited| visited.ffv_fname.as_slice()),
+            Some(b"visited".as_slice())
+        );
+        assert_eq!(
+            header
+                .ffvl_next
+                .as_deref()
+                .map(|next| next.ffvl_filename.as_slice()),
             Some(b"second".as_slice())
         );
     }
