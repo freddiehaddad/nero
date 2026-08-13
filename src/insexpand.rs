@@ -434,6 +434,81 @@ unsafe fn may_advance_cpt_index(remaining: &[u8]) -> bool {
         .is_some_and(|&byte| byte != crate::ascii_defs::NUL)
 }
 
+fn parse_cpt_max_matches(value: &[u8]) -> i32 {
+    let mut offset = 0;
+    let negative = value.first() == Some(&b'-');
+    if negative || value.first() == Some(&b'+') {
+        offset = 1;
+    }
+    let mut result = 0i32;
+    let mut found = false;
+    while let Some(&byte) = value.get(offset) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        found = true;
+        result = result
+            .saturating_mul(10)
+            .saturating_add(i32::from(byte - b'0'));
+        offset += 1;
+    }
+    if !found {
+        0
+    } else if negative {
+        -result
+    } else {
+        result
+    }
+}
+
+/// Parse the current buffer's `'complete'` sources
+/// (`setup_cpt_sources`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer; mutates completion
+/// source state.
+#[allow(dead_code)]
+unsafe fn setup_cpt_sources() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { cpt_sources_clear() };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { get_cpt_sources_count() } == 0 {
+        return;
+    }
+    // Clone because source parsing mutates completion globals but not
+    // the buffer option itself.
+    let value = unsafe {
+        (*crate::globals::GLOBALS.get_mut().curbuf)
+            .b_p_cpt
+            .clone()
+            .unwrap_or_default()
+    };
+    let mut offset = 0;
+    while value.get(offset).is_some_and(|&byte| byte != 0) {
+        while value
+            .get(offset)
+            .is_some_and(|&byte| byte == b',' || byte == b' ')
+        {
+            offset += 1;
+        }
+        let Some(&flag) = value.get(offset).filter(|&&byte| byte != 0) else {
+            break;
+        };
+        let (part, next) =
+            crate::option::copy_option_part(&value, offset, crate::tag::LSIZE, b",");
+        let max_matches = part
+            .iter()
+            .position(|&byte| byte == b'^')
+            .map_or(0, |caret| parse_cpt_max_matches(&part[caret + 1..]));
+        unsafe { CPT_SOURCES.get_mut() }.push(CptSourceT {
+            cs_flag: flag,
+            cs_max_matches: max_matches,
+            ..Default::default()
+        });
+        offset = next;
+    }
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1988,6 +2063,29 @@ mod tests {
         assert!(unsafe { may_advance_cpt_index(b",  next") });
         assert!(!unsafe { may_advance_cpt_index(b",  ") });
         assert!(!unsafe { may_advance_cpt_index(b", \0next") });
+    }
+
+    #[test]
+    fn setup_cpt_sources_parses_flags_and_caret_limits() {
+        let _lock = global_state_test_lock();
+        let mut buffer = crate::buffer_defs::BufT {
+            b_p_cpt: Some(b".^12,w,Ffunc^7".to_vec()),
+            ..Default::default()
+        };
+        let _buffer = CurbufGuard::set(&mut buffer);
+        let _sources = CptSourcesGuard::install(Vec::new(), -1);
+
+        unsafe { setup_cpt_sources() };
+
+        let sources = unsafe { CPT_SOURCES.get_mut() };
+        assert_eq!(sources.len(), 3);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| (source.cs_flag, source.cs_max_matches))
+                .collect::<Vec<_>>(),
+            vec![(b'.', 12), (b'w', 0), (b'F', 7)]
+        );
     }
 
     /// With no match shown there is nothing to be stuck on, so this
