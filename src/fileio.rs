@@ -46,6 +46,33 @@ static VIM_TEMPDIR: std::sync::LazyLock<crate::globals::GlobalCell<Option<Vec<u8
 static TEMP_COUNT: std::sync::LazyLock<crate::globals::GlobalCell<u64>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(0));
 
+/// Append a line-ending format marker to `IObuff`
+/// (`msg_add_fileformat`).
+///
+/// # Safety
+/// Mutates `GLOBALS.IObuff`.
+#[must_use]
+pub unsafe fn msg_add_fileformat(eol_type: i32) -> bool {
+    let suffix: Option<&[u8]> = if !cfg!(windows)
+        && eol_type == crate::option_vars::EOL_DOS
+    {
+        Some(b"[dos]")
+    } else if eol_type == crate::option_vars::EOL_MAC {
+        Some(b"[mac]")
+    } else if cfg!(windows) && eol_type == crate::option_vars::EOL_UNIX {
+        Some(b"[unix]")
+    } else {
+        None
+    };
+    let Some(suffix) = suffix else {
+        return false;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let io = &mut unsafe { crate::globals::GLOBALS.get_mut() }.IObuff;
+    crate::memory::xstrlcat(io, suffix, crate::globals::IOSIZE);
+    true
+}
+
 /// Set Nvim's own temp directory to `tempdir`, which must already
 /// exist (`vim_settempdir`).
 ///
@@ -875,6 +902,31 @@ pub fn modname(fname: Option<&[u8]>, ext: &[u8], prepend_dot: bool) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msg_add_fileformat_appends_non_native_line_ending_markers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut initial = [0; crate::globals::IOSIZE];
+        initial[..5].copy_from_slice(b"file ");
+        let _io = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.IObuff,
+                initial,
+            )
+        };
+
+        assert!(unsafe { msg_add_fileformat(crate::option_vars::EOL_MAC) });
+        let io = &unsafe { crate::globals::GLOBALS.get_mut() }.IObuff;
+        let end = io.iter().position(|&byte| byte == 0).unwrap();
+        assert_eq!(&io[..end], b"file [mac]");
+
+        let native = if cfg!(windows) {
+            crate::option_vars::EOL_DOS
+        } else {
+            crate::option_vars::EOL_UNIX
+        };
+        assert!(!unsafe { msg_add_fileformat(native) });
+    }
     use crate::globals::global_state_test_lock;
 
     // ---- modname ----
