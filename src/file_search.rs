@@ -50,6 +50,13 @@ fn ff_free_visited_list(list: &mut Option<Box<FfVisitedT>>) {
     *list = None;
 }
 
+/// Free the list of named visited-file lists
+/// (`vim_findfile_free_visited_list`).
+#[allow(dead_code)]
+fn vim_findfile_free_visited_list(list: &mut Option<Box<FfVisitedListHdrT>>) {
+    *list = None;
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -405,6 +412,27 @@ mod tests {
             ..Default::default()
         }));
         ff_free_visited_list(&mut list);
+        assert!(list.is_none());
+    }
+
+    #[test]
+    fn vim_findfile_free_visited_list_drops_headers_and_nested_lists() {
+        let mut list = Some(Box::new(FfVisitedListHdrT {
+            ffvl_next: Some(Box::new(FfVisitedListHdrT {
+                ffvl_filename: b"tail".to_vec(),
+                ..Default::default()
+            })),
+            ffvl_filename: b"head".to_vec(),
+            ffvl_visited_list: Some(Box::new(FfVisitedT {
+                ffv_next: Some(Box::new(FfVisitedT {
+                    ffv_fname: b"nested-tail".to_vec(),
+                    ..Default::default()
+                })),
+                ffv_fname: b"nested-head".to_vec(),
+                ..Default::default()
+            })),
+        }));
+        vim_findfile_free_visited_list(&mut list);
         assert!(list.is_none());
     }
 
