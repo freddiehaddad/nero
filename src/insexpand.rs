@@ -287,6 +287,15 @@ static CPT_SOURCES: GlobalCell<Vec<CptSourceT>> = GlobalCell::new(Vec::new());
 #[allow(dead_code)]
 static CPT_SOURCES_INDEX: GlobalCell<i32> = GlobalCell::new(-1);
 
+/// Whether any completion source requested `refresh: "always"`
+/// (`is_cpt_func_refresh_always`).
+#[allow(dead_code)]
+fn is_cpt_func_refresh_always() -> bool {
+    unsafe { CPT_SOURCES.get_mut() }
+        .iter()
+        .any(|source| source.cs_refresh_always)
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1669,6 +1678,24 @@ mod tests {
         let _guard = CptSourcesGuard::install(vec![source], 0);
         assert_eq!((unsafe { CPT_SOURCES.get_mut() })[0], source);
         assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, 0);
+    }
+
+    #[test]
+    fn completion_source_refresh_predicate_scans_every_source() {
+        let _lock = global_state_test_lock();
+        let _guard = CptSourcesGuard::install(
+            vec![
+                CptSourceT::default(),
+                CptSourceT {
+                    cs_refresh_always: true,
+                    ..Default::default()
+                },
+            ],
+            0,
+        );
+        assert!(is_cpt_func_refresh_always());
+        (unsafe { CPT_SOURCES.get_mut() })[1].cs_refresh_always = false;
+        assert!(!is_cpt_func_refresh_always());
     }
 
     /// With no match shown there is nothing to be stuck on, so this
