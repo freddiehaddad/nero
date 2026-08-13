@@ -242,6 +242,16 @@ fn shift_cmd_args(eap: &mut crate::ex_cmds_defs::ExargT) {
     eap.arg = Some(eap.args.first().cloned().unwrap_or_default());
 }
 
+/// Return one valid `++bad=` value (`get_bad_name`).
+#[allow(dead_code)]
+#[must_use]
+fn get_bad_name(index: i32) -> Option<&'static [u8]> {
+    const BAD_VALUES: [&[u8]; 3] = [b"?", b"keep", b"drop"];
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| BAD_VALUES.get(index).copied())
+}
+
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
 ///
 /// Only ever set by `post_chdir` (not yet translated), so this stays
@@ -1407,6 +1417,15 @@ mod tests {
         shift_cmd_args(&mut eap);
         assert!(eap.args.is_empty());
         assert_eq!(eap.arg, Some(Vec::new()));
+    }
+
+    #[test]
+    fn get_bad_name_enumerates_the_bad_character_values() {
+        assert_eq!(get_bad_name(0), Some(b"?".as_slice()));
+        assert_eq!(get_bad_name(1), Some(b"keep".as_slice()));
+        assert_eq!(get_bad_name(2), Some(b"drop".as_slice()));
+        assert_eq!(get_bad_name(3), None);
+        assert_eq!(get_bad_name(-1), None);
     }
 
     struct FfuGuard {
