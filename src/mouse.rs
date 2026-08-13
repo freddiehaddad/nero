@@ -41,6 +41,43 @@ pub const MOUSE_X1: i32 = 0x300;
 /// Extended mouse button X2 (`MOUSE_X2`).
 pub const MOUSE_X2: i32 = 0x400;
 
+/// Whether `c` is a mouse pseudo-key (`is_mouse_key`).
+#[must_use]
+pub fn is_mouse_key(c: i32) -> bool {
+    use crate::keycodes_defs::{
+        K_LEFTDRAG, K_LEFTMOUSE, K_LEFTMOUSE_NM, K_LEFTRELEASE,
+        K_LEFTRELEASE_NM, K_MIDDLEDRAG, K_MIDDLEMOUSE, K_MIDDLERELEASE,
+        K_MOUSEDOWN, K_MOUSELEFT, K_MOUSEMOVE, K_MOUSERIGHT, K_MOUSEUP,
+        K_RIGHTDRAG, K_RIGHTMOUSE, K_RIGHTRELEASE, K_X1DRAG, K_X1MOUSE,
+        K_X1RELEASE, K_X2DRAG, K_X2MOUSE, K_X2RELEASE,
+    };
+    matches!(
+        c,
+        K_LEFTMOUSE
+            | K_LEFTMOUSE_NM
+            | K_LEFTDRAG
+            | K_LEFTRELEASE
+            | K_LEFTRELEASE_NM
+            | K_MOUSEMOVE
+            | K_MIDDLEMOUSE
+            | K_MIDDLEDRAG
+            | K_MIDDLERELEASE
+            | K_RIGHTMOUSE
+            | K_RIGHTDRAG
+            | K_RIGHTRELEASE
+            | K_MOUSEDOWN
+            | K_MOUSEUP
+            | K_MOUSELEFT
+            | K_MOUSERIGHT
+            | K_X1MOUSE
+            | K_X1DRAG
+            | K_X1RELEASE
+            | K_X2MOUSE
+            | K_X2DRAG
+            | K_X2RELEASE
+    )
+}
+
 /// Get class of a character for selection: same class means same word
 /// (`get_mouse_class`).
 ///
@@ -226,6 +263,26 @@ mod tests {
             ],
             [0, 1, 2, 3, 0x300, 0x400]
         );
+    }
+
+    #[test]
+    fn is_mouse_key_recognizes_button_drag_release_move_and_wheel_keys() {
+        use crate::keycodes_defs::{
+            K_LEFTMOUSE, K_MIDDLEDRAG, K_MOUSEDOWN, K_MOUSEMOVE,
+            K_RIGHTRELEASE, K_X1MOUSE, K_X2RELEASE,
+        };
+        for key in [
+            K_LEFTMOUSE,
+            K_MIDDLEDRAG,
+            K_RIGHTRELEASE,
+            K_MOUSEMOVE,
+            K_MOUSEDOWN,
+            K_X1MOUSE,
+            K_X2RELEASE,
+        ] {
+            assert!(is_mouse_key(key), "{key} should be a mouse key");
+        }
+        assert!(!is_mouse_key(i32::from(b'x')));
     }
     use crate::buffer_defs::BufT;
     use crate::pos_defs::PosT;
