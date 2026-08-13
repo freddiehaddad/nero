@@ -863,6 +863,33 @@ unsafe fn compare_scores(index_a: i32, index_b: i32) -> i32 {
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
 
+/// Cursor column through which the preinsert effect remains active
+/// (`compl_ins_end_col`).
+static COMPL_INS_END_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
+
+/// Whether the preinsert effect is active at the cursor
+/// (`ins_compl_preinsert_effect`).
+///
+/// # Safety
+/// Forwarded from [`ins_compl_has_preinsert`] and
+/// [`ins_compl_preinsert_longest`]; `GLOBALS.curwin` and `curbuf` must
+/// be valid.
+#[must_use]
+pub unsafe fn ins_compl_preinsert_effect() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { ins_compl_has_preinsert() }
+        // SAFETY: forwarded from this function's own safety doc.
+        && !unsafe { ins_compl_preinsert_longest() }
+    {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor_col = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col };
+    // SAFETY: forwarded from this function's own safety doc.
+    cursor_col < unsafe { *COMPL_INS_END_COL.get_mut() }
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -2483,6 +2510,22 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    struct ComplInsEndGuard(crate::pos_defs::ColnrT);
+
+    impl ComplInsEndGuard {
+        fn set(value: crate::pos_defs::ColnrT) -> Self {
+            let previous = unsafe { *COMPL_INS_END_COL.get_mut() };
+            unsafe { *COMPL_INS_END_COL.get_mut() = value };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ComplInsEndGuard {
+        fn drop(&mut self) {
+            unsafe { *COMPL_INS_END_COL.get_mut() = self.0 };
+        }
+    }
+
     impl AutocompleteModeGuard {
         fn set(autocomplete: bool, longest: bool) -> Self {
             let _lock = global_state_test_lock();
@@ -2727,6 +2770,36 @@ mod tests {
         unsafe { *COMPL_AUTOCOMPLETE.get_mut() = true };
         assert!(unsafe { pum_wanted() });
         unsafe { *COMPL_AUTOCOMPLETE.get_mut() = false };
+    }
+
+    #[test]
+    fn ins_compl_preinsert_effect_requires_flags_and_cursor_before_end() {
+        let _mode = AutocompleteModeGuard::set(false, false);
+        let mut buf = crate::buffer_defs::BufT {
+            b_cot_flags: crate::option_vars::opt_cot_flag::PREINSERT
+                | crate::option_vars::opt_cot_flag::MENUONE,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = CurbufGuard::set(unsafe { &mut *buf_ptr });
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_cursor.col = 4;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let _end = ComplInsEndGuard::set(5);
+
+        assert!(unsafe { ins_compl_preinsert_effect() });
+        unsafe { (*win_ptr).w_cursor.col = 5 };
+        assert!(!unsafe { ins_compl_preinsert_effect() });
+        unsafe { (*buf_ptr).b_cot_flags = 0 };
+        let _cot = CotFlagsGuard::set(0);
+        unsafe { (*win_ptr).w_cursor.col = 4 };
+        assert!(!unsafe { ins_compl_preinsert_effect() });
     }
 
     #[test]
