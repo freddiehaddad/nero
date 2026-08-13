@@ -62,6 +62,29 @@ struct SuggestT {
     st_slang: *mut std::ffi::c_void,
 }
 
+/// Compare spelling suggestions by score, alternate score, then word
+/// (`sug_compare`).
+#[allow(dead_code)]
+fn sug_compare(first: &SuggestT, second: &SuggestT) -> i32 {
+    let score_order = first.st_score.cmp(&second.st_score);
+    if score_order != std::cmp::Ordering::Equal {
+        return match score_order {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+    }
+    let alternate_order = first.st_altscore.cmp(&second.st_altscore);
+    if alternate_order != std::cmp::Ordering::Equal {
+        return match alternate_order {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+    }
+    crate::strings::vim_stricmp(&first.st_word, &second.st_word)
+}
+
 /// Flags from `'spellsuggest'` (`sps_flags`).
 static SPS_FLAGS: GlobalCell<i32> = GlobalCell::new(SPS_BEST);
 /// Max number of suggestions given, from `'spellsuggest'`
@@ -302,6 +325,52 @@ mod tests {
         assert!(suggestion.st_salscore);
         assert!(suggestion.st_had_bonus);
         assert_eq!(suggestion.st_slang, language);
+    }
+
+    #[test]
+    fn sug_compare_orders_by_primary_alternate_then_word() {
+        let mut suggestions = [
+            SuggestT {
+                st_word: b"Beta".to_vec(),
+                st_score: 10,
+                st_altscore: 2,
+                ..Default::default()
+            },
+            SuggestT {
+                st_word: b"alpha".to_vec(),
+                st_score: 10,
+                st_altscore: 2,
+                ..Default::default()
+            },
+            SuggestT {
+                st_word: b"later".to_vec(),
+                st_score: 20,
+                st_altscore: 0,
+                ..Default::default()
+            },
+            SuggestT {
+                st_word: b"alternate".to_vec(),
+                st_score: 10,
+                st_altscore: 1,
+                ..Default::default()
+            },
+        ];
+
+        suggestions.sort_by(|first, second| sug_compare(first, second).cmp(&0));
+
+        let words: Vec<&[u8]> = suggestions
+            .iter()
+            .map(|suggestion| suggestion.st_word.as_slice())
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                b"alternate".as_slice(),
+                b"alpha".as_slice(),
+                b"Beta".as_slice(),
+                b"later".as_slice(),
+            ]
+        );
     }
     use crate::globals::global_state_test_lock;
 
