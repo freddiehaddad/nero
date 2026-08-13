@@ -270,6 +270,16 @@ pub fn getargcmd(argument: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(command)
 }
 
+/// Handle `:goto` by moving to the requested byte offset (`ex_goto`).
+///
+/// # Safety
+/// Same as [`crate::memline::goto_byte`].
+#[allow(dead_code)]
+unsafe fn ex_goto(eap: &crate::ex_cmds_defs::ExargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memline::goto_byte(eap.line2) };
+}
+
 /// Shift parsed Ex command arguments left by one (`shift_cmd_args`).
 #[allow(dead_code)]
 fn shift_cmd_args(eap: &mut crate::ex_cmds_defs::ExargT) {
@@ -1451,6 +1461,53 @@ mod tests {
         let mut plain = b"file.txt".to_vec();
         assert_eq!(getargcmd(&mut plain), None);
         assert_eq!(plain, b"file.txt");
+    }
+
+    #[test]
+    fn ex_goto_forwards_the_range_end_as_a_byte_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_ff: Some(b"unix".to_vec()),
+            b_p_fixeol: 1,
+            b_p_eol: 1,
+            ..Default::default()
+        };
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: std::ptr::addr_of_mut!(buf),
+                ..Default::default()
+            };
+            let mut curbuf = crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                std::ptr::addr_of_mut!(buf),
+            );
+            let mut curwin = crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                std::ptr::addr_of_mut!(win),
+            );
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf, 1, b"abc\0"),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"def\0", 4, false),
+                crate::vim_defs::OK
+            );
+
+            ex_goto(&crate::ex_cmds_defs::ExargT {
+                line2: 5,
+                ..Default::default()
+            });
+
+            assert_eq!((*crate::globals::GLOBALS.get_mut().curwin).w_cursor.lnum, 2);
+            assert_eq!((*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col, 0);
+
+            curbuf.restore_now();
+            curwin.restore_now();
+            let memfile = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*memfile, false);
+        }
     }
 
     #[test]
