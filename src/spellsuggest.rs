@@ -47,6 +47,21 @@ pub const SPS_FAST: i32 = 2;
 /// Values for `sps_flags`.
 pub const SPS_DOUBLE: i32 = 4;
 
+/// One spelling suggestion (`suggest_T`).
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct SuggestT {
+    /// Suggested word; `st_wordlen` is derived from this owned buffer.
+    st_word: Vec<u8>,
+    st_orglen: i32,
+    st_score: i32,
+    st_altscore: i32,
+    st_salscore: bool,
+    st_had_bonus: bool,
+    /// Opaque pointer to the spelling language used for sound folding.
+    st_slang: *mut std::ffi::c_void,
+}
+
 /// Flags from `'spellsuggest'` (`sps_flags`).
 static SPS_FLAGS: GlobalCell<i32> = GlobalCell::new(SPS_BEST);
 /// Max number of suggestions given, from `'spellsuggest'`
@@ -266,6 +281,28 @@ pub unsafe fn badword_captype(word: &[u8], end: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggestion_owns_word_scores_flags_and_language_identity() {
+        let language = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        let suggestion = SuggestT {
+            st_word: b"spelling".to_vec(),
+            st_orglen: 5,
+            st_score: 10,
+            st_altscore: 20,
+            st_salscore: true,
+            st_had_bonus: true,
+            st_slang: language,
+        };
+
+        assert_eq!(suggestion.st_word.len(), 8);
+        assert_eq!(suggestion.st_orglen, 5);
+        assert_eq!(suggestion.st_score, 10);
+        assert_eq!(suggestion.st_altscore, 20);
+        assert!(suggestion.st_salscore);
+        assert!(suggestion.st_had_bonus);
+        assert_eq!(suggestion.st_slang, language);
+    }
     use crate::globals::global_state_test_lock;
 
     // ---- badword_captype ----
