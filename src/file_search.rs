@@ -123,6 +123,31 @@ fn vim_findfile_free_visited(search_ctx: Option<&mut FfSearchCtxT>) {
     );
 }
 
+/// Clear a search context except for its visited-list cache (`ff_clear`).
+///
+/// # Safety
+/// `ffsc_stack_ptr` must head a valid stack allocated by
+/// [`ff_create_stack_element`].
+#[allow(dead_code)]
+unsafe fn ff_clear(search_ctx: &mut FfSearchCtxT) {
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let element = unsafe { ff_pop(&mut search_ctx.ffsc_stack_ptr) };
+        if element.is_null() {
+            break;
+        }
+        // SAFETY: `ff_pop` transfers ownership of this live node.
+        unsafe { ff_free_stack_element(element) };
+    }
+    search_ctx.ffsc_stopdirs_v.clear();
+    search_ctx.ffsc_stopdirs_v.shrink_to_fit();
+    search_ctx.ffsc_file_to_search.clear();
+    search_ctx.ffsc_start_dir.clear();
+    search_ctx.ffsc_fix_path.clear();
+    search_ctx.ffsc_wc_path.clear();
+    search_ctx.ffsc_level = 0;
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -598,6 +623,50 @@ mod tests {
         assert_eq!(context.ffsc_visited_list, file_active);
         assert_eq!(context.ffsc_dir_visited_list, dir_active);
         vim_findfile_free_visited(None);
+    }
+
+    #[test]
+    fn ff_clear_releases_transient_state_but_preserves_visited_cache() {
+        let mut stack = std::ptr::null_mut();
+        unsafe {
+            ff_push(
+                &mut stack,
+                ff_create_stack_element(Some(b"one"), Some(b"*"), 1, 0),
+            );
+            ff_push(
+                &mut stack,
+                ff_create_stack_element(Some(b"two"), Some(b"**"), 2, 0),
+            );
+        }
+        let mut context = FfSearchCtxT {
+            ffsc_stack_ptr: stack,
+            ffsc_visited_lists_list: Some(Box::new(FfVisitedListHdrT {
+                ffvl_filename: b"cached".to_vec(),
+                ..Default::default()
+            })),
+            ffsc_file_to_search: b"target".to_vec(),
+            ffsc_start_dir: b"/start".to_vec(),
+            ffsc_fix_path: b"src".to_vec(),
+            ffsc_wc_path: b"**/*.rs".to_vec(),
+            ffsc_level: 8,
+            ffsc_stopdirs_v: vec![b"/".to_vec(), b"/tmp".to_vec()],
+            ffsc_find_what: 2,
+            ffsc_tagfile: 1,
+            ..Default::default()
+        };
+
+        unsafe { ff_clear(&mut context) };
+
+        assert!(context.ffsc_stack_ptr.is_null());
+        assert!(context.ffsc_stopdirs_v.is_empty());
+        assert!(context.ffsc_file_to_search.is_empty());
+        assert!(context.ffsc_start_dir.is_empty());
+        assert!(context.ffsc_fix_path.is_empty());
+        assert!(context.ffsc_wc_path.is_empty());
+        assert_eq!(context.ffsc_level, 0);
+        assert!(context.ffsc_visited_lists_list.is_some());
+        assert_eq!(context.ffsc_find_what, 2);
+        assert_eq!(context.ffsc_tagfile, 1);
     }
 
     // ---- ff_create_stack_element ----
