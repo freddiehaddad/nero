@@ -20,6 +20,19 @@
 use crate::mbyte::utf_ptr2char;
 use crate::path::{path_fnamencmp, vim_ispathsep};
 
+/// Shared filename-expansion buffer (`ff_expand_buffer`).
+static FF_EXPAND_BUFFER: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Release shared find-file expansion storage (`free_findfile`).
+///
+/// # Safety
+/// Must not run concurrently with file-search operations.
+pub unsafe fn free_findfile() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { FF_EXPAND_BUFFER.get_mut() } = None;
+}
+
 /// Splits `buf` at the first unescaped `;` (where `\;` is an escape
 /// sequence for a literal `;`), returning the de-escaped stopdir list
 /// before it and the remainder after it (`vim_findfile_stopdir`).
@@ -269,6 +282,35 @@ pub unsafe fn ff_free_stack_element(stack_ptr: *mut FfStackT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ExpandBufferGuard(Option<Vec<u8>>);
+
+    impl ExpandBufferGuard {
+        fn install(value: Option<Vec<u8>>) -> Self {
+            Self(std::mem::replace(
+                unsafe { FF_EXPAND_BUFFER.get_mut() },
+                value,
+            ))
+        }
+    }
+
+    impl Drop for ExpandBufferGuard {
+        fn drop(&mut self) {
+            *unsafe { FF_EXPAND_BUFFER.get_mut() } = self.0.take();
+        }
+    }
+
+    #[test]
+    fn free_findfile_clears_allocated_expansion_storage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            ExpandBufferGuard::install(Some(vec![
+                0;
+                crate::os::os_defs::MAXPATHL as usize
+            ]));
+        unsafe { free_findfile() };
+        assert!(unsafe { FF_EXPAND_BUFFER.get_mut() }.is_none());
+    }
 
     // ---- ff_create_stack_element ----
 
