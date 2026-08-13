@@ -66,6 +66,15 @@ unsafe fn get_extra_buf(size: usize) -> *mut u8 {
     buffer.as_mut_ptr()
 }
 
+/// Release drawline scratch storage (`drawline_free_all_mem`).
+///
+/// # Safety
+/// No pointer returned by [`get_extra_buf`] may be used afterward.
+pub unsafe fn drawline_free_all_mem() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { EXTRA_BUF.get_mut() } = Vec::new();
+}
+
 /// Whether `CursorLineSign` highlighting is to be used for line
 /// `lnum` in window `wp` (`use_cursor_line_highlight`).
 #[must_use]
@@ -197,6 +206,16 @@ mod tests {
 
         let _ = unsafe { get_extra_buf(100) };
         assert_eq!(unsafe { EXTRA_BUF.get_mut() }.len(), 100);
+    }
+
+    #[test]
+    fn drawline_free_all_mem_releases_the_scratch_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ExtraBufGuard::empty();
+        let _ = unsafe { get_extra_buf(128) };
+        assert_eq!(unsafe { EXTRA_BUF.get_mut() }.len(), 128);
+        unsafe { drawline_free_all_mem() };
+        assert!(unsafe { EXTRA_BUF.get_mut() }.is_empty());
     }
 
     // ---- get_lcs_ext ----
