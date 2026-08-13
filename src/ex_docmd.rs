@@ -107,6 +107,14 @@ use crate::buffer_defs::b_flags;
 static CMDLINE_CALL_DEPTH: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 
+/// One command line retained for a `:while`/`:for` loop (`wcmd_T`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WcmdT {
+    line: Vec<u8>,
+    lnum: crate::pos_defs::LinenrT,
+}
+
 /// Begin executing an Ex command line (`do_cmdline_start`).
 ///
 /// # Safety
@@ -1235,6 +1243,18 @@ mod tests {
         assert_eq!(unsafe { do_cmdline_start() }, crate::vim_defs::OK);
         guard.started = true;
         assert_eq!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() }, 200);
+    }
+
+    #[test]
+    fn loop_command_record_owns_line_and_source_number() {
+        let record = WcmdT {
+            line: b"echo value".to_vec(),
+            lnum: 19,
+        };
+        let mut copy = record.clone();
+        copy.line[0] = b'E';
+        assert_eq!(record.line, b"echo value");
+        assert_eq!(record.lnum, 19);
     }
 
     #[test]
