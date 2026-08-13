@@ -198,6 +198,24 @@ fn vgr_get_auname(
     }
 }
 
+/// Autocommand name for `:cbuffer`/`:lbuffer` commands
+/// (`cbuffer_get_auname`).
+#[allow(dead_code)]
+fn cbuffer_get_auname(
+    cmdidx: crate::ex_cmds_defs::CmdIdxT,
+) -> Option<&'static [u8]> {
+    use crate::ex_cmds_defs::CmdIdxT;
+    match cmdidx {
+        CmdIdxT::cbuffer => Some(b"cbuffer"),
+        CmdIdxT::cgetbuffer => Some(b"cgetbuffer"),
+        CmdIdxT::caddbuffer => Some(b"caddbuffer"),
+        CmdIdxT::lbuffer => Some(b"lbuffer"),
+        CmdIdxT::lgetbuffer => Some(b"lgetbuffer"),
+        CmdIdxT::laddbuffer => Some(b"laddbuffer"),
+        _ => None,
+    }
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2257,6 +2275,24 @@ mod tests {
         );
         assert_eq!(vgr_get_auname(CmdIdxT::grep), Some(b"grep".as_slice()));
         assert_eq!(vgr_get_auname(CmdIdxT::edit), None);
+    }
+
+    #[test]
+    fn cbuffer_get_auname_maps_quickfix_and_location_buffer_commands() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert_eq!(
+            cbuffer_get_auname(CmdIdxT::cbuffer),
+            Some(b"cbuffer".as_slice())
+        );
+        assert_eq!(
+            cbuffer_get_auname(CmdIdxT::cgetbuffer),
+            Some(b"cgetbuffer".as_slice())
+        );
+        assert_eq!(
+            cbuffer_get_auname(CmdIdxT::laddbuffer),
+            Some(b"laddbuffer".as_slice())
+        );
+        assert_eq!(cbuffer_get_auname(CmdIdxT::cfile), None);
     }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
