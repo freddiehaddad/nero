@@ -45,6 +45,27 @@
 use crate::buffer_defs::WinT;
 use crate::pos_defs::LinenrT;
 
+/// Reusable line-rendering scratch buffer (`extra_buf`).
+static EXTRA_BUF: crate::globals::GlobalCell<Vec<u8>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
+/// Ensure the reusable scratch buffer has at least `size` bytes and
+/// return its data pointer (`get_extra_buf`).
+///
+/// # Safety
+/// The returned pointer is invalidated by a later call that grows or
+/// frees the buffer; no concurrent access is allowed.
+#[allow(dead_code)]
+unsafe fn get_extra_buf(size: usize) -> *mut u8 {
+    let size = size.max(64);
+    // SAFETY: forwarded from this function's own safety doc.
+    let buffer = unsafe { EXTRA_BUF.get_mut() };
+    if buffer.len() < size {
+        *buffer = vec![0; size];
+    }
+    buffer.as_mut_ptr()
+}
+
 /// Whether `CursorLineSign` highlighting is to be used for line
 /// `lnum` in window `wp` (`use_cursor_line_highlight`).
 #[must_use]
@@ -147,6 +168,36 @@ pub fn get_rightmost_vcol(wp: &WinT, color_cols: Option<&[i32]>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ExtraBufGuard(Vec<u8>);
+
+    impl ExtraBufGuard {
+        fn empty() -> Self {
+            Self(std::mem::take(unsafe { EXTRA_BUF.get_mut() }))
+        }
+    }
+
+    impl Drop for ExtraBufGuard {
+        fn drop(&mut self) {
+            *unsafe { EXTRA_BUF.get_mut() } = std::mem::take(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn get_extra_buf_allocates_at_least_64_and_reuses_large_enough_storage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ExtraBufGuard::empty();
+        let first = unsafe { get_extra_buf(3) };
+        unsafe { *first = 0x5a };
+        assert_eq!(unsafe { EXTRA_BUF.get_mut() }.len(), 64);
+
+        let second = unsafe { get_extra_buf(32) };
+        assert_eq!(second, first);
+        assert_eq!(unsafe { *second }, 0x5a);
+
+        let _ = unsafe { get_extra_buf(100) };
+        assert_eq!(unsafe { EXTRA_BUF.get_mut() }.len(), 100);
+    }
 
     // ---- get_lcs_ext ----
 
