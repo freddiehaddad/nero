@@ -677,6 +677,39 @@ unsafe fn ins_compl_make_linear() {
     }
 }
 
+/// Make the completion list cyclic and return the number of matches,
+/// excluding the original-text entry (`ins_compl_make_cyclic`).
+///
+/// # Safety
+/// `COMPL_FIRST_MATCH`, when non-null, must head a valid completion
+/// list whose links remain live for the call.
+#[allow(dead_code)]
+unsafe fn ins_compl_make_cyclic() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let first = unsafe { *COMPL_FIRST_MATCH.get_mut() };
+    if first.is_null() {
+        return 0;
+    }
+
+    let mut current = first;
+    let mut count = 0;
+    loop {
+        // SAFETY: `current` is a live list node by contract.
+        let next = unsafe { (*current).cp_next };
+        if next.is_null() || unsafe { is_first_match(next) } {
+            break;
+        }
+        current = next;
+        count += 1;
+    }
+    // SAFETY: `current` and `first` are live list nodes by contract.
+    unsafe {
+        (*current).cp_next = first;
+        (*first).cp_prev = current;
+    }
+    count
+}
+
 /// Whether a completion match is selected, even if it has not yet
 /// been inserted (`ins_compl_is_match_selected`).
 ///
@@ -2259,6 +2292,26 @@ mod tests {
         assert!(unsafe { (*last_ptr).cp_next.is_null() });
         assert_eq!(unsafe { (*first_ptr).cp_next }, last_ptr);
         assert_eq!(unsafe { (*last_ptr).cp_prev }, first_ptr);
+    }
+
+    #[test]
+    fn ins_compl_make_cyclic_links_the_tail_and_excludes_original_from_count() {
+        let _lock = global_state_test_lock();
+        let mut first = ComplT::default();
+        let mut second = ComplT::default();
+        let mut last = ComplT::default();
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let last_ptr = std::ptr::addr_of_mut!(last);
+        unsafe {
+            (*first_ptr).cp_next = second_ptr;
+            (*second_ptr).cp_next = last_ptr;
+        }
+        let _first = FirstMatchGuard::install(first_ptr);
+
+        assert_eq!(unsafe { ins_compl_make_cyclic() }, 2);
+        assert_eq!(unsafe { (*last_ptr).cp_next }, first_ptr);
+        assert_eq!(unsafe { (*first_ptr).cp_prev }, last_ptr);
     }
 
     #[test]
