@@ -57,6 +57,40 @@ fn vim_findfile_free_visited_list(list: &mut Option<Box<FfVisitedListHdrT>>) {
     *list = None;
 }
 
+/// Get or create the visited list for `filename`
+/// (`ff_get_visited_list`).
+#[allow(dead_code)]
+fn ff_get_visited_list<'a>(
+    filename: &[u8],
+    list: &'a mut Option<Box<FfVisitedListHdrT>>,
+) -> &'a mut FfVisitedListHdrT {
+    let mut depth = 0;
+    let mut current = list.as_deref();
+    while let Some(header) = current {
+        // SAFETY: both names are valid byte slices.
+        if unsafe { crate::path::path_fnamecmp(filename, &header.ffvl_filename) } == 0 {
+            let mut found = list.as_deref_mut().expect("visited-list head disappeared");
+            for _ in 0..depth {
+                found = found
+                    .ffvl_next
+                    .as_deref_mut()
+                    .expect("visited-list chain changed");
+            }
+            return found;
+        }
+        depth += 1;
+        current = header.ffvl_next.as_deref();
+    }
+
+    let next = list.take();
+    *list = Some(Box::new(FfVisitedListHdrT {
+        ffvl_next: next,
+        ffvl_filename: filename.to_vec(),
+        ffvl_visited_list: None,
+    }));
+    list.as_deref_mut().expect("new visited-list head missing")
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -434,6 +468,42 @@ mod tests {
         }));
         vim_findfile_free_visited_list(&mut list);
         assert!(list.is_none());
+    }
+
+    #[test]
+    fn ff_get_visited_list_reuses_matching_name_and_prepends_new_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut list = None;
+
+        let first = ff_get_visited_list(b"first", &mut list) as *mut FfVisitedListHdrT;
+        unsafe {
+            (*first).ffvl_visited_list = Some(Box::new(FfVisitedT {
+                ffv_fname: b"kept".to_vec(),
+                ..Default::default()
+            }));
+        }
+
+        let reused = ff_get_visited_list(b"first", &mut list) as *mut FfVisitedListHdrT;
+        assert_eq!(reused, first);
+        assert_eq!(
+            unsafe {
+                (*reused)
+                    .ffvl_visited_list
+                    .as_deref()
+                    .map(|visited| visited.ffv_fname.as_slice())
+            },
+            Some(b"kept".as_slice())
+        );
+
+        let second = ff_get_visited_list(b"second", &mut list);
+        assert_eq!(second.ffvl_filename, b"second");
+        assert_eq!(
+            second
+                .ffvl_next
+                .as_deref()
+                .map(|header| header.ffvl_filename.as_slice()),
+            Some(b"first".as_slice())
+        );
     }
 
     // ---- ff_create_stack_element ----
