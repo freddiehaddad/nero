@@ -299,6 +299,18 @@ use crate::eval::typval_defs::{Callback, TypvalT, TypvalValue, VarLockStatus, Va
 use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
+/// Persistence class of a variable name (`var_flavour_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VarFlavourT {
+    /// Does not start with uppercase (`VAR_FLAVOUR_DEFAULT`).
+    Default = 1,
+    /// Starts uppercase and contains lowercase (`VAR_FLAVOUR_SESSION`).
+    Session = 2,
+    /// Contains only uppercase characters (`VAR_FLAVOUR_SHADA`).
+    Shada = 4,
+}
+
 /// Whether a typval is a usable expression argument
 /// (`eval_expr_valid_arg`).
 #[must_use]
@@ -5883,6 +5895,13 @@ unsafe fn get_lval_list(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variable_flavour_values_match_eval_h() {
+        assert_eq!(VarFlavourT::Default as i32, 1);
+        assert_eq!(VarFlavourT::Session as i32, 2);
+        assert_eq!(VarFlavourT::Shada as i32, 4);
+    }
     use crate::eval::typval_defs::VarLockStatus;
 
     struct EvalInitCleanup;
