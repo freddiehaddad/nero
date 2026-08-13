@@ -6709,6 +6709,28 @@ pub fn optval_equal(o1: &crate::option_defs::OptVal, o2: &crate::option_defs::Op
     o1 == o2
 }
 
+/// Convert an option value to an API object (`optval_as_object`).
+#[must_use]
+pub fn optval_as_object(
+    value: crate::option_defs::OptVal,
+) -> crate::api::private::defs::Object {
+    use crate::api::private::defs::Object;
+    use crate::option_defs::OptVal;
+    match value {
+        OptVal::Nil | OptVal::Boolean(crate::types_defs::TriState::None) => {
+            Object::Nil
+        }
+        OptVal::Boolean(crate::types_defs::TriState::False) => {
+            Object::Boolean(false)
+        }
+        OptVal::Boolean(crate::types_defs::TriState::True) => {
+            Object::Boolean(true)
+        }
+        OptVal::Number(number) => Object::Integer(number),
+        OptVal::String(string) => Object::String(string),
+    }
+}
+
 /// Whether an option currently has its default value
 /// (`optval_default`).
 ///
@@ -7686,6 +7708,29 @@ mod did_set_title_tests {
         // Different variants are never equal, whatever they carry.
         assert!(!optval_equal(&OptVal::Nil, &OptVal::Number(0)));
         assert!(!optval_equal(&OptVal::Number(1), &OptVal::Boolean(TriState::True)));
+    }
+
+    #[test]
+    fn optval_as_object_maps_every_option_variant() {
+        use crate::api::private::defs::Object;
+        use crate::option_defs::OptVal;
+        assert!(matches!(optval_as_object(OptVal::Nil), Object::Nil));
+        assert!(matches!(
+            optval_as_object(OptVal::Boolean(crate::types_defs::TriState::None)),
+            Object::Nil
+        ));
+        assert!(matches!(
+            optval_as_object(OptVal::Boolean(crate::types_defs::TriState::True)),
+            Object::Boolean(true)
+        ));
+        assert!(matches!(
+            optval_as_object(OptVal::Number(42)),
+            Object::Integer(42)
+        ));
+        match optval_as_object(OptVal::String(b"value".to_vec())) {
+            Object::String(value) => assert_eq!(value, b"value"),
+            other => panic!("unexpected object: {other:?}"),
+        }
     }
 
     #[test]
