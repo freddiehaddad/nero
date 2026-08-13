@@ -6731,6 +6731,31 @@ pub fn optval_as_object(
     }
 }
 
+/// Convert an API object to an option value (`object_as_optval`).
+///
+/// The boolean reports the original out-parameter `error`.
+#[must_use]
+pub fn object_as_optval(
+    object: crate::api::private::defs::Object,
+) -> (crate::option_defs::OptVal, bool) {
+    use crate::api::private::defs::Object;
+    use crate::option_defs::OptVal;
+    match object {
+        Object::Nil => (OptVal::Nil, false),
+        Object::Boolean(value) => (
+            OptVal::Boolean(if value {
+                crate::types_defs::TriState::True
+            } else {
+                crate::types_defs::TriState::False
+            }),
+            false,
+        ),
+        Object::Integer(value) => (OptVal::Number(value), false),
+        Object::String(value) => (OptVal::String(value), false),
+        _ => (OptVal::Nil, true),
+    }
+}
+
 /// Whether an option currently has its default value
 /// (`optval_default`).
 ///
@@ -7731,6 +7756,32 @@ mod did_set_title_tests {
             Object::String(value) => assert_eq!(value, b"value"),
             other => panic!("unexpected object: {other:?}"),
         }
+    }
+
+    #[test]
+    fn object_as_optval_maps_supported_types_and_flags_others() {
+        use crate::api::private::defs::Object;
+        use crate::option_defs::OptVal;
+        assert_eq!(object_as_optval(Object::Nil), (OptVal::Nil, false));
+        assert_eq!(
+            object_as_optval(Object::Boolean(false)),
+            (
+                OptVal::Boolean(crate::types_defs::TriState::False),
+                false
+            )
+        );
+        assert_eq!(
+            object_as_optval(Object::Integer(7)),
+            (OptVal::Number(7), false)
+        );
+        assert_eq!(
+            object_as_optval(Object::String(b"text".to_vec())),
+            (OptVal::String(b"text".to_vec()), false)
+        );
+        assert_eq!(
+            object_as_optval(Object::Float(1.5)),
+            (OptVal::Nil, true)
+        );
     }
 
     #[test]
