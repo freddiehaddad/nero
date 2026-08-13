@@ -910,6 +910,34 @@ unsafe fn thesaurus_func_complete(completion_type: i32) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
+/// Get the configured completion function name (`get_complete_funcname`).
+///
+/// The C function returns a borrowed option pointer; this ownership-safe
+/// translation returns the same bytes in an owned buffer.
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer.
+#[allow(dead_code)]
+unsafe fn get_complete_funcname(completion_type: i32) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    match completion_type {
+        CTRL_X_FUNCTION => buf.b_p_cfu.clone().unwrap_or_default(),
+        CTRL_X_OMNI => buf.b_p_ofu.clone().unwrap_or_default(),
+        CTRL_X_THESAURUS => {
+            if buf.b_p_tsrfu.as_deref().is_some_and(|value| !value.is_empty()) {
+                buf.b_p_tsrfu.clone().unwrap_or_default()
+            } else {
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                    .p_tsrfu
+                    .clone()
+                    .unwrap_or_default()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -2856,6 +2884,33 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tsrfu =
             Some(b"GlobalThesaurus".to_vec());
         assert!(unsafe { thesaurus_func_complete(CTRL_X_THESAURUS) });
+    }
+
+    #[test]
+    fn get_complete_funcname_selects_the_mode_specific_option() {
+        let _lock = global_state_test_lock();
+        let _global = GlobalThesaurusFuncGuard::set(Some(b"GlobalThesaurus".to_vec()));
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_cfu: Some(b"Complete".to_vec()),
+            b_p_ofu: Some(b"Omni".to_vec()),
+            b_p_tsrfu: Some(Vec::new()),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = CurbufGuard::set(unsafe { &mut *buf_ptr });
+
+        assert_eq!(unsafe { get_complete_funcname(CTRL_X_FUNCTION) }, b"Complete");
+        assert_eq!(unsafe { get_complete_funcname(CTRL_X_OMNI) }, b"Omni");
+        assert_eq!(
+            unsafe { get_complete_funcname(CTRL_X_THESAURUS) },
+            b"GlobalThesaurus"
+        );
+        unsafe { (*buf_ptr).b_p_tsrfu = Some(b"LocalThesaurus".to_vec()) };
+        assert_eq!(
+            unsafe { get_complete_funcname(CTRL_X_THESAURUS) },
+            b"LocalThesaurus"
+        );
+        assert!(unsafe { get_complete_funcname(CTRL_X_NORMAL) }.is_empty());
     }
 
     #[test]
