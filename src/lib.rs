@@ -139,6 +139,7 @@ pub mod sha256;
 pub mod sign;
 pub mod sign_defs;
 pub mod spell;
+pub mod spell_defs;
 pub mod spellfile;
 pub mod spellsuggest;
 pub mod state;
