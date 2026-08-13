@@ -104,6 +104,29 @@
 
 use crate::os::os_defs::MAXPATHL;
 
+/// Move `separator` back to the previous path separator
+/// (`find_previous_pathsep`).
+#[allow(dead_code)]
+fn find_previous_pathsep(path: &[u8], separator: &mut usize) -> i32 {
+    if *separator > 0
+        && path
+            .get(*separator)
+            .is_some_and(|&byte| vim_ispathsep(i32::from(byte)))
+    {
+        *separator -= 1;
+    }
+    while *separator > 0 {
+        if vim_ispathsep(i32::from(path[*separator])) {
+            return crate::vim_defs::OK;
+        }
+        *separator -= 1;
+        while *separator > 0 && path[*separator] & 0xc0 == 0x80 {
+            *separator -= 1;
+        }
+    }
+    crate::vim_defs::FAIL
+}
+
 /// True if `c` is a path separator (`vim_ispathsep`). Note that on Windows
 /// this includes the colon.
 #[cfg(unix)]
@@ -1461,6 +1484,30 @@ pub fn concat_fnames(fname1: &[u8], fname2: &[u8], sep: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_previous_pathsep_skips_current_and_respects_utf8_boundaries() {
+        let path = "α/beta/file".as_bytes();
+        let mut separator = path.len() - 1;
+        assert_eq!(
+            find_previous_pathsep(path, &mut separator),
+            crate::vim_defs::OK
+        );
+        assert_eq!(path[separator], b'/');
+        assert_eq!(&path[separator + 1..], b"file");
+
+        assert_eq!(
+            find_previous_pathsep(path, &mut separator),
+            crate::vim_defs::OK
+        );
+        assert_eq!(&path[separator + 1..], b"beta/file");
+
+        assert_eq!(
+            find_previous_pathsep(path, &mut separator),
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(separator, 0);
+    }
 
     #[test]
     fn has_env_var_finds_a_dollar_sign() {
