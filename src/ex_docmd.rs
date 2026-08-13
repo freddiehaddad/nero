@@ -115,6 +115,15 @@ struct WcmdT {
     lnum: crate::pos_defs::LinenrT,
 }
 
+/// Retain one command line for loop replay (`store_loop_line`).
+#[allow(dead_code)]
+fn store_loop_line(lines: &mut Vec<WcmdT>, line: &[u8]) {
+    lines.push(WcmdT {
+        line: line.to_vec(),
+        lnum: crate::runtime::sourcing_lnum(),
+    });
+}
+
 /// Begin executing an Ex command line (`do_cmdline_start`).
 ///
 /// # Safety
@@ -1209,6 +1218,26 @@ mod tests {
         started: bool,
     }
 
+    struct ExdocmdStackGuard(Vec<crate::runtime_defs::EstackT>);
+
+    impl ExdocmdStackGuard {
+        fn line(line: crate::pos_defs::LinenrT) -> Self {
+            Self(crate::runtime::replace_exestack_for_test(vec![
+                crate::runtime_defs::EstackT {
+                    es_lnum: line,
+                    ..Default::default()
+                },
+            ]))
+        }
+    }
+
+    impl Drop for ExdocmdStackGuard {
+        fn drop(&mut self) {
+            let saved = std::mem::take(&mut self.0);
+            let _ = crate::runtime::replace_exestack_for_test(saved);
+        }
+    }
+
     impl CmdlineStartGuard {
         fn install(depth: i32, maxfuncdepth: crate::types_defs::OptInt) -> Self {
             let saved_depth = unsafe {
@@ -1255,6 +1284,20 @@ mod tests {
         copy.line[0] = b'E';
         assert_eq!(record.line, b"echo value");
         assert_eq!(record.lnum, 19);
+    }
+
+    #[test]
+    fn store_loop_line_copies_text_and_current_source_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stack = ExdocmdStackGuard::line(22);
+        let mut input = b"echo value".to_vec();
+        let mut lines = Vec::new();
+        store_loop_line(&mut lines, &input);
+        input[0] = b'E';
+        assert_eq!(lines, vec![WcmdT {
+            line: b"echo value".to_vec(),
+            lnum: 22,
+        }]);
     }
 
     #[test]
