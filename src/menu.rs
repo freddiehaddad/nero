@@ -56,6 +56,12 @@
 
 use crate::menu_defs::{VimMenu, MNU_HIDDEN_CHAR};
 
+/// Release one mode's menu command (`free_menu_string`).
+#[allow(dead_code)]
+fn free_menu_string(menu: &mut VimMenu, index: usize) {
+    menu.strings[index] = None;
+}
+
 /// Whether `name` is a popup menu name (`menu_is_popup`).
 #[must_use]
 pub fn menu_is_popup(name: &[u8]) -> bool {
@@ -406,6 +412,19 @@ pub fn menu_unescape_name(name: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_menu_string_clears_only_the_selected_mode() {
+        let mut menu = VimMenu::default();
+        menu.strings[0] = Some(b"shared-command".to_vec());
+        menu.strings[1] = Some(b"shared-command".to_vec());
+        free_menu_string(&mut menu, 0);
+        assert!(menu.strings[0].is_none());
+        assert_eq!(
+            menu.strings[1].as_deref(),
+            Some(b"shared-command".as_slice())
+        );
+    }
 
     struct RootMenuGuard(*mut VimMenu);
 
