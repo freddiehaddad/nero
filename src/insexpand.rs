@@ -1735,6 +1735,16 @@ static TSRFU_CB: GlobalCell<crate::eval::typval_defs::Callback> =
 /// this crate can currently populate it.
 static CPT_CB: GlobalCell<Vec<crate::eval::typval_defs::Callback>> = GlobalCell::new(Vec::new());
 
+/// Free an array of `'complete'` callbacks (`clear_cpt_callbacks`).
+#[allow(dead_code)]
+fn clear_cpt_callbacks(callbacks: &mut Vec<crate::eval::typval_defs::Callback>) {
+    for callback in callbacks.iter_mut() {
+        crate::eval::typval::callback_free(callback);
+    }
+    callbacks.clear();
+    callbacks.shrink_to_fit();
+}
+
 /// Mark `copy_id` on every callback in `callbacks` so none of them are
 /// garbage collected (`set_ref_in_cpt_callbacks`).
 ///
@@ -3740,5 +3750,25 @@ mod tests {
             crate::eval::typval_defs::Callback::Funcref(b"MyFunc".to_vec()),
         ];
         assert!(!unsafe { set_ref_in_cpt_callbacks(&callbacks, 1) });
+    }
+
+    #[test]
+    fn clear_cpt_callbacks_releases_each_callback_and_empties_the_array() {
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let mut callbacks = vec![
+            crate::eval::typval_defs::Callback::Partial(partial),
+            crate::eval::typval_defs::Callback::None,
+        ];
+
+        clear_cpt_callbacks(&mut callbacks);
+
+        assert!(callbacks.is_empty());
+        assert_eq!(unsafe { (*partial).pt_refcount }, 1);
+        unsafe { crate::eval::typval::partial_unref(partial) };
     }
 }
