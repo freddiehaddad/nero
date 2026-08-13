@@ -147,6 +147,40 @@ fn skip_wildmenu_char(
     0
 }
 
+/// Display width of one wildmenu match (`wildmenu_match_len`).
+///
+/// # Safety
+/// Forwarded from [`crate::charset::ptr2cells`].
+#[allow(dead_code)]
+unsafe fn wildmenu_match_len(
+    xp: &crate::cmdexpand_defs::ExpandT,
+    text: &[u8],
+) -> i32 {
+    let menu = matches!(
+        xp.xp_context,
+        crate::cmdexpand_defs::ExpandContext::Menus
+            | crate::cmdexpand_defs::ExpandContext::Menunames
+    );
+    if menu && crate::menu::menu_is_separator(text) {
+        return 1;
+    }
+
+    let end = text.iter().position(|&byte| byte == 0).unwrap_or(text.len());
+    let mut offset = 0;
+    let mut cells = 0;
+    while offset < end {
+        offset += skip_wildmenu_char(xp, &text[offset..end]);
+        if offset >= end {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        cells += unsafe { crate::charset::ptr2cells(&text[offset..end]) };
+        // SAFETY: forwarded from this function's own safety doc.
+        offset += unsafe { crate::mbyte::utfc_ptr2len(&text[offset..end]) }.max(1) as usize;
+    }
+    cells
+}
+
 /// Translate keys while wildmenu completion is active
 /// (`wildmenu_translate_key`).
 ///
@@ -734,6 +768,23 @@ mod tests {
         xp.xp_context = ExpandContext::Menus;
         assert_eq!(skip_wildmenu_char(&xp, b"\tName"), 1);
         assert_eq!(skip_wildmenu_char(&xp, b"\\x"), 1);
+    }
+
+    #[test]
+    fn wildmenu_match_len_accounts_for_escapes_tabs_and_separators() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Files,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { wildmenu_match_len(&xp, b"one\\ two") }, 7);
+
+        xp.xp_context = crate::cmdexpand_defs::ExpandContext::Help;
+        assert_eq!(unsafe { wildmenu_match_len(&xp, b"one\\ two") }, 8);
+
+        xp.xp_context = crate::cmdexpand_defs::ExpandContext::Menus;
+        assert_eq!(unsafe { wildmenu_match_len(&xp, b"---") }, 1);
+        assert_eq!(unsafe { wildmenu_match_len(&xp, b"File\tOpen") }, 8);
     }
 
     #[test]
