@@ -35,6 +35,12 @@ struct FfVisitedT {
     ffv_fname: Vec<u8>,
 }
 
+/// Free an entire visited-file chain (`ff_free_visited_list`).
+#[allow(dead_code)]
+fn ff_free_visited_list(list: &mut Option<Box<FfVisitedT>>) {
+    *list = None;
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -346,6 +352,21 @@ mod tests {
             node.ffv_next.as_deref().map(|next| next.ffv_fname.as_slice()),
             Some(b"second".as_slice())
         );
+    }
+
+    #[test]
+    fn ff_free_visited_list_drops_the_entire_owned_chain() {
+        let mut list = Some(Box::new(FfVisitedT {
+            ffv_next: Some(Box::new(FfVisitedT {
+                ffv_fname: b"tail".to_vec(),
+                ..Default::default()
+            })),
+            ffv_wc_path: Some(b"*.vim".to_vec()),
+            ffv_fname: b"head".to_vec(),
+            ..Default::default()
+        }));
+        ff_free_visited_list(&mut list);
+        assert!(list.is_none());
     }
 
     // ---- ff_create_stack_element ----
