@@ -171,6 +171,25 @@ fn addr_error(addr_type: crate::ex_cmds_defs::CmdAddrT) -> &'static [u8] {
     }
 }
 
+/// Parse the value of a `++bad=` argument (`get_bad_opt`).
+pub fn get_bad_opt(value: &[u8], eap: &mut crate::ex_cmds_defs::ExargT) -> i32 {
+    let end = value
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(value.len());
+    let value = &value[..end];
+    if value.eq_ignore_ascii_case(b"keep") {
+        eap.bad_char = crate::ex_cmds_defs::BAD_KEEP;
+    } else if value.eq_ignore_ascii_case(b"drop") {
+        eap.bad_char = crate::ex_cmds_defs::BAD_DROP;
+    } else if value.len() == 1 && crate::mbyte::utf_byte2len(value[0]) == 1 {
+        eap.bad_char = i32::from(value[0]);
+    } else {
+        return crate::vim_defs::FAIL;
+    }
+    crate::vim_defs::OK
+}
+
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
 ///
 /// Only ever set by `post_chdir` (not yet translated), so this stays
@@ -1244,6 +1263,20 @@ mod tests {
         ] {
             assert_eq!(addr_error(addr), crate::errors::e_invrange.as_bytes());
         }
+    }
+
+    #[test]
+    fn get_bad_opt_accepts_named_and_single_byte_values() {
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        assert_eq!(get_bad_opt(b"KeEp", &mut eap), crate::vim_defs::OK);
+        assert_eq!(eap.bad_char, crate::ex_cmds_defs::BAD_KEEP);
+        assert_eq!(get_bad_opt(b"DROP", &mut eap), crate::vim_defs::OK);
+        assert_eq!(eap.bad_char, crate::ex_cmds_defs::BAD_DROP);
+        assert_eq!(get_bad_opt(b"?", &mut eap), crate::vim_defs::OK);
+        assert_eq!(eap.bad_char, i32::from(b'?'));
+
+        assert_eq!(get_bad_opt("é".as_bytes(), &mut eap), crate::vim_defs::FAIL);
+        assert_eq!(get_bad_opt(b"xx", &mut eap), crate::vim_defs::FAIL);
     }
 
     struct FfuGuard {
