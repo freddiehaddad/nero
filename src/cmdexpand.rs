@@ -200,6 +200,16 @@ pub fn expand_init(xp: &mut crate::cmdexpand_defs::ExpandT) {
     xp.xp_numfiles = -1;
 }
 
+/// Clean up an expansion structure after use (`ExpandCleanup`).
+pub fn expand_cleanup(xp: &mut crate::cmdexpand_defs::ExpandT) {
+    if xp.xp_numfiles >= 0 {
+        free_xp_files_extra(xp, xp.xp_numfiles);
+        xp.xp_files = None;
+        xp.xp_numfiles = -1;
+    }
+    xp.xp_orig = None;
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -791,6 +801,30 @@ mod tests {
         assert_eq!(xp.xp_numfiles, -1);
         assert!(xp.xp_files.is_none());
         assert!(!xp.xp_shell);
+    }
+
+    #[test]
+    fn expand_cleanup_releases_matches_metadata_and_original_text() {
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_numfiles: 1,
+            xp_orig: Some(b"original".to_vec()),
+            xp_files: Some(vec![b"match".to_vec()]),
+            xp_files_abbr: Some(vec![b"abbr".to_vec()]),
+            xp_files_kind: Some(vec![b"kind".to_vec()]),
+            xp_files_menu: Some(vec![b"menu".to_vec()]),
+            xp_files_info: Some(vec![b"info".to_vec()]),
+            ..Default::default()
+        };
+
+        expand_cleanup(&mut xp);
+
+        assert_eq!(xp.xp_numfiles, -1);
+        assert!(xp.xp_orig.is_none());
+        assert!(xp.xp_files.is_none());
+        assert!(xp.xp_files_abbr.is_none());
+        assert!(xp.xp_files_kind.is_none());
+        assert!(xp.xp_files_menu.is_none());
+        assert!(xp.xp_files_info.is_none());
     }
 
     #[test]
