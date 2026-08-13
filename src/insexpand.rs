@@ -286,6 +286,13 @@ static CPT_SOURCES: GlobalCell<Vec<CptSourceT>> = GlobalCell::new(Vec::new());
 /// Current completion source index (`cpt_sources_index`).
 #[allow(dead_code)]
 static CPT_SOURCES_INDEX: GlobalCell<i32> = GlobalCell::new(-1);
+/// Initial completion source budget in milliseconds.
+const COMPL_INITIAL_TIMEOUT_MS: u64 = 80;
+/// Budget below which decay stops being applied.
+const COMPL_MIN_TIMEOUT_MS: u64 = 5;
+/// Current completion source budget (`compl_timeout_ms`).
+static COMPL_TIMEOUT_MS: GlobalCell<u64> =
+    GlobalCell::new(COMPL_INITIAL_TIMEOUT_MS);
 
 /// Whether any completion source requested `refresh: "always"`
 /// (`is_cpt_func_refresh_always`).
@@ -313,6 +320,29 @@ unsafe fn compl_source_start_timer(source_idx: usize) {
             crate::os::time::os_hrtime();
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() = false };
+    }
+}
+
+/// Stop a completion source after it exceeds its time budget
+/// (`check_elapsed_time`).
+///
+/// # Safety
+/// `CPT_SOURCES_INDEX` must identify a live source.
+#[allow(dead_code)]
+unsafe fn check_elapsed_time() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let index = unsafe { *CPT_SOURCES_INDEX.get_mut() } as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let start = (unsafe { CPT_SOURCES.get_mut() })[index].compl_start_tv;
+    let elapsed = crate::os::time::os_hrtime().wrapping_sub(start) / 1_000_000;
+    // SAFETY: forwarded from this function's own safety doc.
+    let timeout = unsafe { COMPL_TIMEOUT_MS.get_mut() };
+    if elapsed > *timeout {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() = true };
+        if *timeout > COMPL_MIN_TIMEOUT_MS {
+            *timeout /= 2;
+        }
     }
 }
 
@@ -1556,6 +1586,22 @@ mod tests {
         expired: bool,
     }
 
+    struct CompletionLimitGuard(u64);
+
+    impl CompletionLimitGuard {
+        fn set(value: u64) -> Self {
+            let saved = unsafe { *COMPL_TIMEOUT_MS.get_mut() };
+            unsafe { *COMPL_TIMEOUT_MS.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for CompletionLimitGuard {
+        fn drop(&mut self) {
+            unsafe { *COMPL_TIMEOUT_MS.get_mut() = self.0 };
+        }
+    }
+
     impl CompletionTimerGuard {
         fn set(timeout: crate::types_defs::OptInt, expired: bool) -> Self {
             let saved = Self {
@@ -1768,6 +1814,34 @@ mod tests {
         let start = (unsafe { CPT_SOURCES.get_mut() })[0].compl_start_tv;
         assert!((before..=after).contains(&start));
         assert!(!unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() });
+    }
+
+    #[test]
+    fn check_elapsed_time_expires_and_halves_the_source_budget() {
+        let _mode = AutocompleteModeGuard::set(false, false);
+        let now = crate::os::time::os_hrtime();
+        let _sources = CptSourcesGuard::install(
+            vec![CptSourceT {
+                compl_start_tv: now.wrapping_sub(100_000_000),
+                ..Default::default()
+            }],
+            0,
+        );
+        let _timer = CompletionTimerGuard::set(0, false);
+        let _limit = CompletionLimitGuard::set(80);
+
+        unsafe { check_elapsed_time() };
+
+        assert!(unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() });
+        assert_eq!(unsafe { *COMPL_TIMEOUT_MS.get_mut() }, 40);
+
+        unsafe {
+            *COMPL_TIMEOUT_MS.get_mut() = 5;
+            *COMPL_TIME_SLICE_EXPIRED.get_mut() = false;
+        }
+        unsafe { check_elapsed_time() };
+        assert!(unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() });
+        assert_eq!(unsafe { *COMPL_TIMEOUT_MS.get_mut() }, 5);
     }
 
     /// With no match shown there is nothing to be stuck on, so this
