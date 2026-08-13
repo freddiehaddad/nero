@@ -709,6 +709,54 @@ pub unsafe fn buf_has_cstyle_comments() -> bool {
     false
 }
 
+/// Whether a byte belongs to a balloon-evaluation item
+/// (`find_is_eval_item`).
+#[allow(dead_code)]
+fn find_is_eval_item(
+    text: &[u8],
+    index: usize,
+    col: &mut i32,
+    brackets: &mut i32,
+    direction: crate::vim_defs::Direction,
+) -> bool {
+    let byte = text.get(index).copied().unwrap_or(0);
+    if (byte == b']' && direction == crate::vim_defs::Direction::Backward)
+        || (byte == b'[' && direction == crate::vim_defs::Direction::Forward)
+    {
+        *brackets += 1;
+    }
+    if *brackets > 0 {
+        if (byte == b'[' && direction == crate::vim_defs::Direction::Backward)
+            || (byte == b']' && direction == crate::vim_defs::Direction::Forward)
+        {
+            *brackets -= 1;
+        }
+        return true;
+    }
+    if byte == b'.' {
+        return true;
+    }
+
+    let is_arrow = match direction {
+        crate::vim_defs::Direction::Backward => {
+            byte == b'>'
+                && index
+                    .checked_sub(1)
+                    .and_then(|previous| text.get(previous))
+                    == Some(&b'-')
+        }
+        crate::vim_defs::Direction::Forward => {
+            byte == b'-' && text.get(index + 1) == Some(&b'>')
+        }
+        _ => false,
+    };
+    if is_arrow {
+        *col += direction as i32;
+        return true;
+    }
+    false
+}
+
 /// Returns `true` if `line[offset]` is NOT inside a C-style comment or
 /// string, `false` otherwise (`is_ident`).
 ///
@@ -1821,6 +1869,27 @@ mod tests {
     #[test]
     fn is_ident_plain_code_before_offset_is_true() {
         assert!(is_ident(b"int x = 5;\0", 5));
+    }
+
+    #[test]
+    fn find_is_eval_item_tracks_brackets_dots_and_arrows() {
+        use crate::vim_defs::Direction::{Backward, Forward};
+
+        let mut col = 0;
+        let mut brackets = 0;
+        assert!(find_is_eval_item(b"[x]", 0, &mut col, &mut brackets, Forward));
+        assert_eq!(brackets, 1);
+        assert!(find_is_eval_item(b"[x]", 1, &mut col, &mut brackets, Forward));
+        assert!(find_is_eval_item(b"[x]", 2, &mut col, &mut brackets, Forward));
+        assert_eq!(brackets, 0);
+
+        assert!(find_is_eval_item(b"s.var", 1, &mut col, &mut brackets, Forward));
+        col = 2;
+        assert!(find_is_eval_item(b"s->var", 1, &mut col, &mut brackets, Forward));
+        assert_eq!(col, 3);
+        assert!(find_is_eval_item(b"s->var", 2, &mut col, &mut brackets, Backward));
+        assert_eq!(col, 2);
+        assert!(!find_is_eval_item(b"word", 1, &mut col, &mut brackets, Forward));
     }
 
     #[test]
