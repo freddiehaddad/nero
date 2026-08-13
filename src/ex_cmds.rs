@@ -59,6 +59,29 @@ pub fn check_regexp_delim(c: i32) -> bool {
     !crate::macros_defs::ascii_isalpha(c)
 }
 
+/// Skip the replacement part of a substitute command
+/// (`skip_substitute`).
+///
+/// Returns the offset after the closing delimiter and replaces that
+/// delimiter with NUL.
+#[allow(dead_code)]
+fn skip_substitute(replacement: &mut [u8], delimiter: u8) -> usize {
+    let mut offset = 0;
+    while replacement.get(offset).is_some_and(|&byte| byte != 0) {
+        if replacement[offset] == delimiter {
+            replacement[offset] = crate::ascii_defs::NUL;
+            return offset + 1;
+        }
+        if replacement[offset] == b'\\'
+            && replacement.get(offset + 1).is_some_and(|&byte| byte != 0)
+        {
+            offset += 1;
+        }
+        offset += crate::mbyte::utf_ptr2len(&replacement[offset..]).max(1) as usize;
+    }
+    offset
+}
+
 /// Find the first unquoted `|` in `cmd` (`find_pipe`).
 ///
 /// Quoted sections (inside `"`) and backslash-escaped bytes do not
@@ -300,6 +323,20 @@ pub unsafe fn free_old_sub() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_substitute_ignores_escaped_delimiters_and_terminates_at_closing_one() {
+        let mut replacement = b"one\\/two/rest".to_vec();
+        let next = skip_substitute(&mut replacement, b'/');
+        assert_eq!(&replacement[..next], b"one\\/two\0");
+        assert_eq!(&replacement[next..], b"rest");
+
+        let mut unterminated = b"replacement".to_vec();
+        assert_eq!(
+            skip_substitute(&mut unterminated, b'/'),
+            unterminated.len()
+        );
+    }
 
     struct OldSubGuard(Option<crate::ex_cmds_defs::SubReplacementString>);
 
