@@ -44,6 +44,13 @@ struct TimeEntryT {
     pattern: Vec<u8>,
 }
 
+/// Sort syntax timing rows by descending total time
+/// (`syn_compare_syntime`).
+#[allow(dead_code)]
+fn syn_compare_syntime(first: &TimeEntryT, second: &TimeEntryT) -> i32 {
+    crate::profile::profile_cmp(first.total, second.total)
+}
+
 /// Set or clear the syntax-recognition timeout (`syn_set_timeout`).
 ///
 /// # Safety
@@ -1372,6 +1379,21 @@ mod tests {
         assert_eq!(entry.average, 25);
         assert_eq!(entry.id, 7);
         assert_eq!(entry.pattern, b"TODO");
+    }
+
+    #[test]
+    fn syn_compare_syntime_orders_larger_totals_first() {
+        let high = TimeEntryT {
+            total: 100,
+            ..Default::default()
+        };
+        let low = TimeEntryT {
+            total: 10,
+            ..Default::default()
+        };
+        assert!(syn_compare_syntime(&high, &low) < 0);
+        assert!(syn_compare_syntime(&low, &high) > 0);
+        assert_eq!(syn_compare_syntime(&high, &high), 0);
     }
 
     #[test]
