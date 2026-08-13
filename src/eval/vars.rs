@@ -1071,6 +1071,42 @@ pub unsafe fn evalvars_init() {
     }
 }
 
+/// Release heap-backed values created by [`evalvars_init`] so tests can
+/// invoke the one-shot bootstrap without polluting global GC lists.
+#[cfg(test)]
+pub(crate) unsafe fn cleanup_evalvars_init_for_test() {
+    // SAFETY: caller serializes global evaluator state.
+    unsafe {
+        let msgpack_types = get_vim_var_dict(VimVarIndex::MsgpackTypes);
+        if !msgpack_types.is_null() {
+            crate::eval::typval::tv_dict_unref(msgpack_types);
+            set_vim_var_dict(VimVarIndex::MsgpackTypes, std::ptr::null_mut());
+        }
+        *EVAL_MSGPACK_TYPE_LISTS.get_mut() =
+            [std::ptr::null_mut(); NUM_MSGPACK_TYPES];
+
+        for index in [VimVarIndex::CompletedItem, VimVarIndex::Event] {
+            let dict = get_vim_var_dict(index);
+            if !dict.is_null() {
+                crate::eval::typval::tv_dict_unref(dict);
+                set_vim_var_dict(index, std::ptr::null_mut());
+            }
+        }
+
+        let errors = get_vim_var_list(VimVarIndex::Errors);
+        if !errors.is_null() {
+            crate::eval::typval::tv_list_unref(errors);
+            set_vim_var_list(VimVarIndex::Errors, std::ptr::null_mut());
+        }
+
+        let lua = get_vim_var_partial(VimVarIndex::Lua);
+        if !lua.is_null() {
+            crate::eval::typval::partial_unref(lua);
+            set_vim_var_partial(VimVarIndex::Lua, std::ptr::null_mut());
+        }
+    }
+}
+
 #[cfg(test)]
 mod evalvars_init_tests {
     use super::*;

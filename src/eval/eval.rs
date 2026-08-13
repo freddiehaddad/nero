@@ -313,6 +313,17 @@ pub fn eval_expr_valid_arg(value: &TypvalT) -> bool {
     }
 }
 
+/// Initialize global/`v:` variables and the function table
+/// (`eval_init`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::evalvars_init`].
+pub unsafe fn eval_init() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::evalvars_init() };
+    crate::eval::userfunc::func_init();
+}
+
 /// Highlight group selected by `:echohl` (`echo_hl_id`).
 static ECHO_HL_ID: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
@@ -5874,6 +5885,14 @@ mod tests {
     use super::*;
     use crate::eval::typval_defs::VarLockStatus;
 
+    struct EvalInitCleanup;
+
+    impl Drop for EvalInitCleanup {
+        fn drop(&mut self) {
+            unsafe { crate::eval::vars::cleanup_evalvars_init_for_test() };
+        }
+    }
+
     #[test]
     fn eval_expr_valid_arg_rejects_unknown_null_and_empty_strings() {
         assert!(!eval_expr_valid_arg(&TypvalT::default()));
@@ -5897,6 +5916,40 @@ mod tests {
             value: TypvalValue::Number(0),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn eval_init_restores_startup_variables_and_resets_functions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cleanup = EvalInitCleanup;
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Version,
+                -1,
+            )
+        };
+        let key = std::ffi::CString::new("TemporaryFunction").expect("CString");
+        let table = crate::eval::userfunc::func_tbl_get();
+        assert_eq!(
+            unsafe { (*table).hash_add(key.as_ptr().cast_mut()) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*table).ht_used }, 1);
+
+        unsafe { eval_init() };
+
+        assert_eq!(
+            unsafe {
+                crate::eval::vars::get_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Version,
+                )
+            },
+            i64::from(crate::version::min_vim_version())
+        );
+        assert_eq!(
+            unsafe { (*crate::eval::userfunc::func_tbl_get()).ht_used },
+            0
+        );
     }
 
     struct EchoHighlightGuard(i32);
