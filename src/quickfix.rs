@@ -216,6 +216,24 @@ fn cbuffer_get_auname(
     }
 }
 
+/// Autocommand name for `:cexpr`/`:lexpr` commands
+/// (`cexpr_get_auname`).
+#[allow(dead_code)]
+fn cexpr_get_auname(
+    cmdidx: crate::ex_cmds_defs::CmdIdxT,
+) -> Option<&'static [u8]> {
+    use crate::ex_cmds_defs::CmdIdxT;
+    match cmdidx {
+        CmdIdxT::cexpr => Some(b"cexpr"),
+        CmdIdxT::cgetexpr => Some(b"cgetexpr"),
+        CmdIdxT::caddexpr => Some(b"caddexpr"),
+        CmdIdxT::lexpr => Some(b"lexpr"),
+        CmdIdxT::lgetexpr => Some(b"lgetexpr"),
+        CmdIdxT::laddexpr => Some(b"laddexpr"),
+        _ => None,
+    }
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2293,6 +2311,21 @@ mod tests {
             Some(b"laddbuffer".as_slice())
         );
         assert_eq!(cbuffer_get_auname(CmdIdxT::cfile), None);
+    }
+
+    #[test]
+    fn cexpr_get_auname_maps_quickfix_and_location_expression_commands() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert_eq!(cexpr_get_auname(CmdIdxT::cexpr), Some(b"cexpr".as_slice()));
+        assert_eq!(
+            cexpr_get_auname(CmdIdxT::cgetexpr),
+            Some(b"cgetexpr".as_slice())
+        );
+        assert_eq!(
+            cexpr_get_auname(CmdIdxT::laddexpr),
+            Some(b"laddexpr".as_slice())
+        );
+        assert_eq!(cexpr_get_auname(CmdIdxT::cbuffer), None);
     }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
