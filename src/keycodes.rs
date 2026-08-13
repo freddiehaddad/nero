@@ -60,9 +60,7 @@
 //! correct piece ahead of its real caller" precedent.
 //!
 //! Deferred: everything else - `get_special_key`/`get_special_key_name`/
-//! `find_special_key`/`replace_termcodes`/`trans_special`/
-//! `special_to_buf` (need substantially more parsing logic beyond the
-//! table itself).
+//! `find_special_key`/`replace_termcodes`/`trans_special`.
 
 #[derive(Clone, Copy)]
 struct MouseTableEntry {
@@ -70,6 +68,37 @@ struct MouseTableEntry {
     button: i32,
     is_click: bool,
     is_drag: bool,
+}
+
+/// Encode a key and modifiers into Neovim's internal byte sequence
+/// (`special_to_buf`).
+#[must_use]
+pub fn special_to_buf(key: i32, modifiers: i32, escape_ks: bool) -> Vec<u8> {
+    let mut result = Vec::with_capacity(8);
+    if modifiers != 0 {
+        result.extend_from_slice(&[
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_MODIFIER,
+            modifiers as u8,
+        ]);
+    }
+
+    if crate::keycodes_defs::is_special(key) {
+        result.extend_from_slice(&[
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::key2termcap0(key),
+            crate::keycodes_defs::key2termcap1(key),
+        ]);
+    } else if escape_ks {
+        let mut encoded = [0; crate::mbyte_defs::MB_MAXBYTES * 3];
+        let len = add_char2buf(key, &mut encoded);
+        result.extend_from_slice(&encoded[..len]);
+    } else {
+        let mut encoded = [0; crate::mbyte_defs::MB_MAXCHAR];
+        let len = crate::mbyte::utf_char2bytes(key, &mut encoded) as usize;
+        result.extend_from_slice(&encoded[..len]);
+    }
+    result
 }
 
 macro_rules! mouse_entry {
@@ -836,6 +865,36 @@ mod tests {
         let written = add_char2buf('A' as i32, &mut buf);
         assert_eq!(written, 1);
         assert_eq!(&buf[..written], &[0x41]);
+    }
+
+    #[test]
+    fn special_to_buf_encodes_modifiers_special_keys_and_characters() {
+        assert_eq!(
+            special_to_buf(
+                crate::keycodes_defs::K_UP,
+                i32::from(crate::keycodes_defs::MOD_MASK_SHIFT),
+                false,
+            ),
+            vec![
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_MODIFIER,
+                crate::keycodes_defs::MOD_MASK_SHIFT as u8,
+                crate::keycodes_defs::K_SPECIAL,
+                b'k',
+                b'u',
+            ]
+        );
+        assert_eq!(special_to_buf(i32::from(b'A'), 0, false), b"A");
+        assert_eq!(special_to_buf(0x00e9, 0, false), "é".as_bytes());
+        assert_eq!(
+            special_to_buf(0x80, 0, true),
+            vec![
+                0xc2,
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+            ]
+        );
     }
 
     #[test]
