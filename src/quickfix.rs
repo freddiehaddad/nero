@@ -143,6 +143,24 @@ unsafe fn qf_set_title_var(list: &QfListT) {
     }
 }
 
+/// Autocommand name for `:make`/`:grep` commands
+/// (`make_get_auname`).
+#[allow(dead_code)]
+fn make_get_auname(
+    cmdidx: crate::ex_cmds_defs::CmdIdxT,
+) -> Option<&'static [u8]> {
+    use crate::ex_cmds_defs::CmdIdxT;
+    match cmdidx {
+        CmdIdxT::make => Some(b"make"),
+        CmdIdxT::lmake => Some(b"lmake"),
+        CmdIdxT::grep => Some(b"grep"),
+        CmdIdxT::lgrep => Some(b"lgrep"),
+        CmdIdxT::grepadd => Some(b"grepadd"),
+        CmdIdxT::lgrepadd => Some(b"lgrepadd"),
+        _ => None,
+    }
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2162,6 +2180,16 @@ mod tests {
             )
         };
         assert_eq!(unchanged.value, value.value);
+    }
+
+    #[test]
+    fn make_get_auname_maps_make_and_grep_commands_only() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert_eq!(make_get_auname(CmdIdxT::make), Some(b"make".as_slice()));
+        assert_eq!(make_get_auname(CmdIdxT::lmake), Some(b"lmake".as_slice()));
+        assert_eq!(make_get_auname(CmdIdxT::grepadd), Some(b"grepadd".as_slice()));
+        assert_eq!(make_get_auname(CmdIdxT::lgrepadd), Some(b"lgrepadd".as_slice()));
+        assert_eq!(make_get_auname(CmdIdxT::edit), None);
     }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
