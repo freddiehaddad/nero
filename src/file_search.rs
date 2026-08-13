@@ -148,6 +148,20 @@ unsafe fn ff_clear(search_ctx: &mut FfSearchCtxT) {
     search_ctx.ffsc_level = 0;
 }
 
+/// Release a find-file search context (`vim_findfile_cleanup`).
+///
+/// # Safety
+/// Same as [`ff_clear`].
+#[allow(dead_code)]
+unsafe fn vim_findfile_cleanup(search_ctx: &mut Option<Box<FfSearchCtxT>>) {
+    let Some(mut context) = search_ctx.take() else {
+        return;
+    };
+    vim_findfile_free_visited(Some(&mut context));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ff_clear(&mut context) };
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -638,6 +652,7 @@ mod tests {
                 ff_create_stack_element(Some(b"two"), Some(b"**"), 2, 0),
             );
         }
+
         let mut context = FfSearchCtxT {
             ffsc_stack_ptr: stack,
             ffsc_visited_lists_list: Some(Box::new(FfVisitedListHdrT {
@@ -667,6 +682,31 @@ mod tests {
         assert!(context.ffsc_visited_lists_list.is_some());
         assert_eq!(context.ffsc_find_what, 2);
         assert_eq!(context.ffsc_tagfile, 1);
+    }
+
+    #[test]
+    fn vim_findfile_cleanup_consumes_the_entire_owned_context() {
+        let mut stack = std::ptr::null_mut();
+        unsafe {
+            ff_push(
+                &mut stack,
+                ff_create_stack_element(Some(b"path"), Some(b"*"), 1, 0),
+            );
+        }
+        let mut context = Some(Box::new(FfSearchCtxT {
+            ffsc_stack_ptr: stack,
+            ffsc_visited_lists_list: Some(Box::new(FfVisitedListHdrT {
+                ffvl_filename: b"cached".to_vec(),
+                ..Default::default()
+            })),
+            ffsc_file_to_search: b"target".to_vec(),
+            ..Default::default()
+        }));
+
+        unsafe { vim_findfile_cleanup(&mut context) };
+
+        assert!(context.is_none());
+        unsafe { vim_findfile_cleanup(&mut context) };
     }
 
     // ---- ff_create_stack_element ----
