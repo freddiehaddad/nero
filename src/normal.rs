@@ -757,6 +757,30 @@ fn find_is_eval_item(
     false
 }
 
+/// Set `v:operator` for an operator type (`set_op_var`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::set_vim_var_string`].
+#[allow(dead_code)]
+unsafe fn set_op_var(optype: crate::ops_defs::OpType) {
+    use crate::eval::vars::VimVarIndex;
+    if optype == crate::ops_defs::OpType::Nop {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::vars::set_vim_var_string(VimVarIndex::Op, None) };
+        return;
+    }
+
+    let mut opchars = vec![crate::ops::get_op_char(optype)];
+    let extra = crate::ops::get_extra_op_char(optype);
+    if extra != crate::ascii_defs::NUL {
+        opchars.push(extra);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::eval::vars::set_vim_var_string(VimVarIndex::Op, Some(&opchars))
+    };
+}
+
 /// Returns `true` if `line[offset]` is NOT inside a C-style comment or
 /// string, `false` otherwise (`is_ident`).
 ///
@@ -809,6 +833,38 @@ mod tests {
     struct CurrentOapGuard(*mut crate::normal_defs::OpargT);
 
     struct SafeStateReset;
+
+    struct OperatorVarGuard(crate::eval::typval_defs::TypvalValue);
+
+    impl OperatorVarGuard {
+        fn save() -> Self {
+            let value = unsafe {
+                std::mem::replace(
+                    &mut (*crate::eval::vars::get_vim_var_tv(
+                        crate::eval::vars::VimVarIndex::Op,
+                    ))
+                    .value,
+                    crate::eval::typval_defs::TypvalValue::String(None),
+                )
+            };
+            Self(value)
+        }
+    }
+
+    impl Drop for OperatorVarGuard {
+        fn drop(&mut self) {
+            let saved = std::mem::replace(
+                &mut self.0,
+                crate::eval::typval_defs::TypvalValue::Unknown,
+            );
+            unsafe {
+                (*crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Op,
+                ))
+                .value = saved;
+            }
+        }
+    }
 
     impl Drop for SafeStateReset {
         fn drop(&mut self) {
@@ -1890,6 +1946,42 @@ mod tests {
         assert!(find_is_eval_item(b"s->var", 2, &mut col, &mut brackets, Backward));
         assert_eq!(col, 2);
         assert!(!find_is_eval_item(b"word", 1, &mut col, &mut brackets, Forward));
+    }
+
+    #[test]
+    fn set_op_var_publishes_single_and_double_character_operators() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _operator = OperatorVarGuard::save();
+
+        unsafe { set_op_var(crate::ops_defs::OpType::Delete) };
+        assert_eq!(
+            unsafe {
+                crate::eval::vars::get_vim_var_str(
+                    crate::eval::vars::VimVarIndex::Op,
+                )
+            },
+            b"d"
+        );
+
+        unsafe { set_op_var(crate::ops_defs::OpType::Format) };
+        assert_eq!(
+            unsafe {
+                crate::eval::vars::get_vim_var_str(
+                    crate::eval::vars::VimVarIndex::Op,
+                )
+            },
+            b"gq"
+        );
+
+        unsafe { set_op_var(crate::ops_defs::OpType::Nop) };
+        assert!(
+            unsafe {
+                crate::eval::vars::get_vim_var_str(
+                    crate::eval::vars::VimVarIndex::Op,
+                )
+            }
+            .is_empty()
+        );
     }
 
     #[test]
