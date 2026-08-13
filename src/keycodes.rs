@@ -62,7 +62,60 @@
 //! Deferred: everything else - `get_special_key`/`get_special_key_name`/
 //! `find_special_key`/`replace_termcodes`/`trans_special`/
 //! `special_to_buf` (need substantially more parsing logic beyond the
-//! table itself), `get_mouse_button` (needs `mouse.c`).
+//! table itself).
+
+#[derive(Clone, Copy)]
+struct MouseTableEntry {
+    pseudo_code: u8,
+    button: i32,
+    is_click: bool,
+    is_drag: bool,
+}
+
+macro_rules! mouse_entry {
+    ($code:ident, $button:ident, $click:literal, $drag:literal) => {
+        MouseTableEntry {
+            pseudo_code: crate::keycodes_defs::$code,
+            button: crate::mouse::$button,
+            is_click: $click,
+            is_drag: $drag,
+        }
+    };
+}
+
+const MOUSE_TABLE: [MouseTableEntry; 17] = [
+    mouse_entry!(KE_LEFTMOUSE, MOUSE_LEFT, true, false),
+    mouse_entry!(KE_LEFTDRAG, MOUSE_LEFT, false, true),
+    mouse_entry!(KE_LEFTRELEASE, MOUSE_LEFT, false, false),
+    mouse_entry!(KE_MIDDLEMOUSE, MOUSE_MIDDLE, true, false),
+    mouse_entry!(KE_MIDDLEDRAG, MOUSE_MIDDLE, false, true),
+    mouse_entry!(KE_MIDDLERELEASE, MOUSE_MIDDLE, false, false),
+    mouse_entry!(KE_RIGHTMOUSE, MOUSE_RIGHT, true, false),
+    mouse_entry!(KE_RIGHTDRAG, MOUSE_RIGHT, false, true),
+    mouse_entry!(KE_RIGHTRELEASE, MOUSE_RIGHT, false, false),
+    mouse_entry!(KE_X1MOUSE, MOUSE_X1, true, false),
+    mouse_entry!(KE_X1DRAG, MOUSE_X1, false, true),
+    mouse_entry!(KE_X1RELEASE, MOUSE_X1, false, false),
+    mouse_entry!(KE_X2MOUSE, MOUSE_X2, true, false),
+    mouse_entry!(KE_X2DRAG, MOUSE_X2, false, true),
+    mouse_entry!(KE_X2RELEASE, MOUSE_X2, false, false),
+    mouse_entry!(KE_MOUSEMOVE, MOUSE_RELEASE, false, true),
+    mouse_entry!(KE_IGNORE, MOUSE_RELEASE, false, false),
+];
+
+/// Decode a pseudo mouse keycode (`get_mouse_button`).
+///
+/// The original writes click/drag booleans through out-parameters;
+/// they are returned with the button as a tuple here.
+#[must_use]
+pub fn get_mouse_button(code: i32) -> (i32, bool, bool) {
+    MOUSE_TABLE
+        .iter()
+        .find(|entry| i32::from(entry.pseudo_code) == code)
+        .map_or((0, false, false), |entry| {
+            (entry.button, entry.is_click, entry.is_drag)
+        })
+}
 
 use crate::ascii_defs::TAB;
 use crate::keycodes_defs::{key2termcap0, key2termcap1, termcap2key, MODIFIER_KEYS_TABLE, 
@@ -586,6 +639,23 @@ pub fn extract_modifiers(key: i32, modifiers: &mut i32, simplify: bool, did_simp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_mouse_button_decodes_click_drag_release_and_unknown() {
+        assert_eq!(
+            get_mouse_button(i32::from(crate::keycodes_defs::KE_LEFTMOUSE)),
+            (crate::mouse::MOUSE_LEFT, true, false)
+        );
+        assert_eq!(
+            get_mouse_button(i32::from(crate::keycodes_defs::KE_X2DRAG)),
+            (crate::mouse::MOUSE_X2, false, true)
+        );
+        assert_eq!(
+            get_mouse_button(i32::from(crate::keycodes_defs::KE_IGNORE)),
+            (crate::mouse::MOUSE_RELEASE, false, false)
+        );
+        assert_eq!(get_mouse_button(-999), (0, false, false));
+    }
 
     #[test]
     fn name_to_mod_mask_recognizes_every_letter() {
