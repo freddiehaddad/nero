@@ -234,6 +234,42 @@ pub fn skip_cmd_arg(argument: &mut Vec<u8>, remove_bs: bool) -> usize {
     offset
 }
 
+/// Extract a leading `+command` from an Ex argument (`getargcmd`).
+///
+/// The command is returned as owned bytes and `argument` is replaced by
+/// the remaining, whitespace-trimmed arguments.
+#[must_use]
+pub fn getargcmd(argument: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if argument.first() != Some(&b'+') {
+        return None;
+    }
+
+    let mut tail = argument[1..].to_vec();
+    let (command, mut rest) = if tail
+        .first()
+        .is_none_or(|&byte| byte == crate::ascii_defs::NUL || byte.is_ascii_whitespace())
+    {
+        (b"$".to_vec(), crate::charset::skipwhite(&tail))
+    } else {
+        let end = skip_cmd_arg(&mut tail, true);
+        let command = tail[..end].to_vec();
+        let rest = end
+            + usize::from(
+                tail.get(end)
+                    .is_some_and(|&byte| byte != crate::ascii_defs::NUL),
+            );
+        (command, rest)
+    };
+
+    rest += crate::charset::skipwhite(&tail[rest..]);
+    let end = tail[rest..]
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .map_or(tail.len(), |offset| rest + offset);
+    *argument = tail[rest..end].to_vec();
+    Some(command)
+}
+
 /// Shift parsed Ex command arguments left by one (`shift_cmd_args`).
 #[allow(dead_code)]
 fn shift_cmd_args(eap: &mut crate::ex_cmds_defs::ExargT) {
@@ -1400,6 +1436,21 @@ mod tests {
         let mut multibyte = "é\\ x tail".as_bytes().to_vec();
         assert_eq!(skip_cmd_arg(&mut multibyte, true), "é x".len());
         assert_eq!(multibyte, "é x tail".as_bytes());
+    }
+
+    #[test]
+    fn getargcmd_extracts_commands_and_advances_to_remaining_arguments() {
+        let mut argument = b"+set\\ nu   file.txt".to_vec();
+        assert_eq!(getargcmd(&mut argument), Some(b"set nu".to_vec()));
+        assert_eq!(argument, b"file.txt");
+
+        let mut default = b"+  file.txt".to_vec();
+        assert_eq!(getargcmd(&mut default), Some(b"$".to_vec()));
+        assert_eq!(default, b"file.txt");
+
+        let mut plain = b"file.txt".to_vec();
+        assert_eq!(getargcmd(&mut plain), None);
+        assert_eq!(plain, b"file.txt");
     }
 
     #[test]
