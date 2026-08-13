@@ -1038,6 +1038,28 @@ fn strip_caret_numbers_in_place(value: &mut Vec<u8>) {
     value.truncate(write);
 }
 
+/// Whether completion with `c` should insert the selected match
+/// (`ins_compl_use_match`).
+#[allow(dead_code)]
+#[must_use]
+fn ins_compl_use_match(c: i32) -> bool {
+    use crate::keycodes_defs::{
+        K_COMMAND, K_DOWN, K_EVENT, K_KPAGEDOWN, K_KPAGEUP, K_LUA, K_PAGEDOWN,
+        K_PAGEUP, K_S_DOWN, K_S_UP, K_UP,
+    };
+    match c {
+        K_UP | K_DOWN | K_PAGEDOWN | K_KPAGEDOWN | K_S_DOWN | K_PAGEUP
+        | K_KPAGEUP | K_S_UP => false,
+        K_EVENT | K_COMMAND | K_LUA => {
+            // SAFETY: a plain read of the compositor's single-threaded
+            // pending-request state.
+            let want = unsafe { *crate::popupmenu::PUM_WANT.get_mut() };
+            want.active && want.insert
+        }
+        _ => true,
+    }
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -2662,6 +2684,24 @@ mod tests {
 
     struct GlobalThesaurusFuncGuard(Option<Vec<u8>>);
 
+    struct PumWantGuard(crate::popupmenu::PumWant);
+
+    impl PumWantGuard {
+        fn set(value: crate::popupmenu::PumWant) -> Self {
+            let previous = std::mem::replace(
+                unsafe { crate::popupmenu::PUM_WANT.get_mut() },
+                value,
+            );
+            Self(previous)
+        }
+    }
+
+    impl Drop for PumWantGuard {
+        fn drop(&mut self) {
+            *unsafe { crate::popupmenu::PUM_WANT.get_mut() } = self.0;
+        }
+    }
+
     impl GlobalThesaurusFuncGuard {
         fn set(value: Option<Vec<u8>>) -> Self {
             Self(std::mem::replace(
@@ -3082,6 +3122,26 @@ mod tests {
         let mut literal = b"foo^12bar,^,x^1y".to_vec();
         strip_caret_numbers_in_place(&mut literal);
         assert_eq!(literal, b"foo^12bar,^,x^1y");
+    }
+
+    #[test]
+    fn ins_compl_use_match_distinguishes_navigation_and_external_requests() {
+        use crate::keycodes_defs::{K_DOWN, K_EVENT};
+        let _lock = global_state_test_lock();
+        let mut want = crate::popupmenu::PumWant {
+            active: true,
+            insert: true,
+            ..Default::default()
+        };
+        let _want = PumWantGuard::set(want);
+
+        assert!(!ins_compl_use_match(K_DOWN));
+        assert!(ins_compl_use_match(i32::from(b'a')));
+        assert!(ins_compl_use_match(K_EVENT));
+
+        want.insert = false;
+        *unsafe { crate::popupmenu::PUM_WANT.get_mut() } = want;
+        assert!(!ins_compl_use_match(K_EVENT));
     }
 
     #[test]
