@@ -50,6 +50,14 @@ pub fn callback_reader_start(reader: &mut CallbackReader, reader_type: &[u8]) {
     reader.reader_type = Some(reader_type.to_vec());
 }
 
+/// Release a callback reader's callback and buffered lines
+/// (`callback_reader_free`).
+pub fn callback_reader_free(reader: &mut CallbackReader) {
+    crate::eval::typval::callback_free(&mut reader.cb);
+    reader.buffer.clear();
+    reader.buffer.shrink_to_fit();
+}
+
 /// Add one reference to a channel (`channel_incref`).
 pub fn channel_incref(channel: &mut ChannelT) {
     channel.refcount = channel.refcount.wrapping_add(1);
@@ -154,5 +162,32 @@ mod tests {
         assert_eq!(reader.reader_type.as_deref(), Some(b"stderr".as_slice()));
         assert!(reader.eof);
         assert!(reader.buffered);
+    }
+
+    #[test]
+    fn callback_reader_free_releases_callback_and_buffer() {
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let mut reader = CallbackReader {
+            cb: crate::eval::typval_defs::Callback::Partial(partial),
+            buffer: vec![b"line".to_vec()],
+            reader_type: Some(b"stdout".to_vec()),
+            ..Default::default()
+        };
+
+        callback_reader_free(&mut reader);
+
+        assert_eq!(
+            reader.cb.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(reader.buffer.is_empty());
+        assert_eq!(reader.reader_type.as_deref(), Some(b"stdout".as_slice()));
+        assert_eq!(unsafe { (*partial).pt_refcount }, 1);
+        unsafe { crate::eval::typval::partial_unref(partial) };
     }
 }
