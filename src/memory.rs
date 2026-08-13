@@ -9,8 +9,8 @@
 //!   allocator, see below), and `semsg`/`emsg_silent` (`message.c`, phase
 //!   15).
 //! - The arena bump allocator (`alloc_block`, `arena_alloc_block`,
-//!   `arena_alloc`, `free_block`, `arena_mem_free`,
-//!   `arena_finish`): a from-scratch custom allocator doing manual pointer
+//!   `arena_alloc`, `free_block`, `arena_mem_free`): a from-scratch custom
+//!   allocator doing manual pointer
 //!   arithmetic and block-header tricks in the original; translating it
 //!   properly needs focused `unsafe` Rust and is deferred to its own pass
 //!   rather than being rushed alongside the simpler string utilities below.
@@ -40,6 +40,15 @@ use crate::ascii_defs::NUL;
 fn arena_align_offset(off: u64) -> usize {
     let align = std::mem::align_of::<*const ()>().max(std::mem::align_of::<f64>()) as u64;
     off.wrapping_add(align - 1) as usize & !(align as usize - 1)
+}
+
+/// Finish allocations in an arena and return its consumed-block chain
+/// (`arena_finish`).
+#[allow(dead_code)]
+fn arena_finish(arena: &mut crate::memory_defs::Arena) -> crate::memory_defs::ArenaMem {
+    let memory = arena.cur_blk.cast::<crate::memory_defs::ConsumedBlk>();
+    *arena = crate::memory_defs::Arena::default();
+    memory
 }
 
 /// `xmalloc`: never returns null (aborts via Rust's allocator on OOM,
@@ -326,6 +335,20 @@ mod tests {
         assert_eq!(arena_align_offset(1), align);
         assert_eq!(arena_align_offset(align as u64), align);
         assert_eq!(arena_align_offset(align as u64 + 1), align * 2);
+    }
+
+    #[test]
+    fn arena_finish_returns_the_block_chain_and_resets_the_arena() {
+        let block = std::ptr::NonNull::<crate::memory_defs::ConsumedBlk>::dangling().as_ptr();
+        let mut arena = crate::memory_defs::Arena {
+            cur_blk: block.cast(),
+            pos: 27,
+            size: crate::memory_defs::ARENA_BLOCK_SIZE,
+        };
+        assert_eq!(arena_finish(&mut arena), block);
+        assert!(arena.cur_blk.is_null());
+        assert_eq!(arena.pos, 0);
+        assert_eq!(arena.size, 0);
     }
 
     #[test]
