@@ -1644,6 +1644,27 @@ mod tests {
     }
 
     #[test]
+    fn prep_redo_omits_the_second_count_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe {
+            crate::normal::prep_redo(
+                0,
+                4,
+                i32::from(b'd'),
+                i32::from(b'w'),
+                0,
+                0,
+                0,
+            )
+        };
+
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"4dw".to_vec());
+    }
+
+    #[test]
     fn get_inserted_returns_none_for_an_empty_redo_buffer() {
         let _lock = crate::globals::global_state_test_lock();
         let _guard = RedobuffGuard::new();

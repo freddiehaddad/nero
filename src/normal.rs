@@ -827,6 +827,23 @@ pub unsafe fn prep_redo_num2(
     }
 }
 
+/// Prepare a command for redo (`prep_redo`).
+///
+/// # Safety
+/// Same as [`prep_redo_num2`].
+pub unsafe fn prep_redo(
+    regname: i32,
+    num: i32,
+    cmd1: i32,
+    cmd2: i32,
+    cmd3: i32,
+    cmd4: i32,
+    cmd5: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { prep_redo_num2(regname, num, cmd1, cmd2, 0, cmd3, cmd4, cmd5) };
+}
+
 /// Returns `true` if `line[offset]` is NOT inside a C-style comment or
 /// string, `false` otherwise (`is_ident`).
 ///
