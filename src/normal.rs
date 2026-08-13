@@ -781,6 +781,52 @@ unsafe fn set_op_var(optype: crate::ops_defs::OpType) {
     };
 }
 
+/// Prepare a command with two counts for redo (`prep_redo_num2`).
+///
+/// # Safety
+/// Must not run concurrently with any redo-buffer access.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prep_redo_num2(
+    regname: i32,
+    num1: i32,
+    cmd1: i32,
+    cmd2: i32,
+    num2: i32,
+    cmd3: i32,
+    cmd4: i32,
+    cmd5: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::input::reset_redobuff() };
+    if regname != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::input::append_char_to_redobuff(i32::from(b'"'));
+            crate::input::append_char_to_redobuff(regname);
+        }
+    }
+    if num1 != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::input::append_number_to_redobuff(num1) };
+    }
+    for command in [cmd1, cmd2] {
+        if command != i32::from(crate::ascii_defs::NUL) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::input::append_char_to_redobuff(command) };
+        }
+    }
+    if num2 != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::input::append_number_to_redobuff(num2) };
+    }
+    for command in [cmd3, cmd4, cmd5] {
+        if command != i32::from(crate::ascii_defs::NUL) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::input::append_char_to_redobuff(command) };
+        }
+    }
+}
+
 /// Returns `true` if `line[offset]` is NOT inside a C-style comment or
 /// string, `false` otherwise (`is_ident`).
 ///

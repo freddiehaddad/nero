@@ -1619,6 +1619,31 @@ mod tests {
     }
 
     #[test]
+    fn prep_redo_num2_serializes_register_counts_and_commands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe {
+            crate::normal::prep_redo_num2(
+                i32::from(b'a'),
+                12,
+                i32::from(b'g'),
+                i32::from(b'q'),
+                3,
+                i32::from(b'x'),
+                0,
+                i32::from(b'z'),
+            )
+        };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            b"\"a12gq3xz".to_vec()
+        );
+    }
+
+    #[test]
     fn get_inserted_returns_none_for_an_empty_redo_buffer() {
         let _lock = crate::globals::global_state_test_lock();
         let _guard = RedobuffGuard::new();
