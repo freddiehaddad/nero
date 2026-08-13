@@ -328,6 +328,26 @@ pub fn var_flavour(varname: &[u8]) -> VarFlavourT {
     }
 }
 
+/// Convert any typval to text without reporting an error
+/// (`typval_tostring`).
+///
+/// # Safety
+/// Same as [`crate::eval::encode::encode_tv2string`].
+#[must_use]
+pub unsafe fn typval_tostring(
+    value: Option<&TypvalT>,
+    quotes: bool,
+) -> Vec<u8> {
+    let Some(value) = value else {
+        return b"(does not exist)".to_vec();
+    };
+    if !quotes && let TypvalValue::String(string) = &value.value {
+        return string.clone().unwrap_or_default();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::encode::encode_tv2string(value) }
+}
+
 /// Whether a typval is a usable expression argument
 /// (`eval_expr_valid_arg`).
 #[must_use]
@@ -5927,6 +5947,34 @@ mod tests {
         assert_eq!(var_flavour(b"UPPER_123"), VarFlavourT::Shada);
         assert_eq!(var_flavour(b"U\0lower"), VarFlavourT::Shada);
         assert_eq!(var_flavour(b""), VarFlavourT::Default);
+    }
+
+    #[test]
+    fn typval_tostring_handles_missing_raw_and_quoted_values() {
+        assert_eq!(
+            unsafe { typval_tostring(None, false) },
+            b"(does not exist)"
+        );
+        let string = TypvalT {
+            value: TypvalValue::String(Some(b"a'b".to_vec())),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { typval_tostring(Some(&string), false) },
+            b"a'b"
+        );
+        assert_eq!(
+            unsafe { typval_tostring(Some(&string), true) },
+            b"'a''b'"
+        );
+        let number = TypvalT {
+            value: TypvalValue::Number(42),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { typval_tostring(Some(&number), false) },
+            b"42"
+        );
     }
     use crate::eval::typval_defs::VarLockStatus;
 
