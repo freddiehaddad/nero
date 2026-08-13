@@ -161,6 +161,24 @@ fn make_get_auname(
     }
 }
 
+/// Autocommand name for `:cfile`/`:lfile` commands
+/// (`cfile_get_auname`).
+#[allow(dead_code)]
+fn cfile_get_auname(
+    cmdidx: crate::ex_cmds_defs::CmdIdxT,
+) -> Option<&'static [u8]> {
+    use crate::ex_cmds_defs::CmdIdxT;
+    match cmdidx {
+        CmdIdxT::cfile => Some(b"cfile"),
+        CmdIdxT::cgetfile => Some(b"cgetfile"),
+        CmdIdxT::caddfile => Some(b"caddfile"),
+        CmdIdxT::lfile => Some(b"lfile"),
+        CmdIdxT::lgetfile => Some(b"lgetfile"),
+        CmdIdxT::laddfile => Some(b"laddfile"),
+        _ => None,
+    }
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2190,6 +2208,21 @@ mod tests {
         assert_eq!(make_get_auname(CmdIdxT::grepadd), Some(b"grepadd".as_slice()));
         assert_eq!(make_get_auname(CmdIdxT::lgrepadd), Some(b"lgrepadd".as_slice()));
         assert_eq!(make_get_auname(CmdIdxT::edit), None);
+    }
+
+    #[test]
+    fn cfile_get_auname_maps_quickfix_and_location_file_commands() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert_eq!(cfile_get_auname(CmdIdxT::cfile), Some(b"cfile".as_slice()));
+        assert_eq!(
+            cfile_get_auname(CmdIdxT::cgetfile),
+            Some(b"cgetfile".as_slice())
+        );
+        assert_eq!(
+            cfile_get_auname(CmdIdxT::laddfile),
+            Some(b"laddfile".as_slice())
+        );
+        assert_eq!(cfile_get_auname(CmdIdxT::make), None);
     }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
