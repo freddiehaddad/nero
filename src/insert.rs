@@ -86,6 +86,32 @@ pub unsafe fn replace_join(mut offset: i32) {
     }
 }
 
+/// Truncate trailing whitespace from an Insert-mode line
+/// (`truncate_spaces`).
+///
+/// `line` must include writable storage at `line[length]` for the new
+/// NUL terminator.
+///
+/// # Safety
+/// Reads `GLOBALS.State`; forwarded from [`replace_join`].
+pub unsafe fn truncate_spaces(line: &mut [u8], length: usize) {
+    let mut index = length as isize - 1;
+    while index >= 0
+        && crate::ascii_defs::ascii_iswhite(i32::from(line[index as usize]))
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.State
+            & crate::state_defs::mode::REPLACE_FLAG as i32
+            != 0
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { replace_join(0) };
+        }
+        index -= 1;
+    }
+    line[(index + 1) as usize] = crate::ascii_defs::NUL;
+}
+
 /// Peek at the replacement stack and pop its top byte only when it is
 /// NUL (`replace_pop_if_nul`).
 ///
@@ -848,6 +874,36 @@ mod tests {
         let unchanged = unsafe { REPLACE_STACK.get_mut() }.clone();
         unsafe { replace_join(9) };
         assert_eq!(*unsafe { REPLACE_STACK.get_mut() }, unchanged);
+    }
+
+    #[test]
+    fn truncate_spaces_removes_trailing_ascii_whitespace() {
+        let _lock = global_state_test_lock();
+        let _state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.State,
+                crate::state_defs::mode::INSERT as i32,
+            )
+        };
+        let mut line = *b"abc \t  \0";
+        unsafe { truncate_spaces(&mut line, 7) };
+        assert_eq!(&line[..4], b"abc\0");
+    }
+
+    #[test]
+    fn truncate_spaces_joins_replace_entries_for_each_removed_byte() {
+        let _lock = global_state_test_lock();
+        let _stack = ReplaceStackGuard::install(b"a\0b\0c".to_vec());
+        let _state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.State,
+                crate::state_defs::mode::REPLACE as i32,
+            )
+        };
+        let mut line = *b"x  \0";
+        unsafe { truncate_spaces(&mut line, 3) };
+        assert_eq!(&line[..2], b"x\0");
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"abc");
     }
 
     struct CurwinGuard {
