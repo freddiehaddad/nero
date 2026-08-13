@@ -269,6 +269,24 @@ pub struct ComplT {
     pub cp_cpt_source_idx: i32,
 }
 
+/// One `'complete'` option source (`cpt_source_T`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CptSourceT {
+    cs_refresh_always: bool,
+    cs_startcol: i32,
+    cs_max_matches: i32,
+    compl_start_tv: u64,
+    cs_flag: u8,
+}
+
+/// Parsed completion sources (`cpt_sources_array`).
+#[allow(dead_code)]
+static CPT_SOURCES: GlobalCell<Vec<CptSourceT>> = GlobalCell::new(Vec::new());
+/// Current completion source index (`cpt_sources_index`).
+#[allow(dead_code)]
+static CPT_SOURCES_INDEX: GlobalCell<i32> = GlobalCell::new(-1);
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1499,6 +1517,32 @@ mod tests {
 
     struct FuzzyScoresGuard(Vec<i32>);
 
+    struct CptSourcesGuard {
+        sources: Vec<CptSourceT>,
+        index: i32,
+    }
+
+    impl CptSourcesGuard {
+        fn install(sources: Vec<CptSourceT>, index: i32) -> Self {
+            Self {
+                sources: std::mem::replace(
+                    unsafe { CPT_SOURCES.get_mut() },
+                    sources,
+                ),
+                index: unsafe {
+                    std::mem::replace(CPT_SOURCES_INDEX.get_mut(), index)
+                },
+            }
+        }
+    }
+
+    impl Drop for CptSourcesGuard {
+        fn drop(&mut self) {
+            *unsafe { CPT_SOURCES.get_mut() } = std::mem::take(&mut self.sources);
+            *unsafe { CPT_SOURCES_INDEX.get_mut() } = self.index;
+        }
+    }
+
     impl FuzzyScoresGuard {
         fn install(scores: Vec<i32>) -> Self {
             Self(std::mem::replace(
@@ -1611,6 +1655,20 @@ mod tests {
         assert_eq!(unsafe { compare_scores(1, 2) }, -1);
         assert_eq!(unsafe { compare_scores(2, 1) }, 1);
         assert_eq!(unsafe { compare_scores(2, 2) }, 0);
+    }
+
+    #[test]
+    fn completion_source_core_preserves_parser_and_timer_state() {
+        let source = CptSourceT {
+            cs_refresh_always: true,
+            cs_startcol: 4,
+            cs_max_matches: 20,
+            compl_start_tv: 99,
+            cs_flag: b'F',
+        };
+        let _guard = CptSourcesGuard::install(vec![source], 0);
+        assert_eq!((unsafe { CPT_SOURCES.get_mut() })[0], source);
+        assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, 0);
     }
 
     /// With no match shown there is nothing to be stuck on, so this
