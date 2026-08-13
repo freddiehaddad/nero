@@ -194,6 +194,12 @@ pub unsafe fn wildmenu_translate_key(
     translated
 }
 
+/// Prepare an expansion structure for use (`ExpandInit`).
+pub fn expand_init(xp: &mut crate::cmdexpand_defs::ExpandT) {
+    *xp = crate::cmdexpand_defs::ExpandT::default();
+    xp.xp_numfiles = -1;
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -765,6 +771,26 @@ mod tests {
             unsafe { wildmenu_translate_key(&ccline, i32::from(b'\r'), &xp, true) },
             crate::keycodes_defs::K_DOWN
         );
+    }
+
+    #[test]
+    fn expand_init_clears_state_and_marks_matches_uninitialized() {
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Files,
+            xp_pattern: Some(b"*.rs".to_vec()),
+            xp_numfiles: 3,
+            xp_files: Some(vec![b"a.rs".to_vec()]),
+            xp_shell: true,
+            ..Default::default()
+        };
+
+        expand_init(&mut xp);
+
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Nothing);
+        assert!(xp.xp_pattern.is_none());
+        assert_eq!(xp.xp_numfiles, -1);
+        assert!(xp.xp_files.is_none());
+        assert!(!xp.xp_shell);
     }
 
     #[test]
