@@ -112,6 +112,21 @@ pub unsafe fn op_pending() -> bool {
         && oap.regname == i32::from(crate::ascii_defs::NUL))
 }
 
+/// Re-evaluate whether Normal mode is in a SafeState
+/// (`normal_check_safe_state`).
+///
+/// # Safety
+/// Forwarded from [`op_pending`] and
+/// [`crate::state::may_trigger_safestate`].
+#[allow(dead_code)]
+unsafe fn normal_check_safe_state() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let safe = !unsafe { op_pending() }
+        && unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit == 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::state::may_trigger_safestate(safe) };
+}
+
 /// `|`: move to a specific screen column (`nv_pipe`).
 ///
 /// `w_set_curswant` is deliberately left false: `w_curswant` must
@@ -745,6 +760,14 @@ mod tests {
 
     struct CurrentOapGuard(*mut crate::normal_defs::OpargT);
 
+    struct SafeStateReset;
+
+    impl Drop for SafeStateReset {
+        fn drop(&mut self) {
+            crate::state::state_no_longer_safe();
+        }
+    }
+
     struct ShowcmdGuard {
         option: i32,
         current: [u8; crate::normal_defs::SHOWCMD_BUFLEN],
@@ -854,6 +877,61 @@ mod tests {
         assert!(unsafe { op_pending() });
         unsafe { *CURRENT_OAP.get_mut() = std::ptr::null_mut() };
         assert!(unsafe { op_pending() });
+    }
+
+    #[test]
+    fn normal_check_safe_state_requires_no_operator_or_restart() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _safe = SafeStateReset;
+        let mut buffer = crate::buffer_defs::BufT::default();
+        let buffer_ptr = std::ptr::addr_of_mut!(buffer);
+        let _buffer = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buffer_ptr,
+            )
+        };
+        let mut oap = crate::normal_defs::OpargT::default();
+        let oap_ptr = std::ptr::addr_of_mut!(oap);
+        let _oap = CurrentOapGuard::install(oap_ptr);
+        let _finish = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.finish_op,
+                false,
+            )
+        };
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+        let _state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.State,
+                crate::state_defs::mode::NORMAL as i32,
+            )
+        };
+        let _busy = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.global_busy,
+                0,
+            )
+        };
+        let _debug = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.debug_mode,
+                false,
+            )
+        };
+
+        crate::state::state_no_longer_safe();
+        unsafe { normal_check_safe_state() };
+        assert!(crate::state::get_was_safe_state());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit = 1;
+        unsafe { normal_check_safe_state() };
+        assert!(!crate::state::get_was_safe_state());
     }
 
     #[test]
