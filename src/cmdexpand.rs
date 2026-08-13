@@ -115,6 +115,38 @@ fn find_cmd_after_global_cmd(argument: &[u8]) -> Option<usize> {
     (argument.get(offset) == Some(&delimiter)).then_some(offset + 1)
 }
 
+/// Number of escape bytes to skip before displaying a wildmenu item
+/// (`skip_wildmenu_char`).
+#[allow(dead_code)]
+#[must_use]
+fn skip_wildmenu_char(
+    xp: &crate::cmdexpand_defs::ExpandT,
+    text: &[u8],
+) -> usize {
+    use crate::cmdexpand_defs::ExpandContext;
+    let context = xp.xp_context;
+    let escaped = crate::charset::rem_backslash(text)
+        && context != ExpandContext::Help
+        && context != ExpandContext::PatternInBuf;
+    let escaped_menu = matches!(context, ExpandContext::Menus | ExpandContext::Menunames)
+        && (text.first() == Some(&b'\t')
+            || (text.first() == Some(&b'\\')
+                && text.get(1).is_some_and(|&byte| byte != 0)));
+
+    if escaped || escaped_menu {
+        #[cfg(not(windows))]
+        if xp.xp_shell
+            && crate::option::csh_like_shell()
+            && text.get(1) == Some(&b'\\')
+            && text.get(2) == Some(&b'!')
+        {
+            return 2;
+        }
+        return 1;
+    }
+    0
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -620,6 +652,25 @@ mod tests {
         assert_eq!(find_cmd_after_global_cmd(b"/a\\/b/print"), Some(6));
         assert_eq!(find_cmd_after_global_cmd(b"/unterminated"), None);
         assert_eq!(find_cmd_after_global_cmd(b""), None);
+    }
+
+    #[test]
+    fn skip_wildmenu_char_preserves_help_escapes_and_hides_menu_escapes() {
+        use crate::cmdexpand_defs::ExpandContext;
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: ExpandContext::Files,
+            ..Default::default()
+        };
+        assert_eq!(skip_wildmenu_char(&xp, b"\\ "), 1);
+
+        xp.xp_context = ExpandContext::Help;
+        assert_eq!(skip_wildmenu_char(&xp, b"\\ "), 0);
+        xp.xp_context = ExpandContext::PatternInBuf;
+        assert_eq!(skip_wildmenu_char(&xp, b"\\ "), 0);
+
+        xp.xp_context = ExpandContext::Menus;
+        assert_eq!(skip_wildmenu_char(&xp, b"\tName"), 1);
+        assert_eq!(skip_wildmenu_char(&xp, b"\\x"), 1);
     }
 
     #[test]
