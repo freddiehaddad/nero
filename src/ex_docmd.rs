@@ -190,6 +190,33 @@ pub fn get_bad_opt(value: &[u8], eap: &mut crate::ex_cmds_defs::ExargT) -> i32 {
     crate::vim_defs::OK
 }
 
+/// Find the end of a `+command` argument (`skip_cmd_arg`).
+///
+/// Returns the byte offset where parsing stopped. When `remove_bs` is
+/// true, one backslash is removed from each escaped byte.
+pub fn skip_cmd_arg(argument: &mut Vec<u8>, remove_bs: bool) -> usize {
+    let mut offset = 0;
+    while offset < argument.len()
+        && argument[offset] != crate::ascii_defs::NUL
+        && !crate::ascii_defs::ascii_isspace(i32::from(argument[offset]))
+    {
+        if argument[offset] == b'\\'
+            && argument.get(offset + 1).is_some_and(|&byte| byte != 0)
+        {
+            if remove_bs {
+                argument.remove(offset);
+            } else {
+                offset += 1;
+            }
+        }
+        if offset >= argument.len() {
+            break;
+        }
+        offset += crate::mbyte::utf_ptr2len(&argument[offset..]).max(1) as usize;
+    }
+    offset
+}
+
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
 ///
 /// Only ever set by `post_chdir` (not yet translated), so this stays
@@ -1277,6 +1304,21 @@ mod tests {
 
         assert_eq!(get_bad_opt("é".as_bytes(), &mut eap), crate::vim_defs::FAIL);
         assert_eq!(get_bad_opt(b"xx", &mut eap), crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn skip_cmd_arg_handles_escaped_spaces_and_backslash_removal() {
+        let mut kept = b"one\\ two rest".to_vec();
+        assert_eq!(skip_cmd_arg(&mut kept, false), 8);
+        assert_eq!(kept, b"one\\ two rest");
+
+        let mut removed = b"one\\ two rest".to_vec();
+        assert_eq!(skip_cmd_arg(&mut removed, true), 7);
+        assert_eq!(removed, b"one two rest");
+
+        let mut multibyte = "é\\ x tail".as_bytes().to_vec();
+        assert_eq!(skip_cmd_arg(&mut multibyte, true), "é x".len());
+        assert_eq!(multibyte, "é x tail".as_bytes());
     }
 
     struct FfuGuard {
