@@ -179,6 +179,25 @@ fn cfile_get_auname(
     }
 }
 
+/// Autocommand name for vimgrep-family commands (`vgr_get_auname`).
+#[allow(dead_code)]
+fn vgr_get_auname(
+    cmdidx: crate::ex_cmds_defs::CmdIdxT,
+) -> Option<&'static [u8]> {
+    use crate::ex_cmds_defs::CmdIdxT;
+    match cmdidx {
+        CmdIdxT::vimgrep => Some(b"vimgrep"),
+        CmdIdxT::lvimgrep => Some(b"lvimgrep"),
+        CmdIdxT::vimgrepadd => Some(b"vimgrepadd"),
+        CmdIdxT::lvimgrepadd => Some(b"lvimgrepadd"),
+        CmdIdxT::grep => Some(b"grep"),
+        CmdIdxT::lgrep => Some(b"lgrep"),
+        CmdIdxT::grepadd => Some(b"grepadd"),
+        CmdIdxT::lgrepadd => Some(b"lgrepadd"),
+        _ => None,
+    }
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2223,6 +2242,21 @@ mod tests {
             Some(b"laddfile".as_slice())
         );
         assert_eq!(cfile_get_auname(CmdIdxT::make), None);
+    }
+
+    #[test]
+    fn vgr_get_auname_maps_vimgrep_and_internal_grep_commands() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert_eq!(
+            vgr_get_auname(CmdIdxT::vimgrepadd),
+            Some(b"vimgrepadd".as_slice())
+        );
+        assert_eq!(
+            vgr_get_auname(CmdIdxT::lvimgrep),
+            Some(b"lvimgrep".as_slice())
+        );
+        assert_eq!(vgr_get_auname(CmdIdxT::grep), Some(b"grep".as_slice()));
+        assert_eq!(vgr_get_auname(CmdIdxT::edit), None);
     }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
