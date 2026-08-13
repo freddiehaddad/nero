@@ -969,6 +969,46 @@ unsafe fn get_insert_callback(
     }
 }
 
+/// Return the callback named by one `'complete'` source
+/// (`get_callback_if_cpt_func`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer. For an `F{func}`
+/// source, `idx` must index that buffer's callback array.
+#[allow(dead_code)]
+unsafe fn get_callback_if_cpt_func(
+    source: &[u8],
+    idx: usize,
+) -> *mut crate::eval::typval_defs::Callback {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+    match source.first().copied().unwrap_or(0) {
+        b'o' => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { std::ptr::addr_of_mut!((*buf).b_ofu_cb) }
+        }
+        b'F' => {
+            let name_start = source.get(1).copied().unwrap_or(0);
+            if name_start == b',' || name_start == 0 {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { std::ptr::addr_of_mut!((*buf).b_cfu_cb) }
+            } else {
+                // SAFETY: `buf` is live and the caller guarantees `idx`
+                // is valid.
+                let callbacks = unsafe { &mut (*buf).b_p_cpt_cb };
+                // SAFETY: the caller guarantees `idx` is valid.
+                let callback = unsafe { callbacks.get_unchecked_mut(idx) };
+                if callback.kind() == crate::eval::typval_defs::CallbackType::None {
+                    std::ptr::null_mut()
+                } else {
+                    std::ptr::from_mut(callback)
+                }
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -2969,6 +3009,39 @@ mod tests {
             unsafe { get_insert_callback(CTRL_X_THESAURUS) },
             unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_tsrfu_cb) }
         );
+    }
+
+    #[test]
+    fn get_callback_if_cpt_func_decodes_complete_option_sources() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_cpt_cb: vec![
+                crate::eval::typval_defs::Callback::None,
+                crate::eval::typval_defs::Callback::Funcref(b"Named".to_vec()),
+            ],
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = CurbufGuard::set(unsafe { &mut *buf_ptr });
+
+        assert_eq!(
+            unsafe { get_callback_if_cpt_func(b"o", 0) },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_ofu_cb) }
+        );
+        assert_eq!(
+            unsafe { get_callback_if_cpt_func(b"F", 0) },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_cfu_cb) }
+        );
+        assert_eq!(
+            unsafe { get_callback_if_cpt_func(b"F,", 0) },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_cfu_cb) }
+        );
+        assert!(unsafe { get_callback_if_cpt_func(b"FEmpty", 0) }.is_null());
+        assert_eq!(
+            unsafe { get_callback_if_cpt_func(b"FNamed", 1) },
+            unsafe { (*buf_ptr).b_p_cpt_cb.as_mut_ptr().add(1) }
+        );
+        assert!(unsafe { get_callback_if_cpt_func(b".", 0) }.is_null());
     }
 
     #[test]
