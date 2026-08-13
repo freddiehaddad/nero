@@ -616,6 +616,31 @@ pub fn match_at_original_text(m: &ComplT) -> bool {
     m.cp_flags & cp_flags::ORIGINAL_TEXT != 0
 }
 
+/// Whether `c` commits the currently shown completion match
+/// (`ins_compl_commit_char`).
+///
+/// # Safety
+/// `COMPL_SHOWN_MATCH`, when non-null, must point to a live
+/// [`ComplT`].
+#[must_use]
+pub unsafe fn ins_compl_commit_char(c: i32) -> bool {
+    if c < i32::from(b' ') {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let shown = unsafe { *COMPL_SHOWN_MATCH.get_mut() };
+    if shown.is_null() {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let shown = unsafe { &*shown };
+    !match_at_original_text(shown)
+        && shown
+            .cp_commit_chars
+            .as_deref()
+            .is_some_and(|chars| crate::strings::vim_strchr(chars, c).is_some())
+}
+
 /// Whether `m` is the first match in the completion list
 /// (`is_first_match`).
 ///
@@ -2187,6 +2212,25 @@ mod tests {
         assert!(unsafe { is_first_match(first_ptr) });
         assert!(!unsafe { is_first_match(other_ptr) });
         assert!(!unsafe { is_first_match(std::ptr::null()) });
+    }
+
+    #[test]
+    fn ins_compl_commit_char_requires_a_nonoriginal_shown_match() {
+        let _lock = global_state_test_lock();
+        let _shown = ShownMatchGuard::install(std::ptr::null_mut());
+        assert!(!unsafe { ins_compl_commit_char(i32::from(b'.')) });
+
+        let mut completion = ComplT {
+            cp_commit_chars: Some(b".;".to_vec()),
+            ..Default::default()
+        };
+        unsafe { *COMPL_SHOWN_MATCH.get_mut() = std::ptr::addr_of_mut!(completion) };
+        assert!(unsafe { ins_compl_commit_char(i32::from(b'.')) });
+        assert!(!unsafe { ins_compl_commit_char(i32::from(b',')) });
+        assert!(!unsafe { ins_compl_commit_char(i32::from(b'\n')) });
+
+        completion.cp_flags = cp_flags::ORIGINAL_TEXT;
+        assert!(!unsafe { ins_compl_commit_char(i32::from(b'.')) });
     }
 
     #[test]
