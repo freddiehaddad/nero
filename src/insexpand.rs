@@ -890,6 +890,26 @@ pub unsafe fn ins_compl_preinsert_effect() -> bool {
     cursor_col < unsafe { *COMPL_INS_END_COL.get_mut() }
 }
 
+/// Whether thesaurus completion uses a user-defined function
+/// (`thesaurus_func_complete`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn thesaurus_func_complete(completion_type: i32) -> bool {
+    if completion_type != CTRL_X_THESAURUS {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let local = unsafe { &(*crate::globals::GLOBALS.get_mut().curbuf).b_p_tsrfu };
+    local.as_deref().is_some_and(|value| !value.is_empty())
+        || unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_tsrfu
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -2512,6 +2532,23 @@ mod tests {
 
     struct ComplInsEndGuard(crate::pos_defs::ColnrT);
 
+    struct GlobalThesaurusFuncGuard(Option<Vec<u8>>);
+
+    impl GlobalThesaurusFuncGuard {
+        fn set(value: Option<Vec<u8>>) -> Self {
+            Self(std::mem::replace(
+                &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tsrfu,
+                value,
+            ))
+        }
+    }
+
+    impl Drop for GlobalThesaurusFuncGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tsrfu = self.0.take();
+        }
+    }
+
     impl ComplInsEndGuard {
         fn set(value: crate::pos_defs::ColnrT) -> Self {
             let previous = unsafe { *COMPL_INS_END_COL.get_mut() };
@@ -2800,6 +2837,25 @@ mod tests {
         let _cot = CotFlagsGuard::set(0);
         unsafe { (*win_ptr).w_cursor.col = 4 };
         assert!(!unsafe { ins_compl_preinsert_effect() });
+    }
+
+    #[test]
+    fn thesaurus_func_complete_uses_local_then_global_function_names() {
+        let _lock = global_state_test_lock();
+        let _global = GlobalThesaurusFuncGuard::set(None);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = CurbufGuard::set(unsafe { &mut *buf_ptr });
+
+        assert!(!unsafe { thesaurus_func_complete(CTRL_X_THESAURUS) });
+        unsafe { (*buf_ptr).b_p_tsrfu = Some(b"LocalThesaurus".to_vec()) };
+        assert!(unsafe { thesaurus_func_complete(CTRL_X_THESAURUS) });
+        assert!(!unsafe { thesaurus_func_complete(CTRL_X_OMNI) });
+
+        unsafe { (*buf_ptr).b_p_tsrfu = Some(Vec::new()) };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tsrfu =
+            Some(b"GlobalThesaurus".to_vec());
+        assert!(unsafe { thesaurus_func_complete(CTRL_X_THESAURUS) });
     }
 
     #[test]
