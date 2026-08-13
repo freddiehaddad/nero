@@ -76,6 +76,18 @@ fn set_context_in_scriptnames_cmd(
     xp.xp_pattern = Some(argument.to_vec());
 }
 
+/// Release the optional parallel completion metadata arrays
+/// (`free_xp_files_extra`).
+pub fn free_xp_files_extra(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    _numfiles: i32,
+) {
+    xp.xp_files_abbr = None;
+    xp.xp_files_kind = None;
+    xp.xp_files_menu = None;
+    xp.xp_files_info = None;
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -554,6 +566,26 @@ pub fn sort_func_compare(s1: &[u8], s2: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_xp_files_extra_clears_metadata_but_keeps_primary_matches() {
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_files: Some(vec![b"match".to_vec()]),
+            xp_files_abbr: Some(vec![b"abbr".to_vec()]),
+            xp_files_kind: Some(vec![b"kind".to_vec()]),
+            xp_files_menu: Some(vec![b"menu".to_vec()]),
+            xp_files_info: Some(vec![b"info".to_vec()]),
+            ..Default::default()
+        };
+
+        free_xp_files_extra(&mut xp, 1);
+
+        assert_eq!(xp.xp_files, Some(vec![b"match".to_vec()]));
+        assert!(xp.xp_files_abbr.is_none());
+        assert!(xp.xp_files_kind.is_none());
+        assert!(xp.xp_files_menu.is_none());
+        assert!(xp.xp_files_info.is_none());
+    }
 
     #[test]
     fn set_context_in_argopt_completes_after_equals_or_from_start() {
