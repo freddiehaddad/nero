@@ -938,6 +938,37 @@ unsafe fn get_complete_funcname(completion_type: i32) -> Vec<u8> {
     }
 }
 
+/// Get the callback used for insert-mode completion
+/// (`get_insert_callback`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer, and the returned pointer
+/// must not outlive that buffer.
+#[allow(dead_code)]
+unsafe fn get_insert_callback(
+    completion_type: i32,
+) -> *mut crate::eval::typval_defs::Callback {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+    match completion_type {
+        // SAFETY: forwarded from this function's own safety doc.
+        CTRL_X_FUNCTION => unsafe { std::ptr::addr_of_mut!((*buf).b_cfu_cb) },
+        // SAFETY: forwarded from this function's own safety doc.
+        CTRL_X_OMNI => unsafe { std::ptr::addr_of_mut!((*buf).b_ofu_cb) },
+        _ => {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { (*buf).b_p_tsrfu.as_deref() }
+                .is_some_and(|value| !value.is_empty())
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { std::ptr::addr_of_mut!((*buf).b_tsrfu_cb) }
+            } else {
+                TSRFU_CB.as_ptr()
+            }
+        }
+    }
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -2911,6 +2942,33 @@ mod tests {
             b"LocalThesaurus"
         );
         assert!(unsafe { get_complete_funcname(CTRL_X_NORMAL) }.is_empty());
+    }
+
+    #[test]
+    fn get_insert_callback_selects_buffer_or_global_callback_storage() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = CurbufGuard::set(unsafe { &mut *buf_ptr });
+
+        assert_eq!(
+            unsafe { get_insert_callback(CTRL_X_FUNCTION) },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_cfu_cb) }
+        );
+        assert_eq!(
+            unsafe { get_insert_callback(CTRL_X_OMNI) },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_ofu_cb) }
+        );
+        assert_eq!(
+            unsafe { get_insert_callback(CTRL_X_THESAURUS) },
+            TSRFU_CB.as_ptr()
+        );
+
+        unsafe { (*buf_ptr).b_p_tsrfu = Some(b"LocalThesaurus".to_vec()) };
+        assert_eq!(
+            unsafe { get_insert_callback(CTRL_X_THESAURUS) },
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_tsrfu_cb) }
+        );
     }
 
     #[test]
