@@ -56,6 +56,26 @@ fn set_context_in_argopt(
     xp.xp_context = crate::cmdexpand_defs::ExpandContext::Argopt;
 }
 
+/// Set completion context for `:scriptnames`
+/// (`set_context_in_scriptnames_cmd`).
+#[allow(dead_code)]
+fn set_context_in_scriptnames_cmd(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    argument: &[u8],
+) {
+    xp.xp_context = crate::cmdexpand_defs::ExpandContext::Nothing;
+    xp.xp_pattern = None;
+    let argument = &argument[crate::charset::skipwhite(argument)..];
+    if argument
+        .first()
+        .is_some_and(u8::is_ascii_digit)
+    {
+        return;
+    }
+    xp.xp_context = crate::cmdexpand_defs::ExpandContext::Scriptnames;
+    xp.xp_pattern = Some(argument.to_vec());
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -544,6 +564,28 @@ mod tests {
 
         set_context_in_argopt(&mut xp, b"encoding");
         assert_eq!(xp.xp_pattern.as_deref(), Some(b"encoding".as_slice()));
+    }
+
+    #[test]
+    fn set_context_in_scriptnames_cmd_disables_completion_after_a_number() {
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        set_context_in_scriptnames_cmd(&mut xp, b"  12");
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Nothing);
+        assert!(xp.xp_pattern.is_none());
+
+        set_context_in_scriptnames_cmd(&mut xp, b"  plugin");
+        assert_eq!(
+            xp.xp_context,
+            crate::cmdexpand_defs::ExpandContext::Scriptnames
+        );
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"plugin".as_slice()));
+
+        set_context_in_scriptnames_cmd(&mut xp, b"");
+        assert_eq!(
+            xp.xp_context,
+            crate::cmdexpand_defs::ExpandContext::Scriptnames
+        );
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"".as_slice()));
     }
 
     #[test]
