@@ -351,6 +351,21 @@ struct SearchPatterns {
 static SEARCH_PATTERNS: std::sync::LazyLock<crate::globals::GlobalCell<SearchPatterns>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SearchPatterns::default()));
 
+/// Pattern most recently compiled by `search_regcomp` (`mr_pattern`).
+static MR_PATTERN: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Get the pattern used by the most recent `search_regcomp` call
+/// (`get_search_pat`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `MR_PATTERN`.
+#[must_use]
+pub unsafe fn get_search_pat() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { MR_PATTERN.get_mut() }.as_deref()
+}
+
 /// Record `pat` as the search or substitute pattern at `idx`
 /// (`save_re_pat`).
 ///
@@ -1029,6 +1044,20 @@ mod tests {
         unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat = Some(b"needle".to_vec());
         assert_eq!(unsafe { last_search_pattern() }, Some(&b"needle"[..]));
         assert_eq!(unsafe { last_search_pattern_len() }, 6);
+    }
+
+    #[test]
+    fn get_search_pat_returns_the_most_recent_compilation_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous = unsafe { MR_PATTERN.get_mut() }.clone();
+        *unsafe { MR_PATTERN.get_mut() } = Some(b"compiled".to_vec());
+
+        assert_eq!(
+            unsafe { get_search_pat() },
+            Some(b"compiled".as_slice())
+        );
+
+        *unsafe { MR_PATTERN.get_mut() } = previous;
     }
 
     #[test]
