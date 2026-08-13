@@ -9,7 +9,7 @@
 //!   allocator, see below), and `semsg`/`emsg_silent` (`message.c`, phase
 //!   15).
 //! - The arena bump allocator (`alloc_block`, `arena_alloc_block`,
-//!   `arena_align_offset`, `arena_alloc`, `free_block`, `arena_mem_free`,
+//!   `arena_alloc`, `free_block`, `arena_mem_free`,
 //!   `arena_finish`): a from-scratch custom allocator doing manual pointer
 //!   arithmetic and block-header tricks in the original; translating it
 //!   properly needs focused `unsafe` Rust and is deferred to its own pass
@@ -33,6 +33,14 @@
 //! (`auto/config.h` feature detection) - dead code on every modern target.
 
 use crate::ascii_defs::NUL;
+
+/// Round an arena offset up to the alignment required for pointers and
+/// doubles (`arena_align_offset`).
+#[allow(dead_code)]
+fn arena_align_offset(off: u64) -> usize {
+    let align = std::mem::align_of::<*const ()>().max(std::mem::align_of::<f64>()) as u64;
+    off.wrapping_add(align - 1) as usize & !(align as usize - 1)
+}
 
 /// `xmalloc`: never returns null (aborts via Rust's allocator on OOM,
 /// matching the original's ultimate `preserve_exit` guarantee - but without
@@ -310,6 +318,15 @@ pub fn time_to_bytes(time_: i64, buf: &mut [u8; 8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_align_offset_rounds_up_to_native_arena_alignment() {
+        let align = std::mem::align_of::<*const ()>().max(std::mem::align_of::<f64>());
+        assert_eq!(arena_align_offset(0), 0);
+        assert_eq!(arena_align_offset(1), align);
+        assert_eq!(arena_align_offset(align as u64), align);
+        assert_eq!(arena_align_offset(align as u64 + 1), align * 2);
+    }
 
     #[test]
     fn xmallocz_nul_terminates() {
