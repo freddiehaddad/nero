@@ -24,6 +24,17 @@ use crate::path::{path_fnamencmp, vim_ispathsep};
 static FF_EXPAND_BUFFER: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
+/// One visited file or directory (`ff_visited_T`).
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct FfVisitedT {
+    ffv_next: Option<Box<FfVisitedT>>,
+    ffv_wc_path: Option<Vec<u8>>,
+    file_id_valid: bool,
+    file_id: crate::os::fs_defs::FileID,
+    ffv_fname: Vec<u8>,
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -310,6 +321,31 @@ mod tests {
             ]));
         unsafe { free_findfile() };
         assert!(unsafe { FF_EXPAND_BUFFER.get_mut() }.is_none());
+    }
+
+    #[test]
+    fn visited_file_node_owns_path_identity_and_next_link() {
+        let node = FfVisitedT {
+            ffv_next: Some(Box::new(FfVisitedT {
+                ffv_fname: b"second".to_vec(),
+                ..Default::default()
+            })),
+            ffv_wc_path: Some(b"**/*.rs".to_vec()),
+            file_id_valid: true,
+            file_id: crate::os::fs_defs::FileID {
+                inode: 7,
+                device_id: 9,
+            },
+            ffv_fname: b"first".to_vec(),
+        };
+        assert_eq!(node.ffv_fname, b"first");
+        assert_eq!(node.ffv_wc_path.as_deref(), Some(b"**/*.rs".as_slice()));
+        assert!(node.file_id_valid);
+        assert_eq!(node.file_id.inode, 7);
+        assert_eq!(
+            node.ffv_next.as_deref().map(|next| next.ffv_fname.as_slice()),
+            Some(b"second".as_slice())
+        );
     }
 
     // ---- ff_create_stack_element ----
