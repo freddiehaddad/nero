@@ -31,6 +31,19 @@ static SYN_TM: crate::globals::GlobalCell<*mut crate::types_defs::ProftimeT> =
 /// Include `"None"` in highlight-name completion (`include_none`).
 static INCLUDE_NONE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 
+/// One row in a syntax timing report (`time_entry_T`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TimeEntryT {
+    total: crate::types_defs::ProftimeT,
+    count: i32,
+    matched: i32,
+    slowest: crate::types_defs::ProftimeT,
+    average: crate::types_defs::ProftimeT,
+    id: i32,
+    pattern: Vec<u8>,
+}
+
 /// Set or clear the syntax-recognition timeout (`syn_set_timeout`).
 ///
 /// # Safety
@@ -1339,6 +1352,26 @@ mod tests {
 
         unsafe { syn_set_timeout(std::ptr::null_mut()) };
         assert!(unsafe { *SYN_TM.get_mut() }.is_null());
+    }
+
+    #[test]
+    fn syntax_time_entry_preserves_report_fields() {
+        let entry = TimeEntryT {
+            total: 100,
+            count: 4,
+            matched: 3,
+            slowest: 50,
+            average: 25,
+            id: 7,
+            pattern: b"TODO".to_vec(),
+        };
+        assert_eq!(entry.total, 100);
+        assert_eq!(entry.count, 4);
+        assert_eq!(entry.matched, 3);
+        assert_eq!(entry.slowest, 50);
+        assert_eq!(entry.average, 25);
+        assert_eq!(entry.id, 7);
+        assert_eq!(entry.pattern, b"TODO");
     }
 
     #[test]
