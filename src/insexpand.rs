@@ -378,6 +378,42 @@ unsafe fn advance_cpt_sources_index_safe() -> i32 {
     }
 }
 
+/// Count nonempty entries in the current buffer's `'complete'` option
+/// (`get_cpt_sources_count`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer.
+#[allow(dead_code)]
+unsafe fn get_cpt_sources_count() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let value = unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_cpt.as_deref() }
+        .unwrap_or(&[]);
+    let mut offset = 0;
+    let mut count = 0;
+    while value
+        .get(offset)
+        .is_some_and(|&byte| byte != crate::ascii_defs::NUL)
+    {
+        while value
+            .get(offset)
+            .is_some_and(|&byte| byte == b',' || byte == b' ')
+        {
+            offset += 1;
+        }
+        if !value
+            .get(offset)
+            .is_some_and(|&byte| byte != crate::ascii_defs::NUL)
+        {
+            break;
+        }
+        let (_, next) =
+            crate::option::copy_option_part(value, offset, crate::tag::LSIZE, b",");
+        offset = next;
+        count += 1;
+    }
+    count
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1794,6 +1830,7 @@ mod tests {
 
     #[test]
     fn completion_source_core_preserves_parser_and_timer_state() {
+        let _lock = global_state_test_lock();
         let source = CptSourceT {
             cs_refresh_always: true,
             cs_startcol: 4,
@@ -1905,6 +1942,20 @@ mod tests {
             crate::vim_defs::FAIL
         );
         assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, 1);
+    }
+
+    #[test]
+    fn get_cpt_sources_count_skips_empty_and_honors_escaped_commas() {
+        let _lock = global_state_test_lock();
+        let mut buffer = crate::buffer_defs::BufT {
+            b_p_cpt: Some(b", ,.,w,,Ffunc\\,name".to_vec()),
+            ..Default::default()
+        };
+        let _buffer = CurbufGuard::set(&mut buffer);
+        assert_eq!(unsafe { get_cpt_sources_count() }, 3);
+
+        unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_cpt = Some(b", ,".to_vec()) };
+        assert_eq!(unsafe { get_cpt_sources_count() }, 0);
     }
 
     /// With no match shown there is nothing to be stuck on, so this
