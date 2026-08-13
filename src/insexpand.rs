@@ -414,6 +414,26 @@ unsafe fn get_cpt_sources_count() -> i32 {
     count
 }
 
+/// Whether parsing can advance to another `'complete'` source
+/// (`may_advance_cpt_index`).
+///
+/// # Safety
+/// Reads completion-source state.
+#[allow(dead_code)]
+unsafe fn may_advance_cpt_index(remaining: &[u8]) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *CPT_SOURCES_INDEX.get_mut() } == -1 {
+        return false;
+    }
+    let offset = remaining
+        .iter()
+        .position(|&byte| byte != b',' && byte != b' ')
+        .unwrap_or(remaining.len());
+    remaining
+        .get(offset)
+        .is_some_and(|&byte| byte != crate::ascii_defs::NUL)
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1956,6 +1976,18 @@ mod tests {
 
         unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_cpt = Some(b", ,".to_vec()) };
         assert_eq!(unsafe { get_cpt_sources_count() }, 0);
+    }
+
+    #[test]
+    fn may_advance_cpt_index_requires_an_active_index_and_remaining_value() {
+        let _lock = global_state_test_lock();
+        let _sources = CptSourcesGuard::install(vec![CptSourceT::default()], -1);
+        assert!(!unsafe { may_advance_cpt_index(b"next") });
+
+        unsafe { *CPT_SOURCES_INDEX.get_mut() = 0 };
+        assert!(unsafe { may_advance_cpt_index(b",  next") });
+        assert!(!unsafe { may_advance_cpt_index(b",  ") });
+        assert!(!unsafe { may_advance_cpt_index(b", \0next") });
     }
 
     /// With no match shown there is nothing to be stuck on, so this
