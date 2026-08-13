@@ -41,6 +41,21 @@
 //! `wildescape`/`ExpandEscape` (need `vim_strsave_fnameescape`/
 //! `escape_fname`/`tilde_replace`, not translated).
 
+/// Set completion context for a `++opt=arg` argument
+/// (`set_context_in_argopt`).
+#[allow(dead_code)]
+fn set_context_in_argopt(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    argument: &[u8],
+) {
+    let pattern = argument
+        .iter()
+        .position(|&byte| byte == b'=')
+        .map_or(argument, |equals| &argument[equals + 1..]);
+    xp.xp_pattern = Some(pattern.to_vec());
+    xp.xp_context = crate::cmdexpand_defs::ExpandContext::Argopt;
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -519,6 +534,17 @@ pub fn sort_func_compare(s1: &[u8], s2: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_context_in_argopt_completes_after_equals_or_from_start() {
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        set_context_in_argopt(&mut xp, b"encoding=utf");
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Argopt);
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"utf".as_slice()));
+
+        set_context_in_argopt(&mut xp, b"encoding");
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"encoding".as_slice()));
+    }
 
     #[test]
     fn clear_cmdline_orig_releases_the_saved_command_line() {
