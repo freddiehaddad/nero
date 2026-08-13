@@ -535,6 +535,9 @@ impl Default for ComplT {
 /// First match in the circular completion list (`compl_first_match`).
 static COMPL_FIRST_MATCH: GlobalCell<*mut ComplT> = GlobalCell::new(std::ptr::null_mut());
 
+/// Current match while walking the completion list (`compl_curr_match`).
+static COMPL_CURR_MATCH: GlobalCell<*mut ComplT> = GlobalCell::new(std::ptr::null_mut());
+
 /// The match currently shown in the completion menu
 /// (`compl_shown_match`).
 ///
@@ -708,6 +711,44 @@ unsafe fn ins_compl_make_cyclic() -> i32 {
         (*first).cp_prev = current;
     }
     count
+}
+
+/// Whether popup-menu index `selected` is the current completion match
+/// (`compl_match_curr_select`).
+///
+/// # Safety
+/// `COMPL_FIRST_MATCH` must head a live completion list, and
+/// `COMPL_CURR_MATCH`, when non-null, must point to a live match.
+#[allow(dead_code)]
+unsafe fn compl_match_curr_select(selected: i32) -> bool {
+    if selected < 0 {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut current = unsafe { *COMPL_FIRST_MATCH.get_mut() };
+    let mut selected_idx = -1;
+    let mut list_idx = 0;
+    loop {
+        // SAFETY: `current` is a live list node by contract.
+        let item = unsafe { &*current };
+        if !match_at_original_text(item) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wanted = unsafe { *COMPL_CURR_MATCH.get_mut() };
+            if !wanted.is_null()
+                // SAFETY: `wanted` is live by contract.
+                && unsafe { (*wanted).cp_number } == item.cp_number
+            {
+                selected_idx = list_idx;
+                break;
+            }
+            list_idx += 1;
+        }
+        current = item.cp_next;
+        if current.is_null() || unsafe { is_first_match(current) } {
+            break;
+        }
+    }
+    selected == selected_idx
 }
 
 /// Whether a completion match is selected, even if it has not yet
@@ -2024,6 +2065,22 @@ mod tests {
 
     struct FirstMatchGuard(*mut ComplT);
 
+    struct CurrMatchGuard(*mut ComplT);
+
+    impl CurrMatchGuard {
+        fn install(value: *mut ComplT) -> Self {
+            let previous = unsafe { *COMPL_CURR_MATCH.get_mut() };
+            unsafe { *COMPL_CURR_MATCH.get_mut() = value };
+            Self(previous)
+        }
+    }
+
+    impl Drop for CurrMatchGuard {
+        fn drop(&mut self) {
+            unsafe { *COMPL_CURR_MATCH.get_mut() = self.0 };
+        }
+    }
+
     struct ComplLnumGuard(crate::pos_defs::LinenrT);
 
     struct FuzzyScoresGuard(Vec<i32>);
@@ -2519,6 +2576,37 @@ mod tests {
         assert_eq!(unsafe { ins_compl_make_cyclic() }, 2);
         assert_eq!(unsafe { (*last_ptr).cp_next }, first_ptr);
         assert_eq!(unsafe { (*first_ptr).cp_prev }, last_ptr);
+    }
+
+    #[test]
+    fn compl_match_curr_select_indexes_only_nonoriginal_matches() {
+        let _lock = global_state_test_lock();
+        let mut original = ComplT {
+            cp_flags: cp_flags::ORIGINAL_TEXT,
+            ..Default::default()
+        };
+        let mut first = ComplT {
+            cp_number: 10,
+            ..Default::default()
+        };
+        let mut second = ComplT {
+            cp_number: 20,
+            ..Default::default()
+        };
+        let original_ptr = std::ptr::addr_of_mut!(original);
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        unsafe {
+            (*original_ptr).cp_next = first_ptr;
+            (*first_ptr).cp_next = second_ptr;
+            (*second_ptr).cp_next = original_ptr;
+        }
+        let _first = FirstMatchGuard::install(original_ptr);
+        let _current = CurrMatchGuard::install(second_ptr);
+
+        assert!(unsafe { compl_match_curr_select(1) });
+        assert!(!unsafe { compl_match_curr_select(0) });
+        assert!(!unsafe { compl_match_curr_select(-1) });
     }
 
     #[test]
