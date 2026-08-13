@@ -88,6 +88,33 @@ pub fn free_xp_files_extra(
     xp.xp_files_info = None;
 }
 
+/// Find the command following a `:global` pattern
+/// (`find_cmd_after_global_cmd`).
+///
+/// Returns the byte offset immediately after the closing delimiter.
+#[allow(dead_code)]
+#[must_use]
+fn find_cmd_after_global_cmd(argument: &[u8]) -> Option<usize> {
+    let delimiter = argument.first().copied().unwrap_or(0);
+    if delimiter == 0 {
+        return None;
+    }
+
+    let mut offset = 1;
+    while argument
+        .get(offset)
+        .is_some_and(|&byte| byte != 0 && byte != delimiter)
+    {
+        if argument[offset] == b'\\'
+            && argument.get(offset + 1).is_some_and(|&byte| byte != 0)
+        {
+            offset += 1;
+        }
+        offset += 1;
+    }
+    (argument.get(offset) == Some(&delimiter)).then_some(offset + 1)
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -585,6 +612,14 @@ mod tests {
         assert!(xp.xp_files_kind.is_none());
         assert!(xp.xp_files_menu.is_none());
         assert!(xp.xp_files_info.is_none());
+    }
+
+    #[test]
+    fn find_cmd_after_global_cmd_honors_escaped_delimiters() {
+        assert_eq!(find_cmd_after_global_cmd(b"/pat/print"), Some(5));
+        assert_eq!(find_cmd_after_global_cmd(b"/a\\/b/print"), Some(6));
+        assert_eq!(find_cmd_after_global_cmd(b"/unterminated"), None);
+        assert_eq!(find_cmd_after_global_cmd(b""), None);
     }
 
     #[test]
