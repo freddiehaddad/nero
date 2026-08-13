@@ -751,6 +751,35 @@ unsafe fn compl_match_curr_select(selected: i32) -> bool {
     selected == selected_idx
 }
 
+/// Find the next completion match represented in the popup-menu array
+/// (`find_next_match_in_menu`).
+///
+/// # Safety
+/// `COMPL_SHOWN_MATCH` must point into a live, linked completion list.
+#[allow(dead_code)]
+unsafe fn find_next_match_in_menu() -> *mut ComplT {
+    // SAFETY: reads completion direction state.
+    let forward = unsafe { compl_shows_dir_forward() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut current = unsafe { *COMPL_SHOWN_MATCH.get_mut() };
+    loop {
+        // SAFETY: `current` is a live list node by contract.
+        current = if forward {
+            unsafe { (*current).cp_next }
+        } else {
+            unsafe { (*current).cp_prev }
+        };
+        // SAFETY: every traversed link is live by contract.
+        let item = unsafe { &*current };
+        if item.cp_next.is_null()
+            || item.cp_in_match_array
+            || match_at_original_text(item)
+        {
+            return current;
+        }
+    }
+}
+
 /// Whether a completion match is selected, even if it has not yet
 /// been inserted (`ins_compl_is_match_selected`).
 ///
@@ -2607,6 +2636,34 @@ mod tests {
         assert!(unsafe { compl_match_curr_select(1) });
         assert!(!unsafe { compl_match_curr_select(0) });
         assert!(!unsafe { compl_match_curr_select(-1) });
+    }
+
+    #[test]
+    fn find_next_match_in_menu_skips_matches_absent_from_the_menu_array() {
+        let _state = ComplStateGuard::new();
+        let mut shown = ComplT::default();
+        let mut skipped = ComplT::default();
+        let mut visible = ComplT {
+            cp_in_match_array: true,
+            ..Default::default()
+        };
+        let shown_ptr = std::ptr::addr_of_mut!(shown);
+        let skipped_ptr = std::ptr::addr_of_mut!(skipped);
+        let visible_ptr = std::ptr::addr_of_mut!(visible);
+        unsafe {
+            (*shown_ptr).cp_next = skipped_ptr;
+            (*shown_ptr).cp_prev = visible_ptr;
+            (*skipped_ptr).cp_next = visible_ptr;
+            (*skipped_ptr).cp_prev = shown_ptr;
+            (*visible_ptr).cp_next = shown_ptr;
+            (*visible_ptr).cp_prev = skipped_ptr;
+            *COMPL_SHOWS_DIR.get_mut() = crate::vim_defs::Direction::Forward;
+        }
+        let _shown = ShownMatchGuard::install(shown_ptr);
+
+        assert_eq!(unsafe { find_next_match_in_menu() }, visible_ptr);
+        unsafe { *COMPL_SHOWS_DIR.get_mut() = crate::vim_defs::Direction::Backward };
+        assert_eq!(unsafe { find_next_match_in_menu() }, visible_ptr);
     }
 
     #[test]
