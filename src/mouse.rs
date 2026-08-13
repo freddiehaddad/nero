@@ -28,6 +28,19 @@
 //! not translated) and the entire real mouse-click dispatch/dragging
 //! machinery (needs `os/input.c`'s event loop).
 
+/// Left mouse button result (`MOUSE_LEFT`).
+pub const MOUSE_LEFT: i32 = 0x00;
+/// Middle mouse button result (`MOUSE_MIDDLE`).
+pub const MOUSE_MIDDLE: i32 = 0x01;
+/// Right mouse button result (`MOUSE_RIGHT`).
+pub const MOUSE_RIGHT: i32 = 0x02;
+/// No button remains pressed (`MOUSE_RELEASE`).
+pub const MOUSE_RELEASE: i32 = 0x03;
+/// Extended mouse button X1 (`MOUSE_X1`).
+pub const MOUSE_X1: i32 = 0x300;
+/// Extended mouse button X2 (`MOUSE_X2`).
+pub const MOUSE_X2: i32 = 0x400;
+
 /// Get class of a character for selection: same class means same word
 /// (`get_mouse_class`).
 ///
@@ -199,6 +212,21 @@ pub unsafe fn find_end_of_word(pos: &mut crate::pos_defs::PosT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_button_codes_match_mouse_h() {
+        assert_eq!(
+            [
+                MOUSE_LEFT,
+                MOUSE_MIDDLE,
+                MOUSE_RIGHT,
+                MOUSE_RELEASE,
+                MOUSE_X1,
+                MOUSE_X2,
+            ],
+            [0, 1, 2, 3, 0x300, 0x400]
+        );
+    }
     use crate::buffer_defs::BufT;
     use crate::pos_defs::PosT;
 
