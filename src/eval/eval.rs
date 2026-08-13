@@ -299,6 +299,20 @@ use crate::eval::typval_defs::{Callback, TypvalT, TypvalValue, VarLockStatus, Va
 use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
+/// Whether a typval is a usable expression argument
+/// (`eval_expr_valid_arg`).
+#[must_use]
+pub fn eval_expr_valid_arg(value: &TypvalT) -> bool {
+    match &value.value {
+        TypvalValue::Unknown => false,
+        TypvalValue::String(Some(text)) => {
+            text.first().is_some_and(|&byte| byte != crate::ascii_defs::NUL)
+        }
+        TypvalValue::String(None) => false,
+        _ => true,
+    }
+}
+
 /// Highlight group selected by `:echohl` (`echo_hl_id`).
 static ECHO_HL_ID: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
@@ -5859,6 +5873,31 @@ unsafe fn get_lval_list(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: 
 mod tests {
     use super::*;
     use crate::eval::typval_defs::VarLockStatus;
+
+    #[test]
+    fn eval_expr_valid_arg_rejects_unknown_null_and_empty_strings() {
+        assert!(!eval_expr_valid_arg(&TypvalT::default()));
+        assert!(!eval_expr_valid_arg(&TypvalT {
+            value: TypvalValue::String(None),
+            ..Default::default()
+        }));
+        assert!(!eval_expr_valid_arg(&TypvalT {
+            value: TypvalValue::String(Some(Vec::new())),
+            ..Default::default()
+        }));
+        assert!(!eval_expr_valid_arg(&TypvalT {
+            value: TypvalValue::String(Some(b"\0ignored".to_vec())),
+            ..Default::default()
+        }));
+        assert!(eval_expr_valid_arg(&TypvalT {
+            value: TypvalValue::String(Some(b"x".to_vec())),
+            ..Default::default()
+        }));
+        assert!(eval_expr_valid_arg(&TypvalT {
+            value: TypvalValue::Number(0),
+            ..Default::default()
+        }));
+    }
 
     struct EchoHighlightGuard(i32);
 
