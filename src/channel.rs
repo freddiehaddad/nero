@@ -43,6 +43,13 @@ impl Default for CallbackReader {
     }
 }
 
+/// Initialize a callback reader's line buffer and stream label
+/// (`callback_reader_start`).
+pub fn callback_reader_start(reader: &mut CallbackReader, reader_type: &[u8]) {
+    reader.buffer = Vec::new();
+    reader.reader_type = Some(reader_type.to_vec());
+}
+
 /// Add one reference to a channel (`channel_incref`).
 pub fn channel_incref(channel: &mut ChannelT) {
     channel.refcount = channel.refcount.wrapping_add(1);
@@ -130,5 +137,22 @@ mod tests {
         assert!(!reader.buffered);
         assert!(!reader.fwd_err);
         assert!(reader.reader_type.is_none());
+    }
+
+    #[test]
+    fn callback_reader_start_initializes_buffer_and_type_only() {
+        let mut reader = CallbackReader {
+            buffer: vec![b"stale".to_vec()],
+            eof: true,
+            buffered: true,
+            ..Default::default()
+        };
+
+        callback_reader_start(&mut reader, b"stderr");
+
+        assert!(reader.buffer.is_empty());
+        assert_eq!(reader.reader_type.as_deref(), Some(b"stderr".as_slice()));
+        assert!(reader.eof);
+        assert!(reader.buffered);
     }
 }
