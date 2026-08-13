@@ -1542,6 +1542,9 @@ pub unsafe fn ins_compl_len() -> i32 {
 /// Stays `false` today for the same reason as the statics above: the
 /// completion engine that sets it is not translated.
 static COMPL_AUTOCOMPLETE: GlobalCell<bool> = GlobalCell::new(false);
+/// Whether autocomplete started from a non-keyword character
+/// (`compl_from_nonkeyword`).
+static COMPL_FROM_NONKEYWORD: GlobalCell<bool> = GlobalCell::new(false);
 
 /// Whether the `'autocompletedelay'` timer is pending.
 static COMPL_AUTOCOMPLETE_PENDING: GlobalCell<bool> = GlobalCell::new(false);
@@ -1611,6 +1614,43 @@ pub unsafe fn ins_compl_autocomplete_elapsed() -> i64 {
     // SAFETY: forwarded from this function's own safety doc.
     let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
     (crate::os::time::os_hrtime().wrapping_sub(start) / 1_000_000) as i64
+}
+
+/// Whether `c` remains part of the item currently being completed
+/// (`ins_compl_accept_char`).
+///
+/// # Safety
+/// Reads completion globals; the default word-completion branch also
+/// requires `GLOBALS.curbuf` to point to a live buffer.
+#[must_use]
+pub unsafe fn ins_compl_accept_char(c: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *COMPL_AUTOCOMPLETE.get_mut() }
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { *COMPL_FROM_NONKEYWORD.get_mut() }
+    {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mode = unsafe { *CTRL_X_MODE.get_mut() };
+    if mode & CTRL_X_WANT_IDENT != 0 {
+        return crate::charset::vim_isidc(c);
+    }
+    match mode {
+        CTRL_X_FILES => {
+            crate::charset::vim_isfilec(c) && !crate::path::vim_ispathsep(c)
+        }
+        CTRL_X_CMDLINE | CTRL_X_CMDLINE_CTRL_X | CTRL_X_OMNI => {
+            // SAFETY: forwarded from this function's own safety doc.
+            (unsafe { crate::charset::vim_isprintc(c) })
+                && !crate::ascii_defs::ascii_iswhite(c)
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        CTRL_X_WHOLE_LINE => unsafe { crate::charset::vim_isprintc(c) },
+        // SAFETY: forwarded from this function's own safety doc.
+        _ => unsafe { crate::charset::vim_iswordc(c) },
+    }
 }
 
 /// Get the local or global value of `'completeopt'` flags
@@ -2825,6 +2865,41 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    struct AcceptCharStateGuard {
+        prev_mode: i32,
+        prev_autocomplete: bool,
+        prev_nonkeyword: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AcceptCharStateGuard {
+        fn set(mode: i32, autocomplete: bool, nonkeyword: bool) -> Self {
+            let _lock = global_state_test_lock();
+            let guard = Self {
+                prev_mode: unsafe { *CTRL_X_MODE.get_mut() },
+                prev_autocomplete: unsafe { *COMPL_AUTOCOMPLETE.get_mut() },
+                prev_nonkeyword: unsafe { *COMPL_FROM_NONKEYWORD.get_mut() },
+                _lock,
+            };
+            unsafe {
+                *CTRL_X_MODE.get_mut() = mode;
+                *COMPL_AUTOCOMPLETE.get_mut() = autocomplete;
+                *COMPL_FROM_NONKEYWORD.get_mut() = nonkeyword;
+            }
+            guard
+        }
+    }
+
+    impl Drop for AcceptCharStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *CTRL_X_MODE.get_mut() = self.prev_mode;
+                *COMPL_AUTOCOMPLETE.get_mut() = self.prev_autocomplete;
+                *COMPL_FROM_NONKEYWORD.get_mut() = self.prev_nonkeyword;
+            }
+        }
+    }
+
     struct ComplInsEndGuard(crate::pos_defs::ColnrT);
 
     struct GlobalThesaurusFuncGuard(Option<Vec<u8>>);
@@ -2986,6 +3061,31 @@ mod tests {
         let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
         assert!(unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
         assert!((before..=after).contains(&start));
+    }
+
+    #[test]
+    fn ins_compl_accept_char_applies_mode_specific_character_rules() {
+        let _state = AcceptCharStateGuard::set(CTRL_X_FILES, false, false);
+        assert!(unsafe { ins_compl_accept_char(i32::from(b'a')) });
+        assert!(!unsafe { ins_compl_accept_char(i32::from(b'/')) });
+
+        unsafe { *CTRL_X_MODE.get_mut() = CTRL_X_CMDLINE };
+        assert!(unsafe { ins_compl_accept_char(i32::from(b'x')) });
+        assert!(!unsafe { ins_compl_accept_char(i32::from(b' ')) });
+
+        unsafe { *CTRL_X_MODE.get_mut() = CTRL_X_WHOLE_LINE };
+        assert!(unsafe { ins_compl_accept_char(i32::from(b' ')) });
+
+        unsafe { *CTRL_X_MODE.get_mut() = CTRL_X_TAGS };
+        assert!(unsafe { ins_compl_accept_char(i32::from(b'A')) });
+        assert!(!unsafe { ins_compl_accept_char(i32::from(b'-')) });
+
+        unsafe {
+            *CTRL_X_MODE.get_mut() = CTRL_X_CMDLINE;
+            *COMPL_AUTOCOMPLETE.get_mut() = true;
+            *COMPL_FROM_NONKEYWORD.get_mut() = true;
+        }
+        assert!(!unsafe { ins_compl_accept_char(i32::from(b'x')) });
     }
 
     #[test]
