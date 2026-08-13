@@ -147,6 +147,53 @@ fn skip_wildmenu_char(
     0
 }
 
+/// Translate keys while wildmenu completion is active
+/// (`wildmenu_translate_key`).
+///
+/// # Safety
+/// Forwarded from [`cmdline_pum_active`]; reads global wildmenu state.
+#[must_use]
+pub unsafe fn wildmenu_translate_key(
+    ccline: &crate::ex_getln_defs::CmdlineInfo,
+    key: i32,
+    xp: &crate::cmdexpand_defs::ExpandT,
+    did_wild_list: bool,
+) -> i32 {
+    let mut translated = key;
+    // SAFETY: forwarded from this function's own safety doc.
+    let menu_active = unsafe { cmdline_pum_active() }
+        || did_wild_list
+        || unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing != 0;
+    if menu_active {
+        if translated == crate::keycodes_defs::K_LEFT {
+            translated = i32::from(crate::ascii_defs::CTRL_P);
+        } else if translated == crate::keycodes_defs::K_RIGHT {
+            translated = i32::from(crate::ascii_defs::CTRL_N);
+        }
+    }
+
+    if xp.xp_context == crate::cmdexpand_defs::ExpandContext::Menunames
+        && ccline.cmdpos > 1
+        && ccline
+            .cmdbuff
+            .as_deref()
+            .is_some_and(|line| {
+                let pos = ccline.cmdpos as usize;
+                line.get(pos - 1) == Some(&b'.')
+                    && line.get(pos - 2) != Some(&b'\\')
+            })
+        && matches!(
+            translated,
+            x if x == i32::from(b'\n')
+                || x == i32::from(b'\r')
+                || x == crate::keycodes_defs::K_KENTER
+        )
+    {
+        translated = crate::keycodes_defs::K_DOWN;
+    }
+    translated
+}
+
 static CMDLINE_ORIG: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
 
@@ -671,6 +718,53 @@ mod tests {
         xp.xp_context = ExpandContext::Menus;
         assert_eq!(skip_wildmenu_char(&xp, b"\tName"), 1);
         assert_eq!(skip_wildmenu_char(&xp, b"\\x"), 1);
+    }
+
+    #[test]
+    fn wildmenu_translate_key_maps_arrows_and_submenu_enter() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _showing = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.wild_menu_showing,
+                0,
+            )
+        };
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Menunames,
+            ..Default::default()
+        };
+        let ccline = crate::ex_getln_defs::CmdlineInfo {
+            cmdbuff: Some(b"emenu Name.".to_vec()),
+            cmdpos: 11,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                wildmenu_translate_key(
+                    &ccline,
+                    crate::keycodes_defs::K_LEFT,
+                    &xp,
+                    true,
+                )
+            },
+            i32::from(crate::ascii_defs::CTRL_P)
+        );
+        assert_eq!(
+            unsafe {
+                wildmenu_translate_key(
+                    &ccline,
+                    crate::keycodes_defs::K_RIGHT,
+                    &xp,
+                    true,
+                )
+            },
+            i32::from(crate::ascii_defs::CTRL_N)
+        );
+        assert_eq!(
+            unsafe { wildmenu_translate_key(&ccline, i32::from(b'\r'), &xp, true) },
+            crate::keycodes_defs::K_DOWN
+        );
     }
 
     #[test]
