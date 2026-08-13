@@ -902,6 +902,15 @@ impl QfListT {
     }
 }
 
+/// Whether an entry is still present in a quickfix list
+/// (`is_qf_entry_present`).
+#[allow(dead_code)]
+fn is_qf_entry_present(qfl: &QfListT, entry: *const QflineT) -> bool {
+    qfl.qf_entries
+        .iter()
+        .any(|candidate| std::ptr::eq(candidate, entry))
+}
+
 /// Length of the leading `'errorformat'` part in `efm`, up to (but not
 /// including) the separating comma (`efm_option_part_len`).
 ///
@@ -5586,6 +5595,35 @@ mod tests {
         let mut qfl = QfListT::default();
         qf_store_title(&mut qfl, Some(b""));
         assert_eq!(qfl.qf_title.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn is_qf_entry_present_uses_entry_identity_not_equal_contents() {
+        let duplicate = QflineT {
+            qf_lnum: 5,
+            qf_text: Some(b"same".to_vec()),
+            ..Default::default()
+        };
+        let qfl = QfListT {
+            qf_entries: vec![
+                QflineT {
+                    qf_lnum: 5,
+                    qf_text: Some(b"same".to_vec()),
+                    ..Default::default()
+                },
+                QflineT {
+                    qf_lnum: 8,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(is_qf_entry_present(
+            &qfl,
+            std::ptr::addr_of!(qfl.qf_entries[1]),
+        ));
+        assert!(!is_qf_entry_present(&qfl, std::ptr::addr_of!(duplicate)));
     }
 
     #[test]
