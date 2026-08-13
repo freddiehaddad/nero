@@ -911,6 +911,32 @@ fn is_qf_entry_present(qfl: &QfListT, entry: *const QflineT) -> bool {
         .any(|candidate| std::ptr::eq(candidate, entry))
 }
 
+/// Byte index corresponding to a zero-based screen column
+/// (`qf_screen_col_to_idx`).
+///
+/// A tab always occupies eight columns, independent of `'tabstop'`.
+///
+/// # Safety
+/// Forwarded from [`crate::charset::ptr2cells`].
+#[allow(dead_code)]
+unsafe fn qf_screen_col_to_idx(line: &[u8], vcol: crate::pos_defs::ColnrT) -> i32 {
+    let mut offset = 0;
+    let mut column = 0;
+    while line.get(offset).is_some_and(|&byte| byte != 0) && column < vcol {
+        if line[offset] == crate::ascii_defs::TAB {
+            column += 8 - column % 8;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            column += unsafe { crate::charset::ptr2cells(&line[offset..]) };
+        }
+        if column > vcol {
+            break;
+        }
+        offset += crate::mbyte::utf_ptr2len(&line[offset..]).max(1) as usize;
+    }
+    offset as i32
+}
+
 /// Length of the leading `'errorformat'` part in `efm`, up to (but not
 /// including) the separating comma (`efm_option_part_len`).
 ///
@@ -5624,6 +5650,24 @@ mod tests {
             std::ptr::addr_of!(qfl.qf_entries[1]),
         ));
         assert!(!is_qf_entry_present(&qfl, std::ptr::addr_of!(duplicate)));
+    }
+
+    #[test]
+    fn qf_screen_col_to_idx_uses_fixed_tabs_and_stops_inside_wide_chars() {
+        let _lock = crate::globals::global_state_test_lock();
+        let line = b"a\tbc\0";
+        assert_eq!(unsafe { qf_screen_col_to_idx(line, 0) }, 0);
+        assert_eq!(unsafe { qf_screen_col_to_idx(line, 1) }, 1);
+        assert_eq!(unsafe { qf_screen_col_to_idx(line, 7) }, 1);
+        assert_eq!(unsafe { qf_screen_col_to_idx(line, 8) }, 2);
+        assert_eq!(unsafe { qf_screen_col_to_idx(line, 9) }, 3);
+
+        let wide = "a界b\0".as_bytes();
+        assert_eq!(unsafe { qf_screen_col_to_idx(wide, 2) }, 1);
+        assert_eq!(
+            unsafe { qf_screen_col_to_idx(wide, 3) },
+            "a界".len() as i32
+        );
     }
 
     #[test]
