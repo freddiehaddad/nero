@@ -653,6 +653,30 @@ unsafe fn is_first_match(m: *const ComplT) -> bool {
     m == unsafe { *COMPL_FIRST_MATCH.get_mut() }
 }
 
+/// Make the completion list non-cyclic (`ins_compl_make_linear`).
+///
+/// # Safety
+/// `COMPL_FIRST_MATCH` and its `cp_prev`, when non-null, must point to
+/// live nodes in the same completion list.
+#[allow(dead_code)]
+unsafe fn ins_compl_make_linear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let first = unsafe { *COMPL_FIRST_MATCH.get_mut() };
+    if first.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let last = unsafe { (*first).cp_prev };
+    if last.is_null() {
+        return;
+    }
+    // SAFETY: both pointers are live list nodes by contract.
+    unsafe {
+        (*last).cp_next = std::ptr::null_mut();
+        (*first).cp_prev = std::ptr::null_mut();
+    }
+}
+
 /// Whether a completion match is selected, even if it has not yet
 /// been inserted (`ins_compl_is_match_selected`).
 ///
@@ -2212,6 +2236,29 @@ mod tests {
         assert!(unsafe { is_first_match(first_ptr) });
         assert!(!unsafe { is_first_match(other_ptr) });
         assert!(!unsafe { is_first_match(std::ptr::null()) });
+    }
+
+    #[test]
+    fn ins_compl_make_linear_breaks_both_ends_of_a_cyclic_list() {
+        let _lock = global_state_test_lock();
+        let mut first = ComplT::default();
+        let mut last = ComplT::default();
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let last_ptr = std::ptr::addr_of_mut!(last);
+        unsafe {
+            (*first_ptr).cp_next = last_ptr;
+            (*first_ptr).cp_prev = last_ptr;
+            (*last_ptr).cp_next = first_ptr;
+            (*last_ptr).cp_prev = first_ptr;
+        }
+        let _first = FirstMatchGuard::install(first_ptr);
+
+        unsafe { ins_compl_make_linear() };
+
+        assert!(unsafe { (*first_ptr).cp_prev.is_null() });
+        assert!(unsafe { (*last_ptr).cp_next.is_null() });
+        assert_eq!(unsafe { (*first_ptr).cp_next }, last_ptr);
+        assert_eq!(unsafe { (*last_ptr).cp_prev }, first_ptr);
     }
 
     #[test]
