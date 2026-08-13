@@ -110,6 +110,19 @@ fn ff_get_visited_list<'a>(
     list.as_deref_mut().expect("new visited-list head missing")
 }
 
+/// Free both visited-list chains owned by a search context
+/// (`vim_findfile_free_visited`).
+#[allow(dead_code)]
+fn vim_findfile_free_visited(search_ctx: Option<&mut FfSearchCtxT>) {
+    let Some(search_ctx) = search_ctx else {
+        return;
+    };
+    vim_findfile_free_visited_list(&mut search_ctx.ffsc_visited_lists_list);
+    vim_findfile_free_visited_list(
+        &mut search_ctx.ffsc_dir_visited_lists_list,
+    );
+}
+
 /// Release shared find-file expansion storage (`free_findfile`).
 ///
 /// # Safety
@@ -556,6 +569,35 @@ mod tests {
                 .map(|header| header.ffvl_filename.as_slice()),
             Some(b"first".as_slice())
         );
+    }
+
+    #[test]
+    fn vim_findfile_free_visited_clears_both_context_chains() {
+        let mut files = Box::new(FfVisitedListHdrT {
+            ffvl_filename: b"file".to_vec(),
+            ..Default::default()
+        });
+        let mut dirs = Box::new(FfVisitedListHdrT {
+            ffvl_filename: b"dir".to_vec(),
+            ..Default::default()
+        });
+        let file_active = std::ptr::from_mut(&mut *files);
+        let dir_active = std::ptr::from_mut(&mut *dirs);
+        let mut context = FfSearchCtxT {
+            ffsc_visited_list: file_active,
+            ffsc_dir_visited_list: dir_active,
+            ffsc_visited_lists_list: Some(files),
+            ffsc_dir_visited_lists_list: Some(dirs),
+            ..Default::default()
+        };
+
+        vim_findfile_free_visited(Some(&mut context));
+
+        assert!(context.ffsc_visited_lists_list.is_none());
+        assert!(context.ffsc_dir_visited_lists_list.is_none());
+        assert_eq!(context.ffsc_visited_list, file_active);
+        assert_eq!(context.ffsc_dir_visited_list, dir_active);
+        vim_findfile_free_visited(None);
     }
 
     // ---- ff_create_stack_element ----
