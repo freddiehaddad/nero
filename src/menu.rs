@@ -89,6 +89,38 @@ fn menu_name_skip(name: &mut Vec<u8>) -> usize {
     offset
 }
 
+/// Isolate a menu path and translate `<TAB>` notation
+/// (`menu_translate_tab_and_shift`).
+///
+/// Returns the offset of the mapping text after trailing whitespace.
+#[allow(dead_code)]
+fn menu_translate_tab_and_shift(argument: &mut Vec<u8>) -> usize {
+    let mut offset = 0;
+    while argument
+        .get(offset)
+        .is_some_and(|&byte| byte != 0 && !byte.is_ascii_whitespace())
+    {
+        if (argument[offset] == b'\\'
+            || argument[offset] == crate::ascii_defs::CTRL_V)
+            && argument.get(offset + 1).is_some_and(|&byte| byte != 0)
+        {
+            offset += 1;
+        } else if argument[offset..]
+            .get(..5)
+            .is_some_and(|part| part.eq_ignore_ascii_case(b"<TAB>"))
+        {
+            argument[offset] = crate::ascii_defs::TAB;
+            argument.drain(offset + 1..offset + 5);
+        }
+        offset += 1;
+    }
+    if argument.get(offset).is_some_and(|&byte| byte != 0) {
+        argument[offset] = 0;
+        offset += 1;
+    }
+    offset + crate::charset::skipwhite(&argument[offset..])
+}
+
 /// Whether `name` is a popup menu name (`menu_is_popup`).
 #[must_use]
 pub fn menu_is_popup(name: &[u8]) -> bool {
@@ -464,6 +496,19 @@ mod tests {
         let next = menu_name_skip(&mut ctrl_v);
         assert_eq!(&ctrl_v[..next], b"A.B\0");
         assert_eq!(&ctrl_v[next..], b"C");
+    }
+
+    #[test]
+    fn menu_translate_tab_and_shift_normalizes_name_and_returns_mapping() {
+        let mut argument = b"File<TaB>Name   :echo".to_vec();
+        let mapping = menu_translate_tab_and_shift(&mut argument);
+        assert_eq!(&argument[..10], b"File\tName\0");
+        assert_eq!(&argument[mapping..], b":echo");
+
+        let mut escaped = b"File\\<TAB>Name rhs".to_vec();
+        let mapping = menu_translate_tab_and_shift(&mut escaped);
+        assert_eq!(&escaped[..15], b"File\\<TAB>Name\0");
+        assert_eq!(&escaped[mapping..], b"rhs");
     }
 
     struct RootMenuGuard(*mut VimMenu);
