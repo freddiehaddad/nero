@@ -44,6 +44,25 @@ struct FfVisitedListHdrT {
     ffvl_visited_list: Option<Box<FfVisitedT>>,
 }
 
+/// Find-file search context (`ff_search_ctx_T`).
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct FfSearchCtxT {
+    ffsc_stack_ptr: *mut FfStackT,
+    ffsc_visited_list: *mut FfVisitedListHdrT,
+    ffsc_dir_visited_list: *mut FfVisitedListHdrT,
+    ffsc_visited_lists_list: Option<Box<FfVisitedListHdrT>>,
+    ffsc_dir_visited_lists_list: Option<Box<FfVisitedListHdrT>>,
+    ffsc_file_to_search: Vec<u8>,
+    ffsc_start_dir: Vec<u8>,
+    ffsc_fix_path: Vec<u8>,
+    ffsc_wc_path: Vec<u8>,
+    ffsc_level: i32,
+    ffsc_stopdirs_v: Vec<Vec<u8>>,
+    ffsc_find_what: i32,
+    ffsc_tagfile: i32,
+}
+
 /// Free an entire visited-file chain (`ff_free_visited_list`).
 #[allow(dead_code)]
 fn ff_free_visited_list(list: &mut Option<Box<FfVisitedT>>) {
@@ -432,6 +451,39 @@ mod tests {
                 .map(|next| next.ffvl_filename.as_slice()),
             Some(b"second".as_slice())
         );
+    }
+
+    #[test]
+    fn search_context_owns_both_visited_header_chains_and_search_strings() {
+        let mut header = Box::new(FfVisitedListHdrT {
+            ffvl_filename: b"target".to_vec(),
+            ..Default::default()
+        });
+        let active = std::ptr::from_mut(&mut *header);
+        let context = FfSearchCtxT {
+            ffsc_visited_list: active,
+            ffsc_visited_lists_list: Some(header),
+            ffsc_file_to_search: b"target".to_vec(),
+            ffsc_start_dir: b"/start".to_vec(),
+            ffsc_fix_path: b"src".to_vec(),
+            ffsc_wc_path: b"**/*.rs".to_vec(),
+            ffsc_level: 4,
+            ffsc_stopdirs_v: vec![b"/".to_vec()],
+            ffsc_find_what: 1,
+            ffsc_tagfile: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(context.ffsc_visited_list, active);
+        assert_eq!(
+            context
+                .ffsc_visited_lists_list
+                .as_deref()
+                .map(|item| item.ffvl_filename.as_slice()),
+            Some(b"target".as_slice())
+        );
+        assert_eq!(context.ffsc_wc_path, b"**/*.rs");
+        assert_eq!(context.ffsc_stopdirs_v, vec![b"/".to_vec()]);
     }
 
     #[test]
