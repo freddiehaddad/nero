@@ -509,6 +509,34 @@ static COMPL_ENTER_SELECTS: GlobalCell<bool> = GlobalCell::new(false);
 static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
 /// Line where the current completion started (`compl_lnum`).
 static COMPL_LNUM: GlobalCell<crate::pos_defs::LinenrT> = GlobalCell::new(0);
+/// Fuzzy scores indexed by completion candidate (`compl_fuzzy_scores`).
+static COMPL_FUZZY_SCORES: GlobalCell<Vec<i32>> = GlobalCell::new(Vec::new());
+
+/// Compare fuzzy-score indices for descending-score, stable ordering
+/// (`compare_scores`).
+///
+/// # Safety
+/// Both indices must be valid for `COMPL_FUZZY_SCORES`.
+#[allow(dead_code)]
+unsafe fn compare_scores(index_a: i32, index_b: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let scores = unsafe { COMPL_FUZZY_SCORES.get_mut() };
+    let score_a = scores[index_a as usize];
+    let score_b = scores[index_b as usize];
+    if score_a == score_b {
+        if index_a < index_b {
+            -1
+        } else if index_a > index_b {
+            1
+        } else {
+            0
+        }
+    } else if score_a > score_b {
+        -1
+    } else {
+        1
+    }
+}
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
@@ -1469,6 +1497,24 @@ mod tests {
 
     struct ComplLnumGuard(crate::pos_defs::LinenrT);
 
+    struct FuzzyScoresGuard(Vec<i32>);
+
+    impl FuzzyScoresGuard {
+        fn install(scores: Vec<i32>) -> Self {
+            Self(std::mem::replace(
+                unsafe { COMPL_FUZZY_SCORES.get_mut() },
+                scores,
+            ))
+        }
+    }
+
+    impl Drop for FuzzyScoresGuard {
+        fn drop(&mut self) {
+            *unsafe { COMPL_FUZZY_SCORES.get_mut() } =
+                std::mem::take(&mut self.0);
+        }
+    }
+
     impl ComplLnumGuard {
         fn set(value: crate::pos_defs::LinenrT) -> Self {
             let saved = unsafe { *COMPL_LNUM.get_mut() };
@@ -1554,6 +1600,17 @@ mod tests {
 
         unsafe { (*shown_ptr).cp_str = Some(b"single".to_vec()) };
         assert!(!unsafe { ins_compl_lnum_in_range(5) });
+    }
+
+    #[test]
+    fn compare_scores_orders_high_scores_first_and_ties_by_index() {
+        let _lock = global_state_test_lock();
+        let _scores = FuzzyScoresGuard::install(vec![10, 90, 90, -5]);
+        assert_eq!(unsafe { compare_scores(1, 0) }, -1);
+        assert_eq!(unsafe { compare_scores(0, 1) }, 1);
+        assert_eq!(unsafe { compare_scores(1, 2) }, -1);
+        assert_eq!(unsafe { compare_scores(2, 1) }, 1);
+        assert_eq!(unsafe { compare_scores(2, 2) }, 0);
     }
 
     /// With no match shown there is nothing to be stuck on, so this
