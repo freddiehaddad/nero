@@ -16,6 +16,33 @@ pub struct ChannelT {
     pub did_close_event: bool,
 }
 
+/// Buffered callback reader used by channel stdout/stderr
+/// (`CallbackReader`).
+#[derive(Debug)]
+pub struct CallbackReader {
+    pub cb: crate::eval::typval_defs::Callback,
+    pub self_dict: *mut crate::eval::typval_defs::DictT,
+    pub buffer: Vec<Vec<u8>>,
+    pub eof: bool,
+    pub buffered: bool,
+    pub fwd_err: bool,
+    pub reader_type: Option<Vec<u8>>,
+}
+
+impl Default for CallbackReader {
+    fn default() -> Self {
+        Self {
+            cb: crate::eval::typval_defs::Callback::None,
+            self_dict: std::ptr::null_mut(),
+            buffer: Vec::new(),
+            eof: false,
+            buffered: false,
+            fwd_err: false,
+            reader_type: None,
+        }
+    }
+}
+
 /// Add one reference to a channel (`channel_incref`).
 pub fn channel_incref(channel: &mut ChannelT) {
     channel.refcount = channel.refcount.wrapping_add(1);
@@ -88,5 +115,20 @@ mod tests {
                 did_close_event: false,
             }
         );
+    }
+
+    #[test]
+    fn callback_reader_default_matches_callback_reader_init() {
+        let reader = CallbackReader::default();
+        assert_eq!(
+            reader.cb.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(reader.self_dict.is_null());
+        assert!(reader.buffer.is_empty());
+        assert!(!reader.eof);
+        assert!(!reader.buffered);
+        assert!(!reader.fwd_err);
+        assert!(reader.reader_type.is_none());
     }
 }
