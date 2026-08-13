@@ -358,6 +358,26 @@ unsafe fn cpt_sources_clear() {
     unsafe { *CPT_SOURCES_INDEX.get_mut() = -1 };
 }
 
+/// Advance to the next completion source when one exists
+/// (`advance_cpt_sources_index_safe`).
+///
+/// # Safety
+/// Must not run concurrently with another completion-source operation.
+#[allow(dead_code)]
+unsafe fn advance_cpt_sources_index_safe() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let index = unsafe { *CPT_SOURCES_INDEX.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let count = unsafe { CPT_SOURCES.get_mut() }.len() as i32;
+    if index >= 0 && index < count - 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *CPT_SOURCES_INDEX.get_mut() += 1 };
+        crate::vim_defs::OK
+    } else {
+        crate::vim_defs::FAIL
+    }
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1866,6 +1886,25 @@ mod tests {
         unsafe { cpt_sources_clear() };
         assert!(unsafe { CPT_SOURCES.get_mut() }.is_empty());
         assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, -1);
+    }
+
+    #[test]
+    fn advance_cpt_sources_index_safe_stays_within_the_source_array() {
+        let _lock = global_state_test_lock();
+        let _sources = CptSourcesGuard::install(
+            vec![CptSourceT::default(), CptSourceT::default()],
+            0,
+        );
+        assert_eq!(
+            unsafe { advance_cpt_sources_index_safe() },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, 1);
+        assert_eq!(
+            unsafe { advance_cpt_sources_index_safe() },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, 1);
     }
 
     /// With no match shown there is nothing to be stuck on, so this
