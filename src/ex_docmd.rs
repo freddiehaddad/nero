@@ -217,6 +217,14 @@ pub fn skip_cmd_arg(argument: &mut Vec<u8>, remove_bs: bool) -> usize {
     offset
 }
 
+/// Shift parsed Ex command arguments left by one (`shift_cmd_args`).
+#[allow(dead_code)]
+fn shift_cmd_args(eap: &mut crate::ex_cmds_defs::ExargT) {
+    assert!(!eap.args.is_empty());
+    eap.args.remove(0);
+    eap.arg = Some(eap.args.first().cloned().unwrap_or_default());
+}
+
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
 ///
 /// Only ever set by `post_chdir` (not yet translated), so this stays
@@ -1319,6 +1327,23 @@ mod tests {
         let mut multibyte = "é\\ x tail".as_bytes().to_vec();
         assert_eq!(skip_cmd_arg(&mut multibyte, true), "é x".len());
         assert_eq!(multibyte, "é x tail".as_bytes());
+    }
+
+    #[test]
+    fn shift_cmd_args_removes_first_and_updates_current_argument() {
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"first".to_vec()),
+            args: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+            ..Default::default()
+        };
+        shift_cmd_args(&mut eap);
+        assert_eq!(eap.args, vec![b"second".to_vec(), b"third".to_vec()]);
+        assert_eq!(eap.arg.as_deref(), Some(b"second".as_slice()));
+
+        shift_cmd_args(&mut eap);
+        shift_cmd_args(&mut eap);
+        assert!(eap.args.is_empty());
+        assert_eq!(eap.arg, Some(Vec::new()));
     }
 
     struct FfuGuard {
