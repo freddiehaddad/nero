@@ -1009,6 +1009,35 @@ unsafe fn get_callback_if_cpt_func(
     }
 }
 
+/// Remove `^<digits>` maximum-match suffixes from a `'complete'` value
+/// (`strip_caret_numbers_in_place`).
+#[allow(dead_code)]
+fn strip_caret_numbers_in_place(value: &mut Vec<u8>) {
+    let mut read = 0;
+    let mut write = 0;
+    while read < value.len() {
+        if value[read] == b'^' {
+            let mut suffix_end = read + 1;
+            while value
+                .get(suffix_end)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                suffix_end += 1;
+            }
+            if suffix_end != read + 1
+                && (suffix_end == value.len() || value[suffix_end] == b',')
+            {
+                read = suffix_end;
+                continue;
+            }
+        }
+        value[write] = value[read];
+        write += 1;
+        read += 1;
+    }
+    value.truncate(write);
+}
+
 /// Whether the popup menu should be displayed (`pum_wanted`).
 ///
 /// `'completeopt'` must contain `menu` or `menuone`, unless
@@ -3042,6 +3071,17 @@ mod tests {
             unsafe { (*buf_ptr).b_p_cpt_cb.as_mut_ptr().add(1) }
         );
         assert!(unsafe { get_callback_if_cpt_func(b".", 0) }.is_null());
+    }
+
+    #[test]
+    fn strip_caret_numbers_removes_only_delimited_numeric_suffixes() {
+        let mut value = b"b^10,u^2,Ffunc^3".to_vec();
+        strip_caret_numbers_in_place(&mut value);
+        assert_eq!(value, b"b,u,Ffunc");
+
+        let mut literal = b"foo^12bar,^,x^1y".to_vec();
+        strip_caret_numbers_in_place(&mut literal);
+        assert_eq!(literal, b"foo^12bar,^,x^1y");
     }
 
     #[test]
