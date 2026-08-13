@@ -90,6 +90,13 @@
 //! `check_need_cap`/`expand_spelling`, all needing `slang_T`'s own
 //! spell-file-loaded state or the buffer/window spell-option plumbing.
 
+/// Release one spell replacement pair (`free_fromto`).
+#[allow(dead_code)]
+fn free_fromto(replacement: &mut crate::spell_defs::FromtoT) {
+    replacement.ft_from = None;
+    replacement.ft_to = None;
+}
+
 /// word has one capital (or all capitals) (`WF_ONECAP`).
 pub const WF_ONECAP: i32 = 0x02;
 /// word must be all capitals (`WF_ALLCAP`).
@@ -870,6 +877,16 @@ pub unsafe fn no_spell_checking(wp: &crate::buffer_defs::WinT) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_fromto_clears_both_owned_strings() {
+        let mut replacement = crate::spell_defs::FromtoT {
+            ft_from: Some(b"teh".to_vec()),
+            ft_to: Some(b"the".to_vec()),
+        };
+        free_fromto(&mut replacement);
+        assert_eq!(replacement, crate::spell_defs::FromtoT::default());
+    }
 
     #[test]
     fn byte_in_str_finds_present_byte() {
