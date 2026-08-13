@@ -97,6 +97,20 @@ fn free_fromto(replacement: &mut crate::spell_defs::FromtoT) {
     replacement.ft_to = None;
 }
 
+/// Release the owned portions of a sound-alike rule (`free_salitem`).
+///
+/// `sm_oneof` and `sm_rules` are offsets into `sm_lead`, so they are
+/// deliberately not cleared, matching the original's non-owning
+/// pointers.
+#[allow(dead_code)]
+fn free_salitem(item: &mut crate::spell_defs::SalitemT) {
+    item.sm_lead = None;
+    item.sm_to = None;
+    item.sm_lead_w = None;
+    item.sm_oneof_w = None;
+    item.sm_to_w = None;
+}
+
 /// word has one capital (or all capitals) (`WF_ONECAP`).
 pub const WF_ONECAP: i32 = 0x02;
 /// word must be all capitals (`WF_ALLCAP`).
@@ -886,6 +900,29 @@ mod tests {
         };
         free_fromto(&mut replacement);
         assert_eq!(replacement, crate::spell_defs::FromtoT::default());
+    }
+
+    #[test]
+    fn free_salitem_clears_owned_fields_but_keeps_borrow_offsets() {
+        let mut item = crate::spell_defs::SalitemT {
+            sm_lead: Some(b"ab(cd)^".to_vec()),
+            sm_leadlen: 2,
+            sm_oneof: Some(2),
+            sm_rules: Some(6),
+            sm_to: Some(b"x".to_vec()),
+            sm_lead_w: Some(vec![b'a' as i32]),
+            sm_oneof_w: Some(vec![b'c' as i32]),
+            sm_to_w: Some(vec![b'x' as i32]),
+        };
+        free_salitem(&mut item);
+        assert!(item.sm_lead.is_none());
+        assert!(item.sm_to.is_none());
+        assert!(item.sm_lead_w.is_none());
+        assert!(item.sm_oneof_w.is_none());
+        assert!(item.sm_to_w.is_none());
+        assert_eq!(item.sm_oneof, Some(2));
+        assert_eq!(item.sm_rules, Some(6));
+        assert_eq!(item.sm_leadlen, 2);
     }
 
     #[test]
