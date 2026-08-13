@@ -311,6 +311,23 @@ pub enum VarFlavourT {
     Shada = 4,
 }
 
+/// Classify a variable name for persistence (`var_flavour`).
+#[must_use]
+pub fn var_flavour(varname: &[u8]) -> VarFlavourT {
+    if !varname.first().is_some_and(u8::is_ascii_uppercase) {
+        return VarFlavourT::Default;
+    }
+    if varname[1..]
+        .iter()
+        .take_while(|&&byte| byte != crate::ascii_defs::NUL)
+        .any(u8::is_ascii_lowercase)
+    {
+        VarFlavourT::Session
+    } else {
+        VarFlavourT::Shada
+    }
+}
+
 /// Whether a typval is a usable expression argument
 /// (`eval_expr_valid_arg`).
 #[must_use]
@@ -5901,6 +5918,15 @@ mod tests {
         assert_eq!(VarFlavourT::Default as i32, 1);
         assert_eq!(VarFlavourT::Session as i32, 2);
         assert_eq!(VarFlavourT::Shada as i32, 4);
+    }
+
+    #[test]
+    fn var_flavour_classifies_default_session_and_shada_names() {
+        assert_eq!(var_flavour(b"lower"), VarFlavourT::Default);
+        assert_eq!(var_flavour(b"Mixed"), VarFlavourT::Session);
+        assert_eq!(var_flavour(b"UPPER_123"), VarFlavourT::Shada);
+        assert_eq!(var_flavour(b"U\0lower"), VarFlavourT::Shada);
+        assert_eq!(var_flavour(b""), VarFlavourT::Default);
     }
     use crate::eval::typval_defs::VarLockStatus;
 
