@@ -346,6 +346,18 @@ unsafe fn check_elapsed_time() {
     }
 }
 
+/// Reset all parsed completion-source state (`cpt_sources_clear`).
+///
+/// # Safety
+/// Must not run concurrently with another completion-source operation.
+#[allow(dead_code)]
+unsafe fn cpt_sources_clear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { CPT_SOURCES.get_mut() }.clear();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CPT_SOURCES_INDEX.get_mut() = -1 };
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1842,6 +1854,18 @@ mod tests {
         unsafe { check_elapsed_time() };
         assert!(unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() });
         assert_eq!(unsafe { *COMPL_TIMEOUT_MS.get_mut() }, 5);
+    }
+
+    #[test]
+    fn cpt_sources_clear_drops_sources_and_resets_index() {
+        let _lock = global_state_test_lock();
+        let _sources = CptSourcesGuard::install(
+            vec![CptSourceT::default(), CptSourceT::default()],
+            1,
+        );
+        unsafe { cpt_sources_clear() };
+        assert!(unsafe { CPT_SOURCES.get_mut() }.is_empty());
+        assert_eq!(unsafe { *CPT_SOURCES_INDEX.get_mut() }, -1);
     }
 
     /// With no match shown there is nothing to be stuck on, so this
