@@ -62,6 +62,33 @@ fn free_menu_string(menu: &mut VimMenu, index: usize) {
     menu.strings[index] = None;
 }
 
+/// Split one dot-separated menu path element in place
+/// (`menu_name_skip`).
+///
+/// Returns the offset of the next element; backslash and CTRL-V escape
+/// bytes are removed from the current element.
+#[allow(dead_code)]
+fn menu_name_skip(name: &mut Vec<u8>) -> usize {
+    let mut offset = 0;
+    while name
+        .get(offset)
+        .is_some_and(|&byte| byte != 0 && byte != b'.')
+    {
+        if name[offset] == b'\\' || name[offset] == crate::ascii_defs::CTRL_V {
+            name.remove(offset);
+            if !name.get(offset).is_some_and(|&byte| byte != 0) {
+                break;
+            }
+        }
+        offset += crate::mbyte::utf_ptr2len(&name[offset..]).max(1) as usize;
+    }
+    if name.get(offset).is_some_and(|&byte| byte != 0) {
+        name[offset] = 0;
+        offset += 1;
+    }
+    offset
+}
+
 /// Whether `name` is a popup menu name (`menu_is_popup`).
 #[must_use]
 pub fn menu_is_popup(name: &[u8]) -> bool {
@@ -424,6 +451,19 @@ mod tests {
             menu.strings[1].as_deref(),
             Some(b"shared-command".as_slice())
         );
+    }
+
+    #[test]
+    fn menu_name_skip_splits_unescaped_dot_and_removes_escape_bytes() {
+        let mut name = b"File\\.Name.Sub".to_vec();
+        let next = menu_name_skip(&mut name);
+        assert_eq!(&name[..next], b"File.Name\0");
+        assert_eq!(&name[next..], b"Sub");
+
+        let mut ctrl_v = vec![b'A', crate::ascii_defs::CTRL_V, b'.', b'B', b'.', b'C'];
+        let next = menu_name_skip(&mut ctrl_v);
+        assert_eq!(&ctrl_v[..next], b"A.B\0");
+        assert_eq!(&ctrl_v[next..], b"C");
     }
 
     struct RootMenuGuard(*mut VimMenu);
