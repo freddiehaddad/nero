@@ -200,6 +200,27 @@ pub mod cp_flags {
     pub const FAST: i32 = 32;
 }
 
+/// Whether `lnum` lies in the active multiline completion
+/// (`ins_compl_lnum_in_range`).
+///
+/// # Safety
+/// Forwarded from [`ins_compl_has_multiple`];
+/// `GLOBALS.curwin` must point to a live window.
+#[must_use]
+pub unsafe fn ins_compl_lnum_in_range(
+    lnum: crate::pos_defs::LinenrT,
+) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { ins_compl_has_multiple() } {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let start = unsafe { *COMPL_LNUM.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let end = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.lnum };
+    lnum >= start && lnum <= end
+}
+
 /// One Insert-mode completion match (`compl_T`/`struct compl_S`).
 ///
 /// The matches form an intrusive, circular doubly-linked list, so
@@ -486,6 +507,8 @@ static COMPL_ENTER_SELECTS: GlobalCell<bool> = GlobalCell::new(false);
 
 /// Column where the text being completed starts (`compl_col`).
 static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
+/// Line where the current completion started (`compl_lnum`).
+static COMPL_LNUM: GlobalCell<crate::pos_defs::LinenrT> = GlobalCell::new(0);
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
@@ -1444,6 +1467,22 @@ mod tests {
 
     struct FirstMatchGuard(*mut ComplT);
 
+    struct ComplLnumGuard(crate::pos_defs::LinenrT);
+
+    impl ComplLnumGuard {
+        fn set(value: crate::pos_defs::LinenrT) -> Self {
+            let saved = unsafe { *COMPL_LNUM.get_mut() };
+            unsafe { *COMPL_LNUM.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for ComplLnumGuard {
+        fn drop(&mut self) {
+            unsafe { *COMPL_LNUM.get_mut() = self.0 };
+        }
+    }
+
     impl FirstMatchGuard {
         fn install(value: *mut ComplT) -> Self {
             let saved = unsafe { *COMPL_FIRST_MATCH.get_mut() };
@@ -1495,6 +1534,26 @@ mod tests {
         let mut multi = with_text(b"first\nsecond");
         unsafe { *COMPL_SHOWN_MATCH.get_mut() = std::ptr::from_mut(&mut *multi) };
         assert!(unsafe { ins_compl_has_multiple() });
+    }
+
+    #[test]
+    fn ins_compl_lnum_in_range_requires_multiline_and_inclusive_bounds() {
+        let _lock = global_state_test_lock();
+        let mut shown = with_text(b"first\nsecond");
+        let shown_ptr = std::ptr::from_mut(&mut *shown);
+        let _shown = ShownMatchGuard::install(shown_ptr);
+        let _line = ComplLnumGuard::set(4);
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_cursor.lnum = 7;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = std::ptr::addr_of_mut!(win);
+
+        assert!(!unsafe { ins_compl_lnum_in_range(3) });
+        assert!(unsafe { ins_compl_lnum_in_range(4) });
+        assert!(unsafe { ins_compl_lnum_in_range(7) });
+        assert!(!unsafe { ins_compl_lnum_in_range(8) });
+
+        unsafe { (*shown_ptr).cp_str = Some(b"single".to_vec()) };
+        assert!(!unsafe { ins_compl_lnum_in_range(5) });
     }
 
     /// With no match shown there is nothing to be stuck on, so this
