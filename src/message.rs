@@ -93,6 +93,19 @@ static LAST_SOURCING_NAME: GlobalCell<Option<Vec<u8>>> = GlobalCell::new(None);
 /// (`last_sourcing_lnum`, a file-static in the original).
 static LAST_SOURCING_LNUM: GlobalCell<crate::pos_defs::LinenrT> = GlobalCell::new(0);
 
+/// Pending external-message chunks (`msg_ext_chunks`).
+static MSG_EXT_CHUNKS: GlobalCell<Option<crate::api::private::defs::Array>> =
+    GlobalCell::new(None);
+
+/// Replace the external-message chunk array and return the old one
+/// (`msg_ext_init_chunks`).
+#[allow(dead_code)]
+fn msg_ext_init_chunks() -> Option<crate::api::private::defs::Array> {
+    let previous = unsafe { MSG_EXT_CHUNKS.get_mut() }.replace(Vec::new());
+    unsafe { crate::globals::GLOBALS.get_mut() }.msg_col = 0;
+    previous
+}
+
 /// `default_grid` - the main screen's own [`crate::grid_defs::ScreenGrid`],
 /// harvested here from `grid.c` ahead of the rest of that file (see this
 /// module's own doc comment). Stays at [`crate::grid_defs::ScreenGrid::default`]
@@ -818,6 +831,51 @@ pub unsafe fn sb_text_start_cmdline() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    struct MsgExtChunksGuard(
+        Option<crate::api::private::defs::Array>,
+    );
+
+    impl MsgExtChunksGuard {
+        fn install(value: Option<crate::api::private::defs::Array>) -> Self {
+            Self(std::mem::replace(
+                unsafe { MSG_EXT_CHUNKS.get_mut() },
+                value,
+            ))
+        }
+    }
+
+    impl Drop for MsgExtChunksGuard {
+        fn drop(&mut self) {
+            *unsafe { MSG_EXT_CHUNKS.get_mut() } = self.0.take();
+        }
+    }
+
+    #[test]
+    fn msg_ext_init_chunks_returns_old_array_and_resets_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _column = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.msg_col,
+                17,
+            )
+        };
+        let _chunks = MsgExtChunksGuard::install(Some(vec![
+            crate::api::private::defs::Object::Nil,
+        ]));
+
+        let previous = msg_ext_init_chunks().expect("old chunk array");
+
+        assert_eq!(previous.len(), 1);
+        assert!(matches!(
+            previous.first(),
+            Some(crate::api::private::defs::Object::Nil)
+        ));
+        assert!(unsafe { MSG_EXT_CHUNKS.get_mut() }
+            .as_ref()
+            .is_some_and(Vec::is_empty));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.msg_col, 0);
+    }
 
     // --- msg_use_printf ---
 
