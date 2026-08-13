@@ -296,6 +296,26 @@ fn is_cpt_func_refresh_always() -> bool {
         .any(|source| source.cs_refresh_always)
 }
 
+/// Start timing one completion source (`compl_source_start_timer`).
+///
+/// # Safety
+/// `source_idx` must be valid for `CPT_SOURCES`; reads global option
+/// state and mutates completion timing state.
+#[allow(dead_code)]
+unsafe fn compl_source_start_timer(source_idx: usize) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let autocomplete = unsafe { *COMPL_AUTOCOMPLETE.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let timeout = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cto;
+    if autocomplete || timeout > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        (unsafe { CPT_SOURCES.get_mut() })[source_idx].compl_start_tv =
+            crate::os::time::os_hrtime();
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() = false };
+    }
+}
+
 impl Default for ComplT {
     fn default() -> Self {
         ComplT {
@@ -1531,6 +1551,34 @@ mod tests {
         index: i32,
     }
 
+    struct CompletionTimerGuard {
+        timeout: crate::types_defs::OptInt,
+        expired: bool,
+    }
+
+    impl CompletionTimerGuard {
+        fn set(timeout: crate::types_defs::OptInt, expired: bool) -> Self {
+            let saved = Self {
+                timeout: unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cto,
+                expired: unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() },
+            };
+            unsafe {
+                crate::option_vars::OPTION_VARS.get_mut().p_cto = timeout;
+                *COMPL_TIME_SLICE_EXPIRED.get_mut() = expired;
+            }
+            saved
+        }
+    }
+
+    impl Drop for CompletionTimerGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::option_vars::OPTION_VARS.get_mut().p_cto = self.timeout;
+                *COMPL_TIME_SLICE_EXPIRED.get_mut() = self.expired;
+            }
+        }
+    }
+
     impl CptSourcesGuard {
         fn install(sources: Vec<CptSourceT>, index: i32) -> Self {
             Self {
@@ -1696,6 +1744,30 @@ mod tests {
         assert!(is_cpt_func_refresh_always());
         (unsafe { CPT_SOURCES.get_mut() })[1].cs_refresh_always = false;
         assert!(!is_cpt_func_refresh_always());
+    }
+
+    #[test]
+    fn completion_source_timer_arms_only_when_timing_is_enabled() {
+        let _mode = AutocompleteModeGuard::set(false, false);
+        let _sources = CptSourcesGuard::install(
+            vec![CptSourceT {
+                compl_start_tv: 42,
+                ..Default::default()
+            }],
+            0,
+        );
+        let _timer = CompletionTimerGuard::set(0, true);
+        unsafe { compl_source_start_timer(0) };
+        assert_eq!((unsafe { CPT_SOURCES.get_mut() })[0].compl_start_tv, 42);
+        assert!(unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cto = 10;
+        let before = crate::os::time::os_hrtime();
+        unsafe { compl_source_start_timer(0) };
+        let after = crate::os::time::os_hrtime();
+        let start = (unsafe { CPT_SOURCES.get_mut() })[0].compl_start_tv;
+        assert!((before..=after).contains(&start));
+        assert!(!unsafe { *COMPL_TIME_SLICE_EXPIRED.get_mut() });
     }
 
     /// With no match shown there is nothing to be stuck on, so this
