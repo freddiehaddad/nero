@@ -35,6 +35,19 @@
 /// array, since the entry IS the name.
 static FONTS: crate::globals::GlobalCell<Vec<Vec<u8>>> =
     crate::globals::GlobalCell::new(Vec::new());
+/// Interned URLs, indexed by `HlAttrs.url` (`urls`).
+static URLS: crate::globals::GlobalCell<Vec<Vec<u8>>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
+/// Get an interned URL by index (`hl_get_url`).
+///
+/// # Safety
+/// Reads the `URLS` file-static.
+#[must_use]
+pub unsafe fn hl_get_url(index: u32) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { URLS.get_mut() }.get(index as usize).cloned()
+}
 
 /// Intern `font_name` and return its index (`hl_add_font_idx`).
 ///
@@ -352,6 +365,37 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UrlsGuard(Vec<Vec<u8>>);
+
+    impl UrlsGuard {
+        fn install(urls: Vec<Vec<u8>>) -> Self {
+            Self(std::mem::replace(unsafe { URLS.get_mut() }, urls))
+        }
+    }
+
+    impl Drop for UrlsGuard {
+        fn drop(&mut self) {
+            *unsafe { URLS.get_mut() } = std::mem::take(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn hl_get_url_returns_an_owned_indexed_copy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = UrlsGuard::install(vec![
+            b"https://one.example".to_vec(),
+            b"https://two.example".to_vec(),
+        ]);
+        let mut url = unsafe { hl_get_url(1) }.expect("URL");
+        assert_eq!(url, b"https://two.example");
+        url[8] = b'X';
+        assert_eq!(
+            unsafe { hl_get_url(1) }.as_deref(),
+            Some(b"https://two.example".as_slice())
+        );
+        assert_eq!(unsafe { hl_get_url(9) }, None);
+    }
 
     // ---- hl_add_font_idx / hl_get_font ----
 
