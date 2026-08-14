@@ -412,6 +412,42 @@ fn qf_grow_linebuf(state: &mut QfStateT, new_size: usize) -> *mut u8 {
     state.growbuf.as_mut_ptr()
 }
 
+/// Read the next line from a buffer into quickfix parser state
+/// (`qf_get_next_buf_line`).
+///
+/// # Safety
+/// `state.buf` must point to a live buffer; its memline must satisfy
+/// [`crate::memline::ml_get_buf`].
+#[allow(dead_code)]
+unsafe fn qf_get_next_buf_line(state: &mut QfStateT) -> i32 {
+    if state.buflnum > state.lnumlast {
+        return qf_status::QF_END_OF_INPUT;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buffer = unsafe { &mut *state.buf };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buffer, state.buflnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let length = unsafe { crate::memline::ml_get_buf_len(buffer, state.buflnum) }
+        .max(0) as usize;
+    state.buflnum += 1;
+
+    state.linebuf = if length > crate::globals::IOSIZE - 2 {
+        qf_grow_linebuf(state, length)
+    } else {
+        state.linelen = length;
+        unsafe { crate::globals::GLOBALS.get_mut() }.IObuff.as_mut_ptr()
+    };
+    let destination =
+        unsafe { std::slice::from_raw_parts_mut(state.linebuf, state.linelen + 1) };
+    crate::memory::xstrlcpy(
+        destination,
+        &line[..state.linelen.min(line.len())],
+        state.linelen + 1,
+    );
+    qf_status::QF_OK
+}
+
 /// The fields parsed out of one error line, before they become a
 /// [`QflineT`] entry (`qffields_T`).
 ///
@@ -5701,6 +5737,60 @@ mod tests {
         assert_eq!(state.linelen, LINE_MAXLEN - 1);
         assert_eq!(state.growbufsiz, LINE_MAXLEN - 1);
         assert_eq!(state.growbuf.len(), LINE_MAXLEN);
+    }
+
+    #[test]
+    fn qf_get_next_buf_line_reads_short_and_long_lines_then_reports_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _io = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.IObuff,
+                [0; crate::globals::IOSIZE],
+            )
+        };
+        let mut buffer = crate::buffer_defs::BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buffer), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buffer, 1, b"short\0"),
+                crate::vim_defs::OK
+            );
+            let mut long = vec![b'x'; crate::globals::IOSIZE + 20];
+            long.push(0);
+            assert_eq!(
+                crate::memline::ml_append_buf(
+                    &mut buffer,
+                    1,
+                    &long,
+                    long.len() as i32,
+                    false,
+                ),
+                crate::vim_defs::OK
+            );
+        }
+        let mut state = QfStateT {
+            buf: std::ptr::addr_of_mut!(buffer),
+            buflnum: 1,
+            lnumlast: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_get_next_buf_line(&mut state) }, qf_status::QF_OK);
+        assert_eq!(state.linelen, 5);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(state.linebuf, 5) },
+            b"short"
+        );
+        assert_eq!(unsafe { qf_get_next_buf_line(&mut state) }, qf_status::QF_OK);
+        assert_eq!(state.linelen, crate::globals::IOSIZE + 20);
+        assert_eq!(state.linebuf, state.growbuf.as_mut_ptr());
+        assert_eq!(
+            unsafe { qf_get_next_buf_line(&mut state) },
+            qf_status::QF_END_OF_INPUT
+        );
+
+        let memfile = unsafe { Box::from_raw(buffer.b_ml.ml_mfp) };
+        unsafe { crate::memfile::mf_close(*memfile, false) };
     }
 
     #[test]
