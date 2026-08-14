@@ -141,6 +141,12 @@ struct RedoReaderState {
 static REDO_READER: GlobalCell<Option<RedoReaderState>> =
     GlobalCell::new(None);
 
+/// Bytes recorded for the current macro (`recordbuff`).
+static RECORDBUFF: GlobalCell<BuffheaderT> =
+    GlobalCell::new(BuffheaderT { blocks: Vec::new(), bh_index: 0 });
+/// Number of bytes appended by the last input key (`last_recorded_len`).
+static LAST_RECORDED_LEN: GlobalCell<usize> = GlobalCell::new(0);
+
 /// Whether appending to the redo buffer is currently suppressed
 /// (`block_redo`). File-static in the original.
 static BLOCK_REDO: GlobalCell<bool> = GlobalCell::new(false);
@@ -257,6 +263,29 @@ pub fn get_buffcont(buf: &BuffheaderT, dozero: bool) -> Option<Vec<u8>> {
         out.extend_from_slice(&block.b_str);
     }
     Some(out)
+}
+
+/// Return and clear the recorded macro bytes (`get_recorded`).
+///
+/// # Safety
+/// Must not run concurrently with macro recording or writes to
+/// `GLOBALS.restart_edit`.
+pub unsafe fn get_recorded() -> Vec<u8> {
+    let mut recorded =
+        get_buffcont(unsafe { RECORDBUFF.get_mut() }, true).unwrap_or_default();
+    free_buff(unsafe { RECORDBUFF.get_mut() });
+
+    let last_len = unsafe { *LAST_RECORDED_LEN.get_mut() };
+    if recorded.len() >= last_len {
+        recorded.truncate(recorded.len() - last_len);
+    }
+    if !recorded.is_empty()
+        && unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit != 0
+        && recorded.last() == Some(&crate::ascii_defs::CTRL_O)
+    {
+        recorded.pop();
+    }
+    recorded
 }
 
 /// Fold a pending CTRL modifier into the character itself where an
@@ -1377,6 +1406,47 @@ mod tests {
             get_buffcont(&buf, false),
             Some(vec![crate::keycodes_defs::K_SPECIAL, 0x12, 0x34])
         );
+    }
+
+    #[test]
+    fn get_recorded_removes_the_stopping_key_and_clears_recording_storage() {
+        let _lock = global_state_test_lock();
+        let saved = std::mem::take(unsafe { RECORDBUFF.get_mut() });
+        let saved_len = std::mem::replace(
+            unsafe { LAST_RECORDED_LEN.get_mut() },
+            2,
+        );
+        unsafe {
+            add_buff(RECORDBUFF.get_mut(), b"macro");
+            add_buff(RECORDBUFF.get_mut(), b"q!");
+        }
+
+        assert_eq!(unsafe { get_recorded() }, b"macro".to_vec());
+        assert!(unsafe { RECORDBUFF.get_mut() }.blocks.is_empty());
+
+        *unsafe { RECORDBUFF.get_mut() } = saved;
+        *unsafe { LAST_RECORDED_LEN.get_mut() } = saved_len;
+    }
+
+    #[test]
+    fn get_recorded_removes_ctrl_o_when_stopping_from_insert_mode() {
+        let _lock = global_state_test_lock();
+        let saved = std::mem::take(unsafe { RECORDBUFF.get_mut() });
+        let saved_len = std::mem::replace(
+            unsafe { LAST_RECORDED_LEN.get_mut() },
+            1,
+        );
+        let restart = std::mem::replace(
+            &mut unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit,
+            1,
+        );
+        unsafe { add_buff(RECORDBUFF.get_mut(), b"text\x0fq") };
+
+        assert_eq!(unsafe { get_recorded() }, b"text".to_vec());
+
+        *unsafe { RECORDBUFF.get_mut() } = saved;
+        *unsafe { LAST_RECORDED_LEN.get_mut() } = saved_len;
+        unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit = restart;
     }
 
     // --- merge_modifiers ---
