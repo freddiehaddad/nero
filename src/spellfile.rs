@@ -123,6 +123,57 @@ unsafe fn get_affitem(flag_type: AffFlagType, input: &[u8]) -> (u32, usize) {
     ((second as u32) + ((first as u32) << 16), consumed)
 }
 
+/// Whether an affix list contains `flag` (`flag_in_afflist`).
+///
+/// # Safety
+/// Same as [`get_affitem`].
+#[allow(dead_code)]
+unsafe fn flag_in_afflist(
+    flag_type: AffFlagType,
+    affix_list: &[u8],
+    flag: u32,
+) -> bool {
+    if flag_type == AffFlagType::Char {
+        return crate::strings::vim_strchr(affix_list, flag as i32).is_some();
+    }
+
+    let end = affix_list
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(affix_list.len());
+    let mut offset = 0;
+    if matches!(flag_type, AffFlagType::Long | AffFlagType::CapLong) {
+        while offset < end {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (value, consumed) =
+                unsafe { get_affitem(flag_type, &affix_list[offset..end]) };
+            offset += consumed.max(1);
+            if value == flag {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    while offset < end {
+        let (value, consumed) =
+            crate::charset::getdigits_int(&affix_list[offset..end], true, 0);
+        offset += consumed;
+        let value = if value == 0 {
+            ZERO_FLAG
+        } else {
+            value as u32
+        };
+        if value == flag {
+            return true;
+        }
+        if offset < end {
+            offset += 1;
+        }
+    }
+    false
+}
+
 /// Tunable parameter for when the tree is compressed - memory /
 /// [`SBLOCKSIZE`] (`compress_start`).
 static COMPRESS_START: GlobalCell<i32> = GlobalCell::new(30000);
@@ -383,6 +434,37 @@ mod tests {
             (ZERO_FLAG, 1)
         );
         assert_eq!(unsafe { get_affitem(AffFlagType::Num, b"x") }, (0, 1));
+    }
+
+    #[test]
+    fn flag_in_afflist_scans_each_supported_affix_encoding() {
+        assert!(unsafe {
+            flag_in_afflist(AffFlagType::Char, "aéb".as_bytes(), 0x00e9)
+        });
+        assert!(!unsafe {
+            flag_in_afflist(AffFlagType::Char, b"abc", u32::from(b'z'))
+        });
+
+        let long_flag =
+            (u32::from(b'C') << 16) + u32::from(b'D');
+        assert!(unsafe {
+            flag_in_afflist(AffFlagType::Long, b"ABCD", long_flag)
+        });
+        let caplong_flag =
+            (u32::from(b'B') << 16) + u32::from(b'C');
+        assert!(unsafe {
+            flag_in_afflist(AffFlagType::CapLong, b"aBCDe", caplong_flag)
+        });
+
+        assert!(unsafe {
+            flag_in_afflist(AffFlagType::Num, b"12,0,345", ZERO_FLAG)
+        });
+        assert!(unsafe {
+            flag_in_afflist(AffFlagType::Num, b"12,0,345", 345)
+        });
+        assert!(!unsafe {
+            flag_in_afflist(AffFlagType::Num, b"12,0,345", 99)
+        });
     }
 
     // --- mb_str2wide ---
