@@ -38,6 +38,18 @@ pub fn ui_comp_attach(ui: &mut crate::ui::RemoteUI) {
     ui.composed = true;
 }
 
+/// Detach a UI from the compositor (`ui_comp_detach`).
+pub fn ui_comp_detach(ui: &mut crate::ui::RemoteUI) {
+    let count = unsafe { COMPOSED_UIS.get_mut() };
+    *count = count.wrapping_sub(1);
+    if *count == 0 {
+        *unsafe { LINEBUF.get_mut() } = None;
+        *unsafe { ATTRBUF.get_mut() } = None;
+        *unsafe { BUFSIZE.get_mut() } = 0;
+    }
+    ui.composed = false;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +57,30 @@ mod tests {
     struct CompositorStateGuard {
         composed: i32,
         valid: bool,
+    }
+
+    struct CompositorBuffersGuard {
+        line: Option<Vec<crate::types_defs::ScharT>>,
+        attrs: Option<Vec<crate::types_defs::SattrT>>,
+        size: usize,
+    }
+
+    impl CompositorBuffersGuard {
+        fn install() -> Self {
+            Self {
+                line: unsafe { LINEBUF.get_mut() }.replace(vec![1, 2]),
+                attrs: unsafe { ATTRBUF.get_mut() }.replace(vec![3, 4]),
+                size: std::mem::replace(unsafe { BUFSIZE.get_mut() }, 2),
+            }
+        }
+    }
+
+    impl Drop for CompositorBuffersGuard {
+        fn drop(&mut self) {
+            *unsafe { LINEBUF.get_mut() } = self.line.take();
+            *unsafe { ATTRBUF.get_mut() } = self.attrs.take();
+            *unsafe { BUFSIZE.get_mut() } = self.size;
+        }
     }
 
     impl CompositorStateGuard {
@@ -94,5 +130,24 @@ mod tests {
         assert!(ui.composed);
         assert_eq!(unsafe { *COMPOSED_UIS.get_mut() }, 3);
         assert!(ui_comp_should_draw());
+    }
+
+    #[test]
+    fn ui_comp_detach_releases_scratch_buffers_after_the_last_ui() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = CompositorStateGuard::install(1, true);
+        let _buffers = CompositorBuffersGuard::install();
+        let mut ui = crate::ui::RemoteUI {
+            composed: true,
+            ..Default::default()
+        };
+
+        ui_comp_detach(&mut ui);
+
+        assert!(!ui.composed);
+        assert_eq!(unsafe { *COMPOSED_UIS.get_mut() }, 0);
+        assert!(unsafe { LINEBUF.get_mut() }.is_none());
+        assert!(unsafe { ATTRBUF.get_mut() }.is_none());
+        assert_eq!(unsafe { *BUFSIZE.get_mut() }, 0);
     }
 }
