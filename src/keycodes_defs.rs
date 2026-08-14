@@ -107,6 +107,19 @@ pub const fn k_third(c: i32) -> u8 {
     }
 }
 
+/// Recover one internal key code from the two bytes after `K_SPECIAL`
+/// (`TO_SPECIAL`).
+#[must_use]
+pub const fn to_special(first: u8, second: u8) -> i32 {
+    if first == KS_SPECIAL {
+        K_SPECIAL as i32
+    } else if first == KS_ZERO {
+        K_ZERO
+    } else {
+        termcap2key(first, second)
+    }
+}
+
 /// First termcap byte meaning "this is one of the `KE_*` pseudo-keys
 /// below, see the second byte" (`KS_EXTRA`).
 pub const KS_EXTRA: u8 = 253;
@@ -625,6 +638,13 @@ mod tests {
         assert_eq!(k_third(K_UP), key2termcap1(K_UP));
         assert_eq!(k_second(K_UP), b'k');
         assert_eq!(k_third(K_UP), b'u');
+    }
+
+    #[test]
+    fn to_special_decodes_literal_special_nul_and_termcap_keys() {
+        assert_eq!(to_special(KS_SPECIAL, KE_FILLER), i32::from(K_SPECIAL));
+        assert_eq!(to_special(KS_ZERO, KE_FILLER), K_ZERO);
+        assert_eq!(to_special(b'k', b'u'), K_UP);
     }
 
     #[test]
