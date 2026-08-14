@@ -127,6 +127,31 @@ fn find_previous_pathsep(path: &[u8], separator: &mut usize) -> i32 {
     crate::vim_defs::FAIL
 }
 
+/// Offset in `fname` after the longest matching path prefix
+/// (`get_path_cutoff`).
+#[allow(dead_code)]
+fn get_path_cutoff(fname: &[u8], path_parts: &[Vec<u8>]) -> Option<usize> {
+    let mut longest = 0;
+    for path in path_parts {
+        let mut index = 0;
+        while index < fname.len()
+            && index < path.len()
+            && fname[index] != crate::ascii_defs::NUL
+            && path[index] != crate::ascii_defs::NUL
+            && (fname[index] == path[index]
+                || (cfg!(windows)
+                    && vim_ispathsep(i32::from(fname[index]))
+                    && vim_ispathsep(i32::from(path[index]))))
+        {
+            index += 1;
+        }
+        if index > longest {
+            longest = index;
+        }
+    }
+    (longest > 0).then_some(longest)
+}
+
 /// True if `c` is a path separator (`vim_ispathsep`). Note that on Windows
 /// this includes the colon.
 #[cfg(unix)]
@@ -1507,6 +1532,27 @@ mod tests {
             crate::vim_defs::FAIL
         );
         assert_eq!(separator, 0);
+    }
+
+    #[test]
+    fn get_path_cutoff_returns_the_end_of_the_longest_common_prefix() {
+        let filename = b"/foo/bar/baz/quux.txt";
+        let paths = vec![
+            b"/foo/other".to_vec(),
+            b"/foo/bar".to_vec(),
+            b"/foo/bar/baz".to_vec(),
+        ];
+        let cutoff = get_path_cutoff(filename, &paths).expect("matching prefix");
+        assert_eq!(&filename[cutoff..], b"/quux.txt");
+
+        assert_eq!(get_path_cutoff(b"file", &[b"other".to_vec()]), None);
+        assert_eq!(get_path_cutoff(b"file", &[]), None);
+
+        let nul = b"/foo\0ignored";
+        assert_eq!(
+            get_path_cutoff(nul, &[b"/foo\0different".to_vec()]),
+            Some(4)
+        );
     }
 
     #[test]
