@@ -52,6 +52,16 @@ pub struct VTermKeyEncodingStack {
     pub size: u8,
 }
 
+/// Keyboard-related subset of `VTermState.mode` and `VTerm.mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermKeyboardMode {
+    pub newline: bool,
+    pub cursor: bool,
+    pub keypad: bool,
+    pub bracketpaste: bool,
+    pub ctrl8bit: bool,
+}
+
 impl Default for VTermKeyEncodingStack {
     fn default() -> Self {
         Self {
@@ -270,5 +280,16 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn keyboard_mode_defaults_to_all_modes_disabled() {
+        assert_eq!(VTermKeyboardMode::default(), VTermKeyboardMode {
+            newline: false,
+            cursor: false,
+            keypad: false,
+            bracketpaste: false,
+            ctrl8bit: false,
+        });
     }
 }
