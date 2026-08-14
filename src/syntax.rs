@@ -51,6 +51,42 @@ fn syn_compare_syntime(first: &TimeEntryT, second: &TimeEntryT) -> i32 {
     crate::profile::profile_cmp(first.total, second.total)
 }
 
+/// Release external matches held by one saved syntax state
+/// (`clear_syn_state`).
+///
+/// # Safety
+/// Every non-null `bs_extmatch` in the active stack range must be a
+/// live reference suitable for [`crate::regexp::unref_extmatch`].
+#[allow(dead_code)]
+unsafe fn clear_syn_state(state: &mut crate::types_defs::SynstateT) {
+    if state.sst_stacksize > crate::types_defs::SST_FIX_STATES as i32 {
+        let crate::types_defs::SynstateStorage::Dynamic(stack) =
+            &mut state.sst_storage
+        else {
+            panic!("long syntax state must use dynamic storage");
+        };
+        for item in stack.iter_mut() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::regexp::unref_extmatch(item.bs_extmatch) };
+        }
+        stack.clear();
+        stack.shrink_to_fit();
+    } else {
+        let crate::types_defs::SynstateStorage::Fixed(stack) =
+            &mut state.sst_storage
+        else {
+            panic!("short syntax state must use fixed storage");
+        };
+        for item in stack
+            .iter_mut()
+            .take(state.sst_stacksize.max(0) as usize)
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::regexp::unref_extmatch(item.bs_extmatch) };
+        }
+    }
+}
+
 /// Return one completion candidate for `:syntime`
 /// (`get_syntime_arg`).
 #[must_use]
@@ -1389,6 +1425,54 @@ mod tests {
         assert_eq!(entry.average, 25);
         assert_eq!(entry.id, 7);
         assert_eq!(entry.pattern, b"TODO");
+    }
+
+    #[test]
+    fn clear_syn_state_releases_fixed_and_dynamic_external_matches() {
+        let fixed_match = Box::into_raw(Box::new(
+            crate::types_defs::RegExtmatchT {
+                refcnt: 2,
+                ..Default::default()
+            },
+        ));
+        let mut fixed_stack =
+            [crate::types_defs::BufstateT::default();
+                crate::types_defs::SST_FIX_STATES];
+        fixed_stack[0].bs_extmatch = fixed_match;
+        let mut fixed = crate::types_defs::SynstateT {
+            sst_storage: crate::types_defs::SynstateStorage::Fixed(fixed_stack),
+            sst_stacksize: 1,
+            ..Default::default()
+        };
+        unsafe { clear_syn_state(&mut fixed) };
+        assert_eq!(unsafe { (*fixed_match).refcnt }, 1);
+        unsafe { crate::regexp::unref_extmatch(fixed_match) };
+
+        let dynamic_match = Box::into_raw(Box::new(
+            crate::types_defs::RegExtmatchT {
+                refcnt: 2,
+                ..Default::default()
+            },
+        ));
+        let mut items = vec![
+            crate::types_defs::BufstateT::default();
+            crate::types_defs::SST_FIX_STATES + 1
+        ];
+        items[0].bs_extmatch = dynamic_match;
+        let mut dynamic = crate::types_defs::SynstateT {
+            sst_stacksize: items.len() as i32,
+            sst_storage: crate::types_defs::SynstateStorage::Dynamic(items),
+            ..Default::default()
+        };
+        unsafe { clear_syn_state(&mut dynamic) };
+        let crate::types_defs::SynstateStorage::Dynamic(items) =
+            &dynamic.sst_storage
+        else {
+            panic!("storage changed variant");
+        };
+        assert!(items.is_empty());
+        assert_eq!(unsafe { (*dynamic_match).refcnt }, 1);
+        unsafe { crate::regexp::unref_extmatch(dynamic_match) };
     }
 
     #[test]
