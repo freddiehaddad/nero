@@ -122,6 +122,20 @@ fn unicode_passthrough(c: u32, modifiers: crate::vterm_defs::VTermModifier) -> b
     }
 }
 
+/// Applies the legacy Ctrl-key codepoint mapping from
+/// `vterm_keyboard_unichar`.
+#[allow(dead_code)]
+fn control_codepoint(c: u32) -> u32 {
+    match c {
+        0x32 | 0x20 => 0,
+        0x33..=0x37 => 0x1B + c - u32::from(b'3'),
+        0x38 => 0x7F,
+        0x2F => 0x1F,
+        0x40..=0x7F => c & 0x1F,
+        _ => c,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +307,35 @@ mod tests {
             b'A' as u32,
             crate::vterm_defs::VTERM_MOD_CTRL
         ));
+    }
+
+    #[test]
+    fn control_codepoint_maps_digit_and_slash_special_cases() {
+        assert_eq!(control_codepoint(b'2' as u32), 0);
+        assert_eq!(control_codepoint(b' ' as u32), 0);
+        assert_eq!(
+            (b'3'..=b'7')
+                .map(|byte| control_codepoint(u32::from(byte)))
+                .collect::<Vec<_>>(),
+            [0x1B, 0x1C, 0x1D, 0x1E, 0x1F]
+        );
+        assert_eq!(control_codepoint(b'8' as u32), 0x7F);
+        assert_eq!(control_codepoint(b'/' as u32), 0x1F);
+    }
+
+    #[test]
+    fn control_codepoint_masks_the_historical_ascii_range() {
+        assert_eq!(control_codepoint(b'@' as u32), 0);
+        assert_eq!(control_codepoint(b'A' as u32), 1);
+        assert_eq!(control_codepoint(b'Z' as u32), 26);
+        assert_eq!(control_codepoint(b'[' as u32), 27);
+        assert_eq!(control_codepoint(0x7F), 0x1F);
+    }
+
+    #[test]
+    fn control_codepoint_preserves_values_outside_the_mapping() {
+        for codepoint in [0x1F, b'1' as u32, b'9' as u32, 0x80, 0x20AC] {
+            assert_eq!(control_codepoint(codepoint), codepoint);
+        }
     }
 }
