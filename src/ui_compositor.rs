@@ -50,6 +50,18 @@ pub fn ui_comp_detach(ui: &mut crate::ui::RemoteUI) {
     ui.composed = false;
 }
 
+/// Mark the composed screen valid or invalid (`ui_comp_set_screen_valid`).
+///
+/// Returns the previous validity; invalidating also hides the message
+/// separator until the screen is cleared.
+pub fn ui_comp_set_screen_valid(valid: bool) -> bool {
+    let old = std::mem::replace(unsafe { VALID_SCREEN.get_mut() }, valid);
+    if !valid {
+        *unsafe { MSG_SEP_ROW.get_mut() } = -1;
+    }
+    old
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +75,23 @@ mod tests {
         line: Option<Vec<crate::types_defs::ScharT>>,
         attrs: Option<Vec<crate::types_defs::SattrT>>,
         size: usize,
+    }
+
+    struct MsgSepGuard(i32);
+
+    impl MsgSepGuard {
+        fn install(value: i32) -> Self {
+            Self(std::mem::replace(
+                unsafe { MSG_SEP_ROW.get_mut() },
+                value,
+            ))
+        }
+    }
+
+    impl Drop for MsgSepGuard {
+        fn drop(&mut self) {
+            *unsafe { MSG_SEP_ROW.get_mut() } = self.0;
+        }
     }
 
     impl CompositorBuffersGuard {
@@ -149,5 +178,20 @@ mod tests {
         assert!(unsafe { LINEBUF.get_mut() }.is_none());
         assert!(unsafe { ATTRBUF.get_mut() }.is_none());
         assert_eq!(unsafe { *BUFSIZE.get_mut() }, 0);
+    }
+
+    #[test]
+    fn ui_comp_set_screen_valid_returns_old_state_and_resets_separator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = CompositorStateGuard::install(1, true);
+        let _separator = MsgSepGuard::install(12);
+
+        assert!(ui_comp_set_screen_valid(false));
+        assert!(!ui_comp_should_draw());
+        assert_eq!(unsafe { *MSG_SEP_ROW.get_mut() }, -1);
+
+        assert!(!ui_comp_set_screen_valid(true));
+        assert!(ui_comp_should_draw());
+        assert_eq!(unsafe { *MSG_SEP_ROW.get_mut() }, -1);
     }
 }
