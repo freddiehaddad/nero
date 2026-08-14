@@ -202,6 +202,26 @@ fn use_cursor_line_nr(wp: &WinT, wlv: &WinlinevarsT) -> bool {
                 && flags & crate::option_vars::opt_culopt_flag::LINE != 0))
 }
 
+/// Fill a run of cells in the current drawline buffers (`draw_col_fill`).
+///
+/// # Safety
+/// `wlv.off..wlv.off + width` must be valid in both global line
+/// buffers.
+#[allow(dead_code)]
+unsafe fn draw_col_fill(
+    wlv: &mut WinlinevarsT,
+    fillchar: crate::types_defs::ScharT,
+    width: i32,
+    attr: i32,
+) {
+    for _ in 0..width {
+        let offset = wlv.off as usize;
+        (unsafe { crate::grid::LINEBUF_CHAR.get_mut() })[offset] = fillchar;
+        (unsafe { crate::grid::LINEBUF_ATTR.get_mut() })[offset] = attr;
+        wlv.off += 1;
+    }
+}
+
 /// Ensure the reusable scratch buffer has at least `size` bytes and
 /// return its data pointer (`get_extra_buf`).
 ///
@@ -333,6 +353,35 @@ mod tests {
 
     struct ExtraBufGuard(Vec<u8>);
 
+    struct DrawLinebufGuard {
+        chars: Vec<crate::types_defs::ScharT>,
+        attrs: Vec<crate::types_defs::SattrT>,
+    }
+
+    impl DrawLinebufGuard {
+        fn install(size: usize) -> Self {
+            Self {
+                chars: std::mem::replace(
+                    unsafe { crate::grid::LINEBUF_CHAR.get_mut() },
+                    vec![0; size],
+                ),
+                attrs: std::mem::replace(
+                    unsafe { crate::grid::LINEBUF_ATTR.get_mut() },
+                    vec![0; size],
+                ),
+            }
+        }
+    }
+
+    impl Drop for DrawLinebufGuard {
+        fn drop(&mut self) {
+            *unsafe { crate::grid::LINEBUF_CHAR.get_mut() } =
+                std::mem::take(&mut self.chars);
+            *unsafe { crate::grid::LINEBUF_ATTR.get_mut() } =
+                std::mem::take(&mut self.attrs);
+        }
+    }
+
     impl ExtraBufGuard {
         fn empty() -> Self {
             Self(std::mem::take(unsafe { EXTRA_BUF.get_mut() }))
@@ -455,6 +504,29 @@ mod tests {
 
         state.lnum = 11;
         assert!(!use_cursor_line_nr(&win, &state));
+    }
+
+    #[test]
+    fn draw_col_fill_writes_cells_and_advances_the_line_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _linebuf = DrawLinebufGuard::install(6);
+        let mut state = WinlinevarsT {
+            off: 2,
+            ..Default::default()
+        };
+        let fill = crate::grid::schar_from_ascii(b'-');
+
+        unsafe { draw_col_fill(&mut state, fill, 3, 17) };
+
+        assert_eq!(state.off, 5);
+        assert_eq!(
+            &unsafe { crate::grid::LINEBUF_CHAR.get_mut() }[2..5],
+            &[fill; 3]
+        );
+        assert_eq!(
+            &unsafe { crate::grid::LINEBUF_ATTR.get_mut() }[2..5],
+            &[17; 3]
+        );
     }
 
     // ---- get_lcs_ext ----
