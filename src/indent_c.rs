@@ -114,6 +114,26 @@ pub unsafe fn cindent_on() -> bool {
     paste == 0 && (curbuf.b_p_cin != 0 || !curbuf.b_p_inde.as_deref().unwrap_or(&[]).is_empty())
 }
 
+/// Correct `'cinkeys'` maximum paren search distance for a start
+/// position below the cursor (`corr_ind_maxparen`).
+///
+/// # Safety
+/// `GLOBALS.curwin` and `curbuf` must point to live values.
+#[allow(dead_code)]
+unsafe fn corr_ind_maxparen(startpos: &crate::pos_defs::PosT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let distance = startpos.lnum.wrapping_sub(unsafe { (*globals.curwin).w_cursor.lnum });
+    // SAFETY: forwarded from this function's own safety doc.
+    let maximum = unsafe { (*globals.curbuf).b_ind_maxparen };
+    if distance > 0 && distance < maximum / 2 {
+        maximum - distance
+    } else {
+        maximum
+    }
+}
+
 /// Whether `s` starts with `word` followed by a non-identifier
 /// character (or nothing at all) (`cin_starts_with`).
 #[must_use]
@@ -1436,6 +1456,45 @@ mod tests {
         let result = unsafe { cindent_on() };
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste = old_paste;
         result
+    }
+
+    #[test]
+    fn corr_ind_maxparen_reduces_only_for_nearby_lower_start_positions() {
+        let mut buf = BufT {
+            b_ind_maxparen: 20,
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_cursor.lnum = 10;
+        let _guard = CurbufGuard::set_win_and_buf(&mut win, &mut buf);
+
+        assert_eq!(
+            unsafe {
+                corr_ind_maxparen(&crate::pos_defs::PosT {
+                    lnum: 14,
+                    ..Default::default()
+                })
+            },
+            16
+        );
+        assert_eq!(
+            unsafe {
+                corr_ind_maxparen(&crate::pos_defs::PosT {
+                    lnum: 20,
+                    ..Default::default()
+                })
+            },
+            20
+        );
+        assert_eq!(
+            unsafe {
+                corr_ind_maxparen(&crate::pos_defs::PosT {
+                    lnum: 9,
+                    ..Default::default()
+                })
+            },
+            20
+        );
     }
 
     /// Runs `cin_is_cinword` with `cinw` installed as the buffer's own
