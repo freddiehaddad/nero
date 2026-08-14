@@ -448,6 +448,40 @@ unsafe fn qf_get_next_buf_line(state: &mut QfStateT) -> i32 {
     qf_status::QF_OK
 }
 
+/// Read the next newline-delimited string from quickfix parser input
+/// (`qf_get_next_str_line`).
+///
+/// # Safety
+/// `state.p_str` must point into a live NUL-terminated byte buffer.
+#[allow(dead_code)]
+unsafe fn qf_get_next_str_line(state: &mut QfStateT) -> i32 {
+    if unsafe { *state.p_str } == crate::ascii_defs::NUL {
+        return qf_status::QF_END_OF_INPUT;
+    }
+    let remaining = unsafe {
+        std::ffi::CStr::from_ptr(state.p_str.cast::<std::ffi::c_char>())
+            .to_bytes()
+    };
+    let length = remaining
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(remaining.len(), |index| index + 1);
+
+    state.linebuf = if length > crate::globals::IOSIZE - 2 {
+        qf_grow_linebuf(state, length)
+    } else {
+        state.linelen = length;
+        unsafe { crate::globals::GLOBALS.get_mut() }.IObuff.as_mut_ptr()
+    };
+    let destination =
+        unsafe { std::slice::from_raw_parts_mut(state.linebuf, state.linelen + 1) };
+    destination[..state.linelen]
+        .copy_from_slice(&remaining[..state.linelen]);
+    destination[state.linelen] = crate::ascii_defs::NUL;
+    state.p_str = unsafe { state.p_str.add(length) };
+    qf_status::QF_OK
+}
+
 /// The fields parsed out of one error line, before they become a
 /// [`QflineT`] entry (`qffields_T`).
 ///
@@ -5768,6 +5802,7 @@ mod tests {
                 crate::vim_defs::OK
             );
         }
+
         let mut state = QfStateT {
             buf: std::ptr::addr_of_mut!(buffer),
             buflnum: 1,
@@ -5791,6 +5826,43 @@ mod tests {
 
         let memfile = unsafe { Box::from_raw(buffer.b_ml.ml_mfp) };
         unsafe { crate::memfile::mf_close(*memfile, false) };
+    }
+
+    #[test]
+    fn qf_get_next_str_line_splits_newlines_and_advances_the_source_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _io = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.IObuff,
+                [0; crate::globals::IOSIZE],
+            )
+        };
+        let source = b"first\nsecond\0".to_vec();
+        let mut state = QfStateT {
+            p_str: source.as_ptr(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_get_next_str_line(&mut state) }, qf_status::QF_OK);
+        assert_eq!(state.linelen, 6);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(state.linebuf, 7) },
+            b"first\n\0"
+        );
+        assert_eq!(unsafe { qf_get_next_str_line(&mut state) }, qf_status::QF_OK);
+        assert_eq!(state.linelen, 6);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(state.linebuf, 7) },
+            b"second\0"
+        );
+        assert_eq!(
+            unsafe { qf_get_next_str_line(&mut state) },
+            qf_status::QF_END_OF_INPUT
+        );
+        assert_eq!(
+            unsafe { state.p_str.offset_from(source.as_ptr()) },
+            12
+        );
     }
 
     #[test]

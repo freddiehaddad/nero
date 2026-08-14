@@ -142,7 +142,7 @@ unsafe fn syn_stack_free_entry(
 ///
 /// # Safety
 /// `wp` and `SYN_BLOCK`, when non-null, must point to live values; the
-/// block's saved-state chain must satisfy [`syn_stack_find_entry`].
+/// block's saved-state chain must satisfy `syn_stack_find_entry`.
 pub unsafe fn syntax_end_parsing(
     wp: *mut crate::buffer_defs::WinT,
     lnum: crate::pos_defs::LinenrT,
@@ -200,7 +200,7 @@ unsafe fn syn_stack_free_block(block: &mut crate::buffer_defs::SynblockT) {
 /// (`syn_stack_free_all`).
 ///
 /// # Safety
-/// Same as [`syn_stack_free_block`]; `GLOBALS.firstwin` must head the
+/// Same as `syn_stack_free_block`; `GLOBALS.firstwin` must head the
 /// live current-tab window list.
 pub unsafe fn syn_stack_free_all(block: &mut crate::buffer_defs::SynblockT) {
     // SAFETY: forwarded from this function's own safety doc.
