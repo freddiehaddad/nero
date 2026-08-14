@@ -456,6 +456,24 @@ unsafe fn read_redo(init: bool, old_redo: bool) -> i32 {
     c
 }
 
+/// Copy the unread redo-buffer characters into the redo stuff buffer
+/// (`copy_redo`).
+///
+/// # Safety
+/// `read_redo(true, old_redo)` must have succeeded first.
+#[allow(dead_code)]
+unsafe fn copy_redo(old_redo: bool) {
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let c = unsafe { read_redo(false, old_redo) };
+        if c == i32::from(crate::ascii_defs::NUL) {
+            break;
+        }
+        // SAFETY: momentary access to the redo stuff buffer.
+        add_char_buff(unsafe { READBUF2.get_mut() }, c);
+    }
+}
+
 /// Returns the redo buffer as one owned byte string (`get_inserted`).
 ///
 /// `None` preserves the original null `String.data` for an empty
@@ -1965,6 +1983,30 @@ mod tests {
         assert_eq!(unsafe { read_redo(false, true) }, i32::from(b'o'));
         assert_eq!(unsafe { read_redo(true, false) }, crate::vim_defs::OK);
         assert_eq!(unsafe { read_redo(false, false) }, i32::from(b'n'));
+    }
+
+    #[test]
+    fn copy_redo_transfers_the_remaining_decoded_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe {
+            append_char_to_redobuff(i32::from(b'a'));
+            append_char_to_redobuff(0x00e9);
+            append_char_to_redobuff(crate::keycodes_defs::K_UP);
+        }
+
+        assert_eq!(unsafe { read_redo(true, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { read_redo(false, false) }, i32::from(b'a'));
+        unsafe { copy_redo(false) };
+
+        let mut expected = "é".as_bytes().to_vec();
+        expected.extend_from_slice(&[
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::key2termcap0(crate::keycodes_defs::K_UP),
+            crate::keycodes_defs::key2termcap1(crate::keycodes_defs::K_UP),
+        ]);
+        assert_eq!(buff_bytes(unsafe { READBUF2.get_mut() }), expected);
     }
 
     #[test]
