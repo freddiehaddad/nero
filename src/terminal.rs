@@ -16,6 +16,8 @@
 //! [`terminal_suspended`] - whether the child process is suspended;
 //! `row_to_linenr`/`linenr_to_row` - terminal-row/buffer-line
 //! conversion; `is_focused` - current terminal focus detection.
+//! `convert_modifiers` translates Neovim's key modifier state and
+//! modifier-encoded key codes to libvterm's modifier mask.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -24,6 +26,7 @@
 
 use crate::option_vars::opt_tpf_flag;
 use crate::types_defs::{HandleT, TerminalT};
+use crate::vterm_defs::VTermModifier;
 
 /// Returns the handle of the buffer that owns `term` (`terminal_buf`).
 #[must_use]
@@ -79,6 +82,46 @@ unsafe fn is_focused(term: *const TerminalT) -> bool {
     g.State & crate::state_defs::mode::TERMINAL as i32 != 0
         // SAFETY: `curbuf` is live by the caller's contract.
         && unsafe { (*g.curbuf).terminal == term.cast_mut() }
+}
+
+/// Converts Neovim key modifiers to libvterm modifiers
+/// (`convert_modifiers`).
+///
+/// # Safety
+/// Reads `GLOBALS.mod_mask`; global editor state must not be mutated
+/// concurrently.
+#[allow(dead_code)]
+fn convert_modifiers(key: &mut i32, state: &mut VTermModifier) {
+    use crate::keycodes_defs::{
+        K_C_END, K_C_HOME, K_C_LEFT, K_C_RIGHT, K_S_DOWN, K_S_END, K_S_F1, K_S_F10, K_S_F11,
+        K_S_F12, K_S_F2, K_S_F3, K_S_F4, K_S_F5, K_S_F6, K_S_F7, K_S_F8, K_S_F9, K_S_HOME,
+        K_S_LEFT, K_S_RIGHT, K_S_TAB, K_S_UP, MOD_MASK_ALT, MOD_MASK_CTRL, MOD_MASK_SHIFT,
+    };
+    use crate::vterm_defs::{VTERM_MOD_ALT, VTERM_MOD_CTRL, VTERM_MOD_SHIFT};
+
+    // SAFETY: callers uphold this function's global-state contract.
+    let mod_mask = unsafe { (*crate::globals::GLOBALS.as_ptr()).mod_mask };
+    if mod_mask & i32::from(MOD_MASK_SHIFT) != 0 {
+        *state |= VTERM_MOD_SHIFT;
+    }
+    if mod_mask & i32::from(MOD_MASK_CTRL) != 0 {
+        *state |= VTERM_MOD_CTRL;
+        if mod_mask & i32::from(MOD_MASK_SHIFT) == 0 && (*key >= 'A' as i32 && *key <= 'Z' as i32)
+        {
+            *key += 'a' as i32 - 'A' as i32;
+        }
+    }
+    if mod_mask & i32::from(MOD_MASK_ALT) != 0 {
+        *state |= VTERM_MOD_ALT;
+    }
+
+    match *key {
+        K_S_TAB | K_S_UP | K_S_DOWN | K_S_LEFT | K_S_RIGHT | K_S_HOME | K_S_END | K_S_F1
+        | K_S_F2 | K_S_F3 | K_S_F4 | K_S_F5 | K_S_F6 | K_S_F7 | K_S_F8 | K_S_F9 | K_S_F10
+        | K_S_F11 | K_S_F12 => *state |= VTERM_MOD_SHIFT,
+        K_C_LEFT | K_C_RIGHT | K_C_HOME | K_C_END => *state |= VTERM_MOD_CTRL,
+        _ => {}
+    }
 }
 
 /// Whether character `c` should be filtered out of a terminal paste,
@@ -156,6 +199,93 @@ pub unsafe fn term_theme() -> (bool, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ModMaskGuard {
+        old: i32,
+    }
+
+    impl ModMaskGuard {
+        fn set(value: i32) -> Self {
+            // SAFETY: tests serialize all global-state access.
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let old = std::mem::replace(&mut g.mod_mask, value);
+            Self { old }
+        }
+    }
+
+    impl Drop for ModMaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: the test lock remains held while this guard drops.
+            unsafe { crate::globals::GLOBALS.get_mut() }.mod_mask = self.old;
+        }
+    }
+
+    #[test]
+    fn convert_modifiers_maps_global_modifier_bits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ModMaskGuard::set(i32::from(
+            crate::keycodes_defs::MOD_MASK_SHIFT
+                | crate::keycodes_defs::MOD_MASK_CTRL
+                | crate::keycodes_defs::MOD_MASK_ALT,
+        ));
+        let mut key = 'A' as i32;
+        let mut state = crate::vterm_defs::VTERM_MOD_NONE;
+        convert_modifiers(&mut key, &mut state);
+        assert_eq!(key, 'A' as i32);
+        assert_eq!(state, crate::vterm_defs::VTERM_ALL_MODS_MASK);
+    }
+
+    #[test]
+    fn convert_modifiers_lowercases_control_uppercase_without_shift() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            ModMaskGuard::set(i32::from(crate::keycodes_defs::MOD_MASK_CTRL));
+        let mut key = 'Z' as i32;
+        let mut state = crate::vterm_defs::VTERM_MOD_NONE;
+        convert_modifiers(&mut key, &mut state);
+        assert_eq!(key, 'z' as i32);
+        assert_eq!(state, crate::vterm_defs::VTERM_MOD_CTRL);
+    }
+
+    #[test]
+    fn convert_modifiers_infers_shift_from_shifted_key_codes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ModMaskGuard::set(0);
+        for mut key in [
+            crate::keycodes_defs::K_S_TAB,
+            crate::keycodes_defs::K_S_UP,
+            crate::keycodes_defs::K_S_DOWN,
+            crate::keycodes_defs::K_S_LEFT,
+            crate::keycodes_defs::K_S_RIGHT,
+            crate::keycodes_defs::K_S_HOME,
+            crate::keycodes_defs::K_S_END,
+            crate::keycodes_defs::K_S_F1,
+            crate::keycodes_defs::K_S_F12,
+        ] {
+            let mut state = crate::vterm_defs::VTERM_MOD_NONE;
+            convert_modifiers(&mut key, &mut state);
+            assert_eq!(state, crate::vterm_defs::VTERM_MOD_SHIFT);
+        }
+    }
+
+    #[test]
+    fn convert_modifiers_infers_control_from_control_key_codes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ModMaskGuard::set(0);
+        for mut key in [
+            crate::keycodes_defs::K_C_LEFT,
+            crate::keycodes_defs::K_C_RIGHT,
+            crate::keycodes_defs::K_C_HOME,
+            crate::keycodes_defs::K_C_END,
+        ] {
+            let mut state = crate::vterm_defs::VTERM_MOD_ALT;
+            convert_modifiers(&mut key, &mut state);
+            assert_eq!(
+                state,
+                crate::vterm_defs::VTERM_MOD_ALT | crate::vterm_defs::VTERM_MOD_CTRL
+            );
+        }
+    }
 
     #[test]
     fn terminal_buf_returns_the_owning_buffer_handle() {
