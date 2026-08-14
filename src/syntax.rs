@@ -51,6 +51,16 @@ fn syn_compare_syntime(first: &TimeEntryT, second: &TimeEntryT) -> i32 {
     crate::profile::profile_cmp(first.total, second.total)
 }
 
+/// Return one completion candidate for `:syntime`
+/// (`get_syntime_arg`).
+#[must_use]
+pub fn get_syntime_arg(index: i32) -> Option<&'static [u8]> {
+    const ARGUMENTS: [&[u8]; 4] = [b"on", b"off", b"clear", b"report"];
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| ARGUMENTS.get(index).copied())
+}
+
 /// Set or clear the syntax-recognition timeout (`syn_set_timeout`).
 ///
 /// # Safety
@@ -1394,6 +1404,16 @@ mod tests {
         assert!(syn_compare_syntime(&high, &low) < 0);
         assert!(syn_compare_syntime(&low, &high) > 0);
         assert_eq!(syn_compare_syntime(&high, &high), 0);
+    }
+
+    #[test]
+    fn get_syntime_arg_enumerates_all_supported_subcommands() {
+        assert_eq!(get_syntime_arg(0), Some(b"on".as_slice()));
+        assert_eq!(get_syntime_arg(1), Some(b"off".as_slice()));
+        assert_eq!(get_syntime_arg(2), Some(b"clear".as_slice()));
+        assert_eq!(get_syntime_arg(3), Some(b"report".as_slice()));
+        assert_eq!(get_syntime_arg(4), None);
+        assert_eq!(get_syntime_arg(-1), None);
     }
 
     #[test]
