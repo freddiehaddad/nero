@@ -175,6 +175,66 @@ unsafe fn map_to_exists_mode(rhs: &[u8], modes: i32, abbreviation: bool) -> bool
     false
 }
 
+/// Clear mappings for selected modes (`map_clear_mode`).
+///
+/// # Safety
+/// All selected mapping chains must contain uniquely-owned live nodes
+/// allocated by `Box::into_raw`.
+pub unsafe fn map_clear_mode(
+    buffer: &mut crate::buffer_defs::BufT,
+    modes: i32,
+    local: bool,
+    abbreviation: bool,
+) {
+    for hash in 0..crate::buffer_defs::MAX_MAPHASH as usize {
+        if abbreviation && hash > 0 {
+            break;
+        }
+        let mut link: *mut *mut crate::types_defs::MapblockT =
+            if abbreviation {
+                if local {
+                    std::ptr::addr_of_mut!(buffer.b_first_abbr)
+                } else {
+                    FIRST_ABBR.as_ptr()
+                }
+            } else if local {
+                std::ptr::addr_of_mut!(buffer.b_maphash[hash])
+            } else {
+                std::ptr::addr_of_mut!((unsafe { MAPHASH.get_mut() })[hash])
+            };
+
+        while !unsafe { *link }.is_null() {
+            let mapping = unsafe { *link };
+            if unsafe { (*mapping).m_mode } & modes != 0 {
+                unsafe { (*mapping).m_mode &= !modes };
+                if unsafe { (*mapping).m_mode } == 0 {
+                    unsafe { mapblock_free(&mut *link) };
+                    continue;
+                }
+                let first = unsafe { (&(*mapping).m_keys)[0] };
+                let new_hash = map_hash(unsafe { (*mapping).m_mode }, first);
+                if !abbreviation && new_hash != hash {
+                    unsafe { *link = (*mapping).m_next };
+                    let target: *mut *mut crate::types_defs::MapblockT =
+                        if local {
+                            std::ptr::addr_of_mut!(buffer.b_maphash[new_hash])
+                        } else {
+                            std::ptr::addr_of_mut!(
+                                (unsafe { MAPHASH.get_mut() })[new_hash]
+                            )
+                        };
+                    unsafe {
+                        (*mapping).m_next = *target;
+                        *target = mapping;
+                    }
+                    continue;
+                }
+            }
+            link = unsafe { std::ptr::addr_of_mut!((*mapping).m_next) };
+        }
+    }
+}
+
 /// Resets both language-map tables to the identity mapping
 /// (`langmap_init`).
 pub fn langmap_init() {
@@ -535,6 +595,40 @@ mod tests {
 
         *unsafe { MAPHASH.get_mut() } = saved_hash;
         *unsafe { FIRST_ABBR.get_mut() } = saved_abbr;
+    }
+
+    #[test]
+    fn map_clear_mode_removes_empty_nodes_and_rehashes_remaining_modes() {
+        let _lock = global_state_test_lock();
+        let mut buffer = crate::buffer_defs::BufT::default();
+        let key = b'a';
+        let old_hash = map_hash(mode::NORMAL as i32, key);
+        let new_hash = map_hash(mode::INSERT as i32, key);
+        let retained = Box::into_raw(Box::new(crate::types_defs::MapblockT {
+            m_keys: vec![key],
+            m_mode: mode::NORMAL as i32 | mode::INSERT as i32,
+            ..Default::default()
+        }));
+        let removed = Box::into_raw(Box::new(crate::types_defs::MapblockT {
+            m_next: retained,
+            m_keys: b"b".to_vec(),
+            m_mode: mode::NORMAL as i32,
+            ..Default::default()
+        }));
+        buffer.b_maphash[old_hash] = removed;
+
+        unsafe {
+            map_clear_mode(&mut buffer, mode::NORMAL as i32, true, false)
+        };
+
+        assert!(buffer.b_maphash[old_hash].is_null());
+        assert_eq!(buffer.b_maphash[new_hash], retained);
+        assert_eq!(unsafe { (*retained).m_mode }, mode::INSERT as i32);
+
+        unsafe {
+            map_clear_mode(&mut buffer, mode::INSERT as i32, true, false)
+        };
+        assert!(buffer.b_maphash[new_hash].is_null());
     }
 
     #[test]
