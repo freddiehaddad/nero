@@ -136,6 +136,53 @@ fn control_codepoint(c: u32) -> u32 {
     }
 }
 
+/// Encodes one Unicode key press (`vterm_keyboard_unichar`).
+///
+/// The C function pushes these bytes through `VTerm`'s output
+/// callback. Until the output-callback host is translated, this
+/// equivalent returns the exact byte sequence to its caller.
+#[must_use]
+pub fn vterm_keyboard_unichar(
+    mut c: u32,
+    mut modifiers: crate::vterm_defs::VTermModifier,
+    flags: crate::vterm_defs::VTermKeyEncodingFlags,
+    ctrl8bit: bool,
+) -> Vec<u8> {
+    if unicode_passthrough(c, modifiers) {
+        let mut bytes = [0; 6];
+        let len = crate::mbyte::utf_char2bytes(c as i32, &mut bytes) as usize;
+        return bytes[..len].to_vec();
+    }
+
+    if flags.disambiguate {
+        // CSI-u always reports the unshifted ASCII codepoint.
+        if (u32::from(b'A')..=u32::from(b'Z')).contains(&c) {
+            c += u32::from(b'a' - b'A');
+            modifiers |= crate::vterm_defs::VTERM_MOD_SHIFT;
+        }
+        let mut output = Vec::new();
+        if ctrl8bit {
+            output.push(crate::vterm_defs::C1_CSI);
+        } else {
+            output.extend_from_slice(b"\x1b[");
+        }
+        output.extend_from_slice(format!("{c};{}u", modifiers + 1).as_bytes());
+        return output;
+    }
+
+    if modifiers & crate::vterm_defs::VTERM_MOD_CTRL != 0 {
+        c = control_codepoint(c);
+    }
+
+    let mut output = Vec::with_capacity(2);
+    if modifiers & crate::vterm_defs::VTERM_MOD_ALT != 0 {
+        output.push(0x1B);
+    }
+    // `%c` in the original writes the low unsigned-char byte.
+    output.push(c as u8);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +384,118 @@ mod tests {
         for codepoint in [0x1F, b'1' as u32, b'9' as u32, 0x80, 0x20AC] {
             assert_eq!(control_codepoint(codepoint), codepoint);
         }
+    }
+
+    #[test]
+    fn keyboard_unichar_passes_plain_and_shifted_nonspace_as_utf8() {
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    0x20AC,
+                    crate::vterm_defs::VTERM_MOD_NONE,
+                    Default::default(),
+                    false,
+                ),
+                "€".as_bytes()
+            );
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b'A' as u32,
+                    crate::vterm_defs::VTERM_MOD_SHIFT,
+                    Default::default(),
+                    false,
+                ),
+                b"A"
+            );
+        }
+
+    #[test]
+    fn keyboard_unichar_encodes_csiu_and_unshifts_ascii_uppercase() {
+            let flags = crate::vterm_defs::VTermKeyEncodingFlags {
+                disambiguate: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b'A' as u32,
+                    crate::vterm_defs::VTERM_MOD_CTRL,
+                    flags,
+                    false,
+                ),
+                b"\x1b[97;6u"
+            );
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b'A' as u32,
+                    crate::vterm_defs::VTERM_MOD_CTRL,
+                    flags,
+                    true,
+                ),
+                [vec![crate::vterm_defs::C1_CSI], b"97;6u".to_vec()].concat()
+            );
+        }
+
+    #[test]
+    fn keyboard_unichar_applies_legacy_control_and_alt_encoding() {
+            for (key, expected) in [
+                (b'2', 0x00),
+                (b'3', 0x1B),
+                (b'6', 0x1E),
+                (b'8', 0x7F),
+                (b'/', 0x1F),
+                (b'A', 0x01),
+            ] {
+                assert_eq!(
+                    vterm_keyboard_unichar(
+                        u32::from(key),
+                        crate::vterm_defs::VTERM_MOD_CTRL,
+                        Default::default(),
+                        false,
+                    ),
+                    [expected]
+                );
+            }
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b'x' as u32,
+                    crate::vterm_defs::VTERM_MOD_ALT,
+                    Default::default(),
+                    false,
+                ),
+                b"\x1bx"
+            );
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b'A' as u32,
+                    crate::vterm_defs::VTERM_MOD_CTRL | crate::vterm_defs::VTERM_MOD_ALT,
+                    Default::default(),
+                    false,
+                ),
+                b"\x1b\x01"
+            );
+        }
+
+    #[test]
+    fn keyboard_unichar_treats_shifted_space_as_encoded_input() {
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b' ' as u32,
+                    crate::vterm_defs::VTERM_MOD_SHIFT,
+                    Default::default(),
+                    false,
+                ),
+                b" "
+            );
+            assert_eq!(
+                vterm_keyboard_unichar(
+                    b' ' as u32,
+                    crate::vterm_defs::VTERM_MOD_SHIFT,
+                    crate::vterm_defs::VTermKeyEncodingFlags {
+                        disambiguate: true,
+                        ..Default::default()
+                    },
+                    false,
+                ),
+                b"\x1b[32;2u"
+            );
     }
 }
