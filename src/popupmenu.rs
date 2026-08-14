@@ -165,6 +165,28 @@ unsafe fn pum_compute_size() {
     *unsafe { PUM_EXTRA_WIDTH.get_mut() } = extra_width;
 }
 
+/// Set popup width while aligned with the cursor
+/// (`set_pum_width_aligned_with_cursor`).
+#[allow(dead_code)]
+fn set_pum_width_aligned_with_cursor(
+    mut width: i32,
+    available_width: i32,
+) -> bool {
+    let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let mut end_padding = true;
+    if i64::from(width) < options.p_pw {
+        width = options.p_pw as i32;
+        end_padding = false;
+    }
+    if options.p_pmw > 0 && i64::from(width) > options.p_pmw {
+        width = options.p_pmw as i32;
+        end_padding = false;
+    }
+    let padding = i32::from(end_padding && i64::from(width) >= options.p_pw);
+    *unsafe { PUM_WIDTH.get_mut() } = width.wrapping_add(padding);
+    available_width >= unsafe { *PUM_WIDTH.get_mut() }
+}
+
 /// State for `pum_ext_select_item` (`pum_want`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PumWant {
@@ -478,6 +500,30 @@ pub(crate) mod tests {
         assert_eq!(unsafe { *PUM_BASE_WIDTH.get_mut() }, 3);
         assert_eq!(unsafe { *PUM_KIND_WIDTH.get_mut() }, 5);
         assert_eq!(unsafe { *PUM_EXTRA_WIDTH.get_mut() }, 5);
+    }
+
+    #[test]
+    fn set_pum_width_aligned_clamps_to_options_and_adds_optional_padding() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _sizing = PumSizingGuard::install(Vec::new());
+        let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let saved = (options.p_pw, options.p_pmw);
+        options.p_pw = 5;
+        options.p_pmw = 0;
+
+        assert!(set_pum_width_aligned_with_cursor(8, 9));
+        assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 9);
+        assert!(!set_pum_width_aligned_with_cursor(8, 8));
+
+        assert!(set_pum_width_aligned_with_cursor(3, 5));
+        assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 5);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_pmw = 6;
+        assert!(set_pum_width_aligned_with_cursor(8, 6));
+        assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 6);
+
+        let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        (options.p_pw, options.p_pmw) = saved;
     }
 
     #[test]
