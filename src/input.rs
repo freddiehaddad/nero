@@ -421,6 +421,51 @@ impl Default for GotcharsStateT {
     }
 }
 
+/// Add one byte to a recording/show-command key assembler
+/// (`gotchars_add_byte`).
+#[allow(dead_code)]
+fn gotchars_add_byte(state: &mut GotcharsStateT, byte: u8) -> bool {
+    state.buf[state.buflen] = byte;
+    state.buflen += 1;
+    let mut c = i32::from(byte);
+    let in_special = state.pending_special > 0;
+    let in_mbyte = state.pending_mbyte > 0;
+
+    if in_special {
+        state.pending_special -= 1;
+    } else if byte == crate::keycodes_defs::K_SPECIAL {
+        state.pending_special = 2;
+    }
+    if state.pending_special > 0 {
+        state.prev_c = c;
+        return false;
+    }
+
+    if in_mbyte {
+        state.pending_mbyte -= 1;
+    } else {
+        if in_special {
+            if state.prev_c == i32::from(crate::keycodes_defs::KS_MODIFIER) {
+                state.prev_c = c;
+                return false;
+            }
+            c = crate::keycodes_defs::termcap2key(state.prev_c as u8, byte);
+            if c == crate::keycodes_defs::K_COMPLETE_DELAY {
+                state.buflen = 0;
+            }
+        }
+        let byte_len = if (0..=255).contains(&c) {
+            crate::mbyte::utf_byte2len(c as u8)
+        } else {
+            1
+        };
+        state.pending_mbyte = u32::from(byte_len.saturating_sub(1));
+    }
+
+    state.prev_c = c;
+    state.pending_mbyte == 0
+}
+
 /// Remapping flags for the next `vgetc()`-obtained character
 /// (`KeyNoremap`). File-static in the original.
 static KEY_NOREMAP: GlobalCell<i32> = GlobalCell::new(0);
@@ -1242,6 +1287,60 @@ mod tests {
         assert_eq!(state.buflen, 0);
         assert_eq!(state.pending_special, 0);
         assert_eq!(state.pending_mbyte, 0);
+    }
+
+    #[test]
+    fn gotchars_add_byte_waits_for_complete_multibyte_and_special_keys() {
+        let mut state = GotcharsStateT::default();
+        assert!(gotchars_add_byte(&mut state, b'A'));
+        assert_eq!(&state.buf[..state.buflen], b"A");
+
+        state = GotcharsStateT::default();
+        assert!(!gotchars_add_byte(&mut state, 0xc3));
+        assert!(gotchars_add_byte(&mut state, 0xa9));
+        assert_eq!(&state.buf[..state.buflen], "é".as_bytes());
+
+        state = GotcharsStateT::default();
+        assert!(!gotchars_add_byte(
+            &mut state,
+            crate::keycodes_defs::K_SPECIAL,
+        ));
+        assert!(!gotchars_add_byte(&mut state, b'k'));
+        assert!(gotchars_add_byte(&mut state, b'u'));
+        assert_eq!(state.prev_c, crate::keycodes_defs::K_UP);
+    }
+
+    #[test]
+    fn gotchars_add_byte_waits_past_a_modifier_and_drops_completion_delay() {
+        let mut state = GotcharsStateT::default();
+        for byte in [
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_MODIFIER,
+            crate::keycodes_defs::MOD_MASK_SHIFT as u8,
+        ] {
+            assert!(!gotchars_add_byte(&mut state, byte));
+        }
+        assert!(gotchars_add_byte(&mut state, b'A'));
+        assert_eq!(state.buflen, 4);
+
+        state = GotcharsStateT::default();
+        assert!(!gotchars_add_byte(
+            &mut state,
+            crate::keycodes_defs::K_SPECIAL,
+        ));
+        assert!(!gotchars_add_byte(
+            &mut state,
+            crate::keycodes_defs::key2termcap0(
+                crate::keycodes_defs::K_COMPLETE_DELAY,
+            ),
+        ));
+        assert!(gotchars_add_byte(
+            &mut state,
+            crate::keycodes_defs::key2termcap1(
+                crate::keycodes_defs::K_COMPLETE_DELAY,
+            ),
+        ));
+        assert_eq!(state.buflen, 0);
     }
 
     #[test]
