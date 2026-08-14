@@ -394,6 +394,24 @@ pub struct QfStateT {
     pub vc: crate::types_defs::VimconvT,
 }
 
+/// Maximum bytes retained from one error-file line (`LINE_MAXLEN`).
+const LINE_MAXLEN: usize = 4096;
+
+/// Grow the quickfix parser's line buffer (`qf_grow_linebuf`).
+#[allow(dead_code)]
+fn qf_grow_linebuf(state: &mut QfStateT, new_size: usize) -> *mut u8 {
+    state.linelen = if new_size > LINE_MAXLEN {
+        LINE_MAXLEN - 1
+    } else {
+        new_size
+    };
+    if state.growbuf.is_empty() || state.linelen > state.growbufsiz {
+        state.growbuf.resize(state.linelen + 1, 0);
+        state.growbufsiz = state.linelen;
+    }
+    state.growbuf.as_mut_ptr()
+}
+
 /// The fields parsed out of one error line, before they become a
 /// [`QflineT`] entry (`qffields_T`).
 ///
@@ -5657,6 +5675,32 @@ mod tests {
         assert_eq!(state.buflnum, 0);
         assert_eq!(state.lnumlast, 0);
         assert_eq!(state.vc.vc_type, crate::types_defs::ConvFlags::None);
+    }
+
+    #[test]
+    fn qf_grow_linebuf_allocates_grows_reuses_and_caps_lines() {
+        let mut state = QfStateT::default();
+        let first = qf_grow_linebuf(&mut state, 10);
+        assert!(!first.is_null());
+        assert_eq!(state.linelen, 10);
+        assert_eq!(state.growbufsiz, 10);
+        assert_eq!(state.growbuf.len(), 11);
+
+        let reused = qf_grow_linebuf(&mut state, 5);
+        assert_eq!(reused, first);
+        assert_eq!(state.linelen, 5);
+        assert_eq!(state.growbufsiz, 10);
+        assert_eq!(state.growbuf.len(), 11);
+
+        qf_grow_linebuf(&mut state, 20);
+        assert_eq!(state.linelen, 20);
+        assert_eq!(state.growbufsiz, 20);
+        assert_eq!(state.growbuf.len(), 21);
+
+        qf_grow_linebuf(&mut state, LINE_MAXLEN + 100);
+        assert_eq!(state.linelen, LINE_MAXLEN - 1);
+        assert_eq!(state.growbufsiz, LINE_MAXLEN - 1);
+        assert_eq!(state.growbuf.len(), LINE_MAXLEN);
     }
 
     #[test]
