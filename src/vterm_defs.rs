@@ -15,6 +15,12 @@ pub const KEY_ENCODING_REPORT_ALTERNATE: u8 = 0x04;
 pub const KEY_ENCODING_REPORT_ALL_KEYS: u8 = 0x08;
 pub const KEY_ENCODING_REPORT_ASSOCIATED: u8 = 0x10;
 
+pub const C1_SS3: u8 = 0x8F;
+pub const C1_DCS: u8 = 0x90;
+pub const C1_CSI: u8 = 0x9B;
+pub const C1_ST: u8 = 0x9C;
+pub const C1_OSC: u8 = 0x9D;
+
 /// Kitty keyboard-protocol enhancement flags
 /// (`VTermKeyEncodingFlags`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,6 +221,13 @@ mod tests {
             ],
             [1, 2, 4, 8, 16]
         );
+    }
+
+    #[test]
+    fn c1_control_bytes_match_internal_defs() {
+        assert_eq!([C1_SS3, C1_DCS, C1_CSI, C1_ST, C1_OSC], [
+            0x8F, 0x90, 0x9B, 0x9C, 0x9D,
+        ]);
     }
 
     #[test]
