@@ -23,6 +23,40 @@ pub enum VTermEncoding {
     UsAscii,
 }
 
+/// One selected encoding and its persistent decoder state
+/// (`VTermEncodingInstance`).
+#[derive(Debug, Clone)]
+pub struct VTermEncodingInstance {
+    encoding: VTermEncoding,
+    utf8_data: Utf8DecoderData,
+}
+
+impl VTermEncodingInstance {
+    /// Selects and initializes `encoding`.
+    #[must_use]
+    pub fn new(encoding: VTermEncoding) -> Self {
+        let mut instance = Self {
+            encoding,
+            utf8_data: Utf8DecoderData::default(),
+        };
+        instance.reset();
+        instance
+    }
+
+    /// Returns the selected static encoding.
+    #[must_use]
+    pub fn encoding(&self) -> VTermEncoding {
+        self.encoding
+    }
+
+    /// Invokes the encoding's optional initialization callback.
+    pub fn reset(&mut self) {
+        if self.encoding == VTermEncoding::Utf8 {
+            init_utf8(&mut self.utf8_data);
+        }
+    }
+}
+
 /// Stateful UTF-8 decoder storage (`struct UTF8DecoderData`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Utf8DecoderData {
@@ -469,5 +503,38 @@ mod tests {
             vterm_lookup_encoding(VTermEncodingType::Single94, b'A'),
             None
         );
+    }
+
+    #[test]
+    fn encoding_instance_selects_and_initializes_utf8() {
+        let mut instance = VTermEncodingInstance::new(VTermEncoding::Utf8);
+        assert_eq!(instance.encoding(), VTermEncoding::Utf8);
+        instance.utf8_data.bytes_remaining = 3;
+        instance.utf8_data.bytes_total = 4;
+        instance.utf8_data.this_cp = 0x1234;
+        instance.reset();
+        assert_eq!(instance.utf8_data.bytes_remaining, 0);
+        assert_eq!(instance.utf8_data.bytes_total, 0);
+        assert_eq!(instance.utf8_data.this_cp, 0x1234);
+    }
+
+    #[test]
+    fn encoding_instance_reset_is_a_noop_for_stateless_encodings() {
+        for encoding in [
+            VTermEncoding::UsAscii,
+            VTermEncoding::DecSpecialGraphics,
+        ] {
+            let mut instance = VTermEncodingInstance::new(encoding);
+            instance.utf8_data = Utf8DecoderData {
+                bytes_remaining: 1,
+                bytes_total: 2,
+                this_cp: 3,
+            };
+            instance.reset();
+            assert_eq!(instance.encoding(), encoding);
+            assert_eq!(instance.utf8_data.bytes_remaining, 1);
+            assert_eq!(instance.utf8_data.bytes_total, 2);
+            assert_eq!(instance.utf8_data.this_cp, 3);
+        }
     }
 }
