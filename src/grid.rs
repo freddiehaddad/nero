@@ -716,6 +716,37 @@ pub fn schar_get(sc: ScharT) -> Vec<u8> {
     }
 }
 
+/// Release a grid's four owned parallel arrays (`grid_free`).
+///
+/// # Safety
+/// Each non-null pointer must come from a boxed slice with exactly
+/// `rows * cols` elements (`chars`/`attrs`/`vcols`) or `rows` elements
+/// (`line_offset`), and no aliases may be used afterward.
+pub unsafe fn grid_free(grid: &mut crate::grid_defs::ScreenGrid) {
+    let cells = grid.rows.max(0) as usize * grid.cols.max(0) as usize;
+    let rows = grid.rows.max(0) as usize;
+    if !grid.chars.is_null() {
+        let slice = std::ptr::slice_from_raw_parts_mut(grid.chars, cells);
+        drop(unsafe { Box::from_raw(slice) });
+        grid.chars = std::ptr::null_mut();
+    }
+    if !grid.attrs.is_null() {
+        let slice = std::ptr::slice_from_raw_parts_mut(grid.attrs, cells);
+        drop(unsafe { Box::from_raw(slice) });
+        grid.attrs = std::ptr::null_mut();
+    }
+    if !grid.vcols.is_null() {
+        let slice = std::ptr::slice_from_raw_parts_mut(grid.vcols, cells);
+        drop(unsafe { Box::from_raw(slice) });
+        grid.vcols = std::ptr::null_mut();
+    }
+    if !grid.line_offset.is_null() {
+        let slice = std::ptr::slice_from_raw_parts_mut(grid.line_offset, rows);
+        drop(unsafe { Box::from_raw(slice) });
+        grid.line_offset = std::ptr::null_mut();
+    }
+}
+
 /// The first raw UTF-8 byte of `sc` (`schar_get_first_byte`).
 fn schar_get_first_byte(sc: ScharT) -> u8 {
     if schar_high(sc) {
@@ -1643,6 +1674,41 @@ mod tests {
         assert_eq!(found_first, w1_ptr);
         assert_eq!(found_second, w2_ptr, "the walk continues past the first window");
         assert!(missing.is_null(), "an unknown handle finds nothing");
+    }
+
+    #[test]
+    fn grid_free_releases_parallel_arrays_and_leaves_dirty_columns_alone() {
+        let mut chars = vec![1_u32; 6].into_boxed_slice();
+        let mut attrs = vec![2_i32; 6].into_boxed_slice();
+        let mut vcols = vec![3_i32; 6].into_boxed_slice();
+        let mut offsets = vec![0_usize, 3].into_boxed_slice();
+        let mut dirty = vec![4_i32; 2].into_boxed_slice();
+        let dirty_ptr = dirty.as_mut_ptr();
+        let mut grid = crate::grid_defs::ScreenGrid {
+            chars: chars.as_mut_ptr(),
+            attrs: attrs.as_mut_ptr(),
+            vcols: vcols.as_mut_ptr(),
+            line_offset: offsets.as_mut_ptr(),
+            dirty_col: dirty_ptr,
+            rows: 2,
+            cols: 3,
+            ..Default::default()
+        };
+        std::mem::forget(chars);
+        std::mem::forget(attrs);
+        std::mem::forget(vcols);
+        std::mem::forget(offsets);
+
+        unsafe { grid_free(&mut grid) };
+
+        assert!(grid.chars.is_null());
+        assert!(grid.attrs.is_null());
+        assert!(grid.vcols.is_null());
+        assert!(grid.line_offset.is_null());
+        assert_eq!(grid.dirty_col, dirty_ptr);
+        assert_eq!(dirty[0], 4);
+
+        unsafe { grid_free(&mut grid) };
     }
 
     #[test]
