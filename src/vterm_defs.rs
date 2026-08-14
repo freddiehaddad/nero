@@ -1,4 +1,13 @@
-//! Translated from `src/nvim/vterm/vterm_defs.h` (initial core).
+//! Translated from `src/nvim/vterm/vterm_defs.h` and
+//! `vterm_keycodes_defs.h` (initial core).
+
+/// Terminal key modifier mask (`VTermModifier`).
+pub type VTermModifier = u8;
+pub const VTERM_MOD_NONE: VTermModifier = 0x00;
+pub const VTERM_MOD_SHIFT: VTermModifier = 0x01;
+pub const VTERM_MOD_ALT: VTermModifier = 0x02;
+pub const VTERM_MOD_CTRL: VTermModifier = 0x04;
+pub const VTERM_ALL_MODS_MASK: VTermModifier = 0x07;
 
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
@@ -59,6 +68,18 @@ mod tests {
                 VTERM_UNDERLINE_CURLY,
             ],
             [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn vterm_modifier_bits_match_keycodes_header() {
+        assert_eq!(VTERM_MOD_NONE, 0);
+        assert_eq!(VTERM_MOD_SHIFT, 1);
+        assert_eq!(VTERM_MOD_ALT, 2);
+        assert_eq!(VTERM_MOD_CTRL, 4);
+        assert_eq!(
+            VTERM_MOD_SHIFT | VTERM_MOD_ALT | VTERM_MOD_CTRL,
+            VTERM_ALL_MODS_MASK
         );
     }
 }
