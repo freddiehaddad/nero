@@ -65,6 +65,29 @@ const KEYCODES_FN: [Keycode; 13] = [
     Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 24 },
 ];
 
+/// Legacy keypad key descriptions (`keycodes_kp`).
+#[allow(dead_code)]
+const KEYCODES_KP: [Keycode; 18] = [
+    Keycode { key_type: KeycodeType::Keypad, literal: b'0' as i32, csi_num: b'p' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'1' as i32, csi_num: b'q' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'2' as i32, csi_num: b'r' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'3' as i32, csi_num: b's' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'4' as i32, csi_num: b't' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'5' as i32, csi_num: b'u' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'6' as i32, csi_num: b'v' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'7' as i32, csi_num: b'w' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'8' as i32, csi_num: b'x' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'9' as i32, csi_num: b'y' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'*' as i32, csi_num: b'j' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'+' as i32, csi_num: b'k' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b',' as i32, csi_num: b'l' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'-' as i32, csi_num: b'm' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'.' as i32, csi_num: b'n' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'/' as i32, csi_num: b'o' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'\n' as i32, csi_num: b'M' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: b'=' as i32, csi_num: b'X' as i32 },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +157,42 @@ mod tests {
             KEYCODES_FN[5..=12]
                 .iter()
                 .all(|key| key.key_type == KeycodeType::CsiNum && key.literal == b'~' as i32)
+        );
+    }
+
+    #[test]
+    fn legacy_keypad_table_matches_keyboard_c() {
+        assert_eq!(KEYCODES_KP.len(), 18);
+        assert!(KEYCODES_KP.iter().all(|key| key.key_type == KeycodeType::Keypad));
+        assert_eq!(
+            KEYCODES_KP.iter().map(|key| key.literal).collect::<Vec<_>>(),
+            [
+                b'0' as i32,
+                b'1' as i32,
+                b'2' as i32,
+                b'3' as i32,
+                b'4' as i32,
+                b'5' as i32,
+                b'6' as i32,
+                b'7' as i32,
+                b'8' as i32,
+                b'9' as i32,
+                b'*' as i32,
+                b'+' as i32,
+                b',' as i32,
+                b'-' as i32,
+                b'.' as i32,
+                b'/' as i32,
+                b'\n' as i32,
+                b'=' as i32,
+            ]
+        );
+        assert_eq!(
+            KEYCODES_KP.iter().map(|key| key.csi_num).collect::<Vec<_>>(),
+            b"pqrstuvwxyjklmnoMX"
+                .iter()
+                .map(|&byte| i32::from(byte))
+                .collect::<Vec<_>>()
         );
     }
 }
