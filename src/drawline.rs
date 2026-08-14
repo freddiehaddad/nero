@@ -49,6 +49,113 @@ use crate::pos_defs::LinenrT;
 static EXTRA_BUF: crate::globals::GlobalCell<Vec<u8>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+/// Variables shared by `win_line()` and its helpers (`winlinevars_T`).
+#[allow(dead_code)]
+#[derive(Debug)]
+struct WinlinevarsT {
+    lnum: crate::pos_defs::LinenrT,
+    foldinfo: crate::fold_defs::FoldinfoT,
+    startrow: i32,
+    row: i32,
+    vcol: crate::pos_defs::ColnrT,
+    col: i32,
+    boguscols: i32,
+    old_boguscols: i32,
+    vcol_off_co: i32,
+    off: i32,
+    cul_attr: i32,
+    line_attr: i32,
+    line_attr_lowprio: i32,
+    sign_num_attr: i32,
+    prev_num_attr: i32,
+    sign_cul_attr: i32,
+    fromcol: i32,
+    tocol: i32,
+    vcol_sbr: crate::pos_defs::ColnrT,
+    need_showbreak: bool,
+    char_attr: i32,
+    n_extra: i32,
+    n_attr: i32,
+    p_extra: *mut u8,
+    extra_attr: i32,
+    sc_extra: crate::types_defs::ScharT,
+    sc_final: crate::types_defs::ScharT,
+    extra_for_extmark: bool,
+    extra: [u8; 11],
+    diff_hlf: crate::highlight_defs::HlfT,
+    n_virt_lines: i32,
+    n_virt_below: i32,
+    filler_lines: i32,
+    filler_todo: i32,
+    virt_below_skip: i32,
+    filler_lines_skip: i32,
+    sattrs: [crate::sign_defs::SignTextAttrs;
+        crate::sign_defs::SIGN_SHOW_MAX as usize],
+    need_lbr: bool,
+    virt_inline: crate::decoration_defs::VirtText,
+    virt_inline_i: usize,
+    virt_inline_hl_mode: crate::decoration_defs::HlMode,
+    reset_extra_attr: bool,
+    skip_cells: i32,
+    skipped_cells: i32,
+    color_cols: *const i32,
+}
+
+impl Default for WinlinevarsT {
+    fn default() -> Self {
+        Self {
+            lnum: 0,
+            foldinfo: crate::fold_defs::FoldinfoT::default(),
+            startrow: 0,
+            row: 0,
+            vcol: 0,
+            col: 0,
+            boguscols: 0,
+            old_boguscols: 0,
+            vcol_off_co: 0,
+            off: 0,
+            cul_attr: 0,
+            line_attr: 0,
+            line_attr_lowprio: 0,
+            sign_num_attr: 0,
+            prev_num_attr: 0,
+            sign_cul_attr: 0,
+            fromcol: 0,
+            tocol: 0,
+            vcol_sbr: 0,
+            need_showbreak: false,
+            char_attr: 0,
+            n_extra: 0,
+            n_attr: 0,
+            p_extra: std::ptr::null_mut(),
+            extra_attr: 0,
+            sc_extra: 0,
+            sc_final: 0,
+            extra_for_extmark: false,
+            extra: [0; 11],
+            diff_hlf: crate::highlight_defs::HlfT::default(),
+            n_virt_lines: 0,
+            n_virt_below: 0,
+            filler_lines: 0,
+            filler_todo: 0,
+            virt_below_skip: 0,
+            filler_lines_skip: 0,
+            sattrs: [crate::sign_defs::SignTextAttrs {
+                text: [0; crate::types_defs::SIGN_WIDTH as usize],
+                hl_id: 0,
+            }; crate::sign_defs::SIGN_SHOW_MAX as usize],
+            need_lbr: false,
+            virt_inline: Vec::new(),
+            virt_inline_i: 0,
+            virt_inline_hl_mode: crate::decoration_defs::HlMode::Unknown,
+            reset_extra_attr: false,
+            skip_cells: 0,
+            skipped_cells: 0,
+            color_cols: std::ptr::null(),
+        }
+    }
+}
+
 /// Ensure the reusable scratch buffer has at least `size` bytes and
 /// return its data pointer (`get_extra_buf`).
 ///
@@ -216,6 +323,26 @@ mod tests {
         assert_eq!(unsafe { EXTRA_BUF.get_mut() }.len(), 128);
         unsafe { drawline_free_all_mem() };
         assert!(unsafe { EXTRA_BUF.get_mut() }.is_empty());
+    }
+
+    #[test]
+    fn winlinevars_default_matches_zero_initialized_draw_state() {
+        let state = WinlinevarsT::default();
+        assert_eq!(state.lnum, 0);
+        assert_eq!(state.foldinfo, crate::fold_defs::FoldinfoT::default());
+        assert_eq!(state.off, 0);
+        assert_eq!(state.extra.len(), 11);
+        assert_eq!(
+            state.sattrs.len(),
+            crate::sign_defs::SIGN_SHOW_MAX as usize
+        );
+        assert!(state.p_extra.is_null());
+        assert!(state.color_cols.is_null());
+        assert!(state.virt_inline.is_empty());
+        assert_eq!(
+            state.virt_inline_hl_mode,
+            crate::decoration_defs::HlMode::Unknown
+        );
     }
 
     // ---- get_lcs_ext ----
