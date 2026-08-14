@@ -213,6 +213,19 @@ unsafe fn do_lower(dst: &mut i32, c: i32) {
     *dst = unsafe { crate::mbyte::mb_tolower(c) };
 }
 
+/// Translate a regexp backslash abbreviation (`backslash_trans`).
+#[allow(dead_code)]
+#[must_use]
+fn backslash_trans(c: i32) -> i32 {
+    match c {
+        value if value == i32::from(b'r') => i32::from(crate::ascii_defs::CAR),
+        value if value == i32::from(b't') => i32::from(crate::ascii_defs::TAB),
+        value if value == i32::from(b'e') => i32::from(crate::ascii_defs::ESC),
+        value if value == i32::from(b'b') => i32::from(crate::ascii_defs::BS),
+        _ => c,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +245,27 @@ mod tests {
     }
 
     struct EvalResultGuard([Option<Vec<u8>>; MAX_REGSUB_NESTING]);
+
+    #[test]
+    fn backslash_trans_maps_control_abbreviations_and_preserves_others() {
+        assert_eq!(
+            backslash_trans(i32::from(b'r')),
+            i32::from(crate::ascii_defs::CAR)
+        );
+        assert_eq!(
+            backslash_trans(i32::from(b't')),
+            i32::from(crate::ascii_defs::TAB)
+        );
+        assert_eq!(
+            backslash_trans(i32::from(b'e')),
+            i32::from(crate::ascii_defs::ESC)
+        );
+        assert_eq!(
+            backslash_trans(i32::from(b'b')),
+            i32::from(crate::ascii_defs::BS)
+        );
+        assert_eq!(backslash_trans(i32::from(b'n')), i32::from(b'n'));
+    }
 
     impl EvalResultGuard {
         fn install(values: [Option<Vec<u8>>; MAX_REGSUB_NESTING]) -> Self {
