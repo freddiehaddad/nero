@@ -257,9 +257,48 @@ pub struct QfInfoT {
     /// Quickfix window buffer number (`qf_bufnr`).
     pub qf_bufnr: i32,
 }
-/// Placeholder for `mapblock_T` (`struct mapblock`) - see `src/nvim/mapping_defs.h` (phase 7).
+/// One mapping or abbreviation (`mapblock_T`).
+#[derive(Debug)]
 pub struct MapblockT {
-    _private: (),
+    pub m_next: *mut MapblockT,
+    pub m_alt: *mut MapblockT,
+    pub m_keys: Vec<u8>,
+    pub m_str: Option<Vec<u8>>,
+    pub m_orig_str: Option<Vec<u8>>,
+    pub m_luaref: LuaRef,
+    pub m_keylen: i32,
+    pub m_mode: i32,
+    pub m_simplified: i32,
+    pub m_noremap: i32,
+    pub m_silent: u8,
+    pub m_nowait: u8,
+    pub m_expr: u8,
+    pub m_script_ctx: crate::eval::typval_defs::SctxT,
+    pub m_desc: Option<Vec<u8>>,
+    pub m_replace_keycodes: bool,
+}
+
+impl Default for MapblockT {
+    fn default() -> Self {
+        Self {
+            m_next: std::ptr::null_mut(),
+            m_alt: std::ptr::null_mut(),
+            m_keys: Vec::new(),
+            m_str: None,
+            m_orig_str: None,
+            m_luaref: -1,
+            m_keylen: 0,
+            m_mode: 0,
+            m_simplified: 0,
+            m_noremap: 0,
+            m_silent: 0,
+            m_nowait: 0,
+            m_expr: 0,
+            m_script_ctx: crate::eval::typval_defs::SctxT::default(),
+            m_desc: None,
+            m_replace_keycodes: false,
+        }
+    }
 }
 /// Placeholder for `AutoPatCmd` (`struct AutoPatCmd_S`) - see
 /// `src/nvim/autocmd_defs.h` (phase 6).
@@ -350,6 +389,20 @@ mod tests {
         };
         assert_eq!(stack.len(), SST_FIX_STATES);
         assert!(stack.iter().all(|item| item.bs_extmatch.is_null()));
+    }
+
+    #[test]
+    fn mapblock_default_has_no_links_or_owned_mapping_text() {
+        let mapping = MapblockT::default();
+        assert!(mapping.m_next.is_null());
+        assert!(mapping.m_alt.is_null());
+        assert!(mapping.m_keys.is_empty());
+        assert!(mapping.m_str.is_none());
+        assert!(mapping.m_orig_str.is_none());
+        assert!(mapping.m_desc.is_none());
+        assert_eq!(mapping.m_luaref, -1);
+        assert_eq!(mapping.m_mode, 0);
+        assert!(!mapping.m_replace_keycodes);
     }
 
     #[test]
