@@ -9,6 +9,13 @@ pub const VTERM_MOD_ALT: VTermModifier = 0x02;
 pub const VTERM_MOD_CTRL: VTermModifier = 0x04;
 pub const VTERM_ALL_MODS_MASK: VTermModifier = 0x07;
 
+/// Zero-based terminal screen position (`VTermPos`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermPos {
+    pub row: i32,
+    pub col: i32,
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -81,5 +88,12 @@ mod tests {
             VTERM_MOD_SHIFT | VTERM_MOD_ALT | VTERM_MOD_CTRL,
             VTERM_ALL_MODS_MASK
         );
+    }
+
+    #[test]
+    fn vterm_position_preserves_row_and_column() {
+        assert_eq!(VTermPos::default(), VTermPos { row: 0, col: 0 });
+        assert_eq!(VTermPos { row: 12, col: 34 }.row, 12);
+        assert_eq!(VTermPos { row: 12, col: 34 }.col, 34);
     }
 }
