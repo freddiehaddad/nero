@@ -177,6 +177,18 @@ unsafe fn advance_color_col(wlv: &mut WinlinevarsT, vcol: i32) {
     }
 }
 
+/// Reconcile temporary columns inserted to force wrapping
+/// (`fix_for_boguscols`).
+#[allow(dead_code)]
+fn fix_for_boguscols(wlv: &mut WinlinevarsT) {
+    wlv.n_extra += wlv.vcol_off_co;
+    wlv.vcol -= wlv.vcol_off_co;
+    wlv.vcol_off_co = 0;
+    wlv.col -= wlv.boguscols;
+    wlv.old_boguscols = wlv.boguscols;
+    wlv.boguscols = 0;
+}
+
 /// Ensure the reusable scratch buffer has at least `size` bytes and
 /// return its data pointer (`get_extra_buf`).
 ///
@@ -383,6 +395,28 @@ mod tests {
 
         unsafe { advance_color_col(&mut state, 20) };
         assert!(state.color_cols.is_null());
+    }
+
+    #[test]
+    fn fix_for_boguscols_restores_real_columns_and_tracks_old_amount() {
+        let mut state = WinlinevarsT {
+            n_extra: 4,
+            vcol: 20,
+            vcol_off_co: 3,
+            col: 12,
+            boguscols: 5,
+            old_boguscols: 1,
+            ..Default::default()
+        };
+
+        fix_for_boguscols(&mut state);
+
+        assert_eq!(state.n_extra, 7);
+        assert_eq!(state.vcol, 17);
+        assert_eq!(state.vcol_off_co, 0);
+        assert_eq!(state.col, 7);
+        assert_eq!(state.old_boguscols, 5);
+        assert_eq!(state.boguscols, 0);
     }
 
     // ---- get_lcs_ext ----
