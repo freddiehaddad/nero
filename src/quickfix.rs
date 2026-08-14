@@ -482,6 +482,53 @@ unsafe fn qf_get_next_str_line(state: &mut QfStateT) -> i32 {
     qf_status::QF_OK
 }
 
+/// Read the next string item from quickfix List input
+/// (`qf_get_next_list_line`).
+///
+/// # Safety
+/// `state.p_list` and `p_li` must refer to one live List chain.
+#[allow(dead_code)]
+unsafe fn qf_get_next_list_line(state: &mut QfStateT) -> i32 {
+    let mut item = state.p_li;
+    while !item.is_null()
+        && !matches!(
+            unsafe { &(*item).li_tv.value },
+            crate::eval::typval_defs::TypvalValue::String(Some(_))
+        )
+    {
+        item = unsafe { (*item).li_next };
+    }
+    if item.is_null() {
+        state.p_li = std::ptr::null_mut();
+        return qf_status::QF_END_OF_INPUT;
+    }
+
+    let crate::eval::typval_defs::TypvalValue::String(Some(text)) =
+        (unsafe { &(*item).li_tv.value })
+    else {
+        unreachable!("non-string list item escaped filtering");
+    };
+    let length = text
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(text.len());
+    state.linebuf = if length > crate::globals::IOSIZE - 2 {
+        qf_grow_linebuf(state, length)
+    } else {
+        state.linelen = length;
+        unsafe { crate::globals::GLOBALS.get_mut() }.IObuff.as_mut_ptr()
+    };
+    let destination =
+        unsafe { std::slice::from_raw_parts_mut(state.linebuf, state.linelen + 1) };
+    crate::memory::xstrlcpy(
+        destination,
+        &text[..length],
+        state.linelen + 1,
+    );
+    state.p_li = unsafe { (*item).li_next };
+    qf_status::QF_OK
+}
+
 /// The fields parsed out of one error line, before they become a
 /// [`QflineT`] entry (`qffields_T`).
 ///
@@ -5863,6 +5910,42 @@ mod tests {
             unsafe { state.p_str.offset_from(source.as_ptr()) },
             12
         );
+    }
+
+    #[test]
+    fn qf_get_next_list_line_skips_nonstrings_and_null_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _io = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.IObuff,
+                [0; crate::globals::IOSIZE],
+            )
+        };
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 7);
+            crate::eval::typval::tv_list_append_string(list, None);
+            crate::eval::typval::tv_list_append_string(list, Some(b"line"));
+        }
+        let mut state = QfStateT {
+            p_list: list,
+            p_li: unsafe { crate::eval::typval::tv_list_first(list) },
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_get_next_list_line(&mut state) }, qf_status::QF_OK);
+        assert_eq!(state.linelen, 4);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(state.linebuf, 5) },
+            b"line\0"
+        );
+        assert_eq!(
+            unsafe { qf_get_next_list_line(&mut state) },
+            qf_status::QF_END_OF_INPUT
+        );
+        assert!(state.p_li.is_null());
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 
     #[test]
