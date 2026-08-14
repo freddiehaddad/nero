@@ -57,6 +57,22 @@ use crate::globals::GlobalCell;
 /// Size of one memory block used for the word tree (`SBLOCKSIZE`).
 const SBLOCKSIZE: i32 = 16000;
 
+/// Encoding used for flags in an affix file (`AFT_*`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+enum AffFlagType {
+    Char = 0,
+    Long = 1,
+    CapLong = 2,
+    Num = 3,
+}
+
+/// Internal spelling flag representing textual numeric flag `0`
+/// (`ZERO_FLAG`).
+#[allow(dead_code)]
+const ZERO_FLAG: u32 = 65_009;
+
 /// Tunable parameter for when the tree is compressed - memory /
 /// [`SBLOCKSIZE`] (`compress_start`).
 static COMPRESS_START: GlobalCell<i32> = GlobalCell::new(30000);
@@ -279,6 +295,15 @@ pub unsafe fn mb_str2wide(s: &[u8]) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affix_flag_types_and_zero_sentinel_match_spellfile_c() {
+        assert_eq!(AffFlagType::Char as i32, 0);
+        assert_eq!(AffFlagType::Long as i32, 1);
+        assert_eq!(AffFlagType::CapLong as i32, 2);
+        assert_eq!(AffFlagType::Num as i32, 3);
+        assert_eq!(ZERO_FLAG, 65_009);
+    }
 
     // --- mb_str2wide ---
 
