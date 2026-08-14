@@ -17,7 +17,8 @@
 //! `row_to_linenr`/`linenr_to_row` - terminal-row/buffer-line
 //! conversion; `is_focused` - current terminal focus detection.
 //! `convert_modifiers` translates Neovim's key modifier state and
-//! modifier-encoded key codes to libvterm's modifier mask.
+//! modifier-encoded key codes to libvterm's modifier mask;
+//! `terminal_check_cursor` follows the terminal cursor and viewport.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -121,6 +122,71 @@ fn convert_modifiers(key: &mut i32, state: &mut VTermModifier) {
         | K_S_F11 | K_S_F12 => *state |= VTERM_MOD_SHIFT,
         K_C_LEFT | K_C_RIGHT | K_C_HOME | K_C_END => *state |= VTERM_MOD_CTRL,
         _ => {}
+    }
+}
+
+/// Keeps the current window cursor and topline synchronized with its
+/// terminal (`terminal_check_cursor`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` and `GLOBALS.curwin` must point to a live buffer
+/// and window. The buffer must own a live `TerminalT`, the window must
+/// display that buffer, and global editor state must not be mutated
+/// concurrently.
+#[allow(dead_code)]
+unsafe fn terminal_check_cursor() {
+    // Keep raw pointers across calls that independently reborrow the
+    // same globals; create each reference only for its immediate use.
+    let g = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety contract.
+    let curbuf = unsafe { (*g).curbuf };
+    // SAFETY: forwarded from this function's own safety contract.
+    let curwin = unsafe { (*g).curwin };
+    // SAFETY: forwarded from this function's own safety contract.
+    let term = unsafe { (*curbuf).terminal };
+    // SAFETY: all three pointers are live by the caller's contract.
+    let line_count = unsafe { (*curbuf).b_ml.ml_line_count };
+    // SAFETY: `term` is live by the caller's contract.
+    let cursor_row = unsafe { (*term).cursor.row };
+    // SAFETY: all pointers are live by the caller's contract.
+    unsafe {
+        (*curwin).w_cursor.lnum =
+            line_count.min(row_to_linenr(&*term, cursor_row));
+    }
+
+    // SAFETY: `curwin` is live by the caller's contract.
+    let view_height = unsafe { (*curwin).w_view_height };
+    let topline = line_count.wrapping_sub(view_height).wrapping_add(1).max(1);
+    // SAFETY: `curwin` is live by the caller's contract.
+    if topline != unsafe { (*curwin).w_topline } {
+        // SAFETY: forwarded from this function's own safety contract.
+        unsafe { crate::r#move::set_topline(curwin, topline) };
+    }
+
+    // SAFETY: `term` and global state are live by the caller's contract.
+    if unsafe { (*term).suspended }
+        && unsafe { (*g).State } & crate::state_defs::mode::TERMINAL as i32 != 0
+    {
+        // SAFETY: `curwin` is live by the caller's contract.
+        unsafe {
+            (*curwin).w_cursor = crate::pos_defs::PosT {
+                lnum: line_count,
+                ..Default::default()
+            };
+        }
+    } else {
+        // SAFETY: `curwin`, `term`, and global state are live.
+        let off = if unsafe { (*g).State } & crate::state_defs::mode::TERMINAL as i32 != 0 {
+            0
+        } else if unsafe { (*curwin).w_onebuf_opt.wo_rl } != 0 {
+            1
+        } else {
+            -1
+        };
+        // SAFETY: `term` is live.
+        let col = unsafe { (*term).cursor.col }.wrapping_add(off).max(0);
+        // SAFETY: forwarded from this function's own safety contract.
+        let _ = unsafe { crate::cursor::coladvance(curwin, col) };
     }
 }
 
@@ -285,6 +351,119 @@ mod tests {
                 crate::vterm_defs::VTERM_MOD_ALT | crate::vterm_defs::VTERM_MOD_CTRL
             );
         }
+    }
+
+    #[test]
+    fn terminal_check_cursor_places_suspended_process_on_last_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut term = TerminalT {
+            sb_current: 3,
+            suspended: true,
+            cursor: crate::types_defs::TerminalCursorT {
+                row: 4,
+                col: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let term_ptr = std::ptr::addr_of_mut!(term);
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_line_count = 30;
+        buf.terminal = term_ptr;
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_view_height: 10,
+            w_topline: 1,
+            w_botline: 11,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr) };
+        let _state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.State,
+                crate::state_defs::mode::TERMINAL as i32,
+            )
+        };
+
+        // SAFETY: the test installed a mutually-linked live terminal,
+        // buffer, and window and holds the global-state lock.
+        unsafe { terminal_check_cursor() };
+
+        assert_eq!(win.w_cursor, crate::pos_defs::PosT {
+            lnum: 30,
+            ..Default::default()
+        });
+        assert_eq!(win.w_topline, 21);
+        assert!(win.w_topline_was_set);
+    }
+
+    #[test]
+    fn terminal_check_cursor_nudges_the_cursor_by_editor_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut term = TerminalT {
+            cursor: crate::types_defs::TerminalCursorT {
+                col: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let term_ptr = std::ptr::addr_of_mut!(term);
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        // All subsequent buffer access uses the one raw-pointer lineage.
+        unsafe {
+            (*buf_ptr).terminal = term_ptr;
+        }
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        unsafe {
+            (*win_ptr).w_buffer = buf_ptr;
+            (*win_ptr).w_view_height = 10;
+            (*win_ptr).w_topline = 1;
+            (*win_ptr).w_botline = 2;
+        }
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr) };
+        let state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.State,
+                crate::state_defs::mode::TERMINAL as i32,
+            )
+        };
+        assert_eq!(unsafe { crate::memline::ml_replace(1, b"abcd\0") }, crate::vim_defs::OK);
+
+        unsafe { terminal_check_cursor() };
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 2);
+
+        drop(state);
+        let state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.State,
+                crate::state_defs::mode::NORMAL as i32,
+            )
+        };
+        unsafe { terminal_check_cursor() };
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1);
+
+        unsafe {
+            (*win_ptr).w_onebuf_opt.wo_rl = 1;
+            terminal_check_cursor();
+        }
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3);
+
+        drop(state);
+        drop(_curwin);
+        drop(_curbuf);
+        // SAFETY: the globals no longer alias this live memline.
+        unsafe { crate::memline::ml_close(&mut *buf_ptr, false) };
     }
 
     #[test]
