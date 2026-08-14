@@ -94,6 +94,21 @@ pub fn get_maphash_list(
     (unsafe { MAPHASH.get_mut() })[map_hash(state, c as u8)]
 }
 
+/// Head of the current buffer's mapping bucket
+/// (`get_buf_maphash_list`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer.
+#[must_use]
+pub unsafe fn get_buf_maphash_list(
+    state: i32,
+    c: i32,
+) -> *mut crate::types_defs::MapblockT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buffer = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    buffer.b_maphash[map_hash(state, c as u8)]
+}
+
 /// Resets both language-map tables to the identity mapping
 /// (`langmap_init`).
 pub fn langmap_init() {
@@ -343,6 +358,35 @@ mod tests {
         assert!(get_maphash_list(mode::NORMAL as i32, i32::from(b'x')).is_null());
 
         *unsafe { MAPHASH.get_mut() } = saved;
+    }
+
+    #[test]
+    fn get_buf_maphash_list_returns_the_current_buffers_chain_head() {
+        let _lock = global_state_test_lock();
+        let mut mapping = Box::new(crate::types_defs::MapblockT {
+            m_keys: b"q".to_vec(),
+            ..Default::default()
+        });
+        let pointer = std::ptr::addr_of_mut!(*mapping);
+        let mut buffer = crate::buffer_defs::BufT::default();
+        buffer.b_maphash[map_hash(mode::NORMAL as i32, b'q')] = pointer;
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                std::ptr::addr_of_mut!(buffer),
+            )
+        };
+
+        assert_eq!(
+            unsafe {
+                get_buf_maphash_list(mode::NORMAL as i32, i32::from(b'q'))
+            },
+            pointer
+        );
+        assert!(unsafe {
+            get_buf_maphash_list(mode::INSERT as i32, i32::from(b'q'))
+        }
+        .is_null());
     }
 
     #[test]
