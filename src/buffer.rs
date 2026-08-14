@@ -88,6 +88,19 @@ static TOP_FILE_NUM: GlobalCell<i32> = GlobalCell::new(1);
 /// `buf_free_count`).
 static BUF_FREE_COUNT: GlobalCell<i32> = GlobalCell::new(0);
 
+/// Last title sent to the UI (`lasttitle`).
+static LASTTITLE: GlobalCell<Option<Vec<u8>>> = GlobalCell::new(None);
+/// Last icon label sent to the UI (`lasticon`).
+static LASTICON: GlobalCell<Option<Vec<u8>>> = GlobalCell::new(None);
+
+/// Release cached title and icon strings (`free_titles`).
+pub fn free_titles() {
+    unsafe {
+        *LASTTITLE.get_mut() = None;
+        *LASTICON.get_mut() = None;
+    }
+}
+
 /// Returns byte `idx` of an option modeled as `Option<Vec<u8>>`, or NUL
 /// (`0`) if unset/short - matches how the original dereferences
 /// `buf->b_p_bt[idx]`/`buf->b_p_bh[idx]` (a `char *` that in practice is
@@ -819,6 +832,38 @@ pub fn buf_get_fname(buf: &BufT) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TitlesGuard {
+        title: Option<Vec<u8>>,
+        icon: Option<Vec<u8>>,
+    }
+
+    impl TitlesGuard {
+        fn install() -> Self {
+            Self {
+                title: unsafe { LASTTITLE.get_mut() }.replace(b"title".to_vec()),
+                icon: unsafe { LASTICON.get_mut() }.replace(b"icon".to_vec()),
+            }
+        }
+    }
+
+    impl Drop for TitlesGuard {
+        fn drop(&mut self) {
+            *unsafe { LASTTITLE.get_mut() } = self.title.take();
+            *unsafe { LASTICON.get_mut() } = self.icon.take();
+        }
+    }
+
+    #[test]
+    fn free_titles_releases_both_cached_ui_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _titles = TitlesGuard::install();
+
+        free_titles();
+
+        assert!(unsafe { LASTTITLE.get_mut() }.is_none());
+        assert!(unsafe { LASTICON.get_mut() }.is_none());
+    }
     use crate::buffer_defs::BufT;
 
     #[test]
