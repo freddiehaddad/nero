@@ -111,6 +111,17 @@ const KEYCODES_KP_CSIU: [Keycode; 18] = [
     Keycode { key_type: KeycodeType::Keypad, literal: 57415, csi_num: b'X' as i32 },
 ];
 
+/// Whether a Unicode key bypasses modifier encoding and is emitted as
+/// plain UTF-8 (`vterm_keyboard_unichar`'s `passthru` test).
+#[allow(dead_code)]
+fn unicode_passthrough(c: u32, modifiers: crate::vterm_defs::VTermModifier) -> bool {
+    if c == u32::from(b' ') {
+        modifiers == crate::vterm_defs::VTERM_MOD_NONE
+    } else {
+        modifiers & !crate::vterm_defs::VTERM_MOD_SHIFT == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +258,40 @@ mod tests {
                 .map(|key| key.csi_num)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn unicode_passthrough_requires_unmodified_space() {
+        assert!(unicode_passthrough(
+            b' ' as u32,
+            crate::vterm_defs::VTERM_MOD_NONE
+        ));
+        for modifiers in [
+            crate::vterm_defs::VTERM_MOD_SHIFT,
+            crate::vterm_defs::VTERM_MOD_ALT,
+            crate::vterm_defs::VTERM_MOD_CTRL,
+        ] {
+            assert!(!unicode_passthrough(b' ' as u32, modifiers));
+        }
+    }
+
+    #[test]
+    fn unicode_passthrough_ignores_shift_for_non_space_codepoints() {
+        assert!(unicode_passthrough(
+            b'A' as u32,
+            crate::vterm_defs::VTERM_MOD_NONE
+        ));
+        assert!(unicode_passthrough(
+            b'A' as u32,
+            crate::vterm_defs::VTERM_MOD_SHIFT
+        ));
+        assert!(!unicode_passthrough(
+            b'A' as u32,
+            crate::vterm_defs::VTERM_MOD_ALT
+        ));
+        assert!(!unicode_passthrough(
+            b'A' as u32,
+            crate::vterm_defs::VTERM_MOD_CTRL
+        ));
     }
 }
