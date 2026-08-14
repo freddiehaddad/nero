@@ -30,6 +30,9 @@ static SYN_TM: crate::globals::GlobalCell<*mut crate::types_defs::ProftimeT> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
 /// Include `"None"` in highlight-name completion (`include_none`).
 static INCLUDE_NONE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+/// Syntax block currently being parsed (`syn_block`).
+static SYN_BLOCK: crate::globals::GlobalCell<*mut crate::buffer_defs::SynblockT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
 
 /// One row in a syntax timing report (`time_entry_T`).
 #[allow(dead_code)]
@@ -132,6 +135,32 @@ unsafe fn syn_stack_free_entry(
     unsafe { (*state).sst_next = block.b_sst_firstfree };
     block.b_sst_firstfree = state;
     block.b_sst_freecount += 1;
+}
+
+/// Make later saved states depend on the line below the last parsed line
+/// (`syntax_end_parsing`).
+///
+/// # Safety
+/// `wp` and `SYN_BLOCK`, when non-null, must point to live values; the
+/// block's saved-state chain must satisfy [`syn_stack_find_entry`].
+pub unsafe fn syntax_end_parsing(
+    wp: *mut crate::buffer_defs::WinT,
+    lnum: crate::pos_defs::LinenrT,
+) {
+    let block = unsafe { *SYN_BLOCK.get_mut() };
+    if block.is_null() || unsafe { (*wp).w_s } != block {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut state = unsafe { syn_stack_find_entry(&*block, lnum) };
+    if !state.is_null() && unsafe { (*state).sst_lnum } < lnum {
+        // SAFETY: forwarded from this function's own safety doc.
+        state = unsafe { (*state).sst_next };
+    }
+    if !state.is_null() && unsafe { (*state).sst_change_lnum } != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*state).sst_change_lnum = lnum };
+    }
 }
 
 /// Return one completion candidate for `:syntime`
@@ -1574,6 +1603,49 @@ mod tests {
         assert_eq!(block.b_sst_freecount, 2);
         assert_eq!(state.sst_next, existing_ptr);
         assert_eq!(state.sst_lnum, 12);
+    }
+
+    #[test]
+    fn syntax_end_parsing_updates_the_first_saved_state_at_or_after_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut first = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 5,
+            sst_change_lnum: 1,
+            ..Default::default()
+        });
+        let mut second = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 10,
+            sst_change_lnum: 1,
+            ..Default::default()
+        });
+        let mut third = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 20,
+            sst_change_lnum: 1,
+            ..Default::default()
+        });
+        first.sst_next = std::ptr::addr_of_mut!(*second);
+        second.sst_next = std::ptr::addr_of_mut!(*third);
+        let mut block = crate::buffer_defs::SynblockT {
+            b_sst_first: std::ptr::addr_of_mut!(*first),
+            ..Default::default()
+        };
+        let block_ptr = std::ptr::addr_of_mut!(block);
+        let previous = std::mem::replace(
+            unsafe { SYN_BLOCK.get_mut() },
+            block_ptr,
+        );
+        let mut win = crate::buffer_defs::WinT {
+            w_s: block_ptr,
+            ..Default::default()
+        };
+
+        unsafe { syntax_end_parsing(std::ptr::addr_of_mut!(win), 12) };
+
+        assert_eq!(first.sst_change_lnum, 1);
+        assert_eq!(second.sst_change_lnum, 1);
+        assert_eq!(third.sst_change_lnum, 12);
+
+        *unsafe { SYN_BLOCK.get_mut() } = previous;
     }
 
     #[test]
