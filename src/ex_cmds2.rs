@@ -32,6 +32,15 @@
 use crate::buffer_defs::BufT;
 use crate::vim_defs::{FAIL, OK};
 
+/// Append `nr` to `bufnrs` unless it is already present
+/// (`add_bufnum`).
+#[allow(dead_code)]
+fn add_bufnum(bufnrs: &mut Vec<i32>, nr: i32) {
+    if !bufnrs.contains(&nr) {
+        bufnrs.push(nr);
+    }
+}
+
 /// Check that `curbuf` has a file name (`check_fname`).
 ///
 /// The original's own `emsg(_(e_noname))` on failure is omitted
@@ -167,6 +176,15 @@ mod tests {
         ov.p_aw = 0;
         ov.p_awa = 0;
         ov.p_write = 1;
+    }
+
+    #[test]
+    fn add_bufnum_preserves_first_seen_order_and_rejects_duplicates() {
+        let mut numbers = vec![3, 1];
+        add_bufnum(&mut numbers, 3);
+        add_bufnum(&mut numbers, 2);
+        add_bufnum(&mut numbers, 1);
+        assert_eq!(numbers, vec![3, 1, 2]);
     }
 
     struct CurbufGuard {
