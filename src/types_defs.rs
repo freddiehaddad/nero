@@ -185,9 +185,43 @@ impl Default for RegprogT {
         }
     }
 }
-/// Placeholder for `synstate_T` (`struct syn_state`) - see `src/nvim/syntax_defs.h` (phase 8).
+/// One entry in a saved syntax state stack (`bufstate_T`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BufstateT {
+    pub bs_idx: i32,
+    pub bs_flags: i32,
+    pub bs_seqnr: i32,
+    pub bs_cchar: i32,
+    pub bs_extmatch: *mut RegExtmatchT,
+}
+
+/// Number of inline saved syntax states (`SST_FIX_STATES`).
+pub const SST_FIX_STATES: usize = 7;
+
+/// Storage union in [`SynstateT`] (`sst_union`).
+#[derive(Debug)]
+pub enum SynstateStorage {
+    Fixed([BufstateT; SST_FIX_STATES]),
+    Dynamic(Vec<BufstateT>),
+}
+
+impl Default for SynstateStorage {
+    fn default() -> Self {
+        Self::Fixed([BufstateT::default(); SST_FIX_STATES])
+    }
+}
+
+/// Saved syntax state at the start of one line (`synstate_T`).
+#[derive(Debug, Default)]
 pub struct SynstateT {
-    _private: (),
+    pub sst_next: *mut SynstateT,
+    pub sst_lnum: crate::pos_defs::LinenrT,
+    pub sst_storage: SynstateStorage,
+    pub sst_next_flags: i32,
+    pub sst_stacksize: i32,
+    pub sst_next_list: *const i16,
+    pub sst_tick: crate::buffer_defs::DisptickT,
+    pub sst_change_lnum: crate::pos_defs::LinenrT,
 }
 /// Placeholder for `Terminal` (`struct terminal`) - see `src/nvim/terminal.h` (phase 14).
 #[derive(Debug, Default)]
@@ -302,6 +336,20 @@ mod tests {
         assert!(conversion.vc_fd.is_null());
         assert!(!conversion.vc_fail);
         assert_eq!(ConvFlags::Iconv as i32, 5);
+    }
+
+    #[test]
+    fn synstate_default_uses_the_fixed_seven_entry_stack() {
+        let state = SynstateT::default();
+        assert!(state.sst_next.is_null());
+        assert_eq!(state.sst_lnum, 0);
+        assert_eq!(state.sst_stacksize, 0);
+        assert!(state.sst_next_list.is_null());
+        let SynstateStorage::Fixed(stack) = state.sst_storage else {
+            panic!("default syntax state must use fixed storage");
+        };
+        assert_eq!(stack.len(), SST_FIX_STATES);
+        assert!(stack.iter().all(|item| item.bs_extmatch.is_null()));
     }
 
     #[test]
