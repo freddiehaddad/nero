@@ -100,7 +100,7 @@
 //! becomes a [`std::sync::LazyLock`], so that flag has no counterpart.
 //!
 //! Deferred: everything else in the file - the errorformat parsing
-//! machinery (`efm_T`, `qfstate_T`, `qffields_T`, and the
+//! machinery (`efm_T` and the
 //! `dir_stack_T` directory tracking, whose two `qf_list_T` fields are
 //! omitted here for that reason), the quickfix window/buffer UI, and
 //! error navigation.
@@ -374,6 +374,24 @@ pub mod qf_status {
     pub const QF_IGNORE_LINE: i32 = 4;
     /// Rescan the line with the next format (`QF_MULTISCAN`).
     pub const QF_MULTISCAN: i32 = 5;
+}
+
+/// State used while parsing lines into a quickfix list (`qfstate_T`).
+#[derive(Debug, Default)]
+pub struct QfStateT {
+    pub linebuf: *mut u8,
+    pub linelen: usize,
+    pub growbuf: Vec<u8>,
+    pub growbufsiz: usize,
+    pub fd: *mut std::ffi::c_void,
+    pub tv: *mut crate::eval::typval_defs::TypvalT,
+    pub p_str: *const u8,
+    pub p_list: *mut crate::eval::typval_defs::ListT,
+    pub p_li: *mut crate::eval::typval_defs::ListitemT,
+    pub buf: *mut crate::buffer_defs::BufT,
+    pub buflnum: crate::pos_defs::LinenrT,
+    pub lnumlast: crate::pos_defs::LinenrT,
+    pub vc: crate::types_defs::VimconvT,
 }
 
 /// The fields parsed out of one error line, before they become a
@@ -5621,6 +5639,24 @@ mod tests {
         let mut qfl = QfListT::default();
         qf_store_title(&mut qfl, Some(b""));
         assert_eq!(qfl.qf_title.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn quickfix_parser_state_defaults_to_no_input_or_conversion() {
+        let state = QfStateT::default();
+        assert!(state.linebuf.is_null());
+        assert_eq!(state.linelen, 0);
+        assert!(state.growbuf.is_empty());
+        assert_eq!(state.growbufsiz, 0);
+        assert!(state.fd.is_null());
+        assert!(state.tv.is_null());
+        assert!(state.p_str.is_null());
+        assert!(state.p_list.is_null());
+        assert!(state.p_li.is_null());
+        assert!(state.buf.is_null());
+        assert_eq!(state.buflnum, 0);
+        assert_eq!(state.lnumlast, 0);
+        assert_eq!(state.vc.vc_type, crate::types_defs::ConvFlags::None);
     }
 
     #[test]
