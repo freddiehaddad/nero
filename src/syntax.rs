@@ -163,6 +163,39 @@ pub unsafe fn syntax_end_parsing(
     }
 }
 
+/// Free a syntax block's saved-state array (`syn_stack_free_block`).
+///
+/// # Safety
+/// `b_sst_array`, when non-null, must own a boxed slice of
+/// `b_sst_len` states; the used-state chain must be live and every
+/// external match must satisfy [`clear_syn_state`].
+#[allow(dead_code)]
+unsafe fn syn_stack_free_block(block: &mut crate::buffer_defs::SynblockT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { idl_cache_clear(block) };
+    if block.b_sst_array.is_null() {
+        return;
+    }
+
+    let mut state = block.b_sst_first;
+    while !state.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*state).sst_next };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { clear_syn_state(&mut *state) };
+        state = next;
+    }
+
+    let slice = std::ptr::slice_from_raw_parts_mut(
+        block.b_sst_array,
+        block.b_sst_len.max(0) as usize,
+    );
+    drop(unsafe { Box::from_raw(slice) });
+    block.b_sst_array = std::ptr::null_mut();
+    block.b_sst_first = std::ptr::null_mut();
+    block.b_sst_len = 0;
+}
+
 /// Return one completion candidate for `:syntime`
 /// (`get_syntime_arg`).
 #[must_use]
@@ -1646,6 +1679,35 @@ mod tests {
         assert_eq!(third.sst_change_lnum, 12);
 
         *unsafe { SYN_BLOCK.get_mut() } = previous;
+    }
+
+    #[test]
+    fn syn_stack_free_block_releases_the_owned_state_array() {
+        let mut states: Box<[crate::types_defs::SynstateT]> = (0..2)
+            .map(|index| crate::types_defs::SynstateT {
+                sst_lnum: index + 1,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let states_ptr = states.as_mut_ptr();
+        unsafe {
+            (*states_ptr).sst_next = states_ptr.add(1);
+        }
+        let mut block = crate::buffer_defs::SynblockT {
+            b_sst_array: states_ptr,
+            b_sst_len: 2,
+            b_sst_first: states_ptr,
+            ..Default::default()
+        };
+        std::mem::forget(states);
+
+        unsafe { syn_stack_free_block(&mut block) };
+
+        assert!(block.b_sst_array.is_null());
+        assert!(block.b_sst_first.is_null());
+        assert_eq!(block.b_sst_len, 0);
+        unsafe { syn_stack_free_block(&mut block) };
     }
 
     #[test]
