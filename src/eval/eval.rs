@@ -1150,6 +1150,33 @@ pub unsafe fn set_ref_in_callback(
     }
 }
 
+/// Mark references held by a channel callback reader
+/// (`set_ref_in_callback_reader`).
+///
+/// # Safety
+/// Same as [`set_ref_in_callback`] and [`set_ref_in_item`];
+/// `reader.self_dict`, when non-null, must point to a live dictionary.
+pub unsafe fn set_ref_in_callback_reader(
+    reader: &mut crate::channel::CallbackReader,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { set_ref_in_callback(&reader.cb, copy_id, ht_stack, list_stack) } {
+        return true;
+    }
+    if reader.self_dict.is_null() {
+        return false;
+    }
+    let mut value = TypvalT {
+        value: TypvalValue::Dict(reader.self_dict),
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_ref_in_item(&mut value, copy_id, ht_stack, list_stack) }
+}
+
 /// The two operators [`eval_addsub_number`] handles (`op` in the
 /// original, an `int` holding the literal ASCII `'+'`/`'-'` - `eval5`,
 /// this function's only call site, never passes anything else).
@@ -7633,6 +7660,29 @@ mod tests {
         assert!(!aborted);
 
         unsafe { crate::eval::typval::partial_unref(pt) };
+    }
+
+    #[test]
+    fn set_ref_in_callback_reader_marks_its_self_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dictionary = crate::eval::typval::tv_dict_alloc();
+        let mut reader = crate::channel::CallbackReader {
+            self_dict: dictionary,
+            ..Default::default()
+        };
+
+        assert!(!unsafe {
+            set_ref_in_callback_reader(
+                &mut reader,
+                37,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        });
+        assert_eq!(unsafe { (*dictionary).dv_copy_id }, 37);
+
+        reader.self_dict = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dictionary) };
     }
 
     #[test]
