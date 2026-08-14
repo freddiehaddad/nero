@@ -98,6 +98,12 @@ static PUM_BASE_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
 static PUM_KIND_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
 /// Widest extra/menu column including its separator (`pum_extra_width`).
 static PUM_EXTRA_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
+/// Whether a scrollbar column is present (`pum_scrollbar`).
+static PUM_SCROLLBAR: GlobalCell<i32> = GlobalCell::new(0);
+/// Whether the popup is laid out right-to-left (`pum_rl`).
+static PUM_RL: GlobalCell<bool> = GlobalCell::new(false);
+/// Popup-menu anchor column (`pum_col`).
+static PUM_COL: GlobalCell<i32> = GlobalCell::new(0);
 
 /// One popup menu entry (`pumitem_T`).
 ///
@@ -185,6 +191,64 @@ fn set_pum_width_aligned_with_cursor(
     let padding = i32::from(end_padding && i64::from(width) >= options.p_pw);
     *unsafe { PUM_WIDTH.get_mut() } = width.wrapping_add(padding);
     available_width >= unsafe { *PUM_WIDTH.get_mut() }
+}
+
+/// Compute horizontal popup-menu placement
+/// (`pum_compute_horizontal_placement`).
+///
+/// # Safety
+/// Reads global screen geometry and popup option state.
+#[allow(dead_code)]
+unsafe fn pum_compute_horizontal_placement(
+    target_win: Option<&crate::buffer_defs::WinT>,
+    cursor_col: i32,
+    border_width: i32,
+) {
+    let columns = unsafe { crate::globals::GLOBALS.get_mut() }.Columns;
+    let window_end =
+        target_win.map_or(0, |win| win.w_wincol + win.w_view_width);
+    let max_col = columns.max(window_end);
+    let desired_width = unsafe {
+        *PUM_BASE_WIDTH.get_mut()
+            + *PUM_KIND_WIDTH.get_mut()
+            + *PUM_EXTRA_WIDTH.get_mut()
+    };
+    let scrollbar = unsafe { *PUM_SCROLLBAR.get_mut() };
+    let right_left = unsafe { *PUM_RL.get_mut() };
+    let mut available_width = if right_left {
+        cursor_col - scrollbar + 1 - border_width
+    } else {
+        max_col - cursor_col - scrollbar - border_width
+    };
+
+    *unsafe { PUM_COL.get_mut() } = cursor_col;
+    if set_pum_width_aligned_with_cursor(desired_width, available_width) {
+        return;
+    }
+    let minimum = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_pw;
+    if i64::from(available_width) > minimum {
+        *unsafe { PUM_WIDTH.get_mut() } = available_width;
+        return;
+    }
+
+    if right_left {
+        available_width = max_col - scrollbar - border_width;
+    } else {
+        available_width += cursor_col;
+    }
+    if i64::from(available_width) > minimum {
+        let width = minimum as i32 + 1;
+        *unsafe { PUM_WIDTH.get_mut() } = width;
+        *unsafe { PUM_COL.get_mut() } = if right_left {
+            width + scrollbar + border_width
+        } else {
+            max_col - width - scrollbar - border_width
+        };
+        return;
+    }
+
+    *unsafe { PUM_COL.get_mut() } = if right_left { max_col - 1 } else { 0 };
+    *unsafe { PUM_WIDTH.get_mut() } = max_col - scrollbar - border_width;
 }
 
 /// State for `pum_ext_select_item` (`pum_want`).
@@ -413,6 +477,9 @@ pub(crate) mod tests {
         base: i32,
         kind: i32,
         extra: i32,
+        scrollbar: i32,
+        right_left: bool,
+        col: i32,
     }
 
     impl PumSizingGuard {
@@ -425,6 +492,9 @@ pub(crate) mod tests {
                 base: std::mem::replace(unsafe { PUM_BASE_WIDTH.get_mut() }, 0),
                 kind: std::mem::replace(unsafe { PUM_KIND_WIDTH.get_mut() }, 0),
                 extra: std::mem::replace(unsafe { PUM_EXTRA_WIDTH.get_mut() }, 0),
+                scrollbar: std::mem::replace(unsafe { PUM_SCROLLBAR.get_mut() }, 0),
+                right_left: std::mem::replace(unsafe { PUM_RL.get_mut() }, false),
+                col: std::mem::replace(unsafe { PUM_COL.get_mut() }, 0),
             }
         }
     }
@@ -437,6 +507,9 @@ pub(crate) mod tests {
             *unsafe { PUM_BASE_WIDTH.get_mut() } = self.base;
             *unsafe { PUM_KIND_WIDTH.get_mut() } = self.kind;
             *unsafe { PUM_EXTRA_WIDTH.get_mut() } = self.extra;
+            *unsafe { PUM_SCROLLBAR.get_mut() } = self.scrollbar;
+            *unsafe { PUM_RL.get_mut() } = self.right_left;
+            *unsafe { PUM_COL.get_mut() } = self.col;
         }
     }
 
@@ -521,6 +594,42 @@ pub(crate) mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_pmw = 6;
         assert!(set_pum_width_aligned_with_cursor(8, 6));
         assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 6);
+
+        let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        (options.p_pw, options.p_pmw) = saved;
+    }
+
+    #[test]
+    fn pum_compute_horizontal_placement_aligns_then_repositions_when_needed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _sizing = PumSizingGuard::install(Vec::new());
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.Columns,
+                80,
+            )
+        };
+        let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let saved = (options.p_pw, options.p_pmw);
+        options.p_pw = 5;
+        options.p_pmw = 0;
+        unsafe {
+            *PUM_BASE_WIDTH.get_mut() = 10;
+            *PUM_KIND_WIDTH.get_mut() = 5;
+            *PUM_EXTRA_WIDTH.get_mut() = 0;
+            pum_compute_horizontal_placement(None, 10, 0);
+        }
+        assert_eq!(unsafe { *PUM_COL.get_mut() }, 10);
+        assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 16);
+
+        unsafe { pum_compute_horizontal_placement(None, 78, 0) };
+        assert_eq!(unsafe { *PUM_COL.get_mut() }, 74);
+        assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 6);
+
+        unsafe { *PUM_RL.get_mut() = true };
+        unsafe { pum_compute_horizontal_placement(None, 10, 0) };
+        assert_eq!(unsafe { *PUM_COL.get_mut() }, 10);
+        assert_eq!(unsafe { *PUM_WIDTH.get_mut() }, 11);
 
         let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         (options.p_pw, options.p_pmw) = saved;
