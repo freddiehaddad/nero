@@ -183,6 +183,33 @@ pub fn vterm_keyboard_unichar(
     output
 }
 
+/// Selects a key descriptor from the three static keyboard tables.
+#[allow(dead_code)]
+fn select_keycode(
+    key: crate::vterm_defs::VTermKey,
+    flags: crate::vterm_defs::VTermKeyEncodingFlags,
+) -> Option<Keycode> {
+    if key < 0 {
+        return None;
+    }
+    if key < crate::vterm_defs::VTERM_KEY_FUNCTION_0 {
+        KEYCODES.get(key as usize).copied()
+    } else if key <= crate::vterm_defs::VTERM_KEY_FUNCTION_MAX {
+        KEYCODES_FN
+            .get((key - crate::vterm_defs::VTERM_KEY_FUNCTION_0) as usize)
+            .copied()
+    } else if key >= crate::vterm_defs::VTERM_KEY_KP_0 {
+        let index = (key - crate::vterm_defs::VTERM_KEY_KP_0) as usize;
+        if flags.disambiguate {
+            KEYCODES_KP_CSIU.get(index).copied()
+        } else {
+            KEYCODES_KP.get(index).copied()
+        }
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +524,51 @@ mod tests {
                 ),
                 b"\x1b[32;2u"
             );
+    }
+
+    #[test]
+    fn select_keycode_dispatches_ordinary_function_and_keypad_ranges() {
+        assert_eq!(
+            select_keycode(crate::vterm_defs::VTERM_KEY_UP, Default::default()),
+            Some(KEYCODES[crate::vterm_defs::VTERM_KEY_UP as usize])
+        );
+        assert_eq!(
+            select_keycode(
+                crate::vterm_defs::vterm_key_function(12),
+                Default::default(),
+            ),
+            Some(KEYCODES_FN[12])
+        );
+        assert_eq!(
+            select_keycode(
+                crate::vterm_defs::VTERM_KEY_KP_PLUS,
+                Default::default(),
+            ),
+            Some(KEYCODES_KP[11])
+        );
+        assert_eq!(
+            select_keycode(
+                crate::vterm_defs::VTERM_KEY_KP_PLUS,
+                crate::vterm_defs::VTermKeyEncodingFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+            ),
+            Some(KEYCODES_KP_CSIU[11])
+        );
+    }
+
+    #[test]
+    fn select_keycode_rejects_unsupported_and_out_of_range_values() {
+        for key in [
+            -1,
+            15,
+            255,
+            crate::vterm_defs::vterm_key_function(13),
+            crate::vterm_defs::VTERM_KEY_MAX,
+            i32::MAX,
+        ] {
+            assert_eq!(select_keycode(key, Default::default()), None);
+        }
     }
 }
