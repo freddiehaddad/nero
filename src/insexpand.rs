@@ -960,6 +960,20 @@ pub unsafe fn ins_compl_preinsert_effect() -> bool {
     cursor_col < unsafe { *COMPL_INS_END_COL.get_mut() }
 }
 
+/// Vimscript `preinserted()` (`f_preinserted`).
+///
+/// # Safety
+/// Same as [`ins_compl_preinsert_effect`].
+pub unsafe fn f_preinserted(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { ins_compl_preinsert_effect() } {
+        rettv.value = crate::eval::typval_defs::TypvalValue::Number(1);
+    }
+}
+
 /// Whether thesaurus completion uses a user-defined function
 /// (`thesaurus_func_complete`).
 ///
@@ -3250,6 +3264,43 @@ mod tests {
         let _cot = CotFlagsGuard::set(0);
         unsafe { (*win_ptr).w_cursor.col = 4 };
         assert!(!unsafe { ins_compl_preinsert_effect() });
+    }
+
+    #[test]
+    fn f_preinserted_reports_only_an_active_preinsert_effect() {
+        let _mode = AutocompleteModeGuard::set(false, false);
+        let mut buf = crate::buffer_defs::BufT {
+            b_cot_flags: crate::option_vars::opt_cot_flag::PREINSERT
+                | crate::option_vars::opt_cot_flag::MENUONE,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = CurbufGuard::set(unsafe { &mut *buf_ptr });
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_cursor.col = 3;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let _end = ComplInsEndGuard::set(4);
+        let mut result = crate::eval::typval_defs::TypvalT::default();
+
+        unsafe { f_preinserted(&[], &mut result) };
+        assert_eq!(
+            result.value,
+            crate::eval::typval_defs::TypvalValue::Number(1)
+        );
+
+        unsafe { (*win_ptr).w_cursor.col = 4 };
+        result.value = crate::eval::typval_defs::TypvalValue::Number(7);
+        unsafe { f_preinserted(&[], &mut result) };
+        assert_eq!(
+            result.value,
+            crate::eval::typval_defs::TypvalValue::Number(7)
+        );
     }
 
     #[test]
