@@ -87,6 +87,34 @@ unsafe fn clear_syn_state(state: &mut crate::types_defs::SynstateT) {
     }
 }
 
+/// Find the saved syntax state at or immediately before `lnum`
+/// (`syn_stack_find_entry`).
+///
+/// # Safety
+/// `block.b_sst_first` must head a live, ascending linked list of
+/// [`crate::types_defs::SynstateT`] entries.
+#[allow(dead_code)]
+unsafe fn syn_stack_find_entry(
+    block: &crate::buffer_defs::SynblockT,
+    lnum: crate::pos_defs::LinenrT,
+) -> *mut crate::types_defs::SynstateT {
+    let mut previous = std::ptr::null_mut();
+    let mut current = block.b_sst_first;
+    while !current.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let state = unsafe { &*current };
+        if state.sst_lnum == lnum {
+            return current;
+        }
+        if state.sst_lnum > lnum {
+            break;
+        }
+        previous = current;
+        current = state.sst_next;
+    }
+    previous
+}
+
 /// Return one completion candidate for `:syntime`
 /// (`get_syntime_arg`).
 #[must_use]
@@ -1473,6 +1501,37 @@ mod tests {
         assert!(items.is_empty());
         assert_eq!(unsafe { (*dynamic_match).refcnt }, 1);
         unsafe { crate::regexp::unref_extmatch(dynamic_match) };
+    }
+
+    #[test]
+    fn syn_stack_find_entry_returns_exact_or_nearest_preceding_state() {
+        let mut first = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 5,
+            ..Default::default()
+        });
+        let mut second = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 10,
+            ..Default::default()
+        });
+        let mut third = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 20,
+            ..Default::default()
+        });
+        let first_ptr = std::ptr::addr_of_mut!(*first);
+        let second_ptr = std::ptr::addr_of_mut!(*second);
+        let third_ptr = std::ptr::addr_of_mut!(*third);
+        first.sst_next = second_ptr;
+        second.sst_next = third_ptr;
+        let block = crate::buffer_defs::SynblockT {
+            b_sst_first: first_ptr,
+            ..Default::default()
+        };
+
+        assert!(unsafe { syn_stack_find_entry(&block, 4) }.is_null());
+        assert_eq!(unsafe { syn_stack_find_entry(&block, 5) }, first_ptr);
+        assert_eq!(unsafe { syn_stack_find_entry(&block, 10) }, second_ptr);
+        assert_eq!(unsafe { syn_stack_find_entry(&block, 15) }, second_ptr);
+        assert_eq!(unsafe { syn_stack_find_entry(&block, 30) }, third_ptr);
     }
 
     #[test]
