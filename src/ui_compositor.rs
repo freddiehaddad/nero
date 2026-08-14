@@ -29,6 +29,15 @@ pub fn ui_comp_should_draw() -> bool {
     unsafe { *COMPOSED_UIS.get_mut() != 0 && *VALID_SCREEN.get_mut() }
 }
 
+/// Attach a UI to the compositor (`ui_comp_attach`).
+pub fn ui_comp_attach(ui: &mut crate::ui::RemoteUI) {
+    unsafe {
+        let count = COMPOSED_UIS.get_mut();
+        *count = count.wrapping_add(1);
+    }
+    ui.composed = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +81,18 @@ mod tests {
 
         unsafe { *VALID_SCREEN.get_mut() = false };
         assert!(!ui_comp_should_draw());
+    }
+
+    #[test]
+    fn ui_comp_attach_marks_the_ui_and_increments_the_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = CompositorStateGuard::install(2, true);
+        let mut ui = crate::ui::RemoteUI::default();
+
+        ui_comp_attach(&mut ui);
+
+        assert!(ui.composed);
+        assert_eq!(unsafe { *COMPOSED_UIS.get_mut() }, 3);
+        assert!(ui_comp_should_draw());
     }
 }
