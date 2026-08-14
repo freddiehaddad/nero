@@ -9,6 +9,35 @@ pub const VTERM_MOD_ALT: VTermModifier = 0x02;
 pub const VTERM_MOD_CTRL: VTermModifier = 0x04;
 pub const VTERM_ALL_MODS_MASK: VTermModifier = 0x07;
 
+pub const KEY_ENCODING_DISAMBIGUATE: u8 = 0x01;
+pub const KEY_ENCODING_REPORT_EVENTS: u8 = 0x02;
+pub const KEY_ENCODING_REPORT_ALTERNATE: u8 = 0x04;
+pub const KEY_ENCODING_REPORT_ALL_KEYS: u8 = 0x08;
+pub const KEY_ENCODING_REPORT_ASSOCIATED: u8 = 0x10;
+
+/// Kitty keyboard-protocol enhancement flags
+/// (`VTermKeyEncodingFlags`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermKeyEncodingFlags {
+    pub disambiguate: bool,
+    pub report_events: bool,
+    pub report_alternate: bool,
+    pub report_all_keys: bool,
+    pub report_associated: bool,
+}
+
+impl VTermKeyEncodingFlags {
+    /// Converts this flag set to the protocol bitmask.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        (if self.disambiguate { KEY_ENCODING_DISAMBIGUATE } else { 0 })
+            | (if self.report_events { KEY_ENCODING_REPORT_EVENTS } else { 0 })
+            | (if self.report_alternate { KEY_ENCODING_REPORT_ALTERNATE } else { 0 })
+            | (if self.report_all_keys { KEY_ENCODING_REPORT_ALL_KEYS } else { 0 })
+            | (if self.report_associated { KEY_ENCODING_REPORT_ASSOCIATED } else { 0 })
+    }
+}
+
 /// Terminal key code (`VTermKey`).
 pub type VTermKey = i32;
 pub const VTERM_KEY_NONE: VTermKey = 0;
@@ -133,6 +162,32 @@ mod tests {
         assert_eq!(
             VTERM_MOD_SHIFT | VTERM_MOD_ALT | VTERM_MOD_CTRL,
             VTERM_ALL_MODS_MASK
+        );
+    }
+
+    #[test]
+    fn key_encoding_flags_match_protocol_bits() {
+        assert_eq!(VTermKeyEncodingFlags::default().bits(), 0);
+        assert_eq!(
+            VTermKeyEncodingFlags {
+                disambiguate: true,
+                report_events: true,
+                report_alternate: true,
+                report_all_keys: true,
+                report_associated: true,
+            }
+            .bits(),
+            0x1F
+        );
+        assert_eq!(
+            [
+                KEY_ENCODING_DISAMBIGUATE,
+                KEY_ENCODING_REPORT_EVENTS,
+                KEY_ENCODING_REPORT_ALTERNATE,
+                KEY_ENCODING_REPORT_ALL_KEYS,
+                KEY_ENCODING_REPORT_ASSOCIATED,
+            ],
+            [1, 2, 4, 8, 16]
         );
     }
 
