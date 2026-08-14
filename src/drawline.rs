@@ -222,6 +222,23 @@ unsafe fn draw_col_fill(
     }
 }
 
+/// Initialize one screen line at column zero (`win_line_start`).
+///
+/// # Safety
+/// Global line buffers must contain at least `wp.w_view_width` cells.
+#[allow(dead_code)]
+unsafe fn win_line_start(wp: &WinT, wlv: &mut WinlinevarsT) {
+    wlv.col = 0;
+    wlv.off = 0;
+    wlv.need_lbr = false;
+    let space = crate::grid::schar_from_ascii(b' ');
+    for index in 0..wp.w_view_width.max(0) as usize {
+        (unsafe { crate::grid::LINEBUF_CHAR.get_mut() })[index] = space;
+        (unsafe { crate::grid::LINEBUF_ATTR.get_mut() })[index] = 0;
+        (unsafe { crate::grid::LINEBUF_VCOL.get_mut() })[index] = -1;
+    }
+}
+
 /// Ensure the reusable scratch buffer has at least `size` bytes and
 /// return its data pointer (`get_extra_buf`).
 ///
@@ -356,6 +373,7 @@ mod tests {
     struct DrawLinebufGuard {
         chars: Vec<crate::types_defs::ScharT>,
         attrs: Vec<crate::types_defs::SattrT>,
+        vcols: Vec<crate::pos_defs::ColnrT>,
     }
 
     impl DrawLinebufGuard {
@@ -369,6 +387,10 @@ mod tests {
                     unsafe { crate::grid::LINEBUF_ATTR.get_mut() },
                     vec![0; size],
                 ),
+                vcols: std::mem::replace(
+                    unsafe { crate::grid::LINEBUF_VCOL.get_mut() },
+                    vec![0; size],
+                ),
             }
         }
     }
@@ -379,6 +401,8 @@ mod tests {
                 std::mem::take(&mut self.chars);
             *unsafe { crate::grid::LINEBUF_ATTR.get_mut() } =
                 std::mem::take(&mut self.attrs);
+            *unsafe { crate::grid::LINEBUF_VCOL.get_mut() } =
+                std::mem::take(&mut self.vcols);
         }
     }
 
@@ -527,6 +551,45 @@ mod tests {
             &unsafe { crate::grid::LINEBUF_ATTR.get_mut() }[2..5],
             &[17; 3]
         );
+    }
+
+    #[test]
+    fn win_line_start_resets_offsets_and_clears_the_visible_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _linebuf = DrawLinebufGuard::install(6);
+        unsafe {
+            crate::grid::LINEBUF_CHAR.get_mut().fill(99);
+            crate::grid::LINEBUF_ATTR.get_mut().fill(7);
+            crate::grid::LINEBUF_VCOL.get_mut().fill(8);
+        }
+        let win = WinT {
+            w_view_width: 4,
+            ..Default::default()
+        };
+        let mut state = WinlinevarsT {
+            col: 9,
+            off: 3,
+            need_lbr: true,
+            ..Default::default()
+        };
+
+        unsafe { win_line_start(&win, &mut state) };
+
+        assert_eq!((state.col, state.off, state.need_lbr), (0, 0, false));
+        let space = crate::grid::schar_from_ascii(b' ');
+        assert_eq!(
+            &unsafe { crate::grid::LINEBUF_CHAR.get_mut() }[..4],
+            &[space; 4]
+        );
+        assert_eq!(
+            &unsafe { crate::grid::LINEBUF_ATTR.get_mut() }[..4],
+            &[0; 4]
+        );
+        assert_eq!(
+            &unsafe { crate::grid::LINEBUF_VCOL.get_mut() }[..4],
+            &[-1; 4]
+        );
+        assert_eq!(unsafe { crate::grid::LINEBUF_CHAR.get_mut() }[4], 99);
     }
 
     // ---- get_lcs_ext ----
