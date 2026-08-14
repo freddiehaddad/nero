@@ -246,6 +246,37 @@ pub unsafe fn find_end_of_word(pos: &mut crate::pos_defs::PosT) {
     }
 }
 
+/// Display width of a line excluding its last character
+/// (`scroll_line_len`).
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin` must be live; forwarded from
+/// [`crate::memline::ml_get`] and [`crate::plines::win_chartabsize`].
+#[allow(dead_code)]
+unsafe fn scroll_line_len(lnum: crate::pos_defs::LinenrT) -> crate::pos_defs::ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(lnum) };
+    if line.first() == Some(&crate::ascii_defs::NUL) {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*crate::globals::GLOBALS.get_mut().curwin };
+    let mut offset = 0;
+    let mut column = 0;
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let width = unsafe {
+            crate::plines::win_chartabsize(win, &line[offset..], column)
+        };
+        offset += crate::mbyte::utf_ptr2len(&line[offset..]).max(1) as usize;
+        if line.get(offset) == Some(&crate::ascii_defs::NUL) {
+            break;
+        }
+        column += width;
+    }
+    column
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +620,29 @@ mod tests {
         unsafe { find_end_of_word(&mut pos) };
         assert_eq!(pos.col, 6); // last real character of the line
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = None;
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn scroll_line_len_counts_cells_but_excludes_the_last_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"a\tbc", b""]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: std::ptr::addr_of_mut!(buf),
+            ..Default::default()
+        };
+        {
+            let _buf = CurbufGuard::set(std::ptr::addr_of_mut!(buf));
+            let mut curwin = unsafe {
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.curwin,
+                    std::ptr::addr_of_mut!(win),
+                )
+            };
+            assert_eq!(unsafe { scroll_line_len(1) }, 9);
+            assert_eq!(unsafe { scroll_line_len(2) }, 0);
+            curwin.restore_now();
+        }
         close_test_buf(buf);
     }
 }
