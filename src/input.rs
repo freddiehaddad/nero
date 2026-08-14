@@ -771,6 +771,39 @@ pub fn stuffnum_readbuff(n: i32) {
     add_num_buff(unsafe { READBUF1.get_mut() }, n);
 }
 
+/// Stuff text literally or as interpreted key bytes (`stuffescaped`).
+pub fn stuffescaped(argument: &[u8], literally: bool) {
+    let end = argument
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(argument.len());
+    let mut offset = 0;
+    while offset < end {
+        let start = offset;
+        while offset < end
+            && ((b' '..crate::ascii_defs::DEL).contains(&argument[offset])
+                || (argument[offset] == crate::keycodes_defs::K_SPECIAL
+                    && !literally))
+        {
+            offset += 1;
+        }
+        if offset > start {
+            stuff_readbuff(&argument[start..offset]);
+        }
+        if offset < end {
+            let c = crate::mbyte::utf_ptr2char(&argument[offset..end]);
+            offset += crate::mbyte::utf_ptr2len(&argument[offset..end]).max(1) as usize;
+            if literally
+                && ((c < i32::from(b' ') && c != i32::from(crate::ascii_defs::TAB))
+                    || c == i32::from(crate::ascii_defs::DEL))
+            {
+                stuffchar_readbuff(i32::from(crate::ascii_defs::CTRL_V));
+            }
+            stuffchar_readbuff(c);
+        }
+    }
+}
+
 /// Free and clear a buffer (`free_buff`).
 ///
 /// Only clears `buf.blocks` - matching the original's own real quirk
@@ -2119,6 +2152,42 @@ mod tests {
         assert!(!stuff_empty());
         assert!(readbuf1_empty(), "readbuf1 itself is untouched");
         assert_eq!(unsafe { READBUF2.get_mut() }.blocks[0].b_str, b"world");
+        reset_buffers();
+    }
+
+    #[test]
+    fn stuffescaped_prefixes_literal_controls_and_preserves_printable_runs() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+
+        stuffescaped(b"ab\x01\t\x7f", true);
+
+        assert_eq!(
+            buff_bytes(unsafe { READBUF1.get_mut() }),
+            vec![
+                b'a',
+                b'b',
+                crate::ascii_defs::CTRL_V,
+                1,
+                crate::ascii_defs::TAB,
+                crate::ascii_defs::CTRL_V,
+                crate::ascii_defs::DEL,
+            ]
+        );
+        reset_buffers();
+    }
+
+    #[test]
+    fn stuffescaped_keeps_interpreted_special_sequences_and_multibyte_text() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        let special = [crate::keycodes_defs::K_SPECIAL, b'k', b'u'];
+        stuffescaped(&special, false);
+        stuffescaped("é".as_bytes(), false);
+
+        let mut expected = special.to_vec();
+        expected.extend_from_slice("é".as_bytes());
+        assert_eq!(buff_bytes(unsafe { READBUF1.get_mut() }), expected);
         reset_buffers();
     }
 
