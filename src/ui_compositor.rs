@@ -86,6 +86,25 @@ pub unsafe fn ui_comp_layers_adjust(mut layer_idx: usize, raise: bool) {
     }
 }
 
+/// Select the compositor grid with `handle` (`ui_comp_set_grid`).
+///
+/// # Safety
+/// Every pointer in `LAYERS` and non-null `CURGRID` must be live.
+#[must_use]
+pub unsafe fn ui_comp_set_grid(handle: crate::types_defs::HandleT) -> bool {
+    let current = unsafe { *CURGRID.get_mut() };
+    if !current.is_null() && unsafe { (*current).handle } == handle {
+        return true;
+    }
+    for &grid in unsafe { LAYERS.get_mut() }.iter() {
+        if unsafe { (*grid).handle } == handle {
+            *unsafe { CURGRID.get_mut() } = grid;
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether the compositor should draw (`ui_comp_should_draw`).
 #[must_use]
 pub fn ui_comp_should_draw() -> bool {
@@ -350,5 +369,30 @@ mod tests {
             &[low_ptr, moving_ptr, high_ptr]
         );
         assert_eq!((moving.comp_index, high.comp_index), (1, 2));
+    }
+
+    #[test]
+    fn ui_comp_set_grid_selects_known_handles_and_preserves_unknown_current() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _layers = LayerStateGuard::empty();
+        let mut first = Box::new(crate::grid_defs::ScreenGrid {
+            handle: 1,
+            ..Default::default()
+        });
+        let mut second = Box::new(crate::grid_defs::ScreenGrid {
+            handle: 9,
+            ..Default::default()
+        });
+        let first_ptr = std::ptr::addr_of_mut!(*first);
+        let second_ptr = std::ptr::addr_of_mut!(*second);
+        unsafe { LAYERS.get_mut() }.extend([first_ptr, second_ptr]);
+        *unsafe { CURGRID.get_mut() } = first_ptr;
+
+        assert!(unsafe { ui_comp_set_grid(1) });
+        assert_eq!(unsafe { *CURGRID.get_mut() }, first_ptr);
+        assert!(unsafe { ui_comp_set_grid(9) });
+        assert_eq!(unsafe { *CURGRID.get_mut() }, second_ptr);
+        assert!(!unsafe { ui_comp_set_grid(99) });
+        assert_eq!(unsafe { *CURGRID.get_mut() }, second_ptr);
     }
 }
