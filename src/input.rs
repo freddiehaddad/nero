@@ -130,6 +130,17 @@ static REDOBUFF: GlobalCell<BuffheaderT> = GlobalCell::new(BuffheaderT { blocks:
 /// the CTRL-O `.` command in Insert mode. File-static in the original.
 static OLD_REDOBUFF: GlobalCell<BuffheaderT> = GlobalCell::new(BuffheaderT { blocks: Vec::new(), bh_index: 0 });
 
+/// Iteration state for `read_redo`'s function-local static pointers.
+#[derive(Debug, Default)]
+struct RedoReaderState {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+/// Current redo-buffer reader (`bp`/`p` in `read_redo`).
+static REDO_READER: GlobalCell<Option<RedoReaderState>> =
+    GlobalCell::new(None);
+
 /// Whether appending to the redo buffer is currently suppressed
 /// (`block_redo`). File-static in the original.
 static BLOCK_REDO: GlobalCell<bool> = GlobalCell::new(false);
@@ -371,6 +382,78 @@ pub unsafe fn append_number_to_redobuff(n: i32) {
     }
     // SAFETY: forwarded from this function's own safety doc.
     add_num_buff(unsafe { REDOBUFF.get_mut() }, n);
+}
+
+/// Read one character from a redo buffer without changing that buffer
+/// (`read_redo`).
+///
+/// With `init`, prepares a fresh read and returns `OK`/`FAIL`.
+#[allow(dead_code)]
+unsafe fn read_redo(init: bool, old_redo: bool) -> i32 {
+    if init {
+        // SAFETY: forwarded from this function's own safety doc.
+        let source = if old_redo {
+            unsafe { OLD_REDOBUFF.get_mut() }
+        } else {
+            unsafe { REDOBUFF.get_mut() }
+        };
+        let bytes: Vec<u8> = source
+            .blocks
+            .iter()
+            .flat_map(|block| block.b_str.iter().copied())
+            .collect();
+        if bytes.is_empty() {
+            return crate::vim_defs::FAIL;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        *unsafe { REDO_READER.get_mut() } =
+            Some(RedoReaderState { bytes, offset: 0 });
+        return crate::vim_defs::OK;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { REDO_READER.get_mut() }
+        .as_mut()
+        .expect("read_redo called before initialization");
+    let Some(&first) = state.bytes.get(state.offset) else {
+        return i32::from(crate::ascii_defs::NUL);
+    };
+    let mut c = i32::from(first);
+    let byte_len = if first != crate::keycodes_defs::K_SPECIAL
+        || state.bytes.get(state.offset + 1)
+            == Some(&crate::keycodes_defs::KS_SPECIAL)
+    {
+        crate::mbyte::utf_byte2len(first)
+    } else {
+        1
+    };
+    let mut bytes = [0; crate::mbyte_defs::MB_MAXBYTES + 1];
+
+    for index in 0..usize::from(byte_len) {
+        if c == i32::from(crate::keycodes_defs::K_SPECIAL) {
+            let first = state.bytes[state.offset + 1];
+            let second = state.bytes[state.offset + 2];
+            c = crate::keycodes_defs::to_special(first, second);
+            state.offset += 2;
+        }
+        state.offset += 1;
+        bytes[index] = c as u8;
+        if index + 1 == usize::from(byte_len) {
+            if byte_len != 1 {
+                c = crate::mbyte::utf_ptr2char(&bytes[..usize::from(byte_len)]);
+            }
+            break;
+        }
+        c = state
+            .bytes
+            .get(state.offset)
+            .copied()
+            .map_or(0, i32::from);
+        if c == 0 {
+            break;
+        }
+    }
+    c
 }
 
 /// Returns the redo buffer as one owned byte string (`get_inserted`).
@@ -1838,6 +1921,50 @@ mod tests {
         unsafe { append_number_to_redobuff(42) };
         unsafe { append_char_to_redobuff(i32::from(b'z')) };
         assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"42z".to_vec());
+    }
+
+    #[test]
+    fn read_redo_decodes_multibyte_special_and_literal_special_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe {
+            append_char_to_redobuff(0x00e9);
+            append_char_to_redobuff(crate::keycodes_defs::K_UP);
+            append_char_to_redobuff(i32::from(crate::keycodes_defs::K_SPECIAL));
+        }
+
+        assert_eq!(unsafe { read_redo(true, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { read_redo(false, false) }, 0x00e9);
+        assert_eq!(
+            unsafe { read_redo(false, false) },
+            crate::keycodes_defs::K_UP
+        );
+        assert_eq!(
+            unsafe { read_redo(false, false) },
+            i32::from(crate::keycodes_defs::K_SPECIAL)
+        );
+        assert_eq!(
+            unsafe { read_redo(false, false) },
+            i32::from(crate::ascii_defs::NUL)
+        );
+    }
+
+    #[test]
+    fn read_redo_selects_old_buffer_and_reports_empty_initialization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        assert_eq!(unsafe { read_redo(true, false) }, crate::vim_defs::FAIL);
+
+        unsafe { append_to_redobuff(b"old") };
+        unsafe { reset_redobuff() };
+        unsafe { append_to_redobuff(b"new") };
+
+        assert_eq!(unsafe { read_redo(true, true) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { read_redo(false, true) }, i32::from(b'o'));
+        assert_eq!(unsafe { read_redo(true, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { read_redo(false, false) }, i32::from(b'n'));
     }
 
     #[test]
