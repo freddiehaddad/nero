@@ -189,6 +189,19 @@ fn fix_for_boguscols(wlv: &mut WinlinevarsT) {
     wlv.boguscols = 0;
 }
 
+/// Whether `CursorLineNr` applies to this screen row
+/// (`use_cursor_line_nr`).
+#[allow(dead_code)]
+fn use_cursor_line_nr(wp: &WinT, wlv: &WinlinevarsT) -> bool {
+    let flags = u32::from(wp.w_p_culopt_flags);
+    wp.w_onebuf_opt.wo_cul != 0
+        && wlv.lnum == wp.w_cursorline
+        && flags & crate::option_vars::opt_culopt_flag::NUMBER != 0
+        && (wlv.row == wlv.startrow + wlv.filler_lines
+            || (wlv.row > wlv.startrow + wlv.filler_lines
+                && flags & crate::option_vars::opt_culopt_flag::LINE != 0))
+}
+
 /// Ensure the reusable scratch buffer has at least `size` bytes and
 /// return its data pointer (`get_extra_buf`).
 ///
@@ -417,6 +430,31 @@ mod tests {
         assert_eq!(state.col, 7);
         assert_eq!(state.old_boguscols, 5);
         assert_eq!(state.boguscols, 0);
+    }
+
+    #[test]
+    fn use_cursor_line_nr_handles_first_and_wrapped_screen_rows() {
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_cul = 1;
+        win.w_cursorline = 12;
+        win.w_p_culopt_flags =
+            crate::option_vars::opt_culopt_flag::NUMBER as u8;
+        let mut state = WinlinevarsT {
+            lnum: 12,
+            startrow: 3,
+            filler_lines: 2,
+            row: 5,
+            ..Default::default()
+        };
+        assert!(use_cursor_line_nr(&win, &state));
+
+        state.row = 6;
+        assert!(!use_cursor_line_nr(&win, &state));
+        win.w_p_culopt_flags |= crate::option_vars::opt_culopt_flag::LINE as u8;
+        assert!(use_cursor_line_nr(&win, &state));
+
+        state.lnum = 11;
+        assert!(!use_cursor_line_nr(&win, &state));
     }
 
     // ---- get_lcs_ext ----
