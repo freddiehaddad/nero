@@ -226,6 +226,29 @@ fn backslash_trans(c: i32) -> i32 {
     }
 }
 
+/// Parse up to `max_input_len` hexadecimal digits (`gethexchrs`).
+///
+/// Returns the value and consumed byte count; `-1, 0` means no valid
+/// digit, replacing the original's advanced `regparse` pointer.
+#[allow(dead_code)]
+#[must_use]
+fn gethexchrs(input: &[u8], max_input_len: usize) -> (i64, usize) {
+    let mut value = 0_i64;
+    let mut consumed = 0;
+    for &byte in input.iter().take(max_input_len) {
+        if !crate::ascii_defs::ascii_isxdigit(i32::from(byte)) {
+            break;
+        }
+        value = (value << 4) | i64::from(crate::charset::hex2nr(i32::from(byte)));
+        consumed += 1;
+    }
+    if consumed == 0 {
+        (-1, 0)
+    } else {
+        (value, consumed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +288,15 @@ mod tests {
             i32::from(crate::ascii_defs::BS)
         );
         assert_eq!(backslash_trans(i32::from(b'n')), i32::from(b'n'));
+    }
+
+    #[test]
+    fn gethexchrs_parses_up_to_the_requested_digit_limit() {
+        assert_eq!(gethexchrs(b"20acZ", 4), (0x20ac, 4));
+        assert_eq!(gethexchrs(b"1234", 2), (0x12, 2));
+        assert_eq!(gethexchrs(b"Ff", 8), (255, 2));
+        assert_eq!(gethexchrs(b"xyz", 4), (-1, 0));
+        assert_eq!(gethexchrs(b"12", 0), (-1, 0));
     }
 
     impl EvalResultGuard {
