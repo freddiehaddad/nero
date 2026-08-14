@@ -61,6 +61,22 @@ use crate::state_defs::mode;
 /// by default, matching the original's own `GA_EMPTY_INIT_VALUE`.
 static LANGMAP_MAPGA: GlobalCell<Vec<(i32, i32)>> = GlobalCell::new(Vec::new());
 
+/// Mapping-table bucket index (`MAP_HASH`).
+#[allow(dead_code)]
+#[must_use]
+fn map_hash(state: i32, first: u8) -> usize {
+    let normal_modes = mode::NORMAL as i32
+        | mode::VISUAL as i32
+        | mode::SELECT as i32
+        | mode::OP_PENDING as i32
+        | mode::TERMINAL as i32;
+    usize::from(if state & normal_modes != 0 {
+        first
+    } else {
+        first ^ 0x80
+    })
+}
+
 /// Resets both language-map tables to the identity mapping
 /// (`langmap_init`).
 pub fn langmap_init() {
@@ -275,6 +291,20 @@ mod tests {
         let mut entries = Vec::new();
         langmap_set_entry(&mut entries, 100, 200);
         assert_eq!(entries, vec![(100, 200)]);
+    }
+
+    #[test]
+    fn map_hash_separates_normal_and_insert_mode_buckets() {
+        assert_eq!(map_hash(mode::NORMAL as i32, b'a'), usize::from(b'a'));
+        assert_eq!(map_hash(mode::VISUAL as i32, b'a'), usize::from(b'a'));
+        assert_eq!(
+            map_hash(mode::INSERT as i32, b'a'),
+            usize::from(b'a' ^ 0x80)
+        );
+        assert_eq!(
+            map_hash(mode::CMDLINE as i32, 0xff),
+            usize::from(0x7f_u8)
+        );
     }
 
     #[test]
