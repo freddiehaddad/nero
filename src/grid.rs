@@ -49,6 +49,13 @@
 use crate::map::Set;
 use crate::types_defs::{MAX_SCHAR_SIZE, ScharT};
 
+/// Main screen grid (`default_grid`).
+pub static DEFAULT_GRID: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::grid_defs::ScreenGrid>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::grid_defs::ScreenGrid::default())
+});
+
 /// The process-wide glyph interning cache (`glyph_cache`).
 ///
 /// The original is a `Set(glyph)` of NUL-terminated strings; here the
@@ -1709,6 +1716,17 @@ mod tests {
         assert_eq!(dirty[0], 4);
 
         unsafe { grid_free(&mut grid) };
+    }
+
+    #[test]
+    fn default_grid_starts_with_the_screen_grid_initializer() {
+        let grid = unsafe { DEFAULT_GRID.get_mut() };
+        assert_eq!(grid.handle, 0);
+        assert!(grid.chars.is_null());
+        assert!(grid.attrs.is_null());
+        assert_eq!(grid.rows, 0);
+        assert_eq!(grid.cols, 0);
+        assert_eq!(grid.comp_index, 0);
     }
 
     #[test]

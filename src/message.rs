@@ -40,8 +40,7 @@
 //! `other_sourcing_name`'s remaining body, which still needs
 //! `SOURCING_NAME`.
 //!
-//! `DEFAULT_GRID` is harvested here ahead of its real owning file,
-//! `grid.c` (not translated) - it is the original's own file-static
+//! `crate::grid::DEFAULT_GRID` is the original's own file-static
 //! `ScreenGrid default_grid` (declared in `grid.c`, `SCREEN_GRID_INIT`-
 //! initialized), needed by [`msg_use_grid`]. Since nothing in this
 //! crate can currently allocate a real grid (`grid_alloc`, not
@@ -105,14 +104,6 @@ fn msg_ext_init_chunks() -> Option<crate::api::private::defs::Array> {
     unsafe { crate::globals::GLOBALS.get_mut() }.msg_col = 0;
     previous
 }
-
-/// `default_grid` - the main screen's own [`crate::grid_defs::ScreenGrid`],
-/// harvested here from `grid.c` ahead of the rest of that file (see this
-/// module's own doc comment). Stays at [`crate::grid_defs::ScreenGrid::default`]
-/// (`SCREEN_GRID_INIT`, `chars` null) forever today, since nothing in
-/// this crate can currently allocate a real grid.
-static DEFAULT_GRID: LazyLock<GlobalCell<crate::grid_defs::ScreenGrid>> =
-    LazyLock::new(|| GlobalCell::new(crate::grid_defs::ScreenGrid::default()));
 
 /// The open `'verbosefile'` handle (`verbose_fd`, a file-static
 /// `FILE *` in the original).
@@ -233,7 +224,7 @@ pub fn msg_id_exists(id: i64) -> bool {
 #[must_use]
 pub fn msg_use_grid() -> bool {
     // SAFETY: a plain read through one exclusive borrow.
-    let has_chars = !unsafe { DEFAULT_GRID.get_mut() }.chars.is_null();
+    let has_chars = !unsafe { crate::grid::DEFAULT_GRID.get_mut() }.chars.is_null();
     has_chars && !crate::ui::ui_has(crate::ui::UiExtension::Messages)
 }
 
