@@ -2,9 +2,26 @@
 //!
 //! This module starts with the state carried across calls to the UTF-8
 //! decoder and its initialization routine. The decoder and the other
-//! libvterm character sets are translated incrementally below.
+//! libvterm character sets, their lookup table, and their dispatch
+//! methods are translated incrementally below.
 
 const UNICODE_INVALID: u32 = 0xFFFD;
+
+/// Encoding class (`VTermEncodingType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VTermEncodingType {
+    Utf8 = 0,
+    Single94 = 1,
+}
+
+/// One entry from libvterm's static encoding table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VTermEncoding {
+    Utf8,
+    DecSpecialGraphics,
+    UsAscii,
+}
 
 /// Stateful UTF-8 decoder storage (`struct UTF8DecoderData`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -212,10 +229,26 @@ fn decode_table(
         if c < 0x20 || c == 0x7F || c >= 0x80 {
             return;
         }
+
         let mapped = table[usize::from(c)];
         codepoints[*cpi] = if mapped != 0 { mapped } else { u32::from(c) };
         *cpi += 1;
         *pos += 1;
+    }
+}
+
+/// Looks up an encoding by class and designation
+/// (`vterm_lookup_encoding`).
+#[must_use]
+pub fn vterm_lookup_encoding(
+    encoding_type: VTermEncodingType,
+    designation: u8,
+) -> Option<VTermEncoding> {
+    match (encoding_type, designation) {
+        (VTermEncodingType::Utf8, b'u') => Some(VTermEncoding::Utf8),
+        (VTermEncodingType::Single94, b'0') => Some(VTermEncoding::DecSpecialGraphics),
+        (VTermEncodingType::Single94, b'B') => Some(VTermEncoding::UsAscii),
+        _ => None,
     }
 }
 
@@ -404,5 +437,37 @@ mod tests {
         );
         assert_eq!(&output[..cpi], &[0x2500, 0x2502]);
         assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn lookup_encoding_matches_the_complete_static_table() {
+        assert_eq!(
+            vterm_lookup_encoding(VTermEncodingType::Utf8, b'u'),
+            Some(VTermEncoding::Utf8)
+        );
+        assert_eq!(
+            vterm_lookup_encoding(VTermEncodingType::Single94, b'0'),
+            Some(VTermEncoding::DecSpecialGraphics)
+        );
+        assert_eq!(
+            vterm_lookup_encoding(VTermEncodingType::Single94, b'B'),
+            Some(VTermEncoding::UsAscii)
+        );
+    }
+
+    #[test]
+    fn lookup_encoding_rejects_wrong_classes_and_designations() {
+        assert_eq!(
+            vterm_lookup_encoding(VTermEncodingType::Utf8, b'B'),
+            None
+        );
+        assert_eq!(
+            vterm_lookup_encoding(VTermEncodingType::Single94, b'u'),
+            None
+        );
+        assert_eq!(
+            vterm_lookup_encoding(VTermEncodingType::Single94, b'A'),
+            None
+        );
     }
 }
