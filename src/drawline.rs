@@ -156,6 +156,27 @@ impl Default for WinlinevarsT {
     }
 }
 
+/// Advance the current `'colorcolumn'` pointer past `vcol`
+/// (`advance_color_col`).
+///
+/// # Safety
+/// `color_cols`, when non-null, must point into a live `-1`-terminated
+/// integer array.
+#[allow(dead_code)]
+unsafe fn advance_color_col(wlv: &mut WinlinevarsT, vcol: i32) {
+    if wlv.color_cols.is_null() {
+        return;
+    }
+    while unsafe { *wlv.color_cols } >= 0
+        && vcol > unsafe { *wlv.color_cols }
+    {
+        wlv.color_cols = unsafe { wlv.color_cols.add(1) };
+    }
+    if unsafe { *wlv.color_cols } < 0 {
+        wlv.color_cols = std::ptr::null();
+    }
+}
+
 /// Ensure the reusable scratch buffer has at least `size` bytes and
 /// return its data pointer (`get_extra_buf`).
 ///
@@ -343,6 +364,25 @@ mod tests {
             state.virt_inline_hl_mode,
             crate::decoration_defs::HlMode::Unknown
         );
+    }
+
+    #[test]
+    fn advance_color_col_skips_past_columns_and_clears_at_sentinel() {
+        let columns = [2, 5, 9, -1];
+        let mut state = WinlinevarsT {
+            color_cols: columns.as_ptr(),
+            ..Default::default()
+        };
+
+        unsafe { advance_color_col(&mut state, 5) };
+        assert_eq!(unsafe { *state.color_cols }, 5);
+        unsafe { advance_color_col(&mut state, 8) };
+        assert_eq!(unsafe { *state.color_cols }, 9);
+        unsafe { advance_color_col(&mut state, 10) };
+        assert!(state.color_cols.is_null());
+
+        unsafe { advance_color_col(&mut state, 20) };
+        assert!(state.color_cols.is_null());
     }
 
     // ---- get_lcs_ext ----
