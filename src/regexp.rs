@@ -249,6 +249,31 @@ fn gethexchrs(input: &[u8], max_input_len: usize) -> (i64, usize) {
     }
 }
 
+/// Parse all leading decimal digits (`getdecchrs`).
+///
+/// Returns the value and consumed byte count; `-1, 0` means no valid
+/// digit.
+#[allow(dead_code)]
+#[must_use]
+fn getdecchrs(input: &[u8]) -> (i64, usize) {
+    let mut value = 0_i64;
+    let mut consumed = 0;
+    for &byte in input {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        value = value
+            .wrapping_mul(10)
+            .wrapping_add(i64::from(byte - b'0'));
+        consumed += 1;
+    }
+    if consumed == 0 {
+        (-1, 0)
+    } else {
+        (value, consumed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +322,15 @@ mod tests {
         assert_eq!(gethexchrs(b"Ff", 8), (255, 2));
         assert_eq!(gethexchrs(b"xyz", 4), (-1, 0));
         assert_eq!(gethexchrs(b"12", 0), (-1, 0));
+    }
+
+    #[test]
+    fn getdecchrs_consumes_every_leading_decimal_digit() {
+        assert_eq!(getdecchrs(b"12345rest"), (12_345, 5));
+        assert_eq!(getdecchrs(b"007"), (7, 3));
+        assert_eq!(getdecchrs(b"9"), (9, 1));
+        assert_eq!(getdecchrs(b"x12"), (-1, 0));
+        assert_eq!(getdecchrs(b""), (-1, 0));
     }
 
     impl EvalResultGuard {
