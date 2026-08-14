@@ -37,6 +37,16 @@ pub fn ui_comp_init() {
     *unsafe { CURGRID.get_mut() } = default;
 }
 
+/// Release compositor-owned allocations (`ui_comp_free_all_mem`).
+pub fn ui_comp_free_all_mem() {
+    let layers = unsafe { LAYERS.get_mut() };
+    layers.clear();
+    layers.shrink_to_fit();
+    *unsafe { LINEBUF.get_mut() } = None;
+    *unsafe { ATTRBUF.get_mut() } = None;
+    *unsafe { BUFSIZE.get_mut() } = 0;
+}
+
 /// Whether the compositor should draw (`ui_comp_should_draw`).
 #[must_use]
 pub fn ui_comp_should_draw() -> bool {
@@ -244,5 +254,20 @@ mod tests {
             std::ptr::from_mut(unsafe { crate::grid::DEFAULT_GRID.get_mut() });
         assert_eq!(unsafe { LAYERS.get_mut() }.as_slice(), &[default]);
         assert_eq!(unsafe { *CURGRID.get_mut() }, default);
+    }
+
+    #[test]
+    fn ui_comp_free_all_mem_releases_layers_and_scratch_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _layers = LayerStateGuard::empty();
+        let _buffers = CompositorBuffersGuard::install();
+        ui_comp_init();
+
+        ui_comp_free_all_mem();
+
+        assert!(unsafe { LAYERS.get_mut() }.is_empty());
+        assert!(unsafe { LINEBUF.get_mut() }.is_none());
+        assert!(unsafe { ATTRBUF.get_mut() }.is_none());
+        assert_eq!(unsafe { *BUFSIZE.get_mut() }, 0);
     }
 }
