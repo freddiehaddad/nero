@@ -47,6 +47,45 @@ pub fn ui_comp_free_all_mem() {
     *unsafe { BUFSIZE.get_mut() } = 0;
 }
 
+/// Raise or lower a compositor layer to match its z-index
+/// (`ui_comp_layers_adjust`).
+///
+/// # Safety
+/// `layer_idx` must index `LAYERS`, whose pointers must all be live.
+pub unsafe fn ui_comp_layers_adjust(mut layer_idx: usize, raise: bool) {
+    let layers = unsafe { LAYERS.get_mut() };
+    let size = layers.len();
+    let layer = layers[layer_idx];
+    if raise {
+        while layer_idx < size - 1
+            && unsafe { (*layer).zindex > (*layers[layer_idx + 1]).zindex }
+        {
+            layers[layer_idx] = layers[layer_idx + 1];
+            unsafe {
+                (*layers[layer_idx]).comp_index = layer_idx;
+                (*layers[layer_idx]).pending_comp_index_update = true;
+            }
+            layer_idx += 1;
+        }
+    } else {
+        while layer_idx > 0
+            && unsafe { (*layer).zindex < (*layers[layer_idx - 1]).zindex }
+        {
+            layers[layer_idx] = layers[layer_idx - 1];
+            unsafe {
+                (*layers[layer_idx]).comp_index = layer_idx;
+                (*layers[layer_idx]).pending_comp_index_update = true;
+            }
+            layer_idx -= 1;
+        }
+    }
+    layers[layer_idx] = layer;
+    unsafe {
+        (*layer).comp_index = layer_idx;
+        (*layer).pending_comp_index_update = true;
+    }
+}
+
 /// Whether the compositor should draw (`ui_comp_should_draw`).
 #[must_use]
 pub fn ui_comp_should_draw() -> bool {
@@ -269,5 +308,47 @@ mod tests {
         assert!(unsafe { LINEBUF.get_mut() }.is_none());
         assert!(unsafe { ATTRBUF.get_mut() }.is_none());
         assert_eq!(unsafe { *BUFSIZE.get_mut() }, 0);
+    }
+
+    #[test]
+    fn ui_comp_layers_adjust_reorders_and_updates_indices() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _layers = LayerStateGuard::empty();
+        let mut low = Box::new(crate::grid_defs::ScreenGrid {
+            zindex: 0,
+            comp_index: 0,
+            ..Default::default()
+        });
+        let mut moving = Box::new(crate::grid_defs::ScreenGrid {
+            zindex: 30,
+            comp_index: 1,
+            ..Default::default()
+        });
+        let mut high = Box::new(crate::grid_defs::ScreenGrid {
+            zindex: 20,
+            comp_index: 2,
+            ..Default::default()
+        });
+        let low_ptr = std::ptr::addr_of_mut!(*low);
+        let moving_ptr = std::ptr::addr_of_mut!(*moving);
+        let high_ptr = std::ptr::addr_of_mut!(*high);
+        unsafe { LAYERS.get_mut() }.extend([low_ptr, moving_ptr, high_ptr]);
+
+        unsafe { ui_comp_layers_adjust(1, true) };
+        assert_eq!(
+            unsafe { LAYERS.get_mut() }.as_slice(),
+            &[low_ptr, high_ptr, moving_ptr]
+        );
+        assert_eq!((low.comp_index, high.comp_index, moving.comp_index), (0, 1, 2));
+        assert!(high.pending_comp_index_update);
+        assert!(moving.pending_comp_index_update);
+
+        moving.zindex = 10;
+        unsafe { ui_comp_layers_adjust(2, false) };
+        assert_eq!(
+            unsafe { LAYERS.get_mut() }.as_slice(),
+            &[low_ptr, moving_ptr, high_ptr]
+        );
+        assert_eq!((moving.comp_index, high.comp_index), (1, 2));
     }
 }
