@@ -88,6 +88,29 @@ const KEYCODES_KP: [Keycode; 18] = [
     Keycode { key_type: KeycodeType::Keypad, literal: b'=' as i32, csi_num: b'X' as i32 },
 ];
 
+/// CSI-u keypad key descriptions (`keycodes_kp_csiu`).
+#[allow(dead_code)]
+const KEYCODES_KP_CSIU: [Keycode; 18] = [
+    Keycode { key_type: KeycodeType::Keypad, literal: 57399, csi_num: b'p' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57400, csi_num: b'q' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57401, csi_num: b'r' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57402, csi_num: b's' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57403, csi_num: b't' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57404, csi_num: b'u' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57405, csi_num: b'v' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57406, csi_num: b'w' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57407, csi_num: b'x' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57408, csi_num: b'y' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57411, csi_num: b'j' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57413, csi_num: b'k' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57416, csi_num: b'l' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57412, csi_num: b'm' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57409, csi_num: b'n' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57410, csi_num: b'o' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57414, csi_num: b'M' as i32 },
+    Keycode { key_type: KeycodeType::Keypad, literal: 57415, csi_num: b'X' as i32 },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +215,36 @@ mod tests {
             b"pqrstuvwxyjklmnoMX"
                 .iter()
                 .map(|&byte| i32::from(byte))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn csiu_keypad_table_matches_keyboard_c() {
+        assert_eq!(KEYCODES_KP_CSIU.len(), KEYCODES_KP.len());
+        assert!(
+            KEYCODES_KP_CSIU
+                .iter()
+                .all(|key| key.key_type == KeycodeType::Keypad)
+        );
+        assert_eq!(
+            KEYCODES_KP_CSIU
+                .iter()
+                .map(|key| key.literal)
+                .collect::<Vec<_>>(),
+            [
+                57399, 57400, 57401, 57402, 57403, 57404, 57405, 57406, 57407,
+                57408, 57411, 57413, 57416, 57412, 57409, 57410, 57414, 57415,
+            ]
+        );
+        assert_eq!(
+            KEYCODES_KP_CSIU
+                .iter()
+                .map(|key| key.csi_num)
+                .collect::<Vec<_>>(),
+            KEYCODES_KP
+                .iter()
+                .map(|key| key.csi_num)
                 .collect::<Vec<_>>()
         );
     }
