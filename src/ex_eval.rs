@@ -200,6 +200,20 @@ pub fn has_loop_cmd(p: &[u8]) -> bool {
         || (rest.first() == Some(&b'f') && rest.get(1) == Some(&b'o') && rest.get(2) == Some(&b'r'))
 }
 
+/// Return the missing conditional terminator for the current stack entry
+/// (`get_end_emsg`).
+#[allow(dead_code)]
+fn get_end_emsg(cstack: &crate::ex_eval_defs::CstackT) -> &'static str {
+    let flags = cstack.cs_flags[cstack.cs_idx as usize];
+    if flags & crate::ex_eval_defs::csf::WHILE != 0 {
+        crate::errors::e_endwhile
+    } else if flags & crate::ex_eval_defs::csf::FOR != 0 {
+        crate::errors::e_endfor
+    } else {
+        crate::errors::e_endif
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +238,28 @@ mod tests {
             });
             head = Box::into_raw(node);
         }
+
         head
+    }
+
+    #[test]
+    fn get_end_emsg_selects_the_active_conditional_terminator() {
+        let mut stack = crate::ex_eval_defs::CstackT {
+            cs_idx: 0,
+            ..Default::default()
+        };
+        stack.cs_flags[0] = crate::ex_eval_defs::csf::WHILE;
+        assert_eq!(get_end_emsg(&stack), crate::errors::e_endwhile);
+
+        stack.cs_flags[0] = crate::ex_eval_defs::csf::FOR;
+        assert_eq!(get_end_emsg(&stack), crate::errors::e_endfor);
+
+        stack.cs_flags[0] = crate::ex_eval_defs::csf::TRUE;
+        assert_eq!(get_end_emsg(&stack), crate::errors::e_endif);
+
+        stack.cs_flags[0] =
+            crate::ex_eval_defs::csf::WHILE | crate::ex_eval_defs::csf::FOR;
+        assert_eq!(get_end_emsg(&stack), crate::errors::e_endwhile);
     }
 
     #[test]
