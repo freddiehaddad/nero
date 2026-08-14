@@ -223,7 +223,17 @@ pub struct SynstateT {
     pub sst_tick: crate::buffer_defs::DisptickT,
     pub sst_change_lnum: crate::pos_defs::LinenrT,
 }
-/// Placeholder for `Terminal` (`struct terminal`) - see `src/nvim/terminal.h` (phase 14).
+/// Cursor state cached by `struct terminal`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalCursorT {
+    pub row: i32,
+    pub col: i32,
+    pub shape: i32,
+    pub visible: bool,
+    pub blink: bool,
+}
+
+/// Partial translation of `Terminal` (`struct terminal`).
 #[derive(Debug, Default)]
 pub struct TerminalT {
     /// Lines currently stored in scrollback (`sb_current`).
@@ -234,6 +244,8 @@ pub struct TerminalT {
     pub suspended: bool,
     /// Whether the terminal has closed (`closed`).
     pub closed: bool,
+    /// Cursor position and presentation requested by libvterm (`cursor`).
+    pub cursor: TerminalCursorT,
 }
 /// Quickfix/location list stack (`qf_info_T`, `struct qf_info_S`) -
 /// a stack of quickfix/location lists.
@@ -403,6 +415,17 @@ mod tests {
         assert_eq!(mapping.m_luaref, -1);
         assert_eq!(mapping.m_mode, 0);
         assert!(!mapping.m_replace_keycodes);
+    }
+
+    #[test]
+    fn terminal_cursor_default_matches_zero_initialized_terminal() {
+        let term = TerminalT::default();
+        assert_eq!(term.cursor, TerminalCursorT::default());
+        assert_eq!(term.cursor.row, 0);
+        assert_eq!(term.cursor.col, 0);
+        assert_eq!(term.cursor.shape, 0);
+        assert!(!term.cursor.visible);
+        assert!(!term.cursor.blink);
     }
 
     #[test]
