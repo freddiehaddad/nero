@@ -386,6 +386,17 @@ pub fn get_inserted() -> Option<Vec<u8>> {
 /// `-1` means no script is being read.
 static CURSCRIPT: GlobalCell<i32> = GlobalCell::new(-1);
 
+/// Maximum nested script input streams (`NSCRIPT`).
+pub const NSCRIPT: usize = 15;
+
+/// Typeahead saved for each active `:source!` stream (`saved_typebuf`).
+#[allow(dead_code)]
+static SAVED_TYPEBUF: std::sync::LazyLock<
+    GlobalCell<[TypebufT; NSCRIPT]>,
+> = std::sync::LazyLock::new(|| {
+    GlobalCell::new(std::array::from_fn(|_| TypebufT::default()))
+});
+
 /// Remapping flags for the next `vgetc()`-obtained character
 /// (`KeyNoremap`). File-static in the original.
 static KEY_NOREMAP: GlobalCell<i32> = GlobalCell::new(0);
@@ -725,6 +736,17 @@ fn alloc_typebuf() {
         tb.tb_change_cnt = 1;
     }
     unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = false;
+}
+
+/// Save the current typeahead for the active script (`save_typebuf`).
+#[allow(dead_code)]
+fn save_typebuf() {
+    let script = unsafe { *CURSCRIPT.get_mut() };
+    assert!(script >= 0);
+    init_typebuf();
+    (unsafe { SAVED_TYPEBUF.get_mut() })[script as usize] =
+        unsafe { TYPEBUF.get_mut() }.clone();
+    alloc_typebuf();
 }
 
 /// Free the buffers of [`TYPEBUF`] (`free_typebuf`).
@@ -1151,6 +1173,36 @@ mod tests {
         reset_buffers();
         unsafe { *CURSCRIPT.get_mut() = 0 };
         assert!(using_script());
+        reset_buffers();
+    }
+
+    #[test]
+    fn save_typebuf_preserves_the_active_scripts_typeahead_and_resets_live_state() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        let saved = std::mem::replace(
+            unsafe { SAVED_TYPEBUF.get_mut() },
+            std::array::from_fn(|_| TypebufT::default()),
+        );
+        unsafe {
+            *CURSCRIPT.get_mut() = 2;
+            TYPEBUF.get_mut().tb_buf = vec![1, 2, 3];
+            TYPEBUF.get_mut().tb_noremap = vec![4, 5, 6];
+            TYPEBUF.get_mut().tb_len = 3;
+            TYPEBUF.get_mut().tb_change_cnt = 9;
+        }
+
+        save_typebuf();
+
+        assert_eq!(unsafe { SAVED_TYPEBUF.get_mut() }[2].tb_buf, vec![1, 2, 3]);
+        assert_eq!(unsafe { SAVED_TYPEBUF.get_mut() }[2].tb_noremap, vec![4, 5, 6]);
+        assert_eq!(unsafe { SAVED_TYPEBUF.get_mut() }[2].tb_len, 3);
+        assert!(unsafe { TYPEBUF.get_mut() }.tb_buf.is_empty());
+        assert!(unsafe { TYPEBUF.get_mut() }.tb_noremap.is_empty());
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_len, 0);
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_change_cnt, 10);
+
+        *unsafe { SAVED_TYPEBUF.get_mut() } = saved;
         reset_buffers();
     }
 
