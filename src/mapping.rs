@@ -109,6 +109,27 @@ pub unsafe fn get_buf_maphash_list(
     buffer.b_maphash[map_hash(state, c as u8)]
 }
 
+/// Delete one mapping from a linked-list slot (`mapblock_free`).
+///
+/// # Safety
+/// `*link` must be a non-null node allocated by `Box::into_raw`; every
+/// linked pointer must be live, and the deleted node may not be used
+/// afterward.
+#[allow(dead_code)]
+unsafe fn mapblock_free(link: &mut *mut crate::types_defs::MapblockT) {
+    let mapping = *link;
+    // SAFETY: forwarded from this function's own safety doc.
+    let node = unsafe { &mut *mapping };
+    if !node.m_alt.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*node.m_alt).m_alt = std::ptr::null_mut() };
+    } else if node.m_luaref != -1 {
+        unimplemented!("mapblock_free: Lua references need the Lua host");
+    }
+    *link = node.m_next;
+    drop(unsafe { Box::from_raw(mapping) });
+}
+
 /// Resets both language-map tables to the identity mapping
 /// (`langmap_init`).
 pub fn langmap_init() {
@@ -387,6 +408,44 @@ mod tests {
             get_buf_maphash_list(mode::INSERT as i32, i32::from(b'q'))
         }
         .is_null());
+    }
+
+    #[test]
+    fn mapblock_free_unlinks_the_node_and_breaks_its_alternative_pair() {
+        let mut next = Box::new(crate::types_defs::MapblockT {
+            m_keys: b"next".to_vec(),
+            ..Default::default()
+        });
+        let next_ptr = std::ptr::addr_of_mut!(*next);
+        let mut alternate = Box::new(crate::types_defs::MapblockT::default());
+        let alternate_ptr = std::ptr::addr_of_mut!(*alternate);
+        let first = Box::into_raw(Box::new(crate::types_defs::MapblockT {
+            m_next: next_ptr,
+            m_alt: alternate_ptr,
+            m_keys: b"first".to_vec(),
+            ..Default::default()
+        }));
+        alternate.m_alt = first;
+        let mut head = first;
+
+        unsafe { mapblock_free(&mut head) };
+
+        assert_eq!(head, next_ptr);
+        assert!(alternate.m_alt.is_null());
+    }
+
+    #[test]
+    fn mapblock_free_drops_owned_rhs_fields_for_a_primary_mapping() {
+        let mapping = Box::into_raw(Box::new(crate::types_defs::MapblockT {
+            m_keys: b"lhs".to_vec(),
+            m_str: Some(b"rhs".to_vec()),
+            m_orig_str: Some(b"original".to_vec()),
+            m_desc: Some(b"description".to_vec()),
+            ..Default::default()
+        }));
+        let mut head = mapping;
+        unsafe { mapblock_free(&mut head) };
+        assert!(head.is_null());
     }
 
     #[test]
