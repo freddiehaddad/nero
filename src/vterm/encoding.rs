@@ -49,6 +49,7 @@ fn decode_utf8(
                 codepoints[*cpi] = UNICODE_INVALID;
                 *cpi += 1;
             }
+
             codepoints[*cpi] = u32::from(c);
             *cpi += 1;
             data.bytes_remaining = 0;
@@ -128,6 +129,31 @@ fn decode_utf8(
             *cpi += 1;
         }
 
+        *pos += 1;
+    }
+}
+
+/// Decodes libvterm's US-ASCII GL or GR character set
+/// (`decode_usascii`).
+///
+/// `*pos` must identify a byte in `bytes`, matching the original's
+/// caller contract: that byte selects whether this invocation decodes
+/// the low (GL) or high (GR) half.
+#[allow(dead_code)]
+fn decode_usascii(
+    codepoints: &mut [u32],
+    cpi: &mut usize,
+    bytes: &[u8],
+    pos: &mut usize,
+) {
+    let is_gr = bytes[*pos] & 0x80;
+    while *pos < bytes.len() && *cpi < codepoints.len() {
+        let c = bytes[*pos] ^ is_gr;
+        if c < 0x20 || c == 0x7F || c >= 0x80 {
+            return;
+        }
+        codepoints[*cpi] = u32::from(c);
+        *cpi += 1;
         *pos += 1;
     }
 }
@@ -223,5 +249,52 @@ mod tests {
         assert_eq!(data.bytes_remaining, 2);
         assert_eq!(data.bytes_total, 4);
         assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn decode_usascii_decodes_the_gl_half() {
+        let mut output = [0; 4];
+        let mut cpi = 0;
+        let mut pos = 0;
+        decode_usascii(&mut output, &mut cpi, b"ABC", &mut pos);
+        assert_eq!(&output[..cpi], &[b'A' as u32, b'B' as u32, b'C' as u32]);
+        assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn decode_usascii_decodes_the_gr_half_by_clearing_bit_eight() {
+        let mut output = [0; 4];
+        let mut cpi = 0;
+        let mut pos = 0;
+        decode_usascii(&mut output, &mut cpi, &[0xC1, 0xC2, 0xC3], &mut pos);
+        assert_eq!(&output[..cpi], &[b'A' as u32, b'B' as u32, b'C' as u32]);
+        assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn decode_usascii_stops_before_controls_or_the_other_half() {
+        let mut output = [0; 4];
+        let mut cpi = 0;
+        let mut pos = 0;
+        decode_usascii(&mut output, &mut cpi, b"A\x1bB", &mut pos);
+        assert_eq!(&output[..cpi], &[b'A' as u32]);
+        assert_eq!(pos, 1);
+
+        let mut cpi = 0;
+        let mut pos = 0;
+        decode_usascii(&mut output, &mut cpi, &[0xC1, b'B'], &mut pos);
+        assert_eq!(&output[..cpi], &[b'A' as u32]);
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn decode_usascii_honors_output_capacity() {
+        let mut output = [0; 2];
+        let mut cpi = 1;
+        let mut pos = 0;
+        decode_usascii(&mut output, &mut cpi, b"AB", &mut pos);
+        assert_eq!(output[1], b'A' as u32);
+        assert_eq!(cpi, 2);
+        assert_eq!(pos, 1);
     }
 }
