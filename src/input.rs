@@ -397,6 +397,30 @@ static SAVED_TYPEBUF: std::sync::LazyLock<
     GlobalCell::new(std::array::from_fn(|_| TypebufT::default()))
 });
 
+/// State for assembling one recorded or show-command key
+/// (`gotchars_state_T`).
+#[allow(dead_code)]
+#[derive(Debug)]
+struct GotcharsStateT {
+    buf: [u8; crate::mbyte_defs::MB_MAXBYTES * 3 + 4],
+    prev_c: i32,
+    buflen: usize,
+    pending_special: u32,
+    pending_mbyte: u32,
+}
+
+impl Default for GotcharsStateT {
+    fn default() -> Self {
+        Self {
+            buf: [0; crate::mbyte_defs::MB_MAXBYTES * 3 + 4],
+            prev_c: 0,
+            buflen: 0,
+            pending_special: 0,
+            pending_mbyte: 0,
+        }
+    }
+}
+
 /// Remapping flags for the next `vgetc()`-obtained character
 /// (`KeyNoremap`). File-static in the original.
 static KEY_NOREMAP: GlobalCell<i32> = GlobalCell::new(0);
@@ -1204,6 +1228,20 @@ mod tests {
 
         *unsafe { SAVED_TYPEBUF.get_mut() } = saved;
         reset_buffers();
+    }
+
+    #[test]
+    fn gotchars_state_defaults_with_room_for_escaped_multibyte_keys() {
+        let state = GotcharsStateT::default();
+        assert_eq!(
+            state.buf.len(),
+            crate::mbyte_defs::MB_MAXBYTES * 3 + 4
+        );
+        assert!(state.buf.iter().all(|&byte| byte == 0));
+        assert_eq!(state.prev_c, 0);
+        assert_eq!(state.buflen, 0);
+        assert_eq!(state.pending_special, 0);
+        assert_eq!(state.pending_mbyte, 0);
     }
 
     #[test]
