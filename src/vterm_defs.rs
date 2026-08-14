@@ -9,6 +9,52 @@ pub const VTERM_MOD_ALT: VTermModifier = 0x02;
 pub const VTERM_MOD_CTRL: VTermModifier = 0x04;
 pub const VTERM_ALL_MODS_MASK: VTermModifier = 0x07;
 
+/// Terminal key code (`VTermKey`).
+pub type VTermKey = i32;
+pub const VTERM_KEY_NONE: VTermKey = 0;
+pub const VTERM_KEY_ENTER: VTermKey = 1;
+pub const VTERM_KEY_TAB: VTermKey = 2;
+pub const VTERM_KEY_BACKSPACE: VTermKey = 3;
+pub const VTERM_KEY_ESCAPE: VTermKey = 4;
+pub const VTERM_KEY_UP: VTermKey = 5;
+pub const VTERM_KEY_DOWN: VTermKey = 6;
+pub const VTERM_KEY_LEFT: VTermKey = 7;
+pub const VTERM_KEY_RIGHT: VTermKey = 8;
+pub const VTERM_KEY_INS: VTermKey = 9;
+pub const VTERM_KEY_DEL: VTermKey = 10;
+pub const VTERM_KEY_HOME: VTermKey = 11;
+pub const VTERM_KEY_END: VTermKey = 12;
+pub const VTERM_KEY_PAGEUP: VTermKey = 13;
+pub const VTERM_KEY_PAGEDOWN: VTermKey = 14;
+pub const VTERM_KEY_FUNCTION_0: VTermKey = 256;
+pub const VTERM_KEY_FUNCTION_MAX: VTermKey = VTERM_KEY_FUNCTION_0 + 255;
+pub const VTERM_KEY_KP_0: VTermKey = VTERM_KEY_FUNCTION_MAX + 1;
+pub const VTERM_KEY_KP_1: VTermKey = VTERM_KEY_KP_0 + 1;
+pub const VTERM_KEY_KP_2: VTermKey = VTERM_KEY_KP_0 + 2;
+pub const VTERM_KEY_KP_3: VTermKey = VTERM_KEY_KP_0 + 3;
+pub const VTERM_KEY_KP_4: VTermKey = VTERM_KEY_KP_0 + 4;
+pub const VTERM_KEY_KP_5: VTermKey = VTERM_KEY_KP_0 + 5;
+pub const VTERM_KEY_KP_6: VTermKey = VTERM_KEY_KP_0 + 6;
+pub const VTERM_KEY_KP_7: VTermKey = VTERM_KEY_KP_0 + 7;
+pub const VTERM_KEY_KP_8: VTermKey = VTERM_KEY_KP_0 + 8;
+pub const VTERM_KEY_KP_9: VTermKey = VTERM_KEY_KP_0 + 9;
+pub const VTERM_KEY_KP_MULT: VTermKey = VTERM_KEY_KP_0 + 10;
+pub const VTERM_KEY_KP_PLUS: VTermKey = VTERM_KEY_KP_0 + 11;
+pub const VTERM_KEY_KP_COMMA: VTermKey = VTERM_KEY_KP_0 + 12;
+pub const VTERM_KEY_KP_MINUS: VTermKey = VTERM_KEY_KP_0 + 13;
+pub const VTERM_KEY_KP_PERIOD: VTermKey = VTERM_KEY_KP_0 + 14;
+pub const VTERM_KEY_KP_DIVIDE: VTermKey = VTERM_KEY_KP_0 + 15;
+pub const VTERM_KEY_KP_ENTER: VTermKey = VTERM_KEY_KP_0 + 16;
+pub const VTERM_KEY_KP_EQUAL: VTermKey = VTERM_KEY_KP_0 + 17;
+pub const VTERM_KEY_MAX: VTermKey = VTERM_KEY_KP_0 + 18;
+pub const VTERM_N_KEYS: VTermKey = VTERM_KEY_MAX;
+
+/// Constructs `VTERM_KEY_FUNCTION(n)`.
+#[must_use]
+pub const fn vterm_key_function(n: i32) -> VTermKey {
+    VTERM_KEY_FUNCTION_0 + n
+}
+
 /// Zero-based terminal screen position (`VTermPos`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VTermPos {
@@ -95,5 +141,17 @@ mod tests {
         assert_eq!(VTermPos::default(), VTermPos { row: 0, col: 0 });
         assert_eq!(VTermPos { row: 12, col: 34 }.row, 12);
         assert_eq!(VTermPos { row: 12, col: 34 }.col, 34);
+    }
+
+    #[test]
+    fn vterm_key_discriminants_match_keycodes_header() {
+        assert_eq!(VTERM_KEY_NONE, 0);
+        assert_eq!(VTERM_KEY_PAGEDOWN, 14);
+        assert_eq!(vterm_key_function(0), 256);
+        assert_eq!(vterm_key_function(255), VTERM_KEY_FUNCTION_MAX);
+        assert_eq!(VTERM_KEY_KP_0, 512);
+        assert_eq!(VTERM_KEY_KP_EQUAL, 529);
+        assert_eq!(VTERM_KEY_MAX, 530);
+        assert_eq!(VTERM_N_KEYS, VTERM_KEY_MAX);
     }
 }
