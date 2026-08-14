@@ -67,6 +67,9 @@ static MAPHASH: GlobalCell<
     std::ptr::null_mut();
     crate::buffer_defs::MAX_MAPHASH as usize
 ]);
+/// Head of the global abbreviation list (`first_abbr`).
+static FIRST_ABBR: GlobalCell<*mut crate::types_defs::MapblockT> =
+    GlobalCell::new(std::ptr::null_mut());
 
 /// Mapping-table bucket index (`MAP_HASH`).
 #[allow(dead_code)]
@@ -128,6 +131,48 @@ unsafe fn mapblock_free(link: &mut *mut crate::types_defs::MapblockT) {
     }
     *link = node.m_next;
     drop(unsafe { Box::from_raw(mapping) });
+}
+
+/// Whether a mapping RHS contains `rhs` in the requested modes
+/// (`map_to_exists_mode`).
+///
+/// # Safety
+/// `GLOBALS.curbuf`, global mapping chains, and its local chains must
+/// all contain live pointers.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn map_to_exists_mode(rhs: &[u8], modes: i32, abbreviation: bool) -> bool {
+    for buffer_local in [false, true] {
+        for hash in 0..crate::buffer_defs::MAX_MAPHASH as usize {
+            if abbreviation && hash > 0 {
+                break;
+            }
+            let mut mapping = if abbreviation {
+                if buffer_local {
+                    unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_first_abbr }
+                } else {
+                    unsafe { *FIRST_ABBR.get_mut() }
+                }
+            } else if buffer_local {
+                unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_maphash[hash] }
+            } else {
+                unsafe { MAPHASH.get_mut()[hash] }
+            };
+            while !mapping.is_null() {
+                let current = unsafe { &*mapping };
+                if current.m_mode & modes != 0
+                    && current.m_str.as_deref().is_some_and(|text| {
+                        rhs.is_empty()
+                            || text.windows(rhs.len()).any(|window| window == rhs)
+                    })
+                {
+                    return true;
+                }
+                mapping = current.m_next;
+            }
+        }
+    }
+    false
 }
 
 /// Resets both language-map tables to the identity mapping
@@ -446,6 +491,50 @@ mod tests {
         let mut head = mapping;
         unsafe { mapblock_free(&mut head) };
         assert!(head.is_null());
+    }
+
+    #[test]
+    fn map_to_exists_mode_searches_global_and_buffer_local_chains() {
+        let _lock = global_state_test_lock();
+        let saved_hash = *unsafe { MAPHASH.get_mut() };
+        let saved_abbr = std::mem::replace(
+            unsafe { FIRST_ABBR.get_mut() },
+            std::ptr::null_mut(),
+        );
+        let mut global = Box::new(crate::types_defs::MapblockT {
+            m_str: Some(b"global rhs".to_vec()),
+            m_mode: mode::NORMAL as i32,
+            ..Default::default()
+        });
+        let mut local = Box::new(crate::types_defs::MapblockT {
+            m_str: Some(b"local rhs".to_vec()),
+            m_mode: mode::INSERT as i32,
+            ..Default::default()
+        });
+        let global_ptr = std::ptr::addr_of_mut!(*global);
+        let local_ptr = std::ptr::addr_of_mut!(*local);
+        (unsafe { MAPHASH.get_mut() })[0] = global_ptr;
+        let mut buffer = crate::buffer_defs::BufT::default();
+        buffer.b_maphash[1] = local_ptr;
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                std::ptr::addr_of_mut!(buffer),
+            )
+        };
+
+        assert!(unsafe {
+            map_to_exists_mode(b"global", mode::NORMAL as i32, false)
+        });
+        assert!(unsafe {
+            map_to_exists_mode(b"local", mode::INSERT as i32, false)
+        });
+        assert!(!unsafe {
+            map_to_exists_mode(b"missing", mode::NORMAL as i32, false)
+        });
+
+        *unsafe { MAPHASH.get_mut() } = saved_hash;
+        *unsafe { FIRST_ABBR.get_mut() } = saved_abbr;
     }
 
     #[test]
