@@ -38,6 +38,32 @@ impl VTermKeyEncodingFlags {
     }
 }
 
+/// Progressive keyboard-encoding flag stack
+/// (`VTermKeyEncodingStack`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VTermKeyEncodingStack {
+    pub items: [VTermKeyEncodingFlags; 16],
+    pub size: u8,
+}
+
+impl Default for VTermKeyEncodingStack {
+    fn default() -> Self {
+        Self {
+            items: [VTermKeyEncodingFlags::default(); 16],
+            size: 1,
+        }
+    }
+}
+
+impl VTermKeyEncodingStack {
+    /// Returns the active top-of-stack flags.
+    #[must_use]
+    pub fn current(&self) -> VTermKeyEncodingFlags {
+        debug_assert!(self.size > 0 && usize::from(self.size) <= self.items.len());
+        self.items[usize::from(self.size) - 1]
+    }
+}
+
 /// Terminal key code (`VTermKey`).
 pub type VTermKey = i32;
 pub const VTERM_KEY_NONE: VTermKey = 0;
@@ -208,5 +234,28 @@ mod tests {
         assert_eq!(VTERM_KEY_KP_EQUAL, 529);
         assert_eq!(VTERM_KEY_MAX, 530);
         assert_eq!(VTERM_N_KEYS, VTERM_KEY_MAX);
+    }
+
+    #[test]
+    fn key_encoding_stack_starts_with_one_zeroed_entry() {
+        let stack = VTermKeyEncodingStack::default();
+        assert_eq!(stack.size, 1);
+        assert_eq!(stack.current(), VTermKeyEncodingFlags::default());
+        assert_eq!(stack.items.len(), 16);
+    }
+
+    #[test]
+    fn key_encoding_stack_current_reads_the_top_entry() {
+        let mut stack = VTermKeyEncodingStack::default();
+        stack.items[0].disambiguate = true;
+        stack.items[1].report_events = true;
+        stack.size = 2;
+        assert_eq!(
+            stack.current(),
+            VTermKeyEncodingFlags {
+                report_events: true,
+                ..Default::default()
+            }
+        );
     }
 }
