@@ -55,6 +55,25 @@ impl VTermEncodingInstance {
             init_utf8(&mut self.utf8_data);
         }
     }
+
+    /// Invokes the selected encoding's decode callback.
+    pub fn decode(
+        &mut self,
+        codepoints: &mut [u32],
+        cpi: &mut usize,
+        bytes: &[u8],
+        pos: &mut usize,
+    ) {
+        match self.encoding {
+            VTermEncoding::Utf8 => {
+                decode_utf8(&mut self.utf8_data, codepoints, cpi, bytes, pos);
+            }
+            VTermEncoding::DecSpecialGraphics => {
+                decode_table(&DEC_SPECIAL_GRAPHICS, codepoints, cpi, bytes, pos);
+            }
+            VTermEncoding::UsAscii => decode_usascii(codepoints, cpi, bytes, pos),
+        }
+    }
 }
 
 /// Stateful UTF-8 decoder storage (`struct UTF8DecoderData`).
@@ -536,5 +555,39 @@ mod tests {
             assert_eq!(instance.utf8_data.bytes_total, 2);
             assert_eq!(instance.utf8_data.this_cp, 3);
         }
+    }
+
+    #[test]
+    fn encoding_instance_dispatches_every_static_decoder() {
+            let cases: [(VTermEncoding, &[u8], &[u32]); 3] = [
+                (VTermEncoding::Utf8, b"\xE2\x82\xAC", &[0x20AC]),
+                (VTermEncoding::DecSpecialGraphics, b"qx", &[0x2500, 0x2502]),
+                (VTermEncoding::UsAscii, b"AB", &[b'A' as u32, b'B' as u32]),
+            ];
+            for (encoding, input, expected) in cases {
+                let mut instance = VTermEncodingInstance::new(encoding);
+                let mut output = [0; 4];
+                let mut cpi = 0;
+                let mut pos = 0;
+                instance.decode(&mut output, &mut cpi, input, &mut pos);
+                assert_eq!(&output[..cpi], expected);
+                assert_eq!(pos, input.len());
+            }
+        }
+
+    #[test]
+    fn encoding_instance_preserves_utf8_state_between_decode_calls() {
+            let mut instance = VTermEncodingInstance::new(VTermEncoding::Utf8);
+            let mut output = [0; 4];
+            let mut cpi = 0;
+            let mut pos = 0;
+            instance.decode(&mut output, &mut cpi, b"\xF0\x9F", &mut pos);
+            assert_eq!(cpi, 0);
+            assert_eq!(instance.utf8_data.bytes_remaining, 2);
+
+            pos = 0;
+            instance.decode(&mut output, &mut cpi, b"\x98\x80", &mut pos);
+            assert_eq!(&output[..cpi], &[0x1F600]);
+            assert_eq!(instance.utf8_data.bytes_remaining, 0);
     }
 }
