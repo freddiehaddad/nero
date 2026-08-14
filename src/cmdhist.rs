@@ -430,6 +430,31 @@ pub unsafe fn init_history() {
     unsafe { *HISLEN.get_mut() = newlen };
 }
 
+/// Get one history array and its current index/number slots
+/// (`hist_get_array`).
+///
+/// # Safety
+/// The returned mutable references alias process-global history state;
+/// callers must hold exclusive access until all three are dropped.
+pub unsafe fn hist_get_array(
+    history_type: u8,
+) -> (
+    &'static mut [HistentryT],
+    &'static mut i32,
+    &'static mut i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { init_history() };
+    let index = usize::from(history_type);
+    // SAFETY: forwarded from this function's own safety doc.
+    let entries = unsafe { &mut HISTORY.get_mut()[index] };
+    // SAFETY: each reference targets a distinct file-static.
+    let last_index = unsafe { &mut HISIDX.get_mut()[index] };
+    // SAFETY: each reference targets a distinct file-static.
+    let last_number = unsafe { &mut HISNUM.get_mut()[index] };
+    (entries.as_mut_slice(), last_index, last_number)
+}
+
 /// Add the given string to a history (`add_to_history`).
 ///
 /// `in_map` marks the entry as coming from inside a mapping;
@@ -1565,6 +1590,32 @@ pub(crate) mod tests {
             // The buffer is `new_entrylen + 2` bytes: text, NUL, sep.
             assert_eq!(e.hisstr.as_deref(), Some(&b"pat\0/"[..]));
         });
+    }
+
+    #[test]
+    fn hist_get_array_returns_the_requested_table_and_live_counters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+        let saved_num = *unsafe { HISNUM.get_mut() };
+        with_p_hi(3, || {
+            unsafe { init_history() };
+            {
+                let (entries, last_index, last_number) = unsafe {
+                    hist_get_array(HistoryType::Search as u8)
+                };
+                assert_eq!(entries.len(), 3);
+                *last_index = 2;
+                *last_number = 17;
+                entries[2].hisnum = 17;
+            }
+
+            let index = HistoryType::Search as usize;
+            assert_eq!(unsafe { HISIDX.get_mut()[index] }, 2);
+            assert_eq!(unsafe { HISNUM.get_mut()[index] }, 17);
+            assert_eq!(unsafe { HISTORY.get_mut()[index][2].hisnum }, 17);
+        });
+        *unsafe { HISNUM.get_mut() } = saved_num;
+        restore_history_state(saved);
     }
 
     #[test]
