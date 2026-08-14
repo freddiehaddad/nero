@@ -301,6 +301,56 @@ fn getoctchrs(input: &[u8]) -> (i64, usize) {
     }
 }
 
+/// Largest finite repetition limit (`MAX_LIMIT`).
+const MAX_LIMIT: i32 = 32_767 << 16;
+
+/// Parse regexp repetition limits after an opening `{` (`read_limits`).
+///
+/// Returns `(minimum, maximum, consumed)`; the consumed count includes
+/// the closing `}` and an optional escaping backslash before it.
+#[allow(dead_code)]
+fn read_limits(input: &[u8]) -> Result<(i32, i32, usize), ()> {
+    let mut offset = 0;
+    let reverse = input.first() == Some(&b'-');
+    if reverse {
+        offset += 1;
+    }
+    let first_is_digit = input.get(offset).is_some_and(u8::is_ascii_digit);
+    let (mut minimum, consumed) =
+        crate::charset::getdigits_int(&input[offset..], false, 0);
+    offset += consumed;
+
+    let mut maximum;
+    if input.get(offset) == Some(&b',') {
+        offset += 1;
+        if input.get(offset).is_some_and(u8::is_ascii_digit) {
+            let (value, consumed) =
+                crate::charset::getdigits_int(&input[offset..], false, MAX_LIMIT);
+            maximum = value;
+            offset += consumed;
+        } else {
+            maximum = MAX_LIMIT;
+        }
+    } else if first_is_digit {
+        maximum = minimum;
+    } else {
+        maximum = MAX_LIMIT;
+    }
+
+    if input.get(offset) == Some(&b'\\') {
+        offset += 1;
+    }
+    if input.get(offset) != Some(&b'}') {
+        return Err(());
+    }
+    offset += 1;
+
+    if (!reverse && minimum > maximum) || (reverse && minimum < maximum) {
+        std::mem::swap(&mut minimum, &mut maximum);
+    }
+    Ok((minimum, maximum, offset))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +418,19 @@ mod tests {
         assert_eq!(getoctchrs(b"078"), (0o7, 2));
         assert_eq!(getoctchrs(b"8"), (-1, 0));
         assert_eq!(getoctchrs(b""), (-1, 0));
+    }
+
+    #[test]
+    fn read_limits_handles_fixed_open_ended_reversed_and_escaped_ranges() {
+        assert_eq!(read_limits(b"3}"), Ok((3, 3, 2)));
+        assert_eq!(read_limits(b"3,5}"), Ok((3, 5, 4)));
+        assert_eq!(read_limits(b"5,3}"), Ok((3, 5, 4)));
+        assert_eq!(read_limits(b"3,}"), Ok((3, MAX_LIMIT, 3)));
+        assert_eq!(read_limits(b"}"), Ok((0, MAX_LIMIT, 1)));
+        assert_eq!(read_limits(b"-3,5}"), Ok((5, 3, 5)));
+        assert_eq!(read_limits(b"-5,3}"), Ok((5, 3, 5)));
+        assert_eq!(read_limits(b"2\\}"), Ok((2, 2, 3)));
+        assert_eq!(read_limits(b"2x"), Err(()));
     }
 
     impl EvalResultGuard {
