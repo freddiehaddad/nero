@@ -73,6 +73,56 @@ enum AffFlagType {
 #[allow(dead_code)]
 const ZERO_FLAG: u32 = 65_009;
 
+/// Decode one affix flag and report consumed bytes (`get_affitem`).
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::utfc_ptr2len`].
+#[allow(dead_code)]
+unsafe fn get_affitem(flag_type: AffFlagType, input: &[u8]) -> (u32, usize) {
+    if flag_type == AffFlagType::Num {
+        if !input.first().is_some_and(u8::is_ascii_digit) {
+            return (0, usize::from(!input.is_empty()));
+        }
+        let (value, consumed) = crate::charset::getdigits_int(input, true, 0);
+        return (
+            if value == 0 {
+                ZERO_FLAG
+            } else {
+                value as u32
+            },
+            consumed,
+        );
+    }
+
+    let Some(&first_byte) = input.first() else {
+        return (0, 0);
+    };
+    if first_byte == crate::ascii_defs::NUL {
+        return (0, 0);
+    }
+    let first = crate::mbyte::utf_ptr2char(input);
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut consumed =
+        unsafe { crate::mbyte::utfc_ptr2len(input) }.max(1) as usize;
+    let needs_second = flag_type == AffFlagType::Long
+        || (flag_type == AffFlagType::CapLong
+            && (i32::from(b'A')..=i32::from(b'Z')).contains(&first));
+    if !needs_second {
+        return (first as u32, consumed);
+    }
+    if input
+        .get(consumed)
+        .is_none_or(|&byte| byte == crate::ascii_defs::NUL)
+    {
+        return (0, consumed);
+    }
+    let second = crate::mbyte::utf_ptr2char(&input[consumed..]);
+    // SAFETY: forwarded from this function's own safety doc.
+    consumed += unsafe { crate::mbyte::utfc_ptr2len(&input[consumed..]) }
+        .max(1) as usize;
+    ((second as u32) + ((first as u32) << 16), consumed)
+}
+
 /// Tunable parameter for when the tree is compressed - memory /
 /// [`SBLOCKSIZE`] (`compress_start`).
 static COMPRESS_START: GlobalCell<i32> = GlobalCell::new(30000);
@@ -303,6 +353,36 @@ mod tests {
         assert_eq!(AffFlagType::CapLong as i32, 2);
         assert_eq!(AffFlagType::Num as i32, 3);
         assert_eq!(ZERO_FLAG, 65_009);
+    }
+
+    #[test]
+    fn get_affitem_decodes_character_long_caplong_and_numeric_flags() {
+        assert_eq!(
+            unsafe { get_affitem(AffFlagType::Char, "éx".as_bytes()) },
+            (0x00e9, 2)
+        );
+        assert_eq!(
+            unsafe { get_affitem(AffFlagType::Long, b"ABx") },
+            ((u32::from(b'A') << 16) + u32::from(b'B'), 2)
+        );
+        assert_eq!(
+            unsafe { get_affitem(AffFlagType::CapLong, b"ABx") },
+            ((u32::from(b'A') << 16) + u32::from(b'B'), 2)
+        );
+        assert_eq!(
+            unsafe { get_affitem(AffFlagType::CapLong, b"aBx") },
+            (u32::from(b'a'), 1)
+        );
+        assert_eq!(unsafe { get_affitem(AffFlagType::Long, b"A") }, (0, 1));
+        assert_eq!(
+            unsafe { get_affitem(AffFlagType::Num, b"123,") },
+            (123, 3)
+        );
+        assert_eq!(
+            unsafe { get_affitem(AffFlagType::Num, b"0,") },
+            (ZERO_FLAG, 1)
+        );
+        assert_eq!(unsafe { get_affitem(AffFlagType::Num, b"x") }, (0, 1));
     }
 
     // --- mb_str2wide ---
