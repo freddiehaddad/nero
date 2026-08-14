@@ -196,6 +196,28 @@ unsafe fn syn_stack_free_block(block: &mut crate::buffer_defs::SynblockT) {
     block.b_sst_len = 0;
 }
 
+/// Free all saved syntax states and invalidate syntax folds
+/// (`syn_stack_free_all`).
+///
+/// # Safety
+/// Same as [`syn_stack_free_block`]; `GLOBALS.firstwin` must head the
+/// live current-tab window list.
+pub unsafe fn syn_stack_free_all(block: &mut crate::buffer_defs::SynblockT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { syn_stack_free_block(block) };
+    let block_ptr = std::ptr::from_mut(block);
+    let mut win = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !win.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let current = unsafe { &*win };
+        if current.w_s == block_ptr && crate::fold::foldmethod_is_syntax(current) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::fold::fold_update_all(win) };
+        }
+        win = current.w_next;
+    }
+}
+
 /// Return one completion candidate for `:syntime`
 /// (`get_syntime_arg`).
 #[must_use]
@@ -1694,6 +1716,7 @@ mod tests {
         unsafe {
             (*states_ptr).sst_next = states_ptr.add(1);
         }
+
         let mut block = crate::buffer_defs::SynblockT {
             b_sst_array: states_ptr,
             b_sst_len: 2,
@@ -1708,6 +1731,41 @@ mod tests {
         assert!(block.b_sst_first.is_null());
         assert_eq!(block.b_sst_len, 0);
         unsafe { syn_stack_free_block(&mut block) };
+    }
+
+    #[test]
+    fn syn_stack_free_all_invalidates_only_syntax_folds_using_the_block() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut block = crate::buffer_defs::SynblockT::default();
+        let block_ptr = std::ptr::addr_of_mut!(block);
+        let mut manual = crate::buffer_defs::WinT {
+            w_s: block_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut syntax = crate::buffer_defs::WinT {
+            w_s: block_ptr,
+            w_next: std::ptr::addr_of_mut!(manual),
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdm: Some(b"syntax".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _first = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::addr_of_mut!(syntax),
+            )
+        };
+
+        unsafe { syn_stack_free_all(&mut block) };
+
+        assert!(syntax.w_foldinvalid);
+        assert!(!manual.w_foldinvalid);
     }
 
     #[test]
