@@ -152,7 +152,68 @@ fn decode_usascii(
         if c < 0x20 || c == 0x7F || c >= 0x80 {
             return;
         }
+
         codepoints[*cpi] = u32::from(c);
+        *cpi += 1;
+        *pos += 1;
+    }
+}
+
+/// DEC Special Graphics character map (`encoding_DECdrawing.chars`).
+#[allow(dead_code)]
+const DEC_SPECIAL_GRAPHICS: [u32; 128] = {
+    let mut chars = [0; 128];
+    chars[0x60] = 0x25C6; // BLACK DIAMOND
+    chars[0x61] = 0x2592; // MEDIUM SHADE
+    chars[0x62] = 0x2409; // SYMBOL FOR HORIZONTAL TAB
+    chars[0x63] = 0x240C; // SYMBOL FOR FORM FEED
+    chars[0x64] = 0x240D; // SYMBOL FOR CARRIAGE RETURN
+    chars[0x65] = 0x240A; // SYMBOL FOR LINE FEED
+    chars[0x66] = 0x00B0; // DEGREE SIGN
+    chars[0x67] = 0x00B1; // PLUS-MINUS SIGN
+    chars[0x68] = 0x2424; // SYMBOL FOR NEW LINE
+    chars[0x69] = 0x240B; // SYMBOL FOR VERTICAL TAB
+    chars[0x6A] = 0x2518; // BOX DRAWINGS LIGHT UP AND LEFT
+    chars[0x6B] = 0x2510; // BOX DRAWINGS LIGHT DOWN AND LEFT
+    chars[0x6C] = 0x250C; // BOX DRAWINGS LIGHT DOWN AND RIGHT
+    chars[0x6D] = 0x2514; // BOX DRAWINGS LIGHT UP AND RIGHT
+    chars[0x6E] = 0x253C; // BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL
+    chars[0x6F] = 0x23BA; // HORIZONTAL SCAN LINE-1
+    chars[0x70] = 0x23BB; // HORIZONTAL SCAN LINE-3
+    chars[0x71] = 0x2500; // BOX DRAWINGS LIGHT HORIZONTAL
+    chars[0x72] = 0x23BC; // HORIZONTAL SCAN LINE-7
+    chars[0x73] = 0x23BD; // HORIZONTAL SCAN LINE-9
+    chars[0x74] = 0x251C; // BOX DRAWINGS LIGHT VERTICAL AND RIGHT
+    chars[0x75] = 0x2524; // BOX DRAWINGS LIGHT VERTICAL AND LEFT
+    chars[0x76] = 0x2534; // BOX DRAWINGS LIGHT UP AND HORIZONTAL
+    chars[0x77] = 0x252C; // BOX DRAWINGS LIGHT DOWN AND HORIZONTAL
+    chars[0x78] = 0x2502; // BOX DRAWINGS LIGHT VERTICAL
+    chars[0x79] = 0x2A7D; // LESS-THAN OR SLANTED EQUAL-TO
+    chars[0x7A] = 0x2A7E; // GREATER-THAN OR SLANTED EQUAL-TO
+    chars[0x7B] = 0x03C0; // GREEK SMALL LETTER PI
+    chars[0x7C] = 0x2260; // NOT EQUAL TO
+    chars[0x7D] = 0x00A3; // POUND SIGN
+    chars[0x7E] = 0x00B7; // MIDDLE DOT
+    chars
+};
+
+/// Decodes a fixed libvterm single-byte table (`decode_table`).
+#[allow(dead_code)]
+fn decode_table(
+    table: &[u32; 128],
+    codepoints: &mut [u32],
+    cpi: &mut usize,
+    bytes: &[u8],
+    pos: &mut usize,
+) {
+    let is_gr = bytes[*pos] & 0x80;
+    while *pos < bytes.len() && *cpi < codepoints.len() {
+        let c = bytes[*pos] ^ is_gr;
+        if c < 0x20 || c == 0x7F || c >= 0x80 {
+            return;
+        }
+        let mapped = table[usize::from(c)];
+        codepoints[*cpi] = if mapped != 0 { mapped } else { u32::from(c) };
         *cpi += 1;
         *pos += 1;
     }
@@ -296,5 +357,52 @@ mod tests {
         assert_eq!(output[1], b'A' as u32);
         assert_eq!(cpi, 2);
         assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn dec_special_graphics_table_matches_the_full_source_mapping() {
+        assert_eq!(
+            &DEC_SPECIAL_GRAPHICS[0x60..=0x7E],
+            &[
+                0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0x00B0, 0x00B1,
+                0x2424, 0x240B, 0x2518, 0x2510, 0x250C, 0x2514, 0x253C, 0x23BA,
+                0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534, 0x252C,
+                0x2502, 0x2A7D, 0x2A7E, 0x03C0, 0x2260, 0x00A3, 0x00B7,
+            ]
+        );
+        assert!(DEC_SPECIAL_GRAPHICS[..0x60].iter().all(|&cp| cp == 0));
+        assert_eq!(DEC_SPECIAL_GRAPHICS[0x7F], 0);
+    }
+
+    #[test]
+    fn decode_table_maps_dec_graphics_and_preserves_unmapped_ascii() {
+        let mut output = [0; 4];
+        let mut cpi = 0;
+        let mut pos = 0;
+        decode_table(
+            &DEC_SPECIAL_GRAPHICS,
+            &mut output,
+            &mut cpi,
+            b"Aqx",
+            &mut pos,
+        );
+        assert_eq!(&output[..cpi], &[b'A' as u32, 0x2500, 0x2502]);
+        assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn decode_table_handles_the_gr_half_and_stops_at_controls() {
+        let mut output = [0; 4];
+        let mut cpi = 0;
+        let mut pos = 0;
+        decode_table(
+            &DEC_SPECIAL_GRAPHICS,
+            &mut output,
+            &mut cpi,
+            &[0xF1, 0xF8, 0x9B],
+            &mut pos,
+        );
+        assert_eq!(&output[..cpi], &[0x2500, 0x2502]);
+        assert_eq!(pos, 2);
     }
 }
