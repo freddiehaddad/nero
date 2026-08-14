@@ -87,6 +87,17 @@ static PUM_INVALID: GlobalCell<bool> = GlobalCell::new(false);
 /// this crate today - matching `PUM_HEIGHT`'s own established
 /// treatment.
 static PUM_SIZE: GlobalCell<i32> = GlobalCell::new(0);
+/// Popup-menu entries currently being displayed (`pum_array`).
+static PUM_ARRAY: GlobalCell<Option<Vec<PumitemT>>> = GlobalCell::new(None);
+/// Width of the popup menu (`pum_width`).
+#[allow(dead_code)]
+static PUM_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
+/// Widest abbreviation column (`pum_base_width`).
+static PUM_BASE_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
+/// Widest kind column including its separator (`pum_kind_width`).
+static PUM_KIND_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
+/// Widest extra/menu column including its separator (`pum_extra_width`).
+static PUM_EXTRA_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
 
 /// One popup menu entry (`pumitem_T`).
 ///
@@ -119,6 +130,39 @@ pub struct PumitemT {
     pub pum_user_abbr_hlattr: i32,
     /// highlight attribute for kind (`pum_user_kind_hlattr`).
     pub pum_user_kind_hlattr: i32,
+}
+
+/// Compute popup-menu text column widths (`pum_compute_size`).
+///
+/// # Safety
+/// Must not run concurrently with popup-menu mutation; forwards
+/// [`crate::charset::vim_strsize`]'s option-state requirements.
+#[allow(dead_code)]
+unsafe fn pum_compute_size() {
+    let mut base_width = 0;
+    let mut kind_width = 0;
+    let mut extra_width = 0;
+    let size = unsafe { *PUM_SIZE.get_mut() }.max(0) as usize;
+    if let Some(items) = unsafe { PUM_ARRAY.get_mut() }.as_ref() {
+        for item in items.iter().take(size) {
+            // SAFETY: forwarded from this function's own safety doc.
+            base_width =
+                base_width.max(unsafe { crate::charset::vim_strsize(&item.pum_text) });
+            if let Some(kind) = item.pum_kind.as_deref() {
+                // SAFETY: forwarded from this function's own safety doc.
+                kind_width = kind_width
+                    .max(unsafe { crate::charset::vim_strsize(kind) } + 1);
+            }
+            if let Some(extra) = item.pum_extra.as_deref() {
+                // SAFETY: forwarded from this function's own safety doc.
+                extra_width = extra_width
+                    .max(unsafe { crate::charset::vim_strsize(extra) } + 1);
+            }
+        }
+    }
+    *unsafe { PUM_BASE_WIDTH.get_mut() } = base_width;
+    *unsafe { PUM_KIND_WIDTH.get_mut() } = kind_width;
+    *unsafe { PUM_EXTRA_WIDTH.get_mut() } = extra_width;
 }
 
 /// State for `pum_ext_select_item` (`pum_want`).
@@ -340,6 +384,40 @@ pub(crate) mod tests {
         want: PumWant,
     }
 
+    struct PumSizingGuard {
+        array: Option<Vec<PumitemT>>,
+        size: i32,
+        width: i32,
+        base: i32,
+        kind: i32,
+        extra: i32,
+    }
+
+    impl PumSizingGuard {
+        fn install(items: Vec<PumitemT>) -> Self {
+            let size = items.len() as i32;
+            Self {
+                array: unsafe { PUM_ARRAY.get_mut() }.replace(items),
+                size: std::mem::replace(unsafe { PUM_SIZE.get_mut() }, size),
+                width: std::mem::replace(unsafe { PUM_WIDTH.get_mut() }, 0),
+                base: std::mem::replace(unsafe { PUM_BASE_WIDTH.get_mut() }, 0),
+                kind: std::mem::replace(unsafe { PUM_KIND_WIDTH.get_mut() }, 0),
+                extra: std::mem::replace(unsafe { PUM_EXTRA_WIDTH.get_mut() }, 0),
+            }
+        }
+    }
+
+    impl Drop for PumSizingGuard {
+        fn drop(&mut self) {
+            *unsafe { PUM_ARRAY.get_mut() } = self.array.take();
+            *unsafe { PUM_SIZE.get_mut() } = self.size;
+            *unsafe { PUM_WIDTH.get_mut() } = self.width;
+            *unsafe { PUM_BASE_WIDTH.get_mut() } = self.base;
+            *unsafe { PUM_KIND_WIDTH.get_mut() } = self.kind;
+            *unsafe { PUM_EXTRA_WIDTH.get_mut() } = self.extra;
+        }
+    }
+
     impl PumStateGuard {
         fn save() -> Self {
             unsafe {
@@ -376,6 +454,30 @@ pub(crate) mod tests {
         unsafe { *PUM_FIRST.get_mut() = 7 };
         pum_clear();
         assert_eq!(unsafe { *PUM_FIRST.get_mut() }, 0);
+    }
+
+    #[test]
+    fn pum_compute_size_tracks_widest_text_kind_and_extra_columns() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _sizing = PumSizingGuard::install(vec![
+            PumitemT {
+                pum_text: b"abc".to_vec(),
+                pum_kind: Some(b"K".to_vec()),
+                pum_extra: Some(b"menu".to_vec()),
+                ..Default::default()
+            },
+            PumitemT {
+                pum_text: "界".as_bytes().to_vec(),
+                pum_kind: Some(b"long".to_vec()),
+                ..Default::default()
+            },
+        ]);
+
+        unsafe { pum_compute_size() };
+
+        assert_eq!(unsafe { *PUM_BASE_WIDTH.get_mut() }, 3);
+        assert_eq!(unsafe { *PUM_KIND_WIDTH.get_mut() }, 5);
+        assert_eq!(unsafe { *PUM_EXTRA_WIDTH.get_mut() }, 5);
     }
 
     #[test]
