@@ -274,6 +274,33 @@ fn getdecchrs(input: &[u8]) -> (i64, usize) {
     }
 }
 
+/// Parse a one-to-three digit byte-sized octal value (`getoctchrs`).
+///
+/// Stops once the accumulated value reaches octal `040`, which makes
+/// an input such as `400` consume and return only `40`, matching Vim's
+/// compatibility behavior.
+#[allow(dead_code)]
+#[must_use]
+fn getoctchrs(input: &[u8]) -> (i64, usize) {
+    let mut value = 0_i64;
+    let mut consumed = 0;
+    while consumed < 3 && value < 0o40 {
+        let Some(&byte) = input.get(consumed) else {
+            break;
+        };
+        if !(b'0'..=b'7').contains(&byte) {
+            break;
+        }
+        value = (value << 3) | i64::from(crate::charset::hex2nr(i32::from(byte)));
+        consumed += 1;
+    }
+    if consumed == 0 {
+        (-1, 0)
+    } else {
+        (value, consumed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +358,16 @@ mod tests {
         assert_eq!(getdecchrs(b"9"), (9, 1));
         assert_eq!(getdecchrs(b"x12"), (-1, 0));
         assert_eq!(getdecchrs(b""), (-1, 0));
+    }
+
+    #[test]
+    fn getoctchrs_limits_values_to_byte_compatible_sequences() {
+        assert_eq!(getoctchrs(b"210rest"), (0o210, 3));
+        assert_eq!(getoctchrs(b"377"), (0o377, 3));
+        assert_eq!(getoctchrs(b"400"), (0o40, 2));
+        assert_eq!(getoctchrs(b"078"), (0o7, 2));
+        assert_eq!(getoctchrs(b"8"), (-1, 0));
+        assert_eq!(getoctchrs(b""), (-1, 0));
     }
 
     impl EvalResultGuard {
