@@ -47,6 +47,24 @@ const KEYCODES: [Keycode; 15] = [
     Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 6 },
 ];
 
+/// Function keys (`keycodes_fn`), indexed from F0.
+#[allow(dead_code)]
+const KEYCODES_FN: [Keycode; 13] = [
+    Keycode { key_type: KeycodeType::None, literal: 0, csi_num: 0 },
+    Keycode { key_type: KeycodeType::Ss3, literal: b'P' as i32, csi_num: 0 },
+    Keycode { key_type: KeycodeType::Ss3, literal: b'Q' as i32, csi_num: 0 },
+    Keycode { key_type: KeycodeType::Ss3, literal: b'R' as i32, csi_num: 0 },
+    Keycode { key_type: KeycodeType::Ss3, literal: b'S' as i32, csi_num: 0 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 15 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 17 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 18 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 19 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 20 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 21 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 23 },
+    Keycode { key_type: KeycodeType::CsiNum, literal: b'~' as i32, csi_num: 24 },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +104,36 @@ mod tests {
                 KEYCODES[crate::vterm_defs::VTERM_KEY_PAGEDOWN as usize].csi_num,
             ],
             [2, 3, 5, 6]
+        );
+    }
+
+    #[test]
+    fn function_keycode_table_matches_keyboard_c() {
+        assert_eq!(KEYCODES_FN.len(), 13);
+        assert_eq!(KEYCODES_FN[0].key_type, KeycodeType::None);
+        assert_eq!(
+            KEYCODES_FN[1..=4]
+                .iter()
+                .map(|key| (key.key_type, key.literal))
+                .collect::<Vec<_>>(),
+            [
+                (KeycodeType::Ss3, b'P' as i32),
+                (KeycodeType::Ss3, b'Q' as i32),
+                (KeycodeType::Ss3, b'R' as i32),
+                (KeycodeType::Ss3, b'S' as i32),
+            ]
+        );
+        assert_eq!(
+            KEYCODES_FN[5..=12]
+                .iter()
+                .map(|key| key.csi_num)
+                .collect::<Vec<_>>(),
+            [15, 17, 18, 19, 20, 21, 23, 24]
+        );
+        assert!(
+            KEYCODES_FN[5..=12]
+                .iter()
+                .all(|key| key.key_type == KeycodeType::CsiNum && key.literal == b'~' as i32)
         );
     }
 }
