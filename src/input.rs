@@ -322,6 +322,22 @@ pub unsafe fn reset_redobuff() {
     *unsafe { OLD_REDOBUFF.get_mut() } = redo;
 }
 
+/// Discard the current redo command and restore the previous one
+/// (`CancelRedo`).
+///
+/// # Safety
+/// Must not run concurrently with redo or stuff-buffer access.
+pub unsafe fn cancel_redo() {
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    let old = std::mem::take(unsafe { OLD_REDOBUFF.get_mut() });
+    *unsafe { REDOBUFF.get_mut() } = old;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { start_stuff() };
+    while read_readbuffers(true) != crate::ascii_defs::NUL {}
+}
+
 /// Restore the redo buffers saved by `saveRedobuff`
 /// (`restoreRedobuff`), used after running autocommands and user
 /// functions.
@@ -1677,6 +1693,7 @@ mod tests {
     struct RedobuffGuard {
         redo: BuffheaderT,
         old: BuffheaderT,
+        read1: BuffheaderT,
         read2: BuffheaderT,
         reader: Option<RedoReaderState>,
         block: bool,
@@ -1688,6 +1705,7 @@ mod tests {
                 Self {
                     redo: std::mem::take(REDOBUFF.get_mut()),
                     old: std::mem::take(OLD_REDOBUFF.get_mut()),
+                    read1: std::mem::take(READBUF1.get_mut()),
                     read2: std::mem::take(READBUF2.get_mut()),
                     reader: REDO_READER.get_mut().take(),
                     block: *BLOCK_REDO.get_mut(),
@@ -1701,6 +1719,7 @@ mod tests {
             unsafe {
                 *REDOBUFF.get_mut() = std::mem::take(&mut self.redo);
                 *OLD_REDOBUFF.get_mut() = std::mem::take(&mut self.old);
+                *READBUF1.get_mut() = std::mem::take(&mut self.read1);
                 *READBUF2.get_mut() = std::mem::take(&mut self.read2);
                 *REDO_READER.get_mut() = self.reader.take();
                 *BLOCK_REDO.get_mut() = self.block;
@@ -2264,6 +2283,40 @@ mod tests {
         // The buffer is left intact rather than being rotated away.
         assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"keep".to_vec());
         assert!(unsafe { OLD_REDOBUFF.get_mut() }.blocks.is_empty());
+    }
+
+    #[test]
+    fn cancel_redo_restores_previous_redo_and_drains_stuff_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe { append_to_redobuff(b"previous") };
+        unsafe { reset_redobuff() };
+        unsafe { append_to_redobuff(b"discard") };
+        stuff_readbuff(b"one");
+        stuff_redo_readbuff(b"two");
+
+        unsafe { cancel_redo() };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            b"previous".to_vec()
+        );
+        assert!(unsafe { OLD_REDOBUFF.get_mut() }.blocks.is_empty());
+        assert!(stuff_empty());
+    }
+
+    #[test]
+    fn cancel_redo_is_inert_while_redo_is_blocked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe {
+            *BLOCK_REDO.get_mut() = false;
+            append_to_redobuff(b"keep");
+            *BLOCK_REDO.get_mut() = true;
+            cancel_redo();
+        }
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"keep".to_vec());
     }
 
     #[test]
