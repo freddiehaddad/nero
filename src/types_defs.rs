@@ -128,16 +128,38 @@ pub const SIGN_WIDTH: i32 = 2;
 pub struct LoopT {
     _private: (),
 }
-/// Placeholder for `vimconv_T` (`struct` in `src/nvim/mbyte_defs.h`,
-/// character-encoding conversion state) - needed by `eval/typval.rs`'s
-/// `tv_list_copy`/`tv_dict_copy`'s `conv` parameter, only ever read by
-/// the `deep`-copy path (`var_item_copy`, `eval.c`, itself not yet
-/// translated - a separate, substantial recursive deep-copy engine),
-/// so an opaque placeholder is enough for now: the shallow-copy path
-/// (`deep == false`, the only one currently reachable) never
-/// dereferences `conv` at all, matching the original exactly.
+/// Conversion mode stored in [`VimconvT`] (`ConvFlags`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum ConvFlags {
+    #[default]
+    None = 0,
+    ToUtf8 = 1,
+    Latin9ToUtf8 = 2,
+    ToLatin1 = 3,
+    ToLatin9 = 4,
+    Iconv = 5,
+}
+
+/// Character-encoding conversion state (`vimconv_T`).
+#[derive(Debug)]
 pub struct VimconvT {
-    _private: (),
+    pub vc_type: ConvFlags,
+    pub vc_factor: i32,
+    pub vc_fd: *mut std::ffi::c_void,
+    pub vc_fail: bool,
+}
+
+impl Default for VimconvT {
+    /// `MBYTE_NONE_CONV`.
+    fn default() -> Self {
+        Self {
+            vc_type: ConvFlags::None,
+            vc_factor: 1,
+            vc_fd: std::ptr::null_mut(),
+            vc_fail: false,
+        }
+    }
 }
 /// Common compiled-regexp header (`struct regprog`, `regexp.c`).
 #[derive(Debug)]
@@ -271,6 +293,16 @@ pub type StringBuilder = Vec<u8>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vimconv_default_matches_mbyte_none_conv() {
+        let conversion = VimconvT::default();
+        assert_eq!(conversion.vc_type, ConvFlags::None);
+        assert_eq!(conversion.vc_factor, 1);
+        assert!(conversion.vc_fd.is_null());
+        assert!(!conversion.vc_fail);
+        assert_eq!(ConvFlags::Iconv as i32, 5);
+    }
 
     #[test]
     fn tristate_to_bool_matches_macro() {
