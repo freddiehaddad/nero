@@ -22,6 +22,20 @@ static BUFSIZE: crate::globals::GlobalCell<usize> =
 #[allow(dead_code)]
 static MSG_SEP_ROW: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(-1);
+/// Compositor layers, bottom to top (`layers`).
+static LAYERS: crate::globals::GlobalCell<
+    Vec<*mut crate::grid_defs::ScreenGrid>,
+> = crate::globals::GlobalCell::new(Vec::new());
+/// Grid currently receiving composed drawing (`curgrid`).
+static CURGRID: crate::globals::GlobalCell<*mut crate::grid_defs::ScreenGrid> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// Initialize compositor layers (`ui_comp_init`).
+pub fn ui_comp_init() {
+    let default = std::ptr::from_mut(unsafe { crate::grid::DEFAULT_GRID.get_mut() });
+    unsafe { LAYERS.get_mut() }.push(default);
+    *unsafe { CURGRID.get_mut() } = default;
+}
 
 /// Whether the compositor should draw (`ui_comp_should_draw`).
 #[must_use]
@@ -78,6 +92,30 @@ mod tests {
     }
 
     struct MsgSepGuard(i32);
+
+    struct LayerStateGuard {
+        layers: Vec<*mut crate::grid_defs::ScreenGrid>,
+        current: *mut crate::grid_defs::ScreenGrid,
+    }
+
+    impl LayerStateGuard {
+        fn empty() -> Self {
+            Self {
+                layers: std::mem::take(unsafe { LAYERS.get_mut() }),
+                current: std::mem::replace(
+                    unsafe { CURGRID.get_mut() },
+                    std::ptr::null_mut(),
+                ),
+            }
+        }
+    }
+
+    impl Drop for LayerStateGuard {
+        fn drop(&mut self) {
+            *unsafe { LAYERS.get_mut() } = std::mem::take(&mut self.layers);
+            *unsafe { CURGRID.get_mut() } = self.current;
+        }
+    }
 
     impl MsgSepGuard {
         fn install(value: i32) -> Self {
@@ -193,5 +231,18 @@ mod tests {
         assert!(!ui_comp_set_screen_valid(true));
         assert!(ui_comp_should_draw());
         assert_eq!(unsafe { *MSG_SEP_ROW.get_mut() }, -1);
+    }
+
+    #[test]
+    fn ui_comp_init_installs_the_default_grid_as_bottom_and_current() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _layers = LayerStateGuard::empty();
+
+        ui_comp_init();
+
+        let default =
+            std::ptr::from_mut(unsafe { crate::grid::DEFAULT_GRID.get_mut() });
+        assert_eq!(unsafe { LAYERS.get_mut() }.as_slice(), &[default]);
+        assert_eq!(unsafe { *CURGRID.get_mut() }, default);
     }
 }
