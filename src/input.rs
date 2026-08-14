@@ -338,6 +338,22 @@ pub unsafe fn cancel_redo() {
     while read_readbuffers(true) != crate::ascii_defs::NUL {}
 }
 
+/// Save both redo buffers while leaving a copy of the current command
+/// available to nested `:normal .` (`saveRedobuff`).
+///
+/// # Safety
+/// Must not run concurrently with redo-buffer access.
+pub unsafe fn save_redobuff(save_redo: &mut crate::input_defs::SaveRedoT) {
+    save_redo.sr_redobuff = std::mem::take(unsafe { REDOBUFF.get_mut() });
+    save_redo.sr_old_redobuff =
+        std::mem::take(unsafe { OLD_REDOBUFF.get_mut() });
+
+    let Some(contents) = get_buffcont(&save_redo.sr_redobuff, false) else {
+        return;
+    };
+    add_buff(unsafe { REDOBUFF.get_mut() }, &contents);
+}
+
 /// Restore the redo buffers saved by `saveRedobuff`
 /// (`restoreRedobuff`), used after running autocommands and user
 /// functions.
@@ -2336,6 +2352,39 @@ mod tests {
 
         assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"saved".to_vec());
         assert_eq!(buff_bytes(unsafe { OLD_REDOBUFF.get_mut() }), b"saved-old".to_vec());
+    }
+
+    #[test]
+    fn save_redobuff_moves_both_buffers_and_keeps_a_nested_redo_copy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe {
+            *BLOCK_REDO.get_mut() = false;
+            add_buff(REDOBUFF.get_mut(), b"ab");
+            add_buff(REDOBUFF.get_mut(), b"cd");
+            add_buff(OLD_REDOBUFF.get_mut(), b"older");
+        }
+        let mut saved = crate::input_defs::SaveRedoT::default();
+
+        unsafe { save_redobuff(&mut saved) };
+
+        assert_eq!(buff_bytes(&saved.sr_redobuff), b"abcd".to_vec());
+        assert_eq!(buff_bytes(&saved.sr_old_redobuff), b"older".to_vec());
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            b"abcd".to_vec()
+        );
+        assert!(unsafe { OLD_REDOBUFF.get_mut() }.blocks.is_empty());
+
+        unsafe { restore_redobuff(&mut saved) };
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            b"abcd".to_vec()
+        );
+        assert_eq!(
+            buff_bytes(unsafe { OLD_REDOBUFF.get_mut() }),
+            b"older".to_vec()
+        );
     }
 
     #[test]
