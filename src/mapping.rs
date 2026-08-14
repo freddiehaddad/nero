@@ -217,6 +217,52 @@ pub fn get_map_mode(cmd: &[u8], forceit: bool) -> (i32, usize) {
     }
 }
 
+/// Decode a mapping mode string such as `"nox"` (`get_map_mode_string`).
+#[allow(dead_code)]
+#[must_use]
+fn get_map_mode_string(mode_string: &[u8], abbreviation: bool) -> i32 {
+    let visual_select = mode::VISUAL as i32 | mode::SELECT as i32;
+    let map = visual_select | mode::NORMAL as i32 | mode::OP_PENDING as i32;
+    let bang = mode::INSERT as i32 | mode::CMDLINE as i32;
+    let source: &[u8] = if mode_string.is_empty() {
+        b" "
+    } else {
+        mode_string
+    };
+    let mut result = 0;
+    for &mode_char in source
+        .iter()
+        .take_while(|&&byte| byte != crate::ascii_defs::NUL)
+    {
+        let value = match mode_char {
+            b'i' => mode::INSERT as i32,
+            b'l' => mode::LANGMAP as i32,
+            b'c' => mode::CMDLINE as i32,
+            b'n' => mode::NORMAL as i32,
+            b'x' => mode::VISUAL as i32,
+            b's' => mode::SELECT as i32,
+            b'o' => mode::OP_PENDING as i32,
+            b't' => mode::TERMINAL as i32,
+            b'v' => visual_select,
+            b'!' => bang,
+            b' ' => map,
+            _ => return 0,
+        };
+        result |= value;
+    }
+
+    let multiple_bits = result != 0 && result & (result - 1) != 0;
+    let in_bang = result & bang != 0 && result & !bang == 0;
+    let in_map = result & map != 0 && result & !map == 0;
+    if (abbreviation && result & !bang != 0)
+        || (!abbreviation && multiple_bits && !(in_bang || in_map))
+    {
+        0
+    } else {
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +297,30 @@ mod tests {
     #[test]
     fn adjust_mb_impl_returns_c_unchanged_on_an_empty_table() {
         assert_eq!(langmap_adjust_mb_impl(&[], 0x4e00), 0x4e00);
+    }
+
+    #[test]
+    fn get_map_mode_string_combines_valid_modes_and_rejects_invalid_sets() {
+        assert_eq!(
+            get_map_mode_string(b"nox", false),
+            mode::NORMAL as i32
+                | mode::OP_PENDING as i32
+                | mode::VISUAL as i32
+        );
+        assert_eq!(
+            get_map_mode_string(b"", false),
+            mode::NORMAL as i32
+                | mode::VISUAL as i32
+                | mode::SELECT as i32
+                | mode::OP_PENDING as i32
+        );
+        assert_eq!(
+            get_map_mode_string(b"!", true),
+            mode::INSERT as i32 | mode::CMDLINE as i32
+        );
+        assert_eq!(get_map_mode_string(b"n", true), 0);
+        assert_eq!(get_map_mode_string(b"nt", false), 0);
+        assert_eq!(get_map_mode_string(b"?", false), 0);
     }
 
     #[test]
