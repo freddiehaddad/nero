@@ -60,6 +60,13 @@ use crate::state_defs::mode;
 /// `'langmap'` character remappings for multi-byte characters. Empty
 /// by default, matching the original's own `GA_EMPTY_INIT_VALUE`.
 static LANGMAP_MAPGA: GlobalCell<Vec<(i32, i32)>> = GlobalCell::new(Vec::new());
+/// Global mapping hash chains (`maphash`).
+static MAPHASH: GlobalCell<
+    [*mut crate::types_defs::MapblockT; crate::buffer_defs::MAX_MAPHASH as usize],
+> = GlobalCell::new([
+    std::ptr::null_mut();
+    crate::buffer_defs::MAX_MAPHASH as usize
+]);
 
 /// Mapping-table bucket index (`MAP_HASH`).
 #[allow(dead_code)]
@@ -75,6 +82,16 @@ fn map_hash(state: i32, first: u8) -> usize {
     } else {
         first ^ 0x80
     })
+}
+
+/// Head of the global mapping bucket for `state` and `c`
+/// (`get_maphash_list`).
+#[must_use]
+pub fn get_maphash_list(
+    state: i32,
+    c: i32,
+) -> *mut crate::types_defs::MapblockT {
+    (unsafe { MAPHASH.get_mut() })[map_hash(state, c as u8)]
 }
 
 /// Resets both language-map tables to the identity mapping
@@ -305,6 +322,27 @@ mod tests {
             map_hash(mode::CMDLINE as i32, 0xff),
             usize::from(0x7f_u8)
         );
+    }
+
+    #[test]
+    fn get_maphash_list_returns_the_selected_global_chain_head() {
+        let _lock = global_state_test_lock();
+        let saved = *unsafe { MAPHASH.get_mut() };
+        let mut mapping = Box::new(crate::types_defs::MapblockT {
+            m_keys: b"x".to_vec(),
+            ..Default::default()
+        });
+        let pointer = std::ptr::addr_of_mut!(*mapping);
+        let bucket = map_hash(mode::INSERT as i32, b'x');
+        (unsafe { MAPHASH.get_mut() })[bucket] = pointer;
+
+        assert_eq!(
+            get_maphash_list(mode::INSERT as i32, i32::from(b'x')),
+            pointer
+        );
+        assert!(get_maphash_list(mode::NORMAL as i32, i32::from(b'x')).is_null());
+
+        *unsafe { MAPHASH.get_mut() } = saved;
     }
 
     #[test]
