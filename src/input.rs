@@ -474,6 +474,64 @@ unsafe fn copy_redo(old_redo: bool) {
     }
 }
 
+/// Stuff a redo command into the redo read buffer (`start_redo`).
+///
+/// # Safety
+/// `GLOBALS.curwin` must be live when the redo starts with Visual-mode
+/// marker `v`; otherwise this only accesses serialized input globals.
+pub unsafe fn start_redo(count: i32, old_redo: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { read_redo(true, old_redo) } == crate::vim_defs::FAIL {
+        return crate::vim_defs::FAIL;
+    }
+    // SAFETY: reader was initialized above.
+    let mut c = unsafe { read_redo(false, old_redo) };
+
+    if c == i32::from(b'"') {
+        add_buff(unsafe { READBUF2.get_mut() }, b"\"");
+        // SAFETY: reader was initialized above.
+        c = unsafe { read_redo(false, old_redo) };
+        if (i32::from(b'1')..i32::from(b'9')).contains(&c) {
+            c += 1;
+        }
+        add_char_buff(unsafe { READBUF2.get_mut() }, c);
+        if c == i32::from(b'=') {
+            add_char_buff(
+                unsafe { READBUF2.get_mut() },
+                i32::from(crate::ascii_defs::CAR),
+            );
+            unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent = true;
+        }
+        // SAFETY: reader was initialized above.
+        c = unsafe { read_redo(false, old_redo) };
+    }
+
+    if c == i32::from(b'v') {
+        // SAFETY: forwarded from this function's own safety doc.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        globals.Visual.start = unsafe { (*globals.curwin).w_cursor };
+        globals.Visual.active = true;
+        globals.Visual.select = false;
+        globals.Visual.reselect = 1;
+        globals.Visual.redo_busy = true;
+        // SAFETY: reader was initialized above.
+        c = unsafe { read_redo(false, old_redo) };
+    }
+
+    if count != 0 {
+        while (i32::from(b'0')..=i32::from(b'9')).contains(&c) {
+            // SAFETY: reader was initialized above.
+            c = unsafe { read_redo(false, old_redo) };
+        }
+        add_num_buff(unsafe { READBUF2.get_mut() }, count);
+    }
+    add_char_buff(unsafe { READBUF2.get_mut() }, c);
+    // SAFETY: reader was initialized above.
+    unsafe { copy_redo(old_redo) };
+    crate::vim_defs::OK
+}
+
 /// Returns the redo buffer as one owned byte string (`get_inserted`).
 ///
 /// `None` preserves the original null `String.data` for an empty
@@ -2007,6 +2065,27 @@ mod tests {
             crate::keycodes_defs::key2termcap1(crate::keycodes_defs::K_UP),
         ]);
         assert_eq!(buff_bytes(unsafe { READBUF2.get_mut() }), expected);
+    }
+
+    #[test]
+    fn start_redo_replaces_the_old_count_and_increments_numbered_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe { append_to_redobuff(b"\"22dw") };
+
+        assert_eq!(unsafe { start_redo(5, false) }, crate::vim_defs::OK);
+        assert_eq!(
+            buff_bytes(unsafe { READBUF2.get_mut() }),
+            b"\"35dw".to_vec()
+        );
+    }
+
+    #[test]
+    fn start_redo_returns_fail_for_an_empty_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        assert_eq!(unsafe { start_redo(0, false) }, crate::vim_defs::FAIL);
     }
 
     #[test]
