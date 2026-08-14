@@ -105,6 +105,46 @@ pub unsafe fn ui_comp_set_grid(handle: crate::types_defs::HandleT) -> bool {
     false
 }
 
+/// Topmost grid covering screen coordinates (`ui_comp_get_grid_at_coord`).
+///
+/// # Safety
+/// Layer and current-tab window lists must contain live pointers.
+#[must_use]
+pub unsafe fn ui_comp_get_grid_at_coord(
+    row: i32,
+    col: i32,
+) -> *mut crate::grid_defs::ScreenGrid {
+    let layers = unsafe { LAYERS.get_mut() };
+    for &grid in layers.iter().skip(1).rev() {
+        let candidate = unsafe { &*grid };
+        if row >= candidate.comp_row
+            && row < candidate.comp_row + candidate.rows
+            && col >= candidate.comp_col
+            && col < candidate.comp_col + candidate.cols
+        {
+            return grid;
+        }
+    }
+
+    let mut win = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !win.is_null() {
+        let window = unsafe { &mut *win };
+        let next = window.w_next;
+        let hidden = window.w_config.hide;
+        let candidate = &mut window.w_grid_alloc;
+        if row >= candidate.comp_row
+            && row < candidate.comp_row + candidate.rows
+            && col >= candidate.comp_col
+            && col < candidate.comp_col + candidate.cols
+            && !hidden
+        {
+            return std::ptr::from_mut(candidate);
+        }
+        win = next;
+    }
+    std::ptr::from_mut(unsafe { crate::grid::DEFAULT_GRID.get_mut() })
+}
+
 /// Whether the compositor should draw (`ui_comp_should_draw`).
 #[must_use]
 pub fn ui_comp_should_draw() -> bool {
@@ -394,5 +434,48 @@ mod tests {
         assert_eq!(unsafe { *CURGRID.get_mut() }, second_ptr);
         assert!(!unsafe { ui_comp_set_grid(99) });
         assert_eq!(unsafe { *CURGRID.get_mut() }, second_ptr);
+    }
+
+    #[test]
+    fn ui_comp_get_grid_at_coord_prefers_top_layers_then_windows_then_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _layers = LayerStateGuard::empty();
+        let default =
+            std::ptr::from_mut(unsafe { crate::grid::DEFAULT_GRID.get_mut() });
+        let mut lower = Box::new(crate::grid_defs::ScreenGrid {
+            comp_row: 2,
+            comp_col: 3,
+            rows: 5,
+            cols: 5,
+            ..Default::default()
+        });
+        let mut upper = Box::new(crate::grid_defs::ScreenGrid {
+            comp_row: 4,
+            comp_col: 4,
+            rows: 3,
+            cols: 3,
+            ..Default::default()
+        });
+        let lower_ptr = std::ptr::addr_of_mut!(*lower);
+        let upper_ptr = std::ptr::addr_of_mut!(*upper);
+        unsafe { LAYERS.get_mut() }.extend([default, lower_ptr, upper_ptr]);
+
+        assert_eq!(unsafe { ui_comp_get_grid_at_coord(4, 4) }, upper_ptr);
+        assert_eq!(unsafe { ui_comp_get_grid_at_coord(2, 3) }, lower_ptr);
+
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_grid_alloc.comp_row = 10;
+        win.w_grid_alloc.comp_col = 20;
+        win.w_grid_alloc.rows = 2;
+        win.w_grid_alloc.cols = 4;
+        let win_grid = std::ptr::addr_of_mut!(win.w_grid_alloc);
+        let _first = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::addr_of_mut!(win),
+            )
+        };
+        assert_eq!(unsafe { ui_comp_get_grid_at_coord(10, 21) }, win_grid);
+        assert_eq!(unsafe { ui_comp_get_grid_at_coord(30, 30) }, default);
     }
 }
