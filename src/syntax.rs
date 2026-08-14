@@ -115,6 +115,25 @@ unsafe fn syn_stack_find_entry(
     previous
 }
 
+/// Clear and move one saved syntax state to a block's free list
+/// (`syn_stack_free_entry`).
+///
+/// # Safety
+/// `state` must point to a live entry belonging to `block`; its
+/// external-match references must satisfy [`clear_syn_state`].
+#[allow(dead_code)]
+unsafe fn syn_stack_free_entry(
+    block: &mut crate::buffer_defs::SynblockT,
+    state: *mut crate::types_defs::SynstateT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { clear_syn_state(&mut *state) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*state).sst_next = block.b_sst_firstfree };
+    block.b_sst_firstfree = state;
+    block.b_sst_freecount += 1;
+}
+
 /// Return one completion candidate for `:syntime`
 /// (`get_syntime_arg`).
 #[must_use]
@@ -1532,6 +1551,29 @@ mod tests {
         assert_eq!(unsafe { syn_stack_find_entry(&block, 10) }, second_ptr);
         assert_eq!(unsafe { syn_stack_find_entry(&block, 15) }, second_ptr);
         assert_eq!(unsafe { syn_stack_find_entry(&block, 30) }, third_ptr);
+    }
+
+    #[test]
+    fn syn_stack_free_entry_prepends_the_cleared_state_to_the_free_list() {
+        let mut existing = Box::new(crate::types_defs::SynstateT::default());
+        let existing_ptr = std::ptr::addr_of_mut!(*existing);
+        let mut state = Box::new(crate::types_defs::SynstateT {
+            sst_lnum: 12,
+            ..Default::default()
+        });
+        let state_ptr = std::ptr::addr_of_mut!(*state);
+        let mut block = crate::buffer_defs::SynblockT {
+            b_sst_firstfree: existing_ptr,
+            b_sst_freecount: 1,
+            ..Default::default()
+        };
+
+        unsafe { syn_stack_free_entry(&mut block, state_ptr) };
+
+        assert_eq!(block.b_sst_firstfree, state_ptr);
+        assert_eq!(block.b_sst_freecount, 2);
+        assert_eq!(state.sst_next, existing_ptr);
+        assert_eq!(state.sst_lnum, 12);
     }
 
     #[test]
