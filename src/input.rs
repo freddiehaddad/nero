@@ -532,6 +532,38 @@ pub unsafe fn start_redo(count: i32, old_redo: bool) -> i32 {
     crate::vim_defs::OK
 }
 
+/// Repeat the text from the last Insert-mode command (`start_redo_ins`).
+///
+/// # Safety
+/// Must not run concurrently with redo or stuff-buffer access.
+pub unsafe fn start_redo_ins() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { read_redo(true, false) } == crate::vim_defs::FAIL {
+        return crate::vim_defs::FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { start_stuff() };
+
+    loop {
+        // SAFETY: redo reader was initialized above.
+        let c = unsafe { read_redo(false, false) };
+        if c == i32::from(crate::ascii_defs::NUL) {
+            break;
+        }
+        if crate::strings::vim_strchr(b"AaIiRrOo", c).is_some() {
+            if c == i32::from(b'O') || c == i32::from(b'o') {
+                add_buff(unsafe { READBUF2.get_mut() }, b"\n");
+            }
+            break;
+        }
+    }
+
+    // SAFETY: redo reader was initialized above.
+    unsafe { copy_redo(false) };
+    *unsafe { BLOCK_REDO.get_mut() } = true;
+    crate::vim_defs::OK
+}
+
 /// Returns the redo buffer as one owned byte string (`get_inserted`).
 ///
 /// `None` preserves the original null `String.data` for an empty
@@ -1645,6 +1677,8 @@ mod tests {
     struct RedobuffGuard {
         redo: BuffheaderT,
         old: BuffheaderT,
+        read2: BuffheaderT,
+        reader: Option<RedoReaderState>,
         block: bool,
     }
 
@@ -1654,6 +1688,8 @@ mod tests {
                 Self {
                     redo: std::mem::take(REDOBUFF.get_mut()),
                     old: std::mem::take(OLD_REDOBUFF.get_mut()),
+                    read2: std::mem::take(READBUF2.get_mut()),
+                    reader: REDO_READER.get_mut().take(),
                     block: *BLOCK_REDO.get_mut(),
                 }
             }
@@ -1665,6 +1701,8 @@ mod tests {
             unsafe {
                 *REDOBUFF.get_mut() = std::mem::take(&mut self.redo);
                 *OLD_REDOBUFF.get_mut() = std::mem::take(&mut self.old);
+                *READBUF2.get_mut() = std::mem::take(&mut self.read2);
+                *REDO_READER.get_mut() = self.reader.take();
                 *BLOCK_REDO.get_mut() = self.block;
             }
         }
@@ -2086,6 +2124,35 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let _guard = RedobuffGuard::new();
         assert_eq!(unsafe { start_redo(0, false) }, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn start_redo_ins_skips_count_and_command_then_blocks_recording() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe { append_to_redobuff(b"12ihello") };
+
+        assert_eq!(unsafe { start_redo_ins() }, crate::vim_defs::OK);
+        assert_eq!(
+            buff_bytes(unsafe { READBUF2.get_mut() }),
+            b"hello".to_vec()
+        );
+        assert!(unsafe { *BLOCK_REDO.get_mut() });
+    }
+
+    #[test]
+    fn start_redo_ins_adds_a_newline_for_open_line_commands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe { append_to_redobuff(b"2otext") };
+
+        assert_eq!(unsafe { start_redo_ins() }, crate::vim_defs::OK);
+        assert_eq!(
+            buff_bytes(unsafe { READBUF2.get_mut() }),
+            b"\ntext".to_vec()
+        );
     }
 
     #[test]
