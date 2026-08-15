@@ -210,6 +210,189 @@ fn select_keycode(
     }
 }
 
+fn push_control(output: &mut Vec<u8>, ctrl: u8, ctrl8bit: bool) {
+    if ctrl >= 0x80 && !ctrl8bit {
+        output.extend_from_slice(&[0x1B, ctrl - 0x40]);
+    } else {
+        output.push(ctrl);
+    }
+}
+
+fn push_literal(
+    output: &mut Vec<u8>,
+    keycode: Keycode,
+    key: crate::vterm_defs::VTermKey,
+    modifiers: crate::vterm_defs::VTermModifier,
+    mut disambiguate: bool,
+    ctrl8bit: bool,
+) {
+    if disambiguate
+        && matches!(
+            key,
+            crate::vterm_defs::VTERM_KEY_TAB
+                | crate::vterm_defs::VTERM_KEY_ENTER
+                | crate::vterm_defs::VTERM_KEY_BACKSPACE
+        )
+    {
+        disambiguate = modifiers != crate::vterm_defs::VTERM_MOD_NONE;
+    }
+    if disambiguate {
+        push_control(output, crate::vterm_defs::C1_CSI, ctrl8bit);
+        output.extend_from_slice(
+            format!("{};{}u", keycode.literal, modifiers + 1).as_bytes(),
+        );
+    } else {
+        if modifiers & crate::vterm_defs::VTERM_MOD_ALT != 0 {
+            output.push(0x1B);
+        }
+        output.push(keycode.literal as u8);
+    }
+}
+
+fn push_csi(
+    output: &mut Vec<u8>,
+    literal: i32,
+    modifiers: crate::vterm_defs::VTermModifier,
+    ctrl8bit: bool,
+) {
+    push_control(output, crate::vterm_defs::C1_CSI, ctrl8bit);
+    if modifiers == 0 {
+        output.push(literal as u8);
+    } else {
+        output.extend_from_slice(format!("1;{}{}", modifiers + 1, literal as u8 as char).as_bytes());
+    }
+}
+
+fn push_ss3(
+    output: &mut Vec<u8>,
+    literal: i32,
+    modifiers: crate::vterm_defs::VTermModifier,
+    ctrl8bit: bool,
+) {
+    if modifiers == 0 {
+        push_control(output, crate::vterm_defs::C1_SS3, ctrl8bit);
+        output.push(literal as u8);
+    } else {
+        push_csi(output, literal, modifiers, ctrl8bit);
+    }
+}
+
+/// Encodes one special terminal key (`vterm_keyboard_key`).
+///
+/// As with [`vterm_keyboard_unichar`], this returns the exact bytes
+/// that the C implementation pushes through `VTerm`'s output callback.
+#[must_use]
+pub fn vterm_keyboard_key(
+    key: crate::vterm_defs::VTermKey,
+    modifiers: crate::vterm_defs::VTermModifier,
+    flags: crate::vterm_defs::VTermKeyEncodingFlags,
+    mode: crate::vterm_defs::VTermKeyboardMode,
+) -> Vec<u8> {
+    if key == crate::vterm_defs::VTERM_KEY_NONE {
+        return Vec::new();
+    }
+    let Some(mut keycode) = select_keycode(key, flags) else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+
+    match keycode.key_type {
+        KeycodeType::None => {}
+        KeycodeType::Tab => {
+            if flags.disambiguate {
+                push_literal(
+                    &mut output,
+                    keycode,
+                    key,
+                    modifiers,
+                    true,
+                    mode.ctrl8bit,
+                );
+            } else if modifiers == crate::vterm_defs::VTERM_MOD_SHIFT {
+                push_control(&mut output, crate::vterm_defs::C1_CSI, mode.ctrl8bit);
+                output.push(b'Z');
+            } else if modifiers & crate::vterm_defs::VTERM_MOD_SHIFT != 0 {
+                push_control(&mut output, crate::vterm_defs::C1_CSI, mode.ctrl8bit);
+                output.extend_from_slice(format!("1;{}Z", modifiers + 1).as_bytes());
+            } else {
+                push_literal(
+                    &mut output,
+                    keycode,
+                    key,
+                    modifiers,
+                    false,
+                    mode.ctrl8bit,
+                );
+            }
+        }
+        KeycodeType::Enter if mode.newline => output.extend_from_slice(b"\r\n"),
+        KeycodeType::Enter | KeycodeType::Literal => push_literal(
+            &mut output,
+            keycode,
+            key,
+            modifiers,
+            flags.disambiguate,
+            mode.ctrl8bit,
+        ),
+        KeycodeType::Ss3 => push_ss3(
+            &mut output,
+            keycode.literal,
+            modifiers,
+            mode.ctrl8bit,
+        ),
+        KeycodeType::Csi => push_csi(
+            &mut output,
+            keycode.literal,
+            modifiers,
+            mode.ctrl8bit,
+        ),
+        KeycodeType::CsiNum => {
+            push_control(&mut output, crate::vterm_defs::C1_CSI, mode.ctrl8bit);
+            let text = if modifiers == 0 {
+                format!("{}{}", keycode.csi_num, keycode.literal as u8 as char)
+            } else {
+                format!(
+                    "{};{}{}",
+                    keycode.csi_num,
+                    modifiers + 1,
+                    keycode.literal as u8 as char
+                )
+            };
+            output.extend_from_slice(text.as_bytes());
+        }
+        KeycodeType::CsiCursor if mode.cursor => push_ss3(
+            &mut output,
+            keycode.literal,
+            modifiers,
+            mode.ctrl8bit,
+        ),
+        KeycodeType::CsiCursor => push_csi(
+            &mut output,
+            keycode.literal,
+            modifiers,
+            mode.ctrl8bit,
+        ),
+        KeycodeType::Keypad if mode.keypad => {
+            keycode.literal = keycode.csi_num;
+            push_ss3(
+                &mut output,
+                keycode.literal,
+                modifiers,
+                mode.ctrl8bit,
+            );
+        }
+        KeycodeType::Keypad => push_literal(
+            &mut output,
+            keycode,
+            key,
+            modifiers,
+            flags.disambiguate,
+            mode.ctrl8bit,
+        ),
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +752,222 @@ mod tests {
             i32::MAX,
         ] {
             assert_eq!(select_keycode(key, Default::default()), None);
+        }
+    }
+
+    #[test]
+    fn keyboard_key_encodes_tab_and_enter_modes() {
+        let mode = crate::vterm_defs::VTermKeyboardMode::default();
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_TAB,
+                0,
+                Default::default(),
+                mode,
+            ),
+            b"\t"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_TAB,
+                crate::vterm_defs::VTERM_MOD_SHIFT,
+                Default::default(),
+                mode,
+            ),
+            b"\x1b[Z"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_TAB,
+                crate::vterm_defs::VTERM_MOD_SHIFT | crate::vterm_defs::VTERM_MOD_CTRL,
+                Default::default(),
+                mode,
+            ),
+            b"\x1b[1;6Z"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_ENTER,
+                0,
+                Default::default(),
+                mode,
+            ),
+            b"\r"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_ENTER,
+                crate::vterm_defs::VTERM_MOD_ALT,
+                Default::default(),
+                crate::vterm_defs::VTermKeyboardMode {
+                    newline: true,
+                    ..Default::default()
+                },
+            ),
+            b"\r\n"
+        );
+    }
+
+    #[test]
+    fn keyboard_key_encodes_cursor_function_and_numbered_keys() {
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_UP,
+                0,
+                Default::default(),
+                Default::default(),
+            ),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_UP,
+                0,
+                Default::default(),
+                crate::vterm_defs::VTermKeyboardMode {
+                    cursor: true,
+                    ..Default::default()
+                },
+            ),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_UP,
+                crate::vterm_defs::VTERM_MOD_CTRL,
+                Default::default(),
+                crate::vterm_defs::VTermKeyboardMode {
+                    cursor: true,
+                    ..Default::default()
+                },
+            ),
+            b"\x1b[1;5A"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::vterm_key_function(1),
+                0,
+                Default::default(),
+                Default::default(),
+            ),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::vterm_key_function(5),
+                crate::vterm_defs::VTERM_MOD_SHIFT,
+                Default::default(),
+                Default::default(),
+            ),
+            b"\x1b[15;2~"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_INS,
+                0,
+                Default::default(),
+                Default::default(),
+            ),
+            b"\x1b[2~"
+        );
+    }
+
+    #[test]
+    fn keyboard_key_encodes_keypad_and_csiu_modes() {
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_KP_2,
+                0,
+                Default::default(),
+                Default::default(),
+            ),
+            b"2"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_KP_2,
+                0,
+                Default::default(),
+                crate::vterm_defs::VTermKeyboardMode {
+                    keypad: true,
+                    ..Default::default()
+                },
+            ),
+            b"\x1bOr"
+        );
+        let flags = crate::vterm_defs::VTermKeyEncodingFlags {
+            disambiguate: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_KP_2,
+                0,
+                flags,
+                Default::default(),
+            ),
+            b"\x1b[57401;1u"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_TAB,
+                0,
+                flags,
+                Default::default(),
+            ),
+            b"\t"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_TAB,
+                crate::vterm_defs::VTERM_MOD_CTRL,
+                flags,
+                Default::default(),
+            ),
+            b"\x1b[9;5u"
+        );
+    }
+
+    #[test]
+    fn keyboard_key_encodes_alt_and_eight_bit_controls() {
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_ESCAPE,
+                crate::vterm_defs::VTERM_MOD_ALT,
+                Default::default(),
+                Default::default(),
+            ),
+            b"\x1b\x1b"
+        );
+        assert_eq!(
+            vterm_keyboard_key(
+                crate::vterm_defs::VTERM_KEY_UP,
+                0,
+                Default::default(),
+                crate::vterm_defs::VTermKeyboardMode {
+                    ctrl8bit: true,
+                    ..Default::default()
+                },
+            ),
+            [crate::vterm_defs::C1_CSI, b'A']
+        );
+    }
+
+    #[test]
+    fn keyboard_key_ignores_none_and_unsupported_values() {
+        for key in [
+            crate::vterm_defs::VTERM_KEY_NONE,
+            15,
+            crate::vterm_defs::vterm_key_function(20),
+            crate::vterm_defs::VTERM_KEY_MAX,
+        ] {
+            assert!(vterm_keyboard_key(
+                key,
+                0,
+                Default::default(),
+                Default::default(),
+            )
+            .is_empty());
         }
     }
 }
