@@ -78,6 +78,30 @@ pub struct VTermPalette {
     pub colors: [crate::vterm_defs::VTermColor; 16],
 }
 
+/// Pen and color fields owned by `VTermState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VTermPenState {
+    pub pen: VTermPen,
+    pub saved_pen: VTermPen,
+    pub default_fg: crate::vterm_defs::VTermColor,
+    pub default_bg: crate::vterm_defs::VTermColor,
+    pub palette: VTermPalette,
+}
+
+impl Default for VTermPenState {
+    fn default() -> Self {
+        Self {
+            pen: VTermPen::default(),
+            saved_pen: VTermPen::default(),
+            default_fg: crate::vterm_defs::VTermColor::default(),
+            default_bg: crate::vterm_defs::VTermColor::default(),
+            palette: VTermPalette {
+                colors: [crate::vterm_defs::VTermColor::default(); 16],
+            },
+        }
+    }
+}
+
 impl Default for VTermPalette {
     fn default() -> Self {
         let mut colors = [crate::vterm_defs::VTermColor::default(); 16];
@@ -248,7 +272,29 @@ mod tests {
                     (expected.red, expected.green, expected.blue)
                 );
             }
-        }
+    }
+
+    #[test]
+    fn pen_state_defaults_to_zeroed_allocator_storage() {
+                let state = VTermPenState::default();
+                assert_eq!(state.pen, VTermPen::default());
+                assert_eq!(state.saved_pen, VTermPen::default());
+                assert_eq!(
+                    state.default_fg,
+                    crate::vterm_defs::VTermColor::default()
+                );
+                assert_eq!(
+                    state.default_bg,
+                    crate::vterm_defs::VTermColor::default()
+                );
+                assert!(
+                    state
+                        .palette
+                        .colors
+                        .iter()
+                        .all(|color| *color == crate::vterm_defs::VTermColor::default())
+                );
+    }
 
     #[test]
     fn ansi_palette_lookup_copies_valid_entries_only() {
