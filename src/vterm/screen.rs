@@ -52,6 +52,56 @@ pub struct VTermScreen {
     pub pen: ScreenPen,
 }
 
+/// Screen callback surface (`VTermScreenCallbacks`).
+pub trait VTermScreenCallbacks {
+    fn damage(&mut self, _rect: crate::vterm_defs::VTermRect) -> bool {
+        false
+    }
+
+    fn move_rect(
+        &mut self,
+        _destination: crate::vterm_defs::VTermRect,
+        _source: crate::vterm_defs::VTermRect,
+    ) -> bool {
+        false
+    }
+
+    fn move_cursor(
+        &mut self,
+        _position: crate::vterm_defs::VTermPos,
+        _old_position: crate::vterm_defs::VTermPos,
+        _visible: bool,
+    ) -> bool {
+        false
+    }
+
+    fn bell(&mut self) -> bool {
+        false
+    }
+
+    fn resize(&mut self, _rows: i32, _cols: i32) -> bool {
+        false
+    }
+
+    fn theme(&mut self, _dark: &mut bool) -> bool {
+        false
+    }
+
+    fn scrollback_push(&mut self, _cells: &[crate::vterm_defs::VTermScreenCell]) -> bool {
+        false
+    }
+
+    fn scrollback_pop(&mut self, _cells: &mut [crate::vterm_defs::VTermScreenCell]) -> bool {
+        false
+    }
+
+    fn scrollback_clear(&mut self) -> bool {
+        false
+    }
+}
+
+impl VTermScreenCallbacks for () {}
+
 /// Creates a screen with its primary buffer (`screen_new`).
 #[must_use]
 pub fn screen_new(rows: i32, cols: i32) -> VTermScreen {
@@ -351,6 +401,28 @@ pub const fn rect_intersects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_screen_callbacks_decline_every_event() {
+        let callbacks = &mut ();
+        assert!(!callbacks.damage(crate::vterm_defs::VTermRect::default()));
+        assert!(!callbacks.move_rect(
+            crate::vterm_defs::VTermRect::default(),
+            crate::vterm_defs::VTermRect::default(),
+        ));
+        assert!(!callbacks.move_cursor(
+            crate::vterm_defs::VTermPos::default(),
+            crate::vterm_defs::VTermPos::default(),
+            true,
+        ));
+        assert!(!callbacks.bell());
+        assert!(!callbacks.resize(24, 80));
+        let mut dark = false;
+        assert!(!callbacks.theme(&mut dark));
+        assert!(!callbacks.scrollback_push(&[]));
+        assert!(!callbacks.scrollback_pop(&mut []));
+        assert!(!callbacks.scrollback_clear());
+    }
 
     #[test]
     fn screen_pen_defaults_match_zeroed_internal_pen() {
