@@ -148,6 +148,47 @@ fn set_pen_col_ansi<C: VTermPenCallbacks>(
     setpenattr_col(callbacks, attr, *target);
 }
 
+#[allow(dead_code)]
+fn apply_sgr_intensity<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    match argument {
+        1 => {
+            let foreground = state.pen.fg;
+            state.pen.bold = true;
+            setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Bold, true);
+            if !foreground.is_default_fg()
+                && foreground.is_indexed()
+                && foreground.index < 8
+                && state.bold_is_highbright
+            {
+                set_pen_col_ansi(
+                    state,
+                    callbacks,
+                    crate::vterm_defs::VTermAttr::Foreground,
+                    i64::from(foreground.index + 8),
+                );
+            }
+            true
+        }
+        2 => {
+            state.pen.dim = true;
+            setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Dim, true);
+            true
+        }
+        22 => {
+            state.pen.bold = false;
+            setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Bold, false);
+            state.pen.dim = false;
+            setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Dim, false);
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -551,6 +592,38 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn sgr_intensity_handles_bold_dim_and_normal_intensity() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        assert!(apply_sgr_intensity(&mut state, &mut capture, 1));
+        assert!(state.pen.bold);
+        assert!(apply_sgr_intensity(&mut state, &mut capture, 2));
+        assert!(state.pen.dim);
+        assert!(apply_sgr_intensity(&mut state, &mut capture, 22));
+        assert!(!state.pen.bold);
+        assert!(!state.pen.dim);
+        assert!(!apply_sgr_intensity(&mut state, &mut capture, 99));
+    }
+
+    #[test]
+    fn sgr_bold_promotes_low_index_foreground_when_configured() {
+        let mut state = VTermPenState {
+            bold_is_highbright: true,
+            ..Default::default()
+        };
+        crate::vterm_defs::vterm_color_indexed(&mut state.pen.fg, 3);
+        let mut capture = PenCapture::default();
+        assert!(apply_sgr_intensity(&mut state, &mut capture, 1));
+        assert_eq!(state.pen.fg.index, 11);
+
+        state.pen.bold = false;
+        state.pen.fg.color_type |= crate::vterm_defs::VTERM_COLOR_DEFAULT_FG;
+        state.pen.fg.index = 2;
+        assert!(apply_sgr_intensity(&mut state, &mut capture, 1));
+        assert_eq!(state.pen.fg.index, 2);
     }
 
     #[test]
