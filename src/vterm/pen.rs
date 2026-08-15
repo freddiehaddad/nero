@@ -88,6 +88,19 @@ pub struct VTermPenState {
     pub palette: VTermPalette,
 }
 
+/// Pen attribute callback from `VTermStateCallbacks::setpenattr`.
+pub trait VTermPenCallbacks {
+    fn set_pen_attr(
+        &mut self,
+        _attr: crate::vterm_defs::VTermAttr,
+        _value: &crate::vterm_defs::VTermValue<'_>,
+    ) -> bool {
+        false
+    }
+}
+
+impl VTermPenCallbacks for () {}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -259,6 +272,14 @@ pub fn lookup_colour(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_pen_callback_declines_attributes() {
+        assert!(!().set_pen_attr(
+            crate::vterm_defs::VTermAttr::Bold,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        ));
+    }
 
     #[test]
     fn ansi_color_table_matches_pen_c() {
