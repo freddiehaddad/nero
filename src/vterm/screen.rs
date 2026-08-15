@@ -74,6 +74,18 @@ pub const fn rect_equal(
         && first.end_col == second.end_col
 }
 
+/// Whether `small` is entirely inside `big` (`rect_contains`).
+#[must_use]
+pub const fn rect_contains(
+    big: &crate::vterm_defs::VTermRect,
+    small: &crate::vterm_defs::VTermRect,
+) -> bool {
+    small.start_row >= big.start_row
+        && small.start_col >= big.start_col
+        && small.end_row <= big.end_row
+        && small.end_col <= big.end_col
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +197,34 @@ mod tests {
             crate::vterm_defs::VTermRect { end_col: 5, ..rect },
         ] {
             assert!(!rect_equal(&rect, &changed));
+        }
+    }
+
+    #[test]
+    fn rect_contains_accepts_shared_edges_and_rejects_each_overhang() {
+            let big = crate::vterm_defs::VTermRect {
+                start_row: 1,
+                end_row: 10,
+                start_col: 2,
+                end_col: 20,
+            };
+            assert!(rect_contains(&big, &big));
+            assert!(rect_contains(
+                &big,
+                &crate::vterm_defs::VTermRect {
+                    start_row: 3,
+                    end_row: 8,
+                    start_col: 4,
+                    end_col: 15,
+                },
+            ));
+            for small in [
+                crate::vterm_defs::VTermRect { start_row: 0, ..big },
+                crate::vterm_defs::VTermRect { end_row: 11, ..big },
+                crate::vterm_defs::VTermRect { start_col: 1, ..big },
+                crate::vterm_defs::VTermRect { end_col: 21, ..big },
+            ] {
+                assert!(!rect_contains(&big, &small));
         }
     }
 }
