@@ -90,6 +90,29 @@ pub fn clearcell(screen: &VTermScreen, cell: &mut ScreenCell) {
     cell.pen = screen.pen;
 }
 
+/// Returns one active-buffer cell (`getcell`).
+#[must_use]
+pub fn getcell(screen: &VTermScreen, row: i32, col: i32) -> Option<&ScreenCell> {
+    if row < 0 || row >= screen.rows || col < 0 || col >= screen.cols {
+        return None;
+    }
+    let index = usize::try_from(screen.cols * row + col).ok()?;
+    screen.buffers[screen.active_buffer].as_ref()?.get(index)
+}
+
+/// Mutable counterpart used by screen callbacks.
+pub fn getcell_mut(
+    screen: &mut VTermScreen,
+    row: i32,
+    col: i32,
+) -> Option<&mut ScreenCell> {
+    if row < 0 || row >= screen.rows || col < 0 || col >= screen.cols {
+        return None;
+    }
+    let index = usize::try_from(screen.cols * row + col).ok()?;
+    screen.buffers[screen.active_buffer].as_mut()?.get_mut(index)
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -222,6 +245,17 @@ mod tests {
         clearcell(&screen, &mut cell);
         assert_eq!(cell.schar, 0);
         assert_eq!(cell.pen, screen.pen);
+    }
+
+    #[test]
+    fn getcell_indexes_active_buffer_and_rejects_out_of_bounds() {
+        let mut screen = screen_new(2, 3);
+        getcell_mut(&mut screen, 1, 2).unwrap().schar = 42;
+        assert_eq!(getcell(&screen, 1, 2).unwrap().schar, 42);
+        for (row, col) in [(-1, 0), (0, -1), (2, 0), (0, 3)] {
+            assert!(getcell(&screen, row, col).is_none());
+            assert!(getcell_mut(&mut screen, row, col).is_none());
+        }
     }
 
     #[test]
