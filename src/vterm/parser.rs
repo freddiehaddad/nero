@@ -161,6 +161,33 @@ pub trait VTermParserCallbacks {
 
 impl VTermParserCallbacks for () {}
 
+#[allow(dead_code)]
+impl VTermParser {
+    fn do_control<C: VTermParserCallbacks>(&self, callbacks: &mut C, control: u8) {
+        let _ = callbacks.control(control);
+    }
+
+    fn do_csi<C: VTermParserCallbacks>(&self, callbacks: &mut C, command: u8) {
+        let leader = (self.csi.leader_len != 0)
+            .then_some(&self.csi.leader[..self.csi.leader_len]);
+        let intermed = (self.intermed_len != 0)
+            .then_some(&self.intermed[..self.intermed_len]);
+        let _ = callbacks.csi(
+            leader,
+            &self.csi.args[..self.csi.argi],
+            intermed,
+            command,
+        );
+    }
+
+    fn do_escape<C: VTermParserCallbacks>(&self, callbacks: &mut C, command: u8) {
+        let mut sequence = Vec::with_capacity(self.intermed_len + 1);
+        sequence.extend_from_slice(&self.intermed[..self.intermed_len]);
+        sequence.push(command);
+        let _ = callbacks.escape(&sequence);
+    }
+}
+
 #[must_use]
 pub const fn csi_arg_has_more(arg: CsiArg) -> bool {
     arg & CSI_ARG_FLAG_MORE != 0
@@ -198,6 +225,43 @@ pub const fn csi_arg_count(arg: CsiArg) -> CsiArg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type CsiCapture = (Option<Vec<u8>>, Vec<CsiArg>, Option<Vec<u8>>, u8);
+
+    #[derive(Default)]
+    struct DispatchCapture {
+        controls: Vec<u8>,
+        escapes: Vec<Vec<u8>>,
+        csi: Vec<CsiCapture>,
+    }
+
+    impl VTermParserCallbacks for DispatchCapture {
+        fn control(&mut self, control: u8) -> bool {
+            self.controls.push(control);
+            true
+        }
+
+        fn escape(&mut self, bytes: &[u8]) -> bool {
+            self.escapes.push(bytes.to_vec());
+            true
+        }
+
+        fn csi(
+            &mut self,
+            leader: Option<&[u8]>,
+            args: &[CsiArg],
+            intermed: Option<&[u8]>,
+            command: u8,
+        ) -> bool {
+            self.csi.push((
+                leader.map(<[u8]>::to_vec),
+                args.to_vec(),
+                intermed.map(<[u8]>::to_vec),
+                command,
+            ));
+            true
+        }
+    }
 
     #[test]
     fn parser_limits_match_internal_defs() {
@@ -290,5 +354,46 @@ mod tests {
         assert!(!callbacks.pm(fragment));
         assert!(!callbacks.sos(fragment));
         assert!(!callbacks.resize(24, 80));
+    }
+
+    #[test]
+    fn parser_dispatch_helpers_forward_exact_sequence_parts() {
+        let mut parser = VTermParser::default();
+        parser.csi.leader[..2].copy_from_slice(b"?>");
+        parser.csi.leader_len = 2;
+        parser.csi.args[..3].copy_from_slice(&[1, CSI_ARG_FLAG_MORE | 2, 3]);
+        parser.csi.argi = 3;
+        parser.intermed[..2].copy_from_slice(b" !");
+        parser.intermed_len = 2;
+        let mut capture = DispatchCapture::default();
+
+        parser.do_control(&mut capture, 0x07);
+        parser.do_escape(&mut capture, b'F');
+        parser.do_csi(&mut capture, b'm');
+
+        assert_eq!(capture.controls, [0x07]);
+        assert_eq!(capture.escapes, [b" !F".to_vec()]);
+        assert_eq!(
+            capture.csi,
+            [(
+                Some(b"?>".to_vec()),
+                vec![1, CSI_ARG_FLAG_MORE | 2, 3],
+                Some(b" !".to_vec()),
+                b'm',
+            )]
+        );
+    }
+
+    #[test]
+    fn parser_csi_dispatch_uses_none_for_empty_optional_parts() {
+        let mut parser = VTermParser::default();
+        parser.csi.argi = 1;
+        parser.csi.args[0] = CSI_ARG_MISSING;
+        let mut capture = DispatchCapture::default();
+        parser.do_csi(&mut capture, b'A');
+        assert_eq!(
+            capture.csi,
+            [(None, vec![CSI_ARG_MISSING], None, b'A')]
+        );
     }
 }
