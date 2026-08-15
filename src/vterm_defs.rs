@@ -326,6 +326,14 @@ pub struct VTermGlyphInfo {
     pub dhl: u8,
 }
 
+/// Per-row terminal layout metadata (`VTermLineInfo`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermLineInfo {
+    pub doublewidth: bool,
+    pub doubleheight: u8,
+    pub continuation: bool,
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -618,6 +626,15 @@ mod tests {
             protected_cell: false,
             dwl: false,
             dhl: 0,
+        });
+    }
+
+    #[test]
+    fn line_info_defaults_match_zeroed_row_metadata() {
+        assert_eq!(VTermLineInfo::default(), VTermLineInfo {
+            doublewidth: false,
+            doubleheight: 0,
+            continuation: false,
         });
     }
 
