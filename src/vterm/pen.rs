@@ -602,6 +602,83 @@ pub fn vterm_state_getpen(state: &VTermPenState) -> Vec<crate::vterm::parser::Cs
     args
 }
 
+/// Sets one pen attribute after validating its value type
+/// (`vterm_state_set_penattr`).
+pub fn vterm_state_set_penattr<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    attr: crate::vterm_defs::VTermAttr,
+    value_type: crate::vterm_defs::VTermValueType,
+    value: Option<&crate::vterm_defs::VTermValue<'_>>,
+    callbacks: &mut C,
+) -> i32 {
+    let Some(value) = value else {
+        return 0;
+    };
+    if value_type != crate::vterm::core::vterm_get_attr_type(attr)
+        || value.value_type() != value_type
+    {
+        return 0;
+    }
+
+    match (attr, value) {
+        (crate::vterm_defs::VTermAttr::Bold, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            state.pen.bold = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Underline,
+            crate::vterm_defs::VTermValue::Number(value),
+        ) => state.pen.underline = *value as u8 & 0x03,
+        (crate::vterm_defs::VTermAttr::Italic, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            state.pen.italic = *value != 0;
+        }
+        (crate::vterm_defs::VTermAttr::Blink, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            state.pen.blink = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Reverse,
+            crate::vterm_defs::VTermValue::Boolean(value),
+        ) => state.pen.reverse = *value != 0,
+        (
+            crate::vterm_defs::VTermAttr::Conceal,
+            crate::vterm_defs::VTermValue::Boolean(value),
+        ) => state.pen.conceal = *value != 0,
+        (crate::vterm_defs::VTermAttr::Strike, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            state.pen.strike = *value != 0;
+        }
+        (crate::vterm_defs::VTermAttr::Font, crate::vterm_defs::VTermValue::Number(value)) => {
+            state.pen.font = *value as u8 & 0x0F;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Foreground,
+            crate::vterm_defs::VTermValue::Color(value),
+        ) => state.pen.fg = *value,
+        (
+            crate::vterm_defs::VTermAttr::Background,
+            crate::vterm_defs::VTermValue::Color(value),
+        ) => state.pen.bg = *value,
+        (crate::vterm_defs::VTermAttr::Small, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            state.pen.small = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Baseline,
+            crate::vterm_defs::VTermValue::Number(value),
+        ) => state.pen.baseline = *value as u8 & 0x03,
+        (crate::vterm_defs::VTermAttr::Uri, crate::vterm_defs::VTermValue::Number(value)) => {
+            state.pen.uri = *value;
+        }
+        (crate::vterm_defs::VTermAttr::Dim, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            state.pen.dim = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Overline,
+            crate::vterm_defs::VTermValue::Boolean(value),
+        ) => state.pen.overline = *value != 0,
+        _ => return 0,
+    }
+    let _ = callbacks.set_pen_attr(attr, value);
+    1
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -1490,6 +1567,98 @@ mod tests {
                 30,
             ]
         );
+    }
+
+    #[test]
+    fn set_penattr_updates_typed_scalar_and_color_fields() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        let color = crate::vterm_defs::VTermColor {
+            red: 1,
+            green: 2,
+            blue: 3,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                crate::vterm_defs::VTermAttr::Bold,
+                crate::vterm_defs::VTermValue::Boolean(2),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Underline,
+                crate::vterm_defs::VTermValue::Number(6),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Font,
+                crate::vterm_defs::VTermValue::Number(18),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Foreground,
+                crate::vterm_defs::VTermValue::Color(color),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Uri,
+                crate::vterm_defs::VTermValue::Number(42),
+            ),
+        ];
+        for (attr, value) in &cases {
+            assert_eq!(
+                vterm_state_set_penattr(
+                    &mut state,
+                    *attr,
+                    value.value_type(),
+                    Some(value),
+                    &mut capture,
+                ),
+                1
+            );
+        }
+        assert!(state.pen.bold);
+        assert_eq!(state.pen.underline, 2);
+        assert_eq!(state.pen.font, 2);
+        assert_eq!(state.pen.fg, color);
+        assert_eq!(state.pen.uri, 42);
+        assert_eq!(capture.0.len(), cases.len());
+    }
+
+    #[test]
+    fn set_penattr_rejects_null_wrong_type_and_nonattributes() {
+        let mut state = VTermPenState::default();
+        let original = state.clone();
+        let mut capture = PenCapture::default();
+        assert_eq!(
+            vterm_state_set_penattr(
+                &mut state,
+                crate::vterm_defs::VTermAttr::Bold,
+                crate::vterm_defs::VTermValueType::Bool,
+                None,
+                &mut capture,
+            ),
+            0
+        );
+        let number = crate::vterm_defs::VTermValue::Number(1);
+        assert_eq!(
+            vterm_state_set_penattr(
+                &mut state,
+                crate::vterm_defs::VTermAttr::Bold,
+                crate::vterm_defs::VTermValueType::Int,
+                Some(&number),
+                &mut capture,
+            ),
+            0
+        );
+        assert_eq!(
+            vterm_state_set_penattr(
+                &mut state,
+                crate::vterm_defs::VTermAttr::NAttrs,
+                crate::vterm_defs::VTermValueType::None,
+                Some(&number),
+                &mut capture,
+            ),
+            0
+        );
+        assert_eq!(state, original);
+        assert!(capture.0.is_empty());
     }
 
     #[test]
