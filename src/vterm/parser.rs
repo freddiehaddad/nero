@@ -161,6 +161,12 @@ pub trait VTermParserCallbacks {
 
 impl VTermParserCallbacks for () {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum C1Action {
+    NoString,
+    StartString,
+}
+
 #[allow(dead_code)]
 impl VTermParser {
     fn do_control<C: VTermParserCallbacks>(&self, callbacks: &mut C, control: u8) {
@@ -225,6 +231,46 @@ impl VTermParser {
             | VTermParserState::OscCommand => return,
         }
         self.string_initial = false;
+    }
+
+    fn do_c1<C: VTermParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        control: u8,
+    ) -> C1Action {
+        match control {
+            0x90 => {
+                self.string_initial = true;
+                self.dcs.command_len = 0;
+                self.state = VTermParserState::DcsCommand;
+            }
+            0x98 => {
+                self.string_initial = true;
+                self.state = VTermParserState::Sos;
+                return C1Action::StartString;
+            }
+            0x9B => {
+                self.csi.leader_len = 0;
+                self.state = VTermParserState::CsiLeader;
+            }
+            0x9D => {
+                self.osc_command = -1;
+                self.string_initial = true;
+                self.state = VTermParserState::OscCommand;
+            }
+            0x9E => {
+                self.string_initial = true;
+                self.state = VTermParserState::Pm;
+                return C1Action::StartString;
+            }
+            0x9F => {
+                self.string_initial = true;
+                self.state = VTermParserState::Apc;
+                return C1Action::StartString;
+            }
+            _ => self.do_control(callbacks, control),
+        }
+        C1Action::NoString
     }
 }
 
@@ -585,5 +631,53 @@ mod tests {
             assert!(capture.strings.is_empty());
             assert!(parser.string_initial);
         }
+    }
+
+    #[test]
+    fn parser_c1_controls_enter_the_matching_states() {
+            let cases = [
+                (0x90, VTermParserState::DcsCommand, C1Action::NoString),
+                (0x98, VTermParserState::Sos, C1Action::StartString),
+                (0x9B, VTermParserState::CsiLeader, C1Action::NoString),
+                (0x9D, VTermParserState::OscCommand, C1Action::NoString),
+                (0x9E, VTermParserState::Pm, C1Action::StartString),
+                (0x9F, VTermParserState::Apc, C1Action::StartString),
+            ];
+            for (control, state, action) in cases {
+                let mut parser = VTermParser::default();
+                parser.csi.leader_len = 4;
+                parser.dcs.command_len = 4;
+                let mut capture = DispatchCapture::default();
+                assert_eq!(parser.do_c1(&mut capture, control), action);
+                assert_eq!(parser.state, state);
+                assert!(capture.controls.is_empty());
+                match state {
+                    VTermParserState::DcsCommand => {
+                        assert_eq!(parser.dcs.command_len, 0);
+                        assert!(parser.string_initial);
+                    }
+                    VTermParserState::CsiLeader => assert_eq!(parser.csi.leader_len, 0),
+                    VTermParserState::OscCommand => {
+                        assert_eq!(parser.osc_command, -1);
+                        assert!(parser.string_initial);
+                    }
+                    VTermParserState::Sos | VTermParserState::Pm | VTermParserState::Apc => {
+                        assert!(parser.string_initial);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+    #[test]
+    fn parser_other_c1_controls_use_the_control_callback() {
+            let mut parser = VTermParser::default();
+            let mut capture = DispatchCapture::default();
+            assert_eq!(
+                parser.do_c1(&mut capture, 0x84),
+                C1Action::NoString
+            );
+            assert_eq!(parser.state, VTermParserState::Normal);
+            assert_eq!(capture.controls, [0x84]);
     }
 }
