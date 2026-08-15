@@ -318,6 +318,26 @@ impl VTermParser {
         self.state = VTermParserState::CsiIntermed;
         false
     }
+
+    /// Handles one byte in `CSI_INTERMED`.
+    fn parse_csi_intermed<C: VTermParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        byte: u8,
+    ) {
+        if is_intermed(byte) {
+            if self.intermed_len < INTERMED_MAX - 1 {
+                self.intermed[self.intermed_len] = byte;
+                self.intermed_len += 1;
+            }
+            return;
+        }
+        if byte != 0x1B && (0x40..=0x7E).contains(&byte) {
+            self.intermed[self.intermed_len] = 0;
+            self.do_csi(callbacks, byte);
+        }
+        self.state = VTermParserState::Normal;
+    }
 }
 
 #[must_use]
@@ -812,5 +832,48 @@ mod tests {
         assert_eq!(parser.csi.args[0], CSI_ARG_MISSING);
         assert_eq!(parser.intermed_len, 0);
         assert_eq!(parser.state, VTermParserState::CsiIntermed);
+    }
+
+    #[test]
+    fn parser_csi_intermediate_collects_and_dispatches_final_byte() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiIntermed,
+            ..Default::default()
+        };
+        parser.csi.argi = 1;
+        parser.csi.args[0] = 4;
+        let mut capture = DispatchCapture::default();
+        parser.parse_csi_intermed(&mut capture, b' ');
+        parser.parse_csi_intermed(&mut capture, b'!');
+        assert_eq!(&parser.intermed[..parser.intermed_len], b" !");
+        assert!(capture.csi.is_empty());
+
+        parser.parse_csi_intermed(&mut capture, b'q');
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert_eq!(
+            capture.csi,
+            [(None, vec![4], Some(b" !".to_vec()), b'q')]
+        );
+    }
+
+    #[test]
+    fn parser_csi_intermediate_truncates_and_cancels_invalid_sequences() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiIntermed,
+            ..Default::default()
+        };
+        let mut capture = DispatchCapture::default();
+        for _ in 0..(INTERMED_MAX + 3) {
+            parser.parse_csi_intermed(&mut capture, b' ');
+        }
+        assert_eq!(parser.intermed_len, INTERMED_MAX - 1);
+        parser.parse_csi_intermed(&mut capture, 0x30);
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert!(capture.csi.is_empty());
+
+        parser.state = VTermParserState::CsiIntermed;
+        parser.parse_csi_intermed(&mut capture, 0x1B);
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert!(capture.csi.is_empty());
     }
 }
