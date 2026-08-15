@@ -102,6 +102,27 @@ impl Default for VTermPenState {
     }
 }
 
+/// Updates the terminal's default colors
+/// (`vterm_state_set_default_colors`).
+pub fn vterm_state_set_default_colors(
+    state: &mut VTermPenState,
+    default_fg: Option<&crate::vterm_defs::VTermColor>,
+    default_bg: Option<&crate::vterm_defs::VTermColor>,
+) {
+    if let Some(default_fg) = default_fg {
+        state.default_fg = *default_fg;
+        state.default_fg.color_type =
+            (state.default_fg.color_type & !crate::vterm_defs::VTERM_COLOR_DEFAULT_MASK)
+                | crate::vterm_defs::VTERM_COLOR_DEFAULT_FG;
+    }
+    if let Some(default_bg) = default_bg {
+        state.default_bg = *default_bg;
+        state.default_bg.color_type =
+            (state.default_bg.color_type & !crate::vterm_defs::VTERM_COLOR_DEFAULT_MASK)
+                | crate::vterm_defs::VTERM_COLOR_DEFAULT_BG;
+    }
+}
+
 impl Default for VTermPalette {
     fn default() -> Self {
         let mut colors = [crate::vterm_defs::VTermColor::default(); 16];
@@ -294,6 +315,51 @@ mod tests {
                         .iter()
                         .all(|color| *color == crate::vterm_defs::VTermColor::default())
                 );
+    }
+
+    #[test]
+    fn set_default_colors_replaces_metadata_with_the_matching_default_flag() {
+        let mut state = VTermPenState::default();
+        let fg = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_INDEXED
+                | crate::vterm_defs::VTERM_COLOR_DEFAULT_BG,
+            index: 7,
+            ..Default::default()
+        };
+        let bg = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_RGB
+                | crate::vterm_defs::VTERM_COLOR_DEFAULT_FG,
+            red: 1,
+            green: 2,
+            blue: 3,
+            ..Default::default()
+        };
+        vterm_state_set_default_colors(&mut state, Some(&fg), Some(&bg));
+        assert!(state.default_fg.is_indexed());
+        assert!(state.default_fg.is_default_fg());
+        assert!(!state.default_fg.is_default_bg());
+        assert_eq!(state.default_fg.index, 7);
+        assert!(state.default_bg.is_rgb());
+        assert!(!state.default_bg.is_default_fg());
+        assert!(state.default_bg.is_default_bg());
+        assert_eq!(
+            (
+                state.default_bg.red,
+                state.default_bg.green,
+                state.default_bg.blue,
+            ),
+            (1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn set_default_colors_leaves_none_side_unchanged() {
+        let mut state = VTermPenState::default();
+        state.default_fg.red = 9;
+        state.default_bg.blue = 8;
+        let original = state.clone();
+        vterm_state_set_default_colors(&mut state, None, None);
+        assert_eq!(state, original);
     }
 
     #[test]
