@@ -113,6 +113,22 @@ pub fn getcell_mut(
     screen.buffers[screen.active_buffer].as_mut()?.get_mut(index)
 }
 
+/// Allocates and clears a screen buffer (`alloc_buffer`).
+#[must_use]
+pub fn alloc_buffer(screen: &VTermScreen, rows: i32, cols: i32) -> Vec<ScreenCell> {
+    let cell_count = usize::try_from(rows)
+        .ok()
+        .and_then(|rows| usize::try_from(cols).ok().and_then(|cols| rows.checked_mul(cols)))
+        .unwrap_or(0);
+    vec![
+        ScreenCell {
+            schar: 0,
+            pen: screen.pen,
+        };
+        cell_count
+    ]
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -256,6 +272,19 @@ mod tests {
             assert!(getcell(&screen, row, col).is_none());
             assert!(getcell_mut(&mut screen, row, col).is_none());
         }
+    }
+
+    #[test]
+    fn alloc_buffer_clears_every_cell_with_current_pen() {
+            let mut screen = screen_new(1, 1);
+            screen.pen.italic = true;
+            screen.pen.uri = 7;
+            let buffer = alloc_buffer(&screen, 2, 3);
+            assert_eq!(buffer.len(), 6);
+            assert!(buffer.iter().all(|cell| {
+                cell.schar == 0 && cell.pen == screen.pen
+            }));
+            assert!(alloc_buffer(&screen, -1, 3).is_empty());
     }
 
     #[test]
