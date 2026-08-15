@@ -313,6 +313,10 @@ pub const VTERM_UNDERLINE_DOUBLE: u8 = 2;
 /// Curly underline (`VTERM_UNDERLINE_CURLY`).
 pub const VTERM_UNDERLINE_CURLY: u8 = 3;
 
+pub const VTERM_BASELINE_NORMAL: u8 = 0;
+pub const VTERM_BASELINE_RAISE: u8 = 1;
+pub const VTERM_BASELINE_LOWER: u8 = 2;
+
 /// Display attributes for one terminal screen cell
 /// (`VTermScreenCellAttrs`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -364,6 +368,13 @@ mod tests {
             ],
             [0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn baseline_constants_match_vterm_header() {
+        assert_eq!(VTERM_BASELINE_NORMAL, 0);
+        assert_eq!(VTERM_BASELINE_RAISE, 1);
+        assert_eq!(VTERM_BASELINE_LOWER, 2);
     }
 
     #[test]
