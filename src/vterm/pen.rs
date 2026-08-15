@@ -549,6 +549,59 @@ fn append_pen_color(
     }
 }
 
+/// Serializes the active pen as SGR arguments (`vterm_state_getpen`).
+#[must_use]
+pub fn vterm_state_getpen(state: &VTermPenState) -> Vec<crate::vterm::parser::CsiArg> {
+    let mut args = Vec::new();
+    if state.pen.bold {
+        args.push(1);
+    }
+    if state.pen.dim {
+        args.push(2);
+    }
+    if state.pen.italic {
+        args.push(3);
+    }
+    if state.pen.underline == crate::vterm_defs::VTERM_UNDERLINE_SINGLE {
+        args.push(4);
+    }
+    if state.pen.underline == crate::vterm_defs::VTERM_UNDERLINE_CURLY {
+        args.push(crate::vterm::parser::CSI_ARG_FLAG_MORE | 4);
+        args.push(3);
+    }
+    if state.pen.blink {
+        args.push(5);
+    }
+    if state.pen.reverse {
+        args.push(7);
+    }
+    if state.pen.conceal {
+        args.push(8);
+    }
+    if state.pen.strike {
+        args.push(9);
+    }
+    if state.pen.font != 0 {
+        args.push(10 + u32::from(state.pen.font));
+    }
+    if state.pen.underline == crate::vterm_defs::VTERM_UNDERLINE_DOUBLE {
+        args.push(21);
+    }
+    append_pen_color(&state.pen.fg, true, &mut args);
+    append_pen_color(&state.pen.bg, false, &mut args);
+    if state.pen.overline {
+        args.push(53);
+    }
+    if state.pen.small {
+        if state.pen.baseline == crate::vterm_defs::VTERM_BASELINE_RAISE {
+            args.push(73);
+        } else if state.pen.baseline == crate::vterm_defs::VTERM_BASELINE_LOWER {
+            args.push(74);
+        }
+    }
+    args
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -1370,6 +1423,73 @@ mod tests {
         args.clear();
         append_pen_color(&color, true, &mut args);
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn getpen_serializes_all_noncolor_attributes_in_source_order() {
+        let state = VTermPenState {
+            pen: VTermPen {
+                bold: true,
+                dim: true,
+                italic: true,
+                underline: crate::vterm_defs::VTERM_UNDERLINE_CURLY,
+                blink: true,
+                reverse: true,
+                conceal: true,
+                strike: true,
+                font: 4,
+                overline: true,
+                small: true,
+                baseline: crate::vterm_defs::VTERM_BASELINE_RAISE,
+                fg: crate::vterm_defs::VTermColor {
+                    color_type: crate::vterm_defs::VTERM_COLOR_DEFAULT_FG,
+                    ..Default::default()
+                },
+                bg: crate::vterm_defs::VTermColor {
+                    color_type: crate::vterm_defs::VTERM_COLOR_DEFAULT_BG,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_state_getpen(&state),
+            [
+                1,
+                2,
+                3,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 4,
+                3,
+                5,
+                7,
+                8,
+                9,
+                14,
+                53,
+                73,
+            ]
+        );
+    }
+
+    #[test]
+    fn getpen_serializes_double_underline_and_both_colors() {
+        let mut state = VTermPenState::default();
+        state.pen.underline = crate::vterm_defs::VTERM_UNDERLINE_DOUBLE;
+        crate::vterm_defs::vterm_color_indexed(&mut state.pen.fg, 2);
+        crate::vterm_defs::vterm_color_rgb(&mut state.pen.bg, 10, 20, 30);
+        assert_eq!(
+            vterm_state_getpen(&state),
+            [
+                21,
+                32,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 48,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 2,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 10,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 20,
+                30,
+            ]
+        );
     }
 
     #[test]
