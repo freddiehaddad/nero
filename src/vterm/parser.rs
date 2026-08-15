@@ -448,7 +448,7 @@ impl VTermParser {
                 pos += 1;
                 continue;
             }
-            if byte != 0x07 && byte < 0x20 {
+            if !(byte == 0x07 && self.state.is_string()) && byte < 0x20 {
                 if self.state == VTermParserState::Sos {
                     pos += 1;
                     continue;
@@ -1328,5 +1328,15 @@ mod tests {
         assert_eq!(capture.controls, [0x00, 0x7F, 0x18, 0x1A, 0x01]);
         assert_eq!(parser.state, VTermParserState::Normal);
         assert!(!parser.in_esc);
+    }
+
+    #[test]
+    fn input_write_dispatches_bel_as_control_outside_strings() {
+        let mut parser = VTermParser::default();
+        let mut capture = DispatchCapture::default();
+        parser.vterm_input_write(&mut capture, b"\x07", true);
+        assert_eq!(capture.controls, [0x07]);
+        assert!(capture.texts.is_empty());
+        assert!(capture.strings.is_empty());
     }
 }
