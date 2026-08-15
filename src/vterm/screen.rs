@@ -231,6 +231,49 @@ pub fn setpenattr(
     1
 }
 
+/// Copies one internal cell to its public representation
+/// (`vterm_screen_get_cell`).
+pub fn vterm_screen_get_cell(
+    screen: &VTermScreen,
+    position: crate::vterm_defs::VTermPos,
+    cell: &mut crate::vterm_defs::VTermScreenCell,
+) -> i32 {
+    let Some(internal) = getcell(screen, position.row, position.col) else {
+        return 0;
+    };
+    cell.schar = if internal.schar == crate::types_defs::ScharT::MAX {
+        0
+    } else {
+        internal.schar
+    };
+    cell.attrs.bold = internal.pen.bold;
+    cell.attrs.underline = internal.pen.underline;
+    cell.attrs.italic = internal.pen.italic;
+    cell.attrs.blink = internal.pen.blink;
+    cell.attrs.reverse = internal.pen.reverse ^ screen.global_reverse;
+    cell.attrs.conceal = internal.pen.conceal;
+    cell.attrs.strike = internal.pen.strike;
+    cell.attrs.font = internal.pen.font;
+    cell.attrs.small = internal.pen.small;
+    cell.attrs.baseline = internal.pen.baseline;
+    cell.attrs.dim = internal.pen.dim;
+    cell.attrs.overline = internal.pen.overline;
+    cell.attrs.dwl = internal.pen.dwl;
+    cell.attrs.dhl = internal.pen.dhl;
+    cell.fg = internal.pen.fg;
+    cell.bg = internal.pen.bg;
+    cell.uri = internal.pen.uri;
+    cell.width = if position.col < screen.cols - 1
+        && getcell(screen, position.row, position.col + 1)
+            .is_some_and(|next| next.schar == crate::types_defs::ScharT::MAX)
+    {
+        2
+    } else {
+        1
+    };
+    1
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -476,6 +519,66 @@ mod tests {
                 &mut screen,
                 crate::vterm_defs::VTermAttr::NAttrs,
                 &crate::vterm_defs::VTermValue::Number(0),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn screen_get_cell_copies_pen_attributes_and_detects_wide_cells() {
+        let mut screen = screen_new(1, 3);
+        screen.global_reverse = true;
+        let cell = getcell_mut(&mut screen, 0, 0).unwrap();
+        cell.schar = 42;
+        cell.pen = ScreenPen {
+            bold: true,
+            underline: 3,
+            reverse: true,
+            dwl: true,
+            dhl: 2,
+            uri: 7,
+            ..Default::default()
+        };
+        getcell_mut(&mut screen, 0, 1).unwrap().schar = crate::types_defs::ScharT::MAX;
+        let mut external = crate::vterm_defs::VTermScreenCell::default();
+        assert_eq!(
+            vterm_screen_get_cell(
+                &screen,
+                crate::vterm_defs::VTermPos { row: 0, col: 0 },
+                &mut external,
+            ),
+            1
+        );
+        assert_eq!(external.schar, 42);
+        assert!(external.attrs.bold);
+        assert_eq!(external.attrs.underline, 3);
+        assert!(!external.attrs.reverse);
+        assert!(external.attrs.dwl);
+        assert_eq!(external.attrs.dhl, 2);
+        assert_eq!(external.uri, 7);
+        assert_eq!(external.width, 2);
+    }
+
+    #[test]
+    fn screen_get_cell_hides_continuation_and_rejects_invalid_position() {
+        let mut screen = screen_new(1, 1);
+        getcell_mut(&mut screen, 0, 0).unwrap().schar = crate::types_defs::ScharT::MAX;
+        let mut external = crate::vterm_defs::VTermScreenCell::default();
+        assert_eq!(
+            vterm_screen_get_cell(
+                &screen,
+                crate::vterm_defs::VTermPos { row: 0, col: 0 },
+                &mut external,
+            ),
+            1
+        );
+        assert_eq!(external.schar, 0);
+        assert_eq!(external.width, 1);
+        assert_eq!(
+            vterm_screen_get_cell(
+                &screen,
+                crate::vterm_defs::VTermPos { row: 1, col: 0 },
+                &mut external,
             ),
             0
         );
