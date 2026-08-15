@@ -86,6 +86,19 @@ pub const fn rect_contains(
         && small.end_col <= big.end_col
 }
 
+/// Whether rectangles overlap according to libvterm's edge-inclusive
+/// test (`rect_intersects`).
+#[must_use]
+pub const fn rect_intersects(
+    first: &crate::vterm_defs::VTermRect,
+    second: &crate::vterm_defs::VTermRect,
+) -> bool {
+    !(first.start_row > second.end_row
+        || second.start_row > first.end_row
+        || first.start_col > second.end_col
+        || second.start_col > first.end_col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +238,43 @@ mod tests {
                 crate::vterm_defs::VTermRect { end_col: 21, ..big },
             ] {
                 assert!(!rect_contains(&big, &small));
-        }
+            }
+    }
+
+    #[test]
+    fn rect_intersects_counts_touching_edges_as_overlap() {
+            let first = crate::vterm_defs::VTermRect {
+                start_row: 0,
+                end_row: 5,
+                start_col: 0,
+                end_col: 5,
+            };
+            assert!(rect_intersects(
+                &first,
+                &crate::vterm_defs::VTermRect {
+                    start_row: 5,
+                    end_row: 10,
+                    start_col: 5,
+                    end_col: 10,
+                },
+            ));
+            assert!(!rect_intersects(
+                &first,
+                &crate::vterm_defs::VTermRect {
+                    start_row: 6,
+                    end_row: 10,
+                    start_col: 0,
+                    end_col: 5,
+                },
+            ));
+            assert!(!rect_intersects(
+                &first,
+                &crate::vterm_defs::VTermRect {
+                    start_row: 0,
+                    end_row: 5,
+                    start_col: 6,
+                    end_col: 10,
+                },
+            ));
     }
 }
