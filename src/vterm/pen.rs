@@ -398,6 +398,35 @@ fn apply_sgr_high_color<C: VTermPenCallbacks>(
     }
 }
 
+#[allow(dead_code)]
+fn apply_sgr_default_color<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    match argument {
+        39 => {
+            state.pen.fg = state.default_fg;
+            setpenattr_col(
+                callbacks,
+                crate::vterm_defs::VTermAttr::Foreground,
+                state.pen.fg,
+            );
+            true
+        }
+        49 => {
+            state.pen.bg = state.default_bg;
+            setpenattr_col(
+                callbacks,
+                crate::vterm_defs::VTermAttr::Background,
+                state.pen.bg,
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -1049,6 +1078,20 @@ mod tests {
         }
         assert!(!apply_sgr_high_color(&mut state, &mut capture, 89));
         assert!(!apply_sgr_high_color(&mut state, &mut capture, 108));
+    }
+
+    #[test]
+    fn sgr_default_color_restores_foreground_and_background() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        crate::vterm_defs::vterm_color_indexed(&mut state.pen.fg, 7);
+        crate::vterm_defs::vterm_color_indexed(&mut state.pen.bg, 8);
+        let mut capture = PenCapture::default();
+        assert!(apply_sgr_default_color(&mut state, &mut capture, 39));
+        assert_eq!(state.pen.fg, state.default_fg);
+        assert!(apply_sgr_default_color(&mut state, &mut capture, 49));
+        assert_eq!(state.pen.bg, state.default_bg);
+        assert!(!apply_sgr_default_color(&mut state, &mut capture, 40));
     }
 
     #[test]
