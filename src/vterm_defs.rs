@@ -145,6 +145,45 @@ pub struct VTermRect {
     pub end_col: i32,
 }
 
+pub const VTERM_COLOR_RGB: u8 = 0x00;
+pub const VTERM_COLOR_INDEXED: u8 = 0x01;
+pub const VTERM_COLOR_TYPE_MASK: u8 = 0x01;
+pub const VTERM_COLOR_DEFAULT_FG: u8 = 0x02;
+pub const VTERM_COLOR_DEFAULT_BG: u8 = 0x04;
+pub const VTERM_COLOR_DEFAULT_MASK: u8 = 0x06;
+
+/// Tagged terminal color (`VTermColor`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermColor {
+    pub color_type: u8,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub index: u8,
+}
+
+impl VTermColor {
+    #[must_use]
+    pub const fn is_indexed(self) -> bool {
+        self.color_type & VTERM_COLOR_TYPE_MASK == VTERM_COLOR_INDEXED
+    }
+
+    #[must_use]
+    pub const fn is_rgb(self) -> bool {
+        self.color_type & VTERM_COLOR_TYPE_MASK == VTERM_COLOR_RGB
+    }
+
+    #[must_use]
+    pub const fn is_default_fg(self) -> bool {
+        self.color_type & VTERM_COLOR_DEFAULT_FG != 0
+    }
+
+    #[must_use]
+    pub const fn is_default_bg(self) -> bool {
+        self.color_type & VTERM_COLOR_DEFAULT_BG != 0
+    }
+}
+
 /// Moves a terminal rectangle (`vterm_rect_move`).
 pub const fn vterm_rect_move(rect: &mut VTermRect, row_delta: i32, col_delta: i32) {
     rect.start_row += row_delta;
@@ -361,6 +400,29 @@ mod tests {
             start_col: 7,
             end_col: 14,
         });
+    }
+
+    #[test]
+    fn terminal_color_flag_tests_match_header_macros() {
+        let rgb = VTermColor {
+            color_type: VTERM_COLOR_RGB | VTERM_COLOR_DEFAULT_FG,
+            ..Default::default()
+        };
+        assert!(rgb.is_rgb());
+        assert!(!rgb.is_indexed());
+        assert!(rgb.is_default_fg());
+        assert!(!rgb.is_default_bg());
+
+        let indexed = VTermColor {
+            color_type: VTERM_COLOR_INDEXED | VTERM_COLOR_DEFAULT_BG,
+            ..Default::default()
+        };
+        assert!(indexed.is_indexed());
+        assert!(!indexed.is_rgb());
+        assert!(!indexed.is_default_fg());
+        assert!(indexed.is_default_bg());
+        assert_eq!(VTERM_COLOR_TYPE_MASK, 1);
+        assert_eq!(VTERM_COLOR_DEFAULT_MASK, 6);
     }
 
     #[test]
