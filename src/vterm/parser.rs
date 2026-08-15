@@ -35,6 +35,63 @@ impl VTermParserState {
     }
 }
 
+/// CSI-specific parser storage (`parser.v.csi`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsiParserData {
+    pub leader_len: usize,
+    pub leader: [u8; CSI_LEADER_MAX],
+    pub argi: usize,
+    pub args: [CsiArg; CSI_ARGS_MAX],
+}
+
+impl Default for CsiParserData {
+    fn default() -> Self {
+        Self {
+            leader_len: 0,
+            leader: [0; CSI_LEADER_MAX],
+            argi: 0,
+            args: [0; CSI_ARGS_MAX],
+        }
+    }
+}
+
+/// DCS-specific parser storage (`parser.v.dcs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DcsParserData {
+    pub command_len: usize,
+    pub command: [u8; CSI_LEADER_MAX],
+}
+
+/// Parser fields embedded in `VTerm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VTermParser {
+    pub state: VTermParserState,
+    pub in_esc: bool,
+    pub intermed_len: usize,
+    pub intermed: [u8; INTERMED_MAX],
+    pub csi: CsiParserData,
+    pub osc_command: i32,
+    pub dcs: DcsParserData,
+    pub string_initial: bool,
+    pub emit_nul: bool,
+}
+
+impl Default for VTermParser {
+    fn default() -> Self {
+        Self {
+            state: VTermParserState::Normal,
+            in_esc: false,
+            intermed_len: 0,
+            intermed: [0; INTERMED_MAX],
+            csi: CsiParserData::default(),
+            osc_command: 0,
+            dcs: DcsParserData::default(),
+            string_initial: false,
+            emit_nul: false,
+        }
+    }
+}
+
 #[must_use]
 pub const fn csi_arg_has_more(arg: CsiArg) -> bool {
     arg & CSI_ARG_FLAG_MORE != 0
@@ -121,5 +178,18 @@ mod tests {
             assert!(state.is_string(), "{state:?}");
         }
         assert_eq!(VTermParserState::default(), VTermParserState::Normal);
+    }
+
+    #[test]
+    fn parser_storage_defaults_match_vterm_build_initialization() {
+        let parser = VTermParser::default();
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert!(!parser.in_esc);
+        assert_eq!(parser.intermed_len, 0);
+        assert_eq!(parser.intermed, [0; INTERMED_MAX]);
+        assert_eq!(parser.csi, CsiParserData::default());
+        assert_eq!(parser.dcs, DcsParserData::default());
+        assert!(!parser.string_initial);
+        assert!(!parser.emit_nul);
     }
 }
