@@ -167,6 +167,70 @@ pub fn vterm_screen_enable_altscreen(screen: &mut VTermScreen, altscreen: i32) {
     }
 }
 
+/// Mirrors a state pen attribute into the screen pen (`setpenattr`).
+pub fn setpenattr(
+    screen: &mut VTermScreen,
+    attr: crate::vterm_defs::VTermAttr,
+    value: &crate::vterm_defs::VTermValue<'_>,
+) -> i32 {
+    match (attr, value) {
+        (crate::vterm_defs::VTermAttr::Bold, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            screen.pen.bold = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Underline,
+            crate::vterm_defs::VTermValue::Number(value),
+        ) => screen.pen.underline = *value as u8 & 0x03,
+        (crate::vterm_defs::VTermAttr::Italic, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            screen.pen.italic = *value != 0;
+        }
+        (crate::vterm_defs::VTermAttr::Blink, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            screen.pen.blink = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Reverse,
+            crate::vterm_defs::VTermValue::Boolean(value),
+        ) => screen.pen.reverse = *value != 0,
+        (
+            crate::vterm_defs::VTermAttr::Conceal,
+            crate::vterm_defs::VTermValue::Boolean(value),
+        ) => screen.pen.conceal = *value != 0,
+        (crate::vterm_defs::VTermAttr::Strike, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            screen.pen.strike = *value != 0;
+        }
+        (crate::vterm_defs::VTermAttr::Font, crate::vterm_defs::VTermValue::Number(value)) => {
+            screen.pen.font = *value as u8 & 0x0F;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Foreground,
+            crate::vterm_defs::VTermValue::Color(value),
+        ) => screen.pen.fg = *value,
+        (
+            crate::vterm_defs::VTermAttr::Background,
+            crate::vterm_defs::VTermValue::Color(value),
+        ) => screen.pen.bg = *value,
+        (crate::vterm_defs::VTermAttr::Small, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            screen.pen.small = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Baseline,
+            crate::vterm_defs::VTermValue::Number(value),
+        ) => screen.pen.baseline = *value as u8 & 0x03,
+        (crate::vterm_defs::VTermAttr::Uri, crate::vterm_defs::VTermValue::Number(value)) => {
+            screen.pen.uri = *value;
+        }
+        (crate::vterm_defs::VTermAttr::Dim, crate::vterm_defs::VTermValue::Boolean(value)) => {
+            screen.pen.dim = *value != 0;
+        }
+        (
+            crate::vterm_defs::VTermAttr::Overline,
+            crate::vterm_defs::VTermValue::Boolean(value),
+        ) => screen.pen.overline = *value != 0,
+        _ => return 0,
+    }
+    1
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -367,6 +431,54 @@ mod tests {
         screen.buffers[1].as_mut().unwrap()[0].schar = 42;
         vterm_screen_enable_altscreen(&mut screen, 1);
         assert_eq!(screen.buffers[1].as_ref().unwrap()[0].schar, 42);
+    }
+
+    #[test]
+    fn screen_setpenattr_updates_all_typed_pen_fields() {
+        let mut screen = screen_new(1, 1);
+        let color = crate::vterm_defs::VTermColor {
+            red: 1,
+            green: 2,
+            blue: 3,
+            ..Default::default()
+        };
+        for (attr, value) in [
+            (
+                crate::vterm_defs::VTermAttr::Bold,
+                crate::vterm_defs::VTermValue::Boolean(1),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Underline,
+                crate::vterm_defs::VTermValue::Number(6),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Font,
+                crate::vterm_defs::VTermValue::Number(18),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Foreground,
+                crate::vterm_defs::VTermValue::Color(color),
+            ),
+            (
+                crate::vterm_defs::VTermAttr::Uri,
+                crate::vterm_defs::VTermValue::Number(42),
+            ),
+        ] {
+            assert_eq!(setpenattr(&mut screen, attr, &value), 1);
+        }
+        assert!(screen.pen.bold);
+        assert_eq!(screen.pen.underline, 2);
+        assert_eq!(screen.pen.font, 2);
+        assert_eq!(screen.pen.fg, color);
+        assert_eq!(screen.pen.uri, 42);
+        assert_eq!(
+            setpenattr(
+                &mut screen,
+                crate::vterm_defs::VTermAttr::NAttrs,
+                &crate::vterm_defs::VTermValue::Number(0),
+            ),
+            0
+        );
     }
 
     #[test]
