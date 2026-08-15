@@ -46,6 +46,7 @@ pub struct VTermScreen {
     pub global_reverse: bool,
     pub reflow: bool,
     pub buffers: [Option<Vec<ScreenCell>>; 2],
+    pub lineinfo: [Option<Vec<crate::vterm_defs::VTermLineInfo>>; 2],
     pub active_buffer: usize,
     pub sb_buffer: Vec<crate::vterm_defs::VTermScreenCell>,
     pub pen: ScreenPen,
@@ -75,6 +76,13 @@ pub fn screen_new(rows: i32, cols: i32) -> VTermScreen {
         global_reverse: false,
         reflow: false,
         buffers: [Some(vec![ScreenCell::default(); cell_count]), None],
+        lineinfo: [
+            Some(vec![
+                crate::vterm_defs::VTermLineInfo::default();
+                usize::try_from(rows).unwrap_or(0)
+            ]),
+            None,
+        ],
         active_buffer: 0,
         sb_buffer: vec![
             crate::vterm_defs::VTermScreenCell::default();
@@ -390,6 +398,8 @@ mod tests {
         assert_eq!(screen.active_buffer, 0);
         assert_eq!(screen.buffers[0].as_ref().unwrap().len(), 12);
         assert!(screen.buffers[1].is_none());
+        assert_eq!(screen.lineinfo[0].as_ref().unwrap().len(), 3);
+        assert!(screen.lineinfo[1].is_none());
         assert_eq!(screen.sb_buffer.len(), 4);
         assert_eq!(screen.pen, ScreenPen::default());
     }
