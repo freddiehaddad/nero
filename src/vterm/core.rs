@@ -76,9 +76,37 @@ pub fn vterm_get_size(
     }
 }
 
+/// Updates terminal dimensions and notifies the parser callback
+/// (`vterm_set_size`).
+pub fn vterm_set_size(
+    term: &mut VTerm,
+    rows: i32,
+    cols: i32,
+    callbacks: Option<&mut dyn crate::vterm::parser::VTermParserCallbacks>,
+) {
+    if rows < 1 || cols < 1 {
+        return;
+    }
+    term.rows = rows;
+    term.cols = cols;
+    if let Some(callbacks) = callbacks {
+        let _ = callbacks.resize(rows, cols);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct ResizeCapture(Vec<(i32, i32)>);
+
+    impl crate::vterm::parser::VTermParserCallbacks for ResizeCapture {
+        fn resize(&mut self, rows: i32, cols: i32) -> bool {
+            self.0.push((rows, cols));
+            true
+        }
+    }
 
     #[test]
     fn vterm_builder_defaults_match_a_zeroed_c_builder() {
@@ -144,5 +172,31 @@ mod tests {
         assert_eq!((rows, cols), (24, -1));
         vterm_get_size(&term, None, Some(&mut cols));
         assert_eq!((rows, cols), (24, 80));
+    }
+
+    #[test]
+    fn vterm_set_size_updates_valid_dimensions_and_calls_resize() {
+        let mut term = vterm_new(24, 80);
+        let mut capture = ResizeCapture::default();
+        vterm_set_size(&mut term, 40, 120, Some(&mut capture));
+        let mut rows = 0;
+        let mut cols = 0;
+        vterm_get_size(&term, Some(&mut rows), Some(&mut cols));
+        assert_eq!((rows, cols), (40, 120));
+        assert_eq!(capture.0, [(40, 120)]);
+    }
+
+    #[test]
+    fn vterm_set_size_rejects_nonpositive_dimensions() {
+        let mut term = vterm_new(24, 80);
+        let mut capture = ResizeCapture::default();
+        for (rows, cols) in [(0, 80), (-1, 80), (24, 0), (24, -1)] {
+            vterm_set_size(&mut term, rows, cols, Some(&mut capture));
+        }
+        let mut rows = 0;
+        let mut cols = 0;
+        vterm_get_size(&term, Some(&mut rows), Some(&mut cols));
+        assert_eq!((rows, cols), (24, 80));
+        assert!(capture.0.is_empty());
     }
 }
