@@ -116,6 +116,40 @@ pub fn lookup_colour_palette(
     false
 }
 
+/// Parses an SGR color payload (`lookup_colour`).
+#[must_use]
+pub fn lookup_colour(
+    palette: i32,
+    args: &[crate::vterm::parser::CsiArg],
+    color: &mut crate::vterm_defs::VTermColor,
+) -> usize {
+    match palette {
+        2 => {
+            if args.len() < 3 {
+                return args.len();
+            }
+            crate::vterm_defs::vterm_color_rgb(
+                color,
+                crate::vterm::parser::csi_arg(args[0]) as u8,
+                crate::vterm::parser::csi_arg(args[1]) as u8,
+                crate::vterm::parser::csi_arg(args[2]) as u8,
+            );
+            3
+        }
+        5 => {
+            let Some(&index) = args.first() else {
+                return 0;
+            };
+            if crate::vterm::parser::csi_arg_is_missing(index) {
+                return 1;
+            }
+            crate::vterm_defs::vterm_color_indexed(color, index as u8);
+            1
+        }
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +271,57 @@ mod tests {
             for index in [-1, 256, i64::MAX] {
                 assert!(!lookup_colour_palette(&palette, index, &mut color));
                 assert_eq!(color, original);
+            }
+    }
+
+    #[test]
+    fn lookup_colour_parses_rgb_payloads_and_partial_input() {
+            let mut color = crate::vterm_defs::VTermColor::default();
+            assert_eq!(lookup_colour(2, &[10, 20], &mut color), 2);
+            assert_eq!(color, crate::vterm_defs::VTermColor::default());
+            assert_eq!(
+                lookup_colour(
+                    2,
+                    &[
+                        crate::vterm::parser::CSI_ARG_FLAG_MORE | 10,
+                        crate::vterm::parser::CSI_ARG_FLAG_MORE | 20,
+                        300,
+                    ],
+                    &mut color,
+                ),
+                3
+            );
+            assert_eq!((color.red, color.green, color.blue), (10, 20, 44));
         }
+
+    #[test]
+    fn lookup_colour_parses_indexed_payloads_and_missing_input() {
+            let mut color = crate::vterm_defs::VTermColor::default();
+            assert_eq!(lookup_colour(5, &[], &mut color), 0);
+            assert_eq!(
+                lookup_colour(
+                    5,
+                    &[crate::vterm::parser::CSI_ARG_MISSING],
+                    &mut color,
+                ),
+                1
+            );
+            assert_eq!(color, crate::vterm_defs::VTermColor::default());
+            assert_eq!(lookup_colour(5, &[300], &mut color), 1);
+            assert!(color.is_indexed());
+            assert_eq!(color.index, 44);
+        }
+
+    #[test]
+    fn lookup_colour_rejects_unknown_palette_modes() {
+            let original = crate::vterm_defs::VTermColor {
+                red: 1,
+                green: 2,
+                blue: 3,
+                ..Default::default()
+            };
+            let mut color = original;
+            assert_eq!(lookup_colour(7, &[1, 2, 3], &mut color), 0);
+            assert_eq!(color, original);
     }
 }
