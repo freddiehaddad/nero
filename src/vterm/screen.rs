@@ -332,6 +332,56 @@ pub fn vterm_screen_get_cell(
     1
 }
 
+fn emit_stored_damage<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+) {
+    if screen.damaged.start_row != -1 {
+        let _ = callbacks.damage(screen.damaged);
+        screen.damaged.start_row = -1;
+    }
+}
+
+/// Records or emits damage according to the merge policy
+/// (`damagerect`).
+pub fn damagerect<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    rect: crate::vterm_defs::VTermRect,
+) {
+    let emit = match screen.damage_merge {
+        crate::vterm_defs::VTermDamageSize::Cell => rect,
+        crate::vterm_defs::VTermDamageSize::Row => {
+            if rect.end_row > rect.start_row + 1 {
+                emit_stored_damage(screen, callbacks);
+                rect
+            } else if screen.damaged.start_row == -1 {
+                screen.damaged = rect;
+                return;
+            } else if rect.start_row == screen.damaged.start_row {
+                screen.damaged.start_col = screen.damaged.start_col.min(rect.start_col);
+                screen.damaged.end_col = screen.damaged.end_col.max(rect.end_col);
+                return;
+            } else {
+                let emit = screen.damaged;
+                screen.damaged = rect;
+                emit
+            }
+        }
+        crate::vterm_defs::VTermDamageSize::Screen
+        | crate::vterm_defs::VTermDamageSize::Scroll => {
+            if screen.damaged.start_row == -1 {
+                screen.damaged = rect;
+            } else {
+                rect_expand(&mut screen.damaged, &rect);
+            }
+            return;
+        }
+        crate::vterm_defs::VTermDamageSize::NDamages => return,
+    };
+    let _ = callbacks.damage(emit);
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -402,6 +452,16 @@ pub const fn rect_intersects(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct DamageCapture(Vec<crate::vterm_defs::VTermRect>);
+
+    impl VTermScreenCallbacks for DamageCapture {
+        fn damage(&mut self, rect: crate::vterm_defs::VTermRect) -> bool {
+            self.0.push(rect);
+            true
+        }
+    }
+
     #[test]
     fn default_screen_callbacks_decline_every_event() {
         let callbacks = &mut ();
@@ -422,6 +482,78 @@ mod tests {
         assert!(!callbacks.scrollback_push(&[]));
         assert!(!callbacks.scrollback_pop(&mut []));
         assert!(!callbacks.scrollback_clear());
+    }
+
+    #[test]
+    fn damagerect_emits_cells_and_accumulates_screen_damage() {
+        let first = crate::vterm_defs::VTermRect {
+            start_row: 1,
+            end_row: 2,
+            start_col: 3,
+            end_col: 4,
+        };
+        let second = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 4,
+            start_col: 5,
+            end_col: 8,
+        };
+        let mut screen = screen_new(5, 10);
+        let mut capture = DamageCapture::default();
+        damagerect(&mut screen, &mut capture, first);
+        assert_eq!(capture.0, [first]);
+
+        screen.damage_merge = crate::vterm_defs::VTermDamageSize::Screen;
+        damagerect(&mut screen, &mut capture, first);
+        damagerect(&mut screen, &mut capture, second);
+        assert_eq!(capture.0, [first]);
+        assert_eq!(screen.damaged, crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 4,
+            start_col: 3,
+            end_col: 8,
+        });
+    }
+
+    #[test]
+    fn damagerect_merges_same_row_and_rotates_different_rows() {
+        let mut screen = screen_new(5, 10);
+        screen.damage_merge = crate::vterm_defs::VTermDamageSize::Row;
+        let mut capture = DamageCapture::default();
+        damagerect(
+            &mut screen,
+            &mut capture,
+            crate::vterm_defs::VTermRect {
+                start_row: 1,
+                end_row: 2,
+                start_col: 4,
+                end_col: 6,
+            },
+        );
+        damagerect(
+            &mut screen,
+            &mut capture,
+            crate::vterm_defs::VTermRect {
+                start_row: 1,
+                end_row: 2,
+                start_col: 2,
+                end_col: 8,
+            },
+        );
+        assert_eq!((screen.damaged.start_col, screen.damaged.end_col), (2, 8));
+        damagerect(
+            &mut screen,
+            &mut capture,
+            crate::vterm_defs::VTermRect {
+                start_row: 2,
+                end_row: 3,
+                start_col: 0,
+                end_col: 1,
+            },
+        );
+        assert_eq!(capture.0.len(), 1);
+        assert_eq!(capture.0[0].start_row, 1);
+        assert_eq!(screen.damaged.start_row, 2);
     }
 
     #[test]
