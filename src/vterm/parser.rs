@@ -92,6 +92,12 @@ impl Default for VTermParser {
     }
 }
 
+/// Whether `c` is an escape/CSI intermediate byte (`is_intermed`).
+#[must_use]
+pub const fn is_intermed(c: u8) -> bool {
+    c >= 0x20 && c <= 0x2F
+}
+
 #[must_use]
 pub const fn csi_arg_has_more(arg: CsiArg) -> bool {
     arg & CSI_ARG_FLAG_MORE != 0
@@ -191,5 +197,14 @@ mod tests {
         assert_eq!(parser.dcs, DcsParserData::default());
         assert!(!parser.string_initial);
         assert!(!parser.emit_nul);
+    }
+
+    #[test]
+    fn intermediate_byte_range_is_inclusive_and_exact() {
+        assert!(!is_intermed(0x1F));
+        assert!(is_intermed(0x20));
+        assert!(is_intermed(0x27));
+        assert!(is_intermed(0x2F));
+        assert!(!is_intermed(0x30));
     }
 }
