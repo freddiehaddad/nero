@@ -290,6 +290,34 @@ impl VTermParser {
         self.state = VTermParserState::CsiArgs;
         false
     }
+
+    /// Handles one byte in `CSI_ARGS`. Returns true when consumed;
+    /// false means the same byte must fall through to `CSI_INTERMED`.
+    fn parse_csi_args(&mut self, mut byte: u8) -> bool {
+        if byte.is_ascii_digit() {
+            let arg = &mut self.csi.args[self.csi.argi];
+            if *arg == CSI_ARG_MISSING {
+                *arg = 0;
+            }
+            *arg = arg.wrapping_mul(10);
+            *arg = arg.wrapping_add(u32::from(byte - b'0'));
+            return true;
+        }
+        if byte == b':' {
+            self.csi.args[self.csi.argi] |= CSI_ARG_FLAG_MORE;
+            byte = b';';
+        }
+        if byte == b';' {
+            self.csi.argi += 1;
+            self.csi.args[self.csi.argi] = CSI_ARG_MISSING;
+            return true;
+        }
+
+        self.csi.argi += 1;
+        self.intermed_len = 0;
+        self.state = VTermParserState::CsiIntermed;
+        false
+    }
 }
 
 #[must_use]
@@ -733,5 +761,56 @@ mod tests {
             .all(|&byte| byte == b'?'));
         assert!(!parser.parse_csi_leader(b'm'));
         assert_eq!(parser.csi.leader[CSI_LEADER_MAX - 1], 0);
+    }
+
+    #[test]
+    fn parser_csi_args_collects_numbers_and_missing_arguments() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiArgs,
+            ..Default::default()
+        };
+        parser.csi.args[0] = CSI_ARG_MISSING;
+        for byte in b"12;3;" {
+            assert!(parser.parse_csi_args(*byte));
+        }
+        assert_eq!(parser.csi.argi, 2);
+        assert_eq!(
+            &parser.csi.args[..=parser.csi.argi],
+            &[12, 3, CSI_ARG_MISSING]
+        );
+    }
+
+    #[test]
+    fn parser_csi_args_marks_colon_subparameters() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiArgs,
+            ..Default::default()
+        };
+        parser.csi.args[0] = CSI_ARG_MISSING;
+        for byte in b"4:3:2" {
+            assert!(parser.parse_csi_args(*byte));
+        }
+        assert_eq!(
+            &parser.csi.args[..=parser.csi.argi],
+            &[
+                CSI_ARG_FLAG_MORE | 4,
+                CSI_ARG_FLAG_MORE | 3,
+                2,
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_csi_args_transitions_to_intermediate_with_argument_count() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiArgs,
+            ..Default::default()
+        };
+        parser.csi.args[0] = CSI_ARG_MISSING;
+        assert!(!parser.parse_csi_args(b'm'));
+        assert_eq!(parser.csi.argi, 1);
+        assert_eq!(parser.csi.args[0], CSI_ARG_MISSING);
+        assert_eq!(parser.intermed_len, 0);
+        assert_eq!(parser.state, VTermParserState::CsiIntermed);
     }
 }
