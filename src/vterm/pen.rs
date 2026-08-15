@@ -136,6 +136,21 @@ pub fn vterm_state_newpen(state: &mut VTermPenState) {
     }
 }
 
+/// Replaces one mutable ANSI palette entry
+/// (`vterm_state_set_palette_color`).
+pub fn vterm_state_set_palette_color(
+    state: &mut VTermPenState,
+    index: i32,
+    color: &crate::vterm_defs::VTermColor,
+) {
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
+    if let Some(slot) = state.palette.colors.get_mut(index) {
+        *slot = *color;
+    }
+}
+
 impl Default for VTermPalette {
     fn default() -> Self {
         let mut colors = [crate::vterm_defs::VTermColor::default(); 16];
@@ -414,6 +429,37 @@ mod tests {
         vterm_state_newpen(&mut state);
         assert!(state.pen.bold);
         assert!(state.saved_pen.italic);
+    }
+
+    #[test]
+    fn set_palette_color_replaces_valid_entries() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        let replacement = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_INDEXED
+                | crate::vterm_defs::VTERM_COLOR_DEFAULT_FG,
+            index: 99,
+            ..Default::default()
+        };
+        vterm_state_set_palette_color(&mut state, 7, &replacement);
+        assert_eq!(state.palette.colors[7], replacement);
+    }
+
+    #[test]
+    fn set_palette_color_ignores_out_of_range_indices() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        let original = state.palette.clone();
+        let replacement = crate::vterm_defs::VTermColor {
+            red: 1,
+            green: 2,
+            blue: 3,
+            ..Default::default()
+        };
+        for index in [-1, 16, i32::MAX] {
+            vterm_state_set_palette_color(&mut state, index, &replacement);
+        }
+        assert_eq!(state.palette, original);
     }
 
     #[test]
