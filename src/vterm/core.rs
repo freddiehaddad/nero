@@ -111,6 +111,15 @@ pub fn vterm_input_write<C: crate::vterm::parser::VTermParserCallbacks>(
         .vterm_input_write(callbacks, bytes, term.utf8)
 }
 
+/// Appends bytes to the internal output buffer
+/// (`vterm_push_output_bytes`, buffered path).
+pub fn vterm_push_output_bytes(term: &mut VTerm, bytes: &[u8]) {
+    if bytes.len() > term.outbuffer_len - term.outbuffer.len() {
+        return;
+    }
+    term.outbuffer.extend_from_slice(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +275,29 @@ mod tests {
             term.parser.state,
             crate::vterm::parser::VTermParserState::Normal
         );
+    }
+
+    #[test]
+    fn push_output_bytes_appends_when_the_entire_write_fits() {
+        let mut term = vterm_build(&VTermBuilder {
+            outbuffer_len: 6,
+            ..Default::default()
+        });
+        vterm_push_output_bytes(&mut term, b"ab");
+        vterm_push_output_bytes(&mut term, b"cdef");
+        assert_eq!(term.outbuffer, b"abcdef");
+    }
+
+    #[test]
+    fn push_output_bytes_drops_an_entire_overflowing_write() {
+        let mut term = vterm_build(&VTermBuilder {
+            outbuffer_len: 5,
+            ..Default::default()
+        });
+        vterm_push_output_bytes(&mut term, b"abc");
+        vterm_push_output_bytes(&mut term, b"def");
+        assert_eq!(term.outbuffer, b"abc");
+        vterm_push_output_bytes(&mut term, b"de");
+        assert_eq!(term.outbuffer, b"abcde");
     }
 }
