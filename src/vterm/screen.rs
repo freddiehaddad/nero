@@ -148,6 +148,11 @@ pub fn line_popcount(
     col + 1
 }
 
+/// Enables or disables screen reflow (`vterm_screen_enable_reflow`).
+pub fn vterm_screen_enable_reflow(screen: &mut VTermScreen, reflow: bool) {
+    screen.reflow = reflow;
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -316,6 +321,16 @@ mod tests {
         assert_eq!(line_popcount(&buffer, 0, 2, 4), 3);
         buffer[7].schar = 1;
         assert_eq!(line_popcount(&buffer, 1, 2, 4), 4);
+    }
+
+    #[test]
+    fn screen_enable_reflow_tracks_requested_state() {
+        let mut screen = screen_new(2, 3);
+        assert!(!screen.reflow);
+        vterm_screen_enable_reflow(&mut screen, true);
+        assert!(screen.reflow);
+        vterm_screen_enable_reflow(&mut screen, false);
+        assert!(!screen.reflow);
     }
 
     #[test]
