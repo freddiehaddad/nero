@@ -33,6 +33,57 @@ pub struct ScreenCell {
     pub pen: ScreenPen,
 }
 
+/// Owned translation of `VTermScreen`'s data fields.
+#[derive(Debug)]
+pub struct VTermScreen {
+    pub damage_merge: crate::vterm_defs::VTermDamageSize,
+    pub damaged: crate::vterm_defs::VTermRect,
+    pub pending_scrollrect: crate::vterm_defs::VTermRect,
+    pub pending_scroll_downward: i32,
+    pub pending_scroll_rightward: i32,
+    pub rows: i32,
+    pub cols: i32,
+    pub global_reverse: bool,
+    pub reflow: bool,
+    pub buffers: [Option<Vec<ScreenCell>>; 2],
+    pub active_buffer: usize,
+    pub sb_buffer: Vec<crate::vterm_defs::VTermScreenCell>,
+    pub pen: ScreenPen,
+}
+
+/// Creates a screen with its primary buffer (`screen_new`).
+#[must_use]
+pub fn screen_new(rows: i32, cols: i32) -> VTermScreen {
+    let cell_count = usize::try_from(rows)
+        .ok()
+        .and_then(|rows| usize::try_from(cols).ok().and_then(|cols| rows.checked_mul(cols)))
+        .unwrap_or(0);
+    VTermScreen {
+        damage_merge: crate::vterm_defs::VTermDamageSize::Cell,
+        damaged: crate::vterm_defs::VTermRect {
+            start_row: -1,
+            ..Default::default()
+        },
+        pending_scrollrect: crate::vterm_defs::VTermRect {
+            start_row: -1,
+            ..Default::default()
+        },
+        pending_scroll_downward: 0,
+        pending_scroll_rightward: 0,
+        rows,
+        cols,
+        global_reverse: false,
+        reflow: false,
+        buffers: [Some(vec![ScreenCell::default(); cell_count]), None],
+        active_buffer: 0,
+        sb_buffer: vec![
+            crate::vterm_defs::VTermScreenCell::default();
+            usize::try_from(cols).unwrap_or(0)
+        ],
+        pen: ScreenPen::default(),
+    }
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -135,6 +186,22 @@ mod tests {
             schar: 0,
             pen: ScreenPen::default(),
         });
+    }
+
+    #[test]
+    fn screen_new_initializes_primary_buffer_and_damage_sentinels() {
+        let screen = screen_new(3, 4);
+        assert_eq!(screen.damage_merge, crate::vterm_defs::VTermDamageSize::Cell);
+        assert_eq!(screen.damaged.start_row, -1);
+        assert_eq!(screen.pending_scrollrect.start_row, -1);
+        assert_eq!((screen.rows, screen.cols), (3, 4));
+        assert!(!screen.global_reverse);
+        assert!(!screen.reflow);
+        assert_eq!(screen.active_buffer, 0);
+        assert_eq!(screen.buffers[0].as_ref().unwrap().len(), 12);
+        assert!(screen.buffers[1].is_none());
+        assert_eq!(screen.sb_buffer.len(), 4);
+        assert_eq!(screen.pen, ScreenPen::default());
     }
 
     #[test]
