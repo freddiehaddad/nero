@@ -1,6 +1,9 @@
 //! Translated from `src/nvim/vterm/vterm_defs.h` and
 //! `vterm_keycodes_defs.h` (initial core).
 
+pub const VTERM_VERSION_MAJOR: i32 = 0;
+pub const VTERM_VERSION_MINOR: i32 = 3;
+
 /// Terminal key modifier mask (`VTermModifier`).
 pub type VTermModifier = u8;
 pub const VTERM_MOD_NONE: VTermModifier = 0x00;
@@ -223,6 +226,12 @@ mod tests {
             VTERM_MOD_SHIFT | VTERM_MOD_ALT | VTERM_MOD_CTRL,
             VTERM_ALL_MODS_MASK
         );
+    }
+
+    #[test]
+    fn vterm_version_matches_vendored_header() {
+        assert_eq!(VTERM_VERSION_MAJOR, 0);
+        assert_eq!(VTERM_VERSION_MINOR, 3);
     }
 
     #[test]
