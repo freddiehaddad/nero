@@ -271,6 +271,24 @@ fn apply_sgr_visibility<C: VTermPenCallbacks>(
     true
 }
 
+#[allow(dead_code)]
+fn apply_sgr_font<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    if !(10..=19).contains(&argument) {
+        return false;
+    }
+    state.pen.font = (argument - 10) as u8;
+    setpenattr_int(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Font,
+        i32::from(state.pen.font),
+    );
+    true
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -804,6 +822,25 @@ mod tests {
             assert!(!state.pen.conceal);
             assert!(!state.pen.strike);
             assert!(!apply_sgr_visibility(&mut state, &mut capture, 6));
+    }
+
+    #[test]
+    fn sgr_font_selects_all_ten_font_slots() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        for argument in 10..=19 {
+            assert!(apply_sgr_font(&mut state, &mut capture, argument));
+            assert_eq!(state.pen.font, (argument - 10) as u8);
+        }
+        assert!(!apply_sgr_font(&mut state, &mut capture, 9));
+        assert!(!apply_sgr_font(&mut state, &mut capture, 20));
+        assert_eq!(
+            capture.0.last(),
+            Some(&(
+                crate::vterm_defs::VTermAttr::Font,
+                crate::vterm_defs::VTermValue::Number(9),
+            ))
+        );
     }
 
     #[test]
