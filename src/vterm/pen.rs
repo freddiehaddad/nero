@@ -243,6 +243,34 @@ fn apply_sgr_underline<C: VTermPenCallbacks>(
     Some(consumed)
 }
 
+#[allow(dead_code)]
+fn apply_sgr_visibility<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    let (attr, enabled) = match argument {
+        5 => (crate::vterm_defs::VTermAttr::Blink, true),
+        25 => (crate::vterm_defs::VTermAttr::Blink, false),
+        7 => (crate::vterm_defs::VTermAttr::Reverse, true),
+        27 => (crate::vterm_defs::VTermAttr::Reverse, false),
+        8 => (crate::vterm_defs::VTermAttr::Conceal, true),
+        28 => (crate::vterm_defs::VTermAttr::Conceal, false),
+        9 => (crate::vterm_defs::VTermAttr::Strike, true),
+        29 => (crate::vterm_defs::VTermAttr::Strike, false),
+        _ => return false,
+    };
+    match attr {
+        crate::vterm_defs::VTermAttr::Blink => state.pen.blink = enabled,
+        crate::vterm_defs::VTermAttr::Reverse => state.pen.reverse = enabled,
+        crate::vterm_defs::VTermAttr::Conceal => state.pen.conceal = enabled,
+        crate::vterm_defs::VTermAttr::Strike => state.pen.strike = enabled,
+        _ => unreachable!(),
+    }
+    setpenattr_bool(callbacks, attr, enabled);
+    true
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -747,6 +775,35 @@ mod tests {
             );
             assert_eq!(state.pen.underline, expected);
         }
+    }
+
+    #[test]
+    fn sgr_visibility_toggles_blink_reverse_conceal_and_strike() {
+            let mut state = VTermPenState::default();
+            let mut capture = PenCapture::default();
+            for (on, off, field) in [
+                (5, 25, crate::vterm_defs::VTermAttr::Blink),
+                (7, 27, crate::vterm_defs::VTermAttr::Reverse),
+                (8, 28, crate::vterm_defs::VTermAttr::Conceal),
+                (9, 29, crate::vterm_defs::VTermAttr::Strike),
+            ] {
+                assert!(apply_sgr_visibility(&mut state, &mut capture, on));
+                assert_eq!(capture.0.last().unwrap().0, field);
+                assert_eq!(
+                    capture.0.last().unwrap().1,
+                    crate::vterm_defs::VTermValue::Boolean(1)
+                );
+                assert!(apply_sgr_visibility(&mut state, &mut capture, off));
+                assert_eq!(
+                    capture.0.last().unwrap().1,
+                    crate::vterm_defs::VTermValue::Boolean(0)
+                );
+            }
+            assert!(!state.pen.blink);
+            assert!(!state.pen.reverse);
+            assert!(!state.pen.conceal);
+            assert!(!state.pen.strike);
+            assert!(!apply_sgr_visibility(&mut state, &mut capture, 6));
     }
 
     #[test]
