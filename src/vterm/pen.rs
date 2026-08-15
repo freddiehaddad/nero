@@ -427,6 +427,46 @@ fn apply_sgr_default_color<C: VTermPenCallbacks>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SgrColorResult {
+    Unhandled,
+    Applied(usize),
+    Truncated,
+}
+
+#[allow(dead_code)]
+fn apply_sgr_alternate_color<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    args: &[crate::vterm::parser::CsiArg],
+    index: usize,
+) -> SgrColorResult {
+    let Some(&argument) = args.get(index) else {
+        return SgrColorResult::Unhandled;
+    };
+    let attr = match crate::vterm::parser::csi_arg(argument) {
+        38 => crate::vterm_defs::VTermAttr::Foreground,
+        48 => crate::vterm_defs::VTermAttr::Background,
+        _ => return SgrColorResult::Unhandled,
+    };
+    let Some(&palette) = args.get(index + 1) else {
+        return SgrColorResult::Truncated;
+    };
+    let target = if attr == crate::vterm_defs::VTermAttr::Foreground {
+        &mut state.pen.fg
+    } else {
+        &mut state.pen.bg
+    };
+    let payload = args.get(index + 2..).unwrap_or_default();
+    let payload_consumed = lookup_colour(
+        crate::vterm::parser::csi_arg(palette) as i32,
+        payload,
+        target,
+    );
+    setpenattr_col(callbacks, attr, *target);
+    SgrColorResult::Applied(2 + payload_consumed)
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -1092,6 +1132,38 @@ mod tests {
         assert!(apply_sgr_default_color(&mut state, &mut capture, 49));
         assert_eq!(state.pen.bg, state.default_bg);
         assert!(!apply_sgr_default_color(&mut state, &mut capture, 40));
+    }
+
+    #[test]
+    fn sgr_alternate_color_parses_rgb_foreground_and_indexed_background() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        assert_eq!(
+            apply_sgr_alternate_color(&mut state, &mut capture, &[38, 2, 1, 2, 3], 0),
+            SgrColorResult::Applied(5)
+        );
+        assert_eq!((state.pen.fg.red, state.pen.fg.green, state.pen.fg.blue), (1, 2, 3));
+        assert_eq!(
+            apply_sgr_alternate_color(&mut state, &mut capture, &[48, 5, 200], 0),
+            SgrColorResult::Applied(3)
+        );
+        assert!(state.pen.bg.is_indexed());
+        assert_eq!(state.pen.bg.index, 200);
+    }
+
+    #[test]
+    fn sgr_alternate_color_reports_unhandled_and_truncated_inputs() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        assert_eq!(
+            apply_sgr_alternate_color(&mut state, &mut capture, &[37], 0),
+            SgrColorResult::Unhandled
+        );
+        assert_eq!(
+            apply_sgr_alternate_color(&mut state, &mut capture, &[38], 0),
+            SgrColorResult::Truncated
+        );
+        assert!(capture.0.is_empty());
     }
 
     #[test]
