@@ -173,6 +173,44 @@ pub fn vterm_push_output_sprintf_ctrl(
     vterm_push_output_bytes(term, &output);
 }
 
+/// Emits an optional control, formatted string payload, and optional
+/// string terminator (`vterm_push_output_sprintf_str`).
+pub fn vterm_push_output_sprintf_str(
+    term: &mut VTerm,
+    control: u8,
+    terminate: bool,
+    arguments: std::fmt::Arguments<'_>,
+) {
+    let mut output = Vec::new();
+    if control != 0 {
+        if control >= 0x80 && !term.ctrl8bit {
+            output.extend_from_slice(&[0x1B, control - 0x40]);
+        } else {
+            output.push(control);
+        }
+        if output.len() >= term.tmpbuffer_len {
+            return;
+        }
+    }
+
+    output.extend_from_slice(arguments.to_string().as_bytes());
+    if output.len() >= term.tmpbuffer_len {
+        return;
+    }
+
+    if terminate {
+        if term.ctrl8bit {
+            output.push(crate::vterm_defs::C1_ST);
+        } else {
+            output.extend_from_slice(b"\x1b\\");
+        }
+        if output.len() >= term.tmpbuffer_len {
+            return;
+        }
+    }
+    vterm_push_output_bytes(term, &output);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +482,65 @@ mod tests {
 
         vterm_push_output_sprintf_ctrl(&mut term, b'\r', format_args!("12"));
         assert_eq!(term.outbuffer, b"\r12");
+    }
+
+    #[test]
+    fn push_output_sprintf_str_handles_optional_control_and_terminator() {
+        let mut term = vterm_new(24, 80);
+        vterm_push_output_sprintf_str(
+            &mut term,
+            crate::vterm_defs::C1_OSC,
+            true,
+            format_args!("{};{}", 2, "title"),
+        );
+        assert_eq!(term.outbuffer, b"\x1b]2;title\x1b\\");
+
+        term.outbuffer.clear();
+        vterm_push_output_sprintf_str(
+            &mut term,
+            0,
+            false,
+            format_args!("plain"),
+        );
+        assert_eq!(term.outbuffer, b"plain");
+    }
+
+    #[test]
+    fn push_output_sprintf_str_uses_eight_bit_control_and_st() {
+        let mut term = vterm_new(24, 80);
+        term.ctrl8bit = true;
+        vterm_push_output_sprintf_str(
+            &mut term,
+            crate::vterm_defs::C1_DCS,
+            true,
+            format_args!("1$r"),
+        );
+        assert_eq!(
+            term.outbuffer,
+            [
+                vec![crate::vterm_defs::C1_DCS],
+                b"1$r".to_vec(),
+                vec![crate::vterm_defs::C1_ST],
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn push_output_sprintf_str_drops_any_stage_that_fills_tmpbuffer() {
+        let mut term = vterm_build(&VTermBuilder {
+            tmpbuffer_len: 6,
+            ..Default::default()
+        });
+        vterm_push_output_sprintf_str(
+            &mut term,
+            crate::vterm_defs::C1_OSC,
+            false,
+            format_args!("1234"),
+        );
+        assert!(term.outbuffer.is_empty());
+
+        vterm_push_output_sprintf_str(&mut term, 0, true, format_args!("1234"));
+        assert!(term.outbuffer.is_empty());
     }
 }
