@@ -234,6 +234,69 @@ pub const fn vterm_get_attr_type(
     }
 }
 
+/// Scrolls a rectangular region by moving the overlap and erasing the
+/// newly exposed edge (`vterm_scroll_rect`).
+pub fn vterm_scroll_rect(
+    mut rect: crate::vterm_defs::VTermRect,
+    downward: i32,
+    rightward: i32,
+    mut move_rect: Option<
+        &mut dyn FnMut(crate::vterm_defs::VTermRect, crate::vterm_defs::VTermRect),
+    >,
+    erase_rect: &mut dyn FnMut(crate::vterm_defs::VTermRect, bool),
+) {
+    let height = rect.end_row - rect.start_row;
+    let width = rect.end_col - rect.start_col;
+    if downward.abs() >= height || rightward.abs() >= width {
+        erase_rect(rect, false);
+        return;
+    }
+
+    let mut source = crate::vterm_defs::VTermRect::default();
+    let mut destination = crate::vterm_defs::VTermRect::default();
+    if rightward >= 0 {
+        destination.start_col = rect.start_col;
+        destination.end_col = rect.end_col - rightward;
+        source.start_col = rect.start_col + rightward;
+        source.end_col = rect.end_col;
+    } else {
+        let leftward = -rightward;
+        destination.start_col = rect.start_col + leftward;
+        destination.end_col = rect.end_col;
+        source.start_col = rect.start_col;
+        source.end_col = rect.end_col - leftward;
+    }
+
+    if downward >= 0 {
+        destination.start_row = rect.start_row;
+        destination.end_row = rect.end_row - downward;
+        source.start_row = rect.start_row + downward;
+        source.end_row = rect.end_row;
+    } else {
+        let upward = -downward;
+        destination.start_row = rect.start_row + upward;
+        destination.end_row = rect.end_row;
+        source.start_row = rect.start_row;
+        source.end_row = rect.end_row - upward;
+    }
+
+    if let Some(move_rect) = move_rect.as_mut() {
+        move_rect(destination, source);
+    }
+
+    if downward > 0 {
+        rect.start_row = rect.end_row - downward;
+    } else if downward < 0 {
+        rect.end_row = rect.start_row - downward;
+    }
+    if rightward > 0 {
+        rect.start_col = rect.end_col - rightward;
+    } else if rightward < 0 {
+        rect.end_col = rect.start_col - rightward;
+    }
+    erase_rect(rect, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +654,94 @@ mod tests {
         }
         assert_eq!(vterm_get_attr_type(Attr::None), Type::None);
         assert_eq!(vterm_get_attr_type(Attr::NAttrs), Type::None);
+    }
+
+    #[test]
+    fn scroll_rect_erases_everything_when_offset_spans_a_dimension() {
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 2,
+            end_row: 7,
+            start_col: 3,
+            end_col: 11,
+        };
+        let mut moved = Vec::new();
+        let mut erased = Vec::new();
+        let mut move_cb = |dest, src| moved.push((dest, src));
+        let mut erase_cb = |area, selective| erased.push((area, selective));
+        vterm_scroll_rect(
+            rect,
+            5,
+            0,
+            Some(&mut move_cb),
+            &mut erase_cb,
+        );
+        assert!(moved.is_empty());
+        assert_eq!(erased, [(rect, false)]);
+    }
+
+    #[test]
+    fn scroll_rect_moves_overlap_and_erases_positive_exposed_corner() {
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 10,
+            start_col: 0,
+            end_col: 20,
+        };
+        let mut moved = Vec::new();
+        let mut erased = Vec::new();
+        let mut move_cb = |dest, src| moved.push((dest, src));
+        let mut erase_cb = |area, selective| erased.push((area, selective));
+        vterm_scroll_rect(
+            rect,
+            2,
+            3,
+            Some(&mut move_cb),
+            &mut erase_cb,
+        );
+        assert_eq!(moved, [(
+            crate::vterm_defs::VTermRect {
+                start_row: 0,
+                end_row: 8,
+                start_col: 0,
+                end_col: 17,
+            },
+            crate::vterm_defs::VTermRect {
+                start_row: 2,
+                end_row: 10,
+                start_col: 3,
+                end_col: 20,
+            },
+        )]);
+        assert_eq!(erased, [(
+            crate::vterm_defs::VTermRect {
+                start_row: 8,
+                end_row: 10,
+                start_col: 17,
+                end_col: 20,
+            },
+            false,
+        )]);
+    }
+
+    #[test]
+    fn scroll_rect_handles_negative_offsets_without_move_callback() {
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 10,
+            start_col: 0,
+            end_col: 20,
+        };
+        let mut erased = Vec::new();
+        let mut erase_cb = |area, selective| erased.push((area, selective));
+        vterm_scroll_rect(rect, -2, -3, None, &mut erase_cb);
+        assert_eq!(erased, [(
+            crate::vterm_defs::VTermRect {
+                start_row: 0,
+                end_row: 2,
+                start_col: 0,
+                end_col: 3,
+            },
+            false,
+        )]);
     }
 }
