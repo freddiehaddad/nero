@@ -467,6 +467,52 @@ fn apply_sgr_alternate_color<C: VTermPenCallbacks>(
     SgrColorResult::Applied(2 + payload_consumed)
 }
 
+/// Applies an SGR argument list (`vterm_state_setpen`).
+pub fn vterm_state_setpen<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    args: &[crate::vterm::parser::CsiArg],
+    callbacks: &mut C,
+) {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = crate::vterm::parser::csi_arg(args[index]);
+        let mut consumed = 1;
+
+        if argument == crate::vterm::parser::CSI_ARG_MISSING || argument == 0 {
+            vterm_state_resetpen(state, callbacks);
+        } else if apply_sgr_intensity(state, callbacks, argument)
+            || apply_sgr_italic(state, callbacks, argument)
+            || apply_sgr_visibility(state, callbacks, argument)
+            || apply_sgr_font(state, callbacks, argument)
+            || apply_sgr_overline(state, callbacks, argument)
+            || apply_sgr_baseline(state, callbacks, argument)
+            || apply_sgr_standard_color(state, callbacks, argument)
+            || apply_sgr_high_color(state, callbacks, argument)
+            || apply_sgr_default_color(state, callbacks, argument)
+        {
+        } else if let Some(underline_consumed) =
+            apply_sgr_underline(state, callbacks, args, index)
+        {
+            consumed = underline_consumed;
+        } else {
+            match apply_sgr_alternate_color(state, callbacks, args, index) {
+                SgrColorResult::Unhandled => {}
+                SgrColorResult::Applied(color_consumed) => consumed = color_consumed,
+                SgrColorResult::Truncated => return,
+            }
+        }
+
+        index += consumed - 1;
+        loop {
+            let has_more = crate::vterm::parser::csi_arg_has_more(args[index]);
+            index += 1;
+            if !has_more || index >= args.len() {
+                break;
+            }
+        }
+    }
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -1164,6 +1210,83 @@ mod tests {
             SgrColorResult::Truncated
         );
         assert!(capture.0.is_empty());
+    }
+
+    #[test]
+    fn setpen_applies_mixed_sgr_sequence_in_order() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        let mut capture = PenCapture::default();
+        vterm_state_setpen(
+            &mut state,
+            &[
+                1,
+                3,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 4,
+                3,
+                5,
+                7,
+                8,
+                9,
+                14,
+                31,
+                44,
+                53,
+                73,
+            ],
+            &mut capture,
+        );
+        assert!(state.pen.bold);
+        assert!(state.pen.italic);
+        assert_eq!(state.pen.underline, crate::vterm_defs::VTERM_UNDERLINE_CURLY);
+        assert!(state.pen.blink);
+        assert!(state.pen.reverse);
+        assert!(state.pen.conceal);
+        assert!(state.pen.strike);
+        assert_eq!(state.pen.font, 4);
+        assert_eq!(state.pen.fg.index, 1);
+        assert_eq!(state.pen.bg.index, 4);
+        assert!(state.pen.overline);
+        assert!(state.pen.small);
+        assert_eq!(state.pen.baseline, crate::vterm_defs::VTERM_BASELINE_RAISE);
+    }
+
+    #[test]
+    fn setpen_handles_reset_extended_colors_and_truncated_sequence() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        let mut capture = PenCapture::default();
+        vterm_state_setpen(
+            &mut state,
+            &[38, 2, 10, 20, 30, 48, 5, 200],
+            &mut capture,
+        );
+        assert_eq!((state.pen.fg.red, state.pen.fg.green, state.pen.fg.blue), (10, 20, 30));
+        assert_eq!(state.pen.bg.index, 200);
+
+        vterm_state_setpen(&mut state, &[crate::vterm::parser::CSI_ARG_MISSING], &mut capture);
+        assert_eq!(state.pen.fg, state.default_fg);
+        assert_eq!(state.pen.bg, state.default_bg);
+
+        let before = state.clone();
+        vterm_state_setpen(&mut state, &[38], &mut capture);
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn setpen_skips_unknown_colon_subparameters() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        vterm_state_setpen(
+            &mut state,
+            &[
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 999,
+                123,
+                2,
+            ],
+            &mut capture,
+        );
+        assert!(state.pen.dim);
     }
 
     #[test]
