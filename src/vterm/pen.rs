@@ -52,6 +52,39 @@ pub fn lookup_default_colour_ansi(
     crate::vterm_defs::vterm_color_rgb(color, rgb.red, rgb.green, rgb.blue);
 }
 
+/// The sixteen mutable ANSI palette entries from `VTermState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VTermPalette {
+    pub colors: [crate::vterm_defs::VTermColor; 16],
+}
+
+impl Default for VTermPalette {
+    fn default() -> Self {
+        let mut colors = [crate::vterm_defs::VTermColor::default(); 16];
+        for (index, color) in colors.iter_mut().enumerate() {
+            lookup_default_colour_ansi(index as i64, color);
+        }
+        Self { colors }
+    }
+}
+
+/// Looks up a mutable ANSI palette entry (`lookup_colour_ansi`).
+#[must_use]
+pub fn lookup_colour_ansi(
+    palette: &VTermPalette,
+    index: i64,
+    color: &mut crate::vterm_defs::VTermColor,
+) -> bool {
+    let Ok(index) = usize::try_from(index) else {
+        return false;
+    };
+    let Some(found) = palette.colors.get(index) else {
+        return false;
+    };
+    *color = *found;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +131,32 @@ mod tests {
             let mut color = original;
             lookup_default_colour_ansi(index, &mut color);
             assert_eq!(color, original);
+        }
+    }
+
+    #[test]
+    fn terminal_palette_defaults_to_the_ansi_table() {
+            let palette = VTermPalette::default();
+            for (color, expected) in palette.colors.iter().zip(ANSI_COLORS) {
+                assert_eq!(
+                    (color.red, color.green, color.blue),
+                    (expected.red, expected.green, expected.blue)
+                );
+            }
+        }
+
+    #[test]
+    fn ansi_palette_lookup_copies_valid_entries_only() {
+            let mut palette = VTermPalette::default();
+            crate::vterm_defs::vterm_color_indexed(&mut palette.colors[3], 99);
+            let mut color = crate::vterm_defs::VTermColor::default();
+            assert!(lookup_colour_ansi(&palette, 3, &mut color));
+            assert_eq!(color, palette.colors[3]);
+
+            for index in [-1, 16] {
+                let original = color;
+                assert!(!lookup_colour_ansi(&palette, index, &mut color));
+                assert_eq!(color, original);
         }
     }
 }
