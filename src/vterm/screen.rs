@@ -405,6 +405,17 @@ pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
     emit_stored_damage(screen, callbacks);
 }
 
+/// Flushes pending damage and changes its merge policy
+/// (`vterm_screen_set_damage_merge`).
+pub fn vterm_screen_set_damage_merge<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    size: crate::vterm_defs::VTermDamageSize,
+) {
+    vterm_screen_flush_damage(screen, callbacks);
+    screen.damage_merge = size;
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -610,6 +621,28 @@ mod tests {
         assert_eq!(screen.damaged.start_row, -1);
         vterm_screen_flush_damage(&mut screen, &mut capture);
         assert_eq!(capture.0, [rect]);
+    }
+
+    #[test]
+    fn screen_set_damage_merge_flushes_before_changing_policy() {
+        let mut screen = screen_new(5, 10);
+        screen.damage_merge = crate::vterm_defs::VTermDamageSize::Screen;
+        let mut capture = DamageCapture::default();
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 1,
+            end_row: 2,
+            start_col: 3,
+            end_col: 4,
+        };
+        damagerect(&mut screen, &mut capture, rect);
+        vterm_screen_set_damage_merge(
+            &mut screen,
+            &mut capture,
+            crate::vterm_defs::VTermDamageSize::Row,
+        );
+        assert_eq!(capture.0, [rect]);
+        assert_eq!(screen.damaged.start_row, -1);
+        assert_eq!(screen.damage_merge, crate::vterm_defs::VTermDamageSize::Row);
     }
 
     #[test]
