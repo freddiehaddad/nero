@@ -283,6 +283,27 @@ pub enum VTermAttr {
     NAttrs = 16,
 }
 
+/// Typed translation of the `VTermValue` union.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VTermValue<'a> {
+    Boolean(i32),
+    Number(i32),
+    String(VTermStringFragment<'a>),
+    Color(VTermColor),
+}
+
+impl VTermValue<'_> {
+    #[must_use]
+    pub const fn value_type(&self) -> VTermValueType {
+        match self {
+            Self::Boolean(_) => VTermValueType::Bool,
+            Self::Number(_) => VTermValueType::Int,
+            Self::String(_) => VTermValueType::String,
+            Self::Color(_) => VTermValueType::Color,
+        }
+    }
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -524,6 +545,26 @@ mod tests {
         assert_eq!(VTermAttr::Foreground as i32, 9);
         assert_eq!(VTermAttr::Overline as i32, 15);
         assert_eq!(VTermAttr::NAttrs as i32, 16);
+    }
+
+    #[test]
+    fn terminal_value_variants_report_their_union_member_type() {
+        let fragment = VTermStringFragment {
+            bytes: b"x",
+            initial: true,
+            final_fragment: false,
+            terminator: VTermTerminator::St,
+        };
+        assert_eq!(VTermValue::Boolean(1).value_type(), VTermValueType::Bool);
+        assert_eq!(VTermValue::Number(2).value_type(), VTermValueType::Int);
+        assert_eq!(
+            VTermValue::String(fragment).value_type(),
+            VTermValueType::String
+        );
+        assert_eq!(
+            VTermValue::Color(VTermColor::default()).value_type(),
+            VTermValueType::Color
+        );
     }
 
     #[test]
