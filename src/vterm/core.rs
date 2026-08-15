@@ -137,6 +137,19 @@ pub fn vterm_output_set_callback(
     term.outfunc = callback;
 }
 
+/// Formats and emits output (`vterm_push_output_sprintf`).
+pub fn vterm_push_output_sprintf(
+    term: &mut VTerm,
+    arguments: std::fmt::Arguments<'_>,
+) {
+    let formatted = arguments.to_string();
+    assert!(
+        formatted.len() < term.tmpbuffer_len,
+        "formatted output exceeds VTerm tmpbuffer"
+    );
+    vterm_push_output_bytes(term, formatted.as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +353,33 @@ mod tests {
         vterm_output_set_callback(&mut term, None);
         vterm_push_output_bytes(&mut term, b"x");
         assert_eq!(term.outbuffer, b"x");
+    }
+
+    #[test]
+    fn push_output_sprintf_formats_into_the_output_path() {
+        let mut term = vterm_new(24, 80);
+        vterm_push_output_sprintf(&mut term, format_args!("{};{}{}", 12, 3, 'm'));
+        assert_eq!(term.outbuffer, b"12;3m");
+
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let callback_capture = std::rc::Rc::clone(&captured);
+        vterm_output_set_callback(
+            &mut term,
+            Some(Box::new(move |bytes| {
+                callback_capture.borrow_mut().extend_from_slice(bytes);
+            })),
+        );
+        vterm_push_output_sprintf(&mut term, format_args!("{}x{}", 4, 5));
+        assert_eq!(&*captured.borrow(), b"4x5");
+    }
+
+    #[test]
+    #[should_panic(expected = "formatted output exceeds VTerm tmpbuffer")]
+    fn push_output_sprintf_enforces_the_c_tmpbuffer_contract() {
+        let mut term = vterm_build(&VTermBuilder {
+            tmpbuffer_len: 4,
+            ..Default::default()
+        });
+        vterm_push_output_sprintf(&mut term, format_args!("abcd"));
     }
 }
