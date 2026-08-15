@@ -9,6 +9,32 @@ pub const CSI_ARG_FLAG_MORE: CsiArg = 1 << 31;
 pub const CSI_ARG_MASK: CsiArg = !CSI_ARG_FLAG_MORE;
 pub const CSI_ARG_MISSING: CsiArg = CSI_ARG_FLAG_MORE - 1;
 
+/// Parser state (`enum VTermParserState`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum VTermParserState {
+    #[default]
+    Normal = 0,
+    CsiLeader,
+    CsiArgs,
+    CsiIntermed,
+    DcsCommand,
+    OscCommand,
+    Osc,
+    DcsVterm,
+    Apc,
+    Pm,
+    Sos,
+}
+
+impl VTermParserState {
+    /// Equivalent to parser.c's `IS_STRING_STATE()` macro.
+    #[must_use]
+    pub const fn is_string(self) -> bool {
+        self as u8 >= Self::OscCommand as u8
+    }
+}
+
 #[must_use]
 pub const fn csi_arg_has_more(arg: CsiArg) -> bool {
     arg & CSI_ARG_FLAG_MORE != 0
@@ -71,5 +97,29 @@ mod tests {
         assert_eq!(csi_arg_or(CSI_ARG_MISSING, 7), 7);
         assert_eq!(csi_arg_count(CSI_ARG_MISSING), 1);
         assert_eq!(csi_arg_count(0), 1);
+    }
+
+    #[test]
+    fn parser_state_order_preserves_string_state_macro() {
+        for state in [
+            VTermParserState::Normal,
+            VTermParserState::CsiLeader,
+            VTermParserState::CsiArgs,
+            VTermParserState::CsiIntermed,
+            VTermParserState::DcsCommand,
+        ] {
+            assert!(!state.is_string(), "{state:?}");
+        }
+        for state in [
+            VTermParserState::OscCommand,
+            VTermParserState::Osc,
+            VTermParserState::DcsVterm,
+            VTermParserState::Apc,
+            VTermParserState::Pm,
+            VTermParserState::Sos,
+        ] {
+            assert!(state.is_string(), "{state:?}");
+        }
+        assert_eq!(VTermParserState::default(), VTermParserState::Normal);
     }
 }
