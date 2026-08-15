@@ -84,6 +84,12 @@ pub fn screen_new(rows: i32, cols: i32) -> VTermScreen {
     }
 }
 
+/// Clears a cell with the screen's current pen (`clearcell`).
+pub fn clearcell(screen: &VTermScreen, cell: &mut ScreenCell) {
+    cell.schar = 0;
+    cell.pen = screen.pen;
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -202,6 +208,20 @@ mod tests {
         assert!(screen.buffers[1].is_none());
         assert_eq!(screen.sb_buffer.len(), 4);
         assert_eq!(screen.pen, ScreenPen::default());
+    }
+
+    #[test]
+    fn clearcell_blanks_the_character_and_copies_current_pen() {
+        let mut screen = screen_new(1, 1);
+        screen.pen.bold = true;
+        screen.pen.uri = 42;
+        let mut cell = ScreenCell {
+            schar: 123,
+            pen: ScreenPen::default(),
+        };
+        clearcell(&screen, &mut cell);
+        assert_eq!(cell.schar, 0);
+        assert_eq!(cell.pen, screen.pen);
     }
 
     #[test]
