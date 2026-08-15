@@ -153,6 +153,11 @@ pub fn vterm_screen_enable_reflow(screen: &mut VTermScreen, reflow: bool) {
     screen.reflow = reflow;
 }
 
+/// Back-compatible reflow setter (`vterm_screen_set_reflow`).
+pub fn vterm_screen_set_reflow(screen: &mut VTermScreen, reflow: bool) {
+    vterm_screen_enable_reflow(screen, reflow);
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -330,6 +335,15 @@ mod tests {
         vterm_screen_enable_reflow(&mut screen, true);
         assert!(screen.reflow);
         vterm_screen_enable_reflow(&mut screen, false);
+        assert!(!screen.reflow);
+    }
+
+    #[test]
+    fn screen_set_reflow_alias_forwards_to_enable_reflow() {
+        let mut screen = screen_new(2, 3);
+        vterm_screen_set_reflow(&mut screen, true);
+        assert!(screen.reflow);
+        vterm_screen_set_reflow(&mut screen, false);
         assert!(!screen.reflow);
     }
 
