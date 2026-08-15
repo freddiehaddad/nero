@@ -94,6 +94,12 @@ pub fn vterm_set_size(
     }
 }
 
+/// Selects whether input bytes are interpreted as UTF-8
+/// (`vterm_set_utf8`).
+pub fn vterm_set_utf8(term: &mut VTerm, is_utf8: i32) {
+    term.utf8 = is_utf8 != 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +204,17 @@ mod tests {
         vterm_get_size(&term, Some(&mut rows), Some(&mut cols));
         assert_eq!((rows, cols), (24, 80));
         assert!(capture.0.is_empty());
+    }
+
+    #[test]
+    fn vterm_set_utf8_uses_c_boolean_semantics() {
+        let mut term = vterm_new(24, 80);
+        assert!(!term.utf8);
+        vterm_set_utf8(&mut term, 1);
+        assert!(term.utf8);
+        vterm_set_utf8(&mut term, -1);
+        assert!(term.utf8);
+        vterm_set_utf8(&mut term, 0);
+        assert!(!term.utf8);
     }
 }
