@@ -289,6 +289,26 @@ fn apply_sgr_font<C: VTermPenCallbacks>(
     true
 }
 
+#[allow(dead_code)]
+fn apply_sgr_overline<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    let overline = match argument {
+        53 => true,
+        55 => false,
+        _ => return false,
+    };
+    state.pen.overline = overline;
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Overline,
+        overline,
+    );
+    true
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -840,6 +860,30 @@ mod tests {
                 crate::vterm_defs::VTermAttr::Font,
                 crate::vterm_defs::VTermValue::Number(9),
             ))
+        );
+    }
+
+    #[test]
+    fn sgr_overline_handles_enable_and_disable() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        assert!(apply_sgr_overline(&mut state, &mut capture, 53));
+        assert!(state.pen.overline);
+        assert!(apply_sgr_overline(&mut state, &mut capture, 55));
+        assert!(!state.pen.overline);
+        assert!(!apply_sgr_overline(&mut state, &mut capture, 54));
+        assert_eq!(
+            capture.0,
+            [
+                (
+                    crate::vterm_defs::VTermAttr::Overline,
+                    crate::vterm_defs::VTermValue::Boolean(1),
+                ),
+                (
+                    crate::vterm_defs::VTermAttr::Overline,
+                    crate::vterm_defs::VTermValue::Boolean(0),
+                ),
+            ]
         );
     }
 
