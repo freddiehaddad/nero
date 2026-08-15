@@ -44,6 +44,24 @@ pub fn rect_expand(
     destination.end_col = destination.end_col.max(source.end_col);
 }
 
+/// Clips `destination` to `bounds` and prevents negative dimensions
+/// (`rect_clip`).
+pub fn rect_clip(
+    destination: &mut crate::vterm_defs::VTermRect,
+    bounds: &crate::vterm_defs::VTermRect,
+) {
+    destination.start_row = destination.start_row.max(bounds.start_row);
+    destination.start_col = destination.start_col.max(bounds.start_col);
+    destination.end_row = destination.end_row.min(bounds.end_row);
+    destination.end_col = destination.end_col.min(bounds.end_col);
+    if destination.end_row < destination.start_row {
+        destination.end_row = destination.start_row;
+    }
+    if destination.end_col < destination.start_col {
+        destination.end_col = destination.start_col;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +122,38 @@ mod tests {
             end_row: 6,
             start_col: 3,
             end_col: 7,
+        });
+    }
+
+    #[test]
+    fn rect_clip_constrains_edges_and_collapses_disjoint_dimensions() {
+        let bounds = crate::vterm_defs::VTermRect {
+            start_row: 2,
+            end_row: 8,
+            start_col: 3,
+            end_col: 9,
+        };
+        let mut destination = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 10,
+            start_col: 1,
+            end_col: 12,
+        };
+        rect_clip(&mut destination, &bounds);
+        assert_eq!(destination, bounds);
+
+        destination = crate::vterm_defs::VTermRect {
+            start_row: 20,
+            end_row: 30,
+            start_col: -5,
+            end_col: 1,
+        };
+        rect_clip(&mut destination, &bounds);
+        assert_eq!(destination, crate::vterm_defs::VTermRect {
+            start_row: 20,
+            end_row: 20,
+            start_col: 3,
+            end_col: 3,
         });
     }
 }
