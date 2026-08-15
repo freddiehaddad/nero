@@ -211,6 +211,29 @@ pub fn vterm_push_output_sprintf_str(
     vterm_push_output_bytes(term, &output);
 }
 
+/// Returns the value kind required by a pen attribute
+/// (`vterm_get_attr_type`).
+#[must_use]
+pub const fn vterm_get_attr_type(
+    attr: crate::vterm_defs::VTermAttr,
+) -> crate::vterm_defs::VTermValueType {
+    use crate::vterm_defs::{VTermAttr as Attr, VTermValueType as Type};
+    match attr {
+        Attr::Bold
+        | Attr::Italic
+        | Attr::Blink
+        | Attr::Reverse
+        | Attr::Conceal
+        | Attr::Strike
+        | Attr::Small
+        | Attr::Dim
+        | Attr::Overline => Type::Bool,
+        Attr::Underline | Attr::Font | Attr::Baseline | Attr::Uri => Type::Int,
+        Attr::Foreground | Attr::Background => Type::Color,
+        Attr::None | Attr::NAttrs => Type::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +565,31 @@ mod tests {
 
         vterm_push_output_sprintf_str(&mut term, 0, true, format_args!("1234"));
         assert!(term.outbuffer.is_empty());
+    }
+
+    #[test]
+    fn get_attr_type_matches_every_attribute_case() {
+        use crate::vterm_defs::{VTermAttr as Attr, VTermValueType as Type};
+        for attr in [
+            Attr::Bold,
+            Attr::Italic,
+            Attr::Blink,
+            Attr::Reverse,
+            Attr::Conceal,
+            Attr::Strike,
+            Attr::Small,
+            Attr::Dim,
+            Attr::Overline,
+        ] {
+            assert_eq!(vterm_get_attr_type(attr), Type::Bool, "{attr:?}");
+        }
+        for attr in [Attr::Underline, Attr::Font, Attr::Baseline, Attr::Uri] {
+            assert_eq!(vterm_get_attr_type(attr), Type::Int, "{attr:?}");
+        }
+        for attr in [Attr::Foreground, Attr::Background] {
+            assert_eq!(vterm_get_attr_type(attr), Type::Color, "{attr:?}");
+        }
+        assert_eq!(vterm_get_attr_type(Attr::None), Type::None);
+        assert_eq!(vterm_get_attr_type(Attr::NAttrs), Type::None);
     }
 }
