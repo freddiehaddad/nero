@@ -150,6 +150,29 @@ pub fn vterm_push_output_sprintf(
     vterm_push_output_bytes(term, formatted.as_bytes());
 }
 
+/// Emits a control byte plus formatted payload
+/// (`vterm_push_output_sprintf_ctrl`).
+pub fn vterm_push_output_sprintf_ctrl(
+    term: &mut VTerm,
+    control: u8,
+    arguments: std::fmt::Arguments<'_>,
+) {
+    let mut output = Vec::new();
+    if control >= 0x80 && !term.ctrl8bit {
+        output.extend_from_slice(&[0x1B, control - 0x40]);
+    } else {
+        output.push(control);
+    }
+    if output.len() >= term.tmpbuffer_len {
+        return;
+    }
+    output.extend_from_slice(arguments.to_string().as_bytes());
+    if output.len() >= term.tmpbuffer_len {
+        return;
+    }
+    vterm_push_output_bytes(term, &output);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +404,45 @@ mod tests {
             ..Default::default()
         });
         vterm_push_output_sprintf(&mut term, format_args!("abcd"));
+    }
+
+    #[test]
+    fn push_output_sprintf_ctrl_selects_seven_or_eight_bit_control() {
+        let mut term = vterm_new(24, 80);
+        vterm_push_output_sprintf_ctrl(
+            &mut term,
+            crate::vterm_defs::C1_CSI,
+            format_args!("{}m", 4),
+        );
+        assert_eq!(term.outbuffer, b"\x1b[4m");
+
+        term.outbuffer.clear();
+        term.ctrl8bit = true;
+        vterm_push_output_sprintf_ctrl(
+            &mut term,
+            crate::vterm_defs::C1_CSI,
+            format_args!("{}m", 4),
+        );
+        assert_eq!(
+            term.outbuffer,
+            [vec![crate::vterm_defs::C1_CSI], b"4m".to_vec()].concat()
+        );
+    }
+
+    #[test]
+    fn push_output_sprintf_ctrl_drops_overlong_output() {
+        let mut term = vterm_build(&VTermBuilder {
+            tmpbuffer_len: 5,
+            ..Default::default()
+        });
+        vterm_push_output_sprintf_ctrl(
+            &mut term,
+            crate::vterm_defs::C1_CSI,
+            format_args!("123"),
+        );
+        assert!(term.outbuffer.is_empty());
+
+        vterm_push_output_sprintf_ctrl(&mut term, b'\r', format_args!("12"));
+        assert_eq!(term.outbuffer, b"\r12");
     }
 }
