@@ -189,6 +189,22 @@ fn apply_sgr_intensity<C: VTermPenCallbacks>(
     }
 }
 
+#[allow(dead_code)]
+fn apply_sgr_italic<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    let italic = match argument {
+        3 => true,
+        23 => false,
+        _ => return false,
+    };
+    state.pen.italic = italic;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Italic, italic);
+    true
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -624,6 +640,30 @@ mod tests {
         state.pen.fg.index = 2;
         assert!(apply_sgr_intensity(&mut state, &mut capture, 1));
         assert_eq!(state.pen.fg.index, 2);
+    }
+
+    #[test]
+    fn sgr_italic_handles_enable_and_disable() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        assert!(apply_sgr_italic(&mut state, &mut capture, 3));
+        assert!(state.pen.italic);
+        assert!(apply_sgr_italic(&mut state, &mut capture, 23));
+        assert!(!state.pen.italic);
+        assert!(!apply_sgr_italic(&mut state, &mut capture, 4));
+        assert_eq!(
+            capture.0,
+            [
+                (
+                    crate::vterm_defs::VTermAttr::Italic,
+                    crate::vterm_defs::VTermValue::Boolean(1),
+                ),
+                (
+                    crate::vterm_defs::VTermAttr::Italic,
+                    crate::vterm_defs::VTermValue::Boolean(0),
+                ),
+            ]
+        );
     }
 
     #[test]
