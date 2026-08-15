@@ -100,6 +100,17 @@ pub fn vterm_set_utf8(term: &mut VTerm, is_utf8: i32) {
     term.utf8 = is_utf8 != 0;
 }
 
+/// Parses input using this terminal's current mode
+/// (`vterm_input_write`).
+pub fn vterm_input_write<C: crate::vterm::parser::VTermParserCallbacks>(
+    term: &mut VTerm,
+    callbacks: &mut C,
+    bytes: &[u8],
+) -> usize {
+    term.parser
+        .vterm_input_write(callbacks, bytes, term.utf8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +227,44 @@ mod tests {
         assert!(term.utf8);
         vterm_set_utf8(&mut term, 0);
         assert!(!term.utf8);
+    }
+
+    #[derive(Default)]
+    struct InputCapture {
+        texts: Vec<Vec<u8>>,
+        controls: Vec<u8>,
+    }
+
+    impl crate::vterm::parser::VTermParserCallbacks for InputCapture {
+        fn text(&mut self, bytes: &[u8]) -> usize {
+            self.texts.push(bytes.to_vec());
+            bytes.len()
+        }
+
+        fn control(&mut self, control: u8) -> bool {
+            self.controls.push(control);
+            true
+        }
+    }
+
+    #[test]
+    fn vterm_input_write_uses_the_terminal_utf8_mode() {
+        let mut term = vterm_new(24, 80);
+        let mut capture = InputCapture::default();
+
+        // In non-UTF-8 mode C1 bytes are controls.
+        vterm_input_write(&mut term, &mut capture, b"\x84");
+        assert_eq!(capture.controls, [0x84]);
+        assert!(capture.texts.is_empty());
+
+        vterm_set_utf8(&mut term, 1);
+        capture.controls.clear();
+        vterm_input_write(&mut term, &mut capture, b"\x84");
+        assert!(capture.controls.is_empty());
+        assert_eq!(capture.texts, [vec![0x84]]);
+        assert_eq!(
+            term.parser.state,
+            crate::vterm::parser::VTermParserState::Normal
+        );
     }
 }
