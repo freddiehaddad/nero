@@ -184,6 +184,24 @@ impl VTermColor {
     }
 }
 
+/// Constructs an RGB color (`vterm_color_rgb`).
+pub const fn vterm_color_rgb(color: &mut VTermColor, red: u8, green: u8, blue: u8) {
+    color.color_type = VTERM_COLOR_RGB;
+    color.red = red;
+    color.green = green;
+    color.blue = blue;
+    // `indexed.idx` aliases `rgb.red` in the C union.
+    color.index = red;
+}
+
+/// Constructs an indexed color (`vterm_color_indexed`).
+pub const fn vterm_color_indexed(color: &mut VTermColor, index: u8) {
+    color.color_type = VTERM_COLOR_INDEXED;
+    // `indexed.idx` aliases `rgb.red` in the C union.
+    color.red = index;
+    color.index = index;
+}
+
 /// Moves a terminal rectangle (`vterm_rect_move`).
 pub const fn vterm_rect_move(rect: &mut VTermRect, row_delta: i32, col_delta: i32) {
     rect.start_row += row_delta;
@@ -423,6 +441,28 @@ mod tests {
         assert!(indexed.is_default_bg());
         assert_eq!(VTERM_COLOR_TYPE_MASK, 1);
         assert_eq!(VTERM_COLOR_DEFAULT_MASK, 6);
+    }
+
+    #[test]
+    fn terminal_color_constructors_reset_type_and_write_union_payload() {
+        let mut color = VTermColor {
+            color_type: VTERM_COLOR_INDEXED | VTERM_COLOR_DEFAULT_BG,
+            red: 1,
+            green: 2,
+            blue: 3,
+            index: 1,
+        };
+        vterm_color_rgb(&mut color, 10, 20, 30);
+        assert_eq!(color.color_type, VTERM_COLOR_RGB);
+        assert_eq!((color.red, color.green, color.blue), (10, 20, 30));
+        assert_eq!(color.index, 10);
+
+        vterm_color_indexed(&mut color, 42);
+        assert_eq!(color.color_type, VTERM_COLOR_INDEXED);
+        assert_eq!(color.index, 42);
+        assert_eq!(color.red, 42);
+        // The C union leaves bytes beyond `indexed.idx` unchanged.
+        assert_eq!((color.green, color.blue), (20, 30));
     }
 
     #[test]
