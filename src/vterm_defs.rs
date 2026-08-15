@@ -304,6 +304,18 @@ impl VTermValue<'_> {
     }
 }
 
+/// Screen damage merge policy (`VTermDamageSize`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VTermDamageSize {
+    #[default]
+    Cell = 0,
+    Row = 1,
+    Screen = 2,
+    Scroll = 3,
+    NDamages = 4,
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -576,6 +588,16 @@ mod tests {
             VTermValue::Color(VTermColor::default()).value_type(),
             VTermValueType::Color
         );
+    }
+
+    #[test]
+    fn damage_size_discriminants_match_vterm_defs() {
+        assert_eq!(VTermDamageSize::Cell as i32, 0);
+        assert_eq!(VTermDamageSize::Row as i32, 1);
+        assert_eq!(VTermDamageSize::Screen as i32, 2);
+        assert_eq!(VTermDamageSize::Scroll as i32, 3);
+        assert_eq!(VTermDamageSize::NDamages as i32, 4);
+        assert_eq!(VTermDamageSize::default(), VTermDamageSize::Cell);
     }
 
     #[test]
