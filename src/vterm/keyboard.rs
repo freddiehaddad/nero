@@ -393,6 +393,21 @@ pub fn vterm_keyboard_key(
     output
 }
 
+/// Emits the bracketed-paste start marker
+/// (`vterm_keyboard_start_paste`).
+#[must_use]
+pub fn vterm_keyboard_start_paste(
+    mode: crate::vterm_defs::VTermKeyboardMode,
+) -> Vec<u8> {
+    if !mode.bracketpaste {
+        return Vec::new();
+    }
+    let mut output = Vec::with_capacity(6);
+    push_control(&mut output, crate::vterm_defs::C1_CSI, mode.ctrl8bit);
+    output.extend_from_slice(b"200~");
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,5 +984,25 @@ mod tests {
             )
             .is_empty());
         }
+    }
+
+    #[test]
+    fn keyboard_start_paste_honors_bracketpaste_and_control_width() {
+            assert!(vterm_keyboard_start_paste(Default::default()).is_empty());
+            assert_eq!(
+                vterm_keyboard_start_paste(crate::vterm_defs::VTermKeyboardMode {
+                    bracketpaste: true,
+                    ..Default::default()
+                }),
+                b"\x1b[200~"
+            );
+            assert_eq!(
+                vterm_keyboard_start_paste(crate::vterm_defs::VTermKeyboardMode {
+                    bracketpaste: true,
+                    ctrl8bit: true,
+                    ..Default::default()
+                }),
+                [vec![crate::vterm_defs::C1_CSI], b"200~".to_vec()].concat()
+            );
     }
 }
