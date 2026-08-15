@@ -98,6 +98,69 @@ pub const fn is_intermed(c: u8) -> bool {
     c >= 0x20 && c <= 0x2F
 }
 
+/// Parser callback surface (`VTermParserCallbacks`).
+pub trait VTermParserCallbacks {
+    /// Returns the number of text bytes consumed.
+    fn text(&mut self, _bytes: &[u8]) -> usize {
+        0
+    }
+
+    /// Returns true when the control was handled.
+    fn control(&mut self, _control: u8) -> bool {
+        false
+    }
+
+    /// Returns true when the escape sequence was handled.
+    fn escape(&mut self, _bytes: &[u8]) -> bool {
+        false
+    }
+
+    /// Returns true when the CSI sequence was handled.
+    fn csi(
+        &mut self,
+        _leader: Option<&[u8]>,
+        _args: &[CsiArg],
+        _intermed: Option<&[u8]>,
+        _command: u8,
+    ) -> bool {
+        false
+    }
+
+    fn osc(
+        &mut self,
+        _command: i32,
+        _fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool {
+        false
+    }
+
+    fn dcs(
+        &mut self,
+        _command: &[u8],
+        _fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool {
+        false
+    }
+
+    fn apc(&mut self, _fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+        false
+    }
+
+    fn pm(&mut self, _fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+        false
+    }
+
+    fn sos(&mut self, _fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+        false
+    }
+
+    fn resize(&mut self, _rows: i32, _cols: i32) -> bool {
+        false
+    }
+}
+
+impl VTermParserCallbacks for () {}
+
 #[must_use]
 pub const fn csi_arg_has_more(arg: CsiArg) -> bool {
     arg & CSI_ARG_FLAG_MORE != 0
@@ -206,5 +269,26 @@ mod tests {
         assert!(is_intermed(0x27));
         assert!(is_intermed(0x2F));
         assert!(!is_intermed(0x30));
+    }
+
+    #[test]
+    fn default_parser_callbacks_match_absent_c_callbacks() {
+        let callbacks = &mut ();
+        assert_eq!(callbacks.text(b"abc"), 0);
+        assert!(!callbacks.control(0x07));
+        assert!(!callbacks.escape(b"(B"));
+        assert!(!callbacks.csi(None, &[], None, b'm'));
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"x",
+            initial: true,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        };
+        assert!(!callbacks.osc(0, fragment));
+        assert!(!callbacks.dcs(b"q", fragment));
+        assert!(!callbacks.apc(fragment));
+        assert!(!callbacks.pm(fragment));
+        assert!(!callbacks.sos(fragment));
+        assert!(!callbacks.resize(24, 80));
     }
 }
