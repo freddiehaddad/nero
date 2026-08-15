@@ -205,6 +205,44 @@ fn apply_sgr_italic<C: VTermPenCallbacks>(
     true
 }
 
+#[allow(dead_code)]
+fn apply_sgr_underline<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    args: &[crate::vterm::parser::CsiArg],
+    index: usize,
+) -> Option<usize> {
+    let argument = crate::vterm::parser::csi_arg(*args.get(index)?);
+    let mut consumed = 1;
+    state.pen.underline = match argument {
+        4 => {
+            let mut underline = crate::vterm_defs::VTERM_UNDERLINE_SINGLE;
+            if crate::vterm::parser::csi_arg_has_more(args[index])
+                && let Some(&subparameter) = args.get(index + 1)
+            {
+                consumed = 2;
+                underline = match crate::vterm::parser::csi_arg(subparameter) {
+                    0 => crate::vterm_defs::VTERM_UNDERLINE_OFF,
+                    1 => crate::vterm_defs::VTERM_UNDERLINE_SINGLE,
+                    2 => crate::vterm_defs::VTERM_UNDERLINE_DOUBLE,
+                    3 => crate::vterm_defs::VTERM_UNDERLINE_CURLY,
+                    _ => underline,
+                };
+            }
+            underline
+        }
+        21 => crate::vterm_defs::VTERM_UNDERLINE_DOUBLE,
+        24 => crate::vterm_defs::VTERM_UNDERLINE_OFF,
+        _ => return None,
+    };
+    setpenattr_int(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Underline,
+        i32::from(state.pen.underline),
+    );
+    Some(consumed)
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -664,6 +702,51 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn sgr_underline_handles_single_double_curly_and_off() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        assert_eq!(
+            apply_sgr_underline(&mut state, &mut capture, &[4], 0),
+            Some(1)
+        );
+        assert_eq!(state.pen.underline, crate::vterm_defs::VTERM_UNDERLINE_SINGLE);
+        assert_eq!(
+            apply_sgr_underline(&mut state, &mut capture, &[21], 0),
+            Some(1)
+        );
+        assert_eq!(state.pen.underline, crate::vterm_defs::VTERM_UNDERLINE_DOUBLE);
+        assert_eq!(
+            apply_sgr_underline(&mut state, &mut capture, &[24], 0),
+            Some(1)
+        );
+        assert_eq!(state.pen.underline, crate::vterm_defs::VTERM_UNDERLINE_OFF);
+        assert_eq!(apply_sgr_underline(&mut state, &mut capture, &[5], 0), None);
+    }
+
+    #[test]
+    fn sgr_underline_consumes_colon_subparameter() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        for (subparameter, expected) in [
+            (0, crate::vterm_defs::VTERM_UNDERLINE_OFF),
+            (1, crate::vterm_defs::VTERM_UNDERLINE_SINGLE),
+            (2, crate::vterm_defs::VTERM_UNDERLINE_DOUBLE),
+            (3, crate::vterm_defs::VTERM_UNDERLINE_CURLY),
+        ] {
+            assert_eq!(
+                apply_sgr_underline(
+                    &mut state,
+                    &mut capture,
+                    &[crate::vterm::parser::CSI_ARG_FLAG_MORE | 4, subparameter],
+                    0,
+                ),
+                Some(2)
+            );
+            assert_eq!(state.pen.underline, expected);
+        }
     }
 
     #[test]
