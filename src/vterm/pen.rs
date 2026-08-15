@@ -8,6 +8,26 @@ pub struct VTermRgb {
     pub blue: u8,
 }
 
+/// Current terminal pen (`VTermPen`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermPen {
+    pub fg: crate::vterm_defs::VTermColor,
+    pub bg: crate::vterm_defs::VTermColor,
+    pub uri: i32,
+    pub bold: bool,
+    pub underline: u8,
+    pub italic: bool,
+    pub blink: bool,
+    pub reverse: bool,
+    pub conceal: bool,
+    pub strike: bool,
+    pub font: u8,
+    pub small: bool,
+    pub baseline: u8,
+    pub dim: bool,
+    pub overline: bool,
+}
+
 #[allow(dead_code)]
 const ANSI_COLORS: [VTermRgb; 16] = [
     VTermRgb { red: 0, green: 0, blue: 0 },
@@ -161,6 +181,26 @@ mod tests {
         assert_eq!(ANSI_COLORS[7], VTermRgb { red: 224, green: 224, blue: 224 });
         assert_eq!(ANSI_COLORS[8], VTermRgb { red: 128, green: 128, blue: 128 });
         assert_eq!(ANSI_COLORS[15], VTermRgb { red: 255, green: 255, blue: 255 });
+    }
+
+    #[test]
+    fn terminal_pen_defaults_to_zeroed_c_state() {
+        let pen = VTermPen::default();
+        assert_eq!(pen.fg, crate::vterm_defs::VTermColor::default());
+        assert_eq!(pen.bg, crate::vterm_defs::VTermColor::default());
+        assert_eq!(pen.uri, 0);
+        assert!(!pen.bold);
+        assert_eq!(pen.underline, 0);
+        assert!(!pen.italic);
+        assert!(!pen.blink);
+        assert!(!pen.reverse);
+        assert!(!pen.conceal);
+        assert!(!pen.strike);
+        assert_eq!(pen.font, 0);
+        assert!(!pen.small);
+        assert_eq!(pen.baseline, 0);
+        assert!(!pen.dim);
+        assert!(!pen.overline);
     }
 
     #[test]
