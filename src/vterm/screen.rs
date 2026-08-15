@@ -33,6 +33,17 @@ pub struct ScreenCell {
     pub pen: ScreenPen,
 }
 
+/// Expands `destination` to contain `source` (`rect_expand`).
+pub fn rect_expand(
+    destination: &mut crate::vterm_defs::VTermRect,
+    source: &crate::vterm_defs::VTermRect,
+) {
+    destination.start_row = destination.start_row.min(source.start_row);
+    destination.start_col = destination.start_col.min(source.start_col);
+    destination.end_row = destination.end_row.max(source.end_row);
+    destination.end_col = destination.end_col.max(source.end_col);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +79,31 @@ mod tests {
         assert_eq!(ScreenCell::default(), ScreenCell {
             schar: 0,
             pen: ScreenPen::default(),
+        });
+    }
+
+    #[test]
+    fn rect_expand_grows_each_edge_only_when_needed() {
+        let mut destination = crate::vterm_defs::VTermRect {
+            start_row: 2,
+            end_row: 5,
+            start_col: 3,
+            end_col: 7,
+        };
+        rect_expand(
+            &mut destination,
+            &crate::vterm_defs::VTermRect {
+                start_row: 1,
+                end_row: 6,
+                start_col: 4,
+                end_col: 5,
+            },
+        );
+        assert_eq!(destination, crate::vterm_defs::VTermRect {
+            start_row: 1,
+            end_row: 6,
+            start_col: 3,
+            end_col: 7,
         });
     }
 }
