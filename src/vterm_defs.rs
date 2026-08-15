@@ -136,6 +136,23 @@ pub struct VTermPos {
     pub col: i32,
 }
 
+/// Half-open terminal rectangle (`VTermRect`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermRect {
+    pub start_row: i32,
+    pub end_row: i32,
+    pub start_col: i32,
+    pub end_col: i32,
+}
+
+/// Moves a terminal rectangle (`vterm_rect_move`).
+pub const fn vterm_rect_move(rect: &mut VTermRect, row_delta: i32, col_delta: i32) {
+    rect.start_row += row_delta;
+    rect.end_row += row_delta;
+    rect.start_col += col_delta;
+    rect.end_col += col_delta;
+}
+
 /// Control-string terminator (`VTermTerminator`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(i32)]
@@ -272,6 +289,23 @@ mod tests {
         assert_eq!(VTermPos::default(), VTermPos { row: 0, col: 0 });
         assert_eq!(VTermPos { row: 12, col: 34 }.row, 12);
         assert_eq!(VTermPos { row: 12, col: 34 }.col, 34);
+    }
+
+    #[test]
+    fn vterm_rect_move_offsets_all_four_edges() {
+        let mut rect = VTermRect {
+            start_row: 2,
+            end_row: 8,
+            start_col: 3,
+            end_col: 10,
+        };
+        vterm_rect_move(&mut rect, -1, 4);
+        assert_eq!(rect, VTermRect {
+            start_row: 1,
+            end_row: 7,
+            start_col: 7,
+            end_col: 14,
+        });
     }
 
     #[test]
