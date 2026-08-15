@@ -336,6 +336,39 @@ fn apply_sgr_baseline<C: VTermPenCallbacks>(
     true
 }
 
+#[allow(dead_code)]
+fn apply_sgr_standard_color<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    match argument {
+        30..=37 => {
+            let mut value = argument - 30;
+            if state.pen.bold && state.bold_is_highbright {
+                value += 8;
+            }
+            set_pen_col_ansi(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermAttr::Foreground,
+                i64::from(value),
+            );
+            true
+        }
+        40..=47 => {
+            set_pen_col_ansi(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermAttr::Background,
+                i64::from(argument - 40),
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -933,6 +966,44 @@ mod tests {
         }
         assert!(!apply_sgr_baseline(&mut state, &mut capture, 72));
         assert_eq!(capture.0.len(), 6);
+    }
+
+    #[test]
+    fn sgr_standard_color_maps_foreground_and_background_ranges() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        for argument in 30..=37 {
+            assert!(apply_sgr_standard_color(
+                &mut state,
+                &mut capture,
+                argument,
+            ));
+            assert_eq!(state.pen.fg.index, (argument - 30) as u8);
+        }
+        for argument in 40..=47 {
+            assert!(apply_sgr_standard_color(
+                &mut state,
+                &mut capture,
+                argument,
+            ));
+            assert_eq!(state.pen.bg.index, (argument - 40) as u8);
+        }
+        assert!(!apply_sgr_standard_color(&mut state, &mut capture, 29));
+        assert!(!apply_sgr_standard_color(&mut state, &mut capture, 48));
+    }
+
+    #[test]
+    fn sgr_standard_foreground_honors_bold_highbright_mode() {
+        let mut state = VTermPenState {
+            bold_is_highbright: true,
+            ..Default::default()
+        };
+        state.pen.bold = true;
+        let mut capture = PenCapture::default();
+        assert!(apply_sgr_standard_color(&mut state, &mut capture, 32));
+        assert_eq!(state.pen.fg.index, 10);
+        assert!(apply_sgr_standard_color(&mut state, &mut capture, 42));
+        assert_eq!(state.pen.bg.index, 2);
     }
 
     #[test]
