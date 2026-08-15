@@ -171,6 +171,24 @@ pub struct VTermStringFragment<'a> {
     pub terminator: VTermTerminator,
 }
 
+pub type VTermAttrMask = u32;
+pub const VTERM_ATTR_BOLD_MASK: VTermAttrMask = 1 << 0;
+pub const VTERM_ATTR_UNDERLINE_MASK: VTermAttrMask = 1 << 1;
+pub const VTERM_ATTR_ITALIC_MASK: VTermAttrMask = 1 << 2;
+pub const VTERM_ATTR_BLINK_MASK: VTermAttrMask = 1 << 3;
+pub const VTERM_ATTR_REVERSE_MASK: VTermAttrMask = 1 << 4;
+pub const VTERM_ATTR_STRIKE_MASK: VTermAttrMask = 1 << 5;
+pub const VTERM_ATTR_FONT_MASK: VTermAttrMask = 1 << 6;
+pub const VTERM_ATTR_FOREGROUND_MASK: VTermAttrMask = 1 << 7;
+pub const VTERM_ATTR_BACKGROUND_MASK: VTermAttrMask = 1 << 8;
+pub const VTERM_ATTR_CONCEAL_MASK: VTermAttrMask = 1 << 9;
+pub const VTERM_ATTR_SMALL_MASK: VTermAttrMask = 1 << 10;
+pub const VTERM_ATTR_BASELINE_MASK: VTermAttrMask = 1 << 11;
+pub const VTERM_ATTR_URI_MASK: VTermAttrMask = 1 << 12;
+pub const VTERM_ATTR_DIM_MASK: VTermAttrMask = 1 << 13;
+pub const VTERM_ATTR_OVERLINE_MASK: VTermAttrMask = 1 << 14;
+pub const VTERM_ALL_ATTRS_MASK: VTermAttrMask = (1 << 15) - 1;
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -323,6 +341,34 @@ mod tests {
         assert_eq!(VTermTerminator::Bel as i32, 0);
         assert_eq!(VTermTerminator::St as i32, 1);
         assert_eq!(VTermTerminator::default(), VTermTerminator::St);
+    }
+
+    #[test]
+    fn attribute_masks_match_vterm_defs_header() {
+        assert_eq!(
+            [
+                VTERM_ATTR_BOLD_MASK,
+                VTERM_ATTR_UNDERLINE_MASK,
+                VTERM_ATTR_ITALIC_MASK,
+                VTERM_ATTR_BLINK_MASK,
+                VTERM_ATTR_REVERSE_MASK,
+                VTERM_ATTR_STRIKE_MASK,
+                VTERM_ATTR_FONT_MASK,
+                VTERM_ATTR_FOREGROUND_MASK,
+                VTERM_ATTR_BACKGROUND_MASK,
+                VTERM_ATTR_CONCEAL_MASK,
+                VTERM_ATTR_SMALL_MASK,
+                VTERM_ATTR_BASELINE_MASK,
+                VTERM_ATTR_URI_MASK,
+                VTERM_ATTR_DIM_MASK,
+                VTERM_ATTR_OVERLINE_MASK,
+            ],
+            [
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+                8192, 16384,
+            ]
+        );
+        assert_eq!(VTERM_ALL_ATTRS_MASK, 0x7FFF);
     }
 
     #[test]
