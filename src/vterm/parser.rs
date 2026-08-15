@@ -356,6 +356,21 @@ impl VTermParser {
         self.state = VTermParserState::Osc;
         byte != b';'
     }
+
+    /// Handles one byte in `DCS_COMMAND`. Returns true when the final
+    /// command byte enters the DCS string state.
+    fn parse_dcs_command(&mut self, byte: u8) -> bool {
+        if self.dcs.command_len < CSI_LEADER_MAX {
+            self.dcs.command[self.dcs.command_len] = byte;
+            self.dcs.command_len += 1;
+        }
+        if (0x40..=0x7E).contains(&byte) {
+            self.state = VTermParserState::DcsVterm;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[must_use]
@@ -921,5 +936,38 @@ mod tests {
         assert!(parser.parse_osc_command(b't'));
         assert_eq!(parser.state, VTermParserState::Osc);
         assert_eq!(parser.osc_command, -1);
+    }
+
+    #[test]
+    fn parser_dcs_command_collects_through_the_final_byte() {
+        let mut parser = VTermParser {
+            state: VTermParserState::DcsCommand,
+            ..Default::default()
+        };
+        for byte in b"+$" {
+            assert!(!parser.parse_dcs_command(*byte));
+            assert_eq!(parser.state, VTermParserState::DcsCommand);
+        }
+        assert!(parser.parse_dcs_command(b'q'));
+        assert_eq!(parser.state, VTermParserState::DcsVterm);
+        assert_eq!(
+            &parser.dcs.command[..parser.dcs.command_len],
+            b"+$q"
+        );
+    }
+
+    #[test]
+    fn parser_dcs_command_truncates_storage_but_still_finds_final() {
+        let mut parser = VTermParser {
+            state: VTermParserState::DcsCommand,
+            ..Default::default()
+        };
+        for _ in 0..(CSI_LEADER_MAX + 3) {
+            assert!(!parser.parse_dcs_command(b'!'));
+        }
+        assert_eq!(parser.dcs.command_len, CSI_LEADER_MAX);
+        assert!(parser.parse_dcs_command(b'p'));
+        assert_eq!(parser.state, VTermParserState::DcsVterm);
+        assert!(parser.dcs.command.iter().all(|&byte| byte == b'!'));
     }
 }
