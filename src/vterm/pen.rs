@@ -225,6 +225,75 @@ pub fn vterm_state_resetpen<C: VTermPenCallbacks>(
     setpenattr_int(callbacks, crate::vterm_defs::VTermAttr::Uri, 0);
 }
 
+/// Saves or restores the pen (`vterm_state_savepen`).
+pub fn vterm_state_savepen<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    save: i32,
+    callbacks: &mut C,
+) {
+    if save != 0 {
+        state.saved_pen = state.pen;
+        return;
+    }
+
+    state.pen = state.saved_pen;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Bold, state.pen.bold);
+    setpenattr_int(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Underline,
+        i32::from(state.pen.underline),
+    );
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Italic,
+        state.pen.italic,
+    );
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Blink, state.pen.blink);
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Reverse,
+        state.pen.reverse,
+    );
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Conceal,
+        state.pen.conceal,
+    );
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Strike,
+        state.pen.strike,
+    );
+    setpenattr_int(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Font,
+        i32::from(state.pen.font),
+    );
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Small, state.pen.small);
+    setpenattr_int(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Baseline,
+        i32::from(state.pen.baseline),
+    );
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Dim, state.pen.dim);
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Overline,
+        state.pen.overline,
+    );
+    setpenattr_col(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Foreground,
+        state.pen.fg,
+    );
+    setpenattr_col(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Background,
+        state.pen.bg,
+    );
+    setpenattr_int(callbacks, crate::vterm_defs::VTermAttr::Uri, state.pen.uri);
+}
+
 /// Replaces one mutable ANSI palette entry
 /// (`vterm_state_set_palette_color`).
 pub fn vterm_state_set_palette_color(
@@ -668,6 +737,38 @@ mod tests {
                 crate::vterm_defs::VTermAttr::Background,
                 crate::vterm_defs::VTermAttr::Uri,
             ]
+        );
+    }
+
+    #[test]
+    fn savepen_copies_without_emitting_and_restore_emits_every_attribute() {
+        let mut state = VTermPenState {
+            pen: VTermPen {
+                bold: true,
+                underline: 2,
+                italic: true,
+                font: 4,
+                uri: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let saved = state.pen;
+        let mut capture = PenCapture::default();
+        vterm_state_savepen(&mut state, 1, &mut capture);
+        assert_eq!(state.saved_pen, saved);
+        assert!(capture.0.is_empty());
+
+        state.pen = VTermPen::default();
+        vterm_state_savepen(&mut state, 0, &mut capture);
+        assert_eq!(state.pen, saved);
+        assert_eq!(capture.0.len(), 15);
+        assert_eq!(
+            capture.0.last(),
+            Some(&(
+                crate::vterm_defs::VTermAttr::Uri,
+                crate::vterm_defs::VTermValue::Number(9),
+            ))
         );
     }
 
