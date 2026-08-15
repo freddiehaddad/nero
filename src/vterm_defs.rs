@@ -133,6 +133,24 @@ pub struct VTermPos {
     pub col: i32,
 }
 
+/// Control-string terminator (`VTermTerminator`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VTermTerminator {
+    Bel = 0,
+    #[default]
+    St = 1,
+}
+
+/// One streamed control-string fragment (`VTermStringFragment`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VTermStringFragment<'a> {
+    pub bytes: &'a [u8],
+    pub initial: bool,
+    pub final_fragment: bool,
+    pub terminator: VTermTerminator,
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -245,6 +263,23 @@ mod tests {
         assert_eq!(VTermPos::default(), VTermPos { row: 0, col: 0 });
         assert_eq!(VTermPos { row: 12, col: 34 }.row, 12);
         assert_eq!(VTermPos { row: 12, col: 34 }.col, 34);
+    }
+
+    #[test]
+    fn string_fragment_preserves_slice_flags_and_terminator() {
+        let fragment = VTermStringFragment {
+            bytes: b"payload",
+            initial: true,
+            final_fragment: false,
+            terminator: VTermTerminator::Bel,
+        };
+        assert_eq!(fragment.bytes, b"payload");
+        assert!(fragment.initial);
+        assert!(!fragment.final_fragment);
+        assert_eq!(fragment.terminator, VTermTerminator::Bel);
+        assert_eq!(VTermTerminator::Bel as i32, 0);
+        assert_eq!(VTermTerminator::St as i32, 1);
+        assert_eq!(VTermTerminator::default(), VTermTerminator::St);
     }
 
     #[test]
