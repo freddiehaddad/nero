@@ -101,6 +101,36 @@ pub trait VTermPenCallbacks {
 
 impl VTermPenCallbacks for () {}
 
+#[allow(dead_code)]
+fn setpenattr_bool<C: VTermPenCallbacks>(
+    callbacks: &mut C,
+    attr: crate::vterm_defs::VTermAttr,
+    boolean: bool,
+) {
+    let value = crate::vterm_defs::VTermValue::Boolean(i32::from(boolean));
+    let _ = callbacks.set_pen_attr(attr, &value);
+}
+
+#[allow(dead_code)]
+fn setpenattr_int<C: VTermPenCallbacks>(
+    callbacks: &mut C,
+    attr: crate::vterm_defs::VTermAttr,
+    number: i32,
+) {
+    let value = crate::vterm_defs::VTermValue::Number(number);
+    let _ = callbacks.set_pen_attr(attr, &value);
+}
+
+#[allow(dead_code)]
+fn setpenattr_col<C: VTermPenCallbacks>(
+    callbacks: &mut C,
+    attr: crate::vterm_defs::VTermAttr,
+    color: crate::vterm_defs::VTermColor,
+) {
+    let value = crate::vterm_defs::VTermValue::Color(color);
+    let _ = callbacks.set_pen_attr(attr, &value);
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -273,12 +303,86 @@ pub fn lookup_colour(
 mod tests {
     use super::*;
 
+    type CapturedPenAttr = (
+        crate::vterm_defs::VTermAttr,
+        crate::vterm_defs::VTermValue<'static>,
+    );
+
+    #[derive(Default)]
+    struct PenCapture(Vec<CapturedPenAttr>);
+
+    impl VTermPenCallbacks for PenCapture {
+        fn set_pen_attr(
+            &mut self,
+            attr: crate::vterm_defs::VTermAttr,
+            value: &crate::vterm_defs::VTermValue<'_>,
+        ) -> bool {
+            let owned = match value {
+                crate::vterm_defs::VTermValue::Boolean(value) => {
+                    crate::vterm_defs::VTermValue::Boolean(*value)
+                }
+                crate::vterm_defs::VTermValue::Number(value) => {
+                    crate::vterm_defs::VTermValue::Number(*value)
+                }
+                crate::vterm_defs::VTermValue::Color(value) => {
+                    crate::vterm_defs::VTermValue::Color(*value)
+                }
+                crate::vterm_defs::VTermValue::String(_) => unreachable!(),
+            };
+            self.0.push((attr, owned));
+            true
+        }
+    }
+
     #[test]
     fn default_pen_callback_declines_attributes() {
         assert!(!().set_pen_attr(
             crate::vterm_defs::VTermAttr::Bold,
             &crate::vterm_defs::VTermValue::Boolean(1),
         ));
+    }
+
+    #[test]
+    fn pen_attribute_helpers_construct_the_matching_value_variants() {
+        let mut capture = PenCapture::default();
+        let color = crate::vterm_defs::VTermColor {
+            red: 1,
+            green: 2,
+            blue: 3,
+            ..Default::default()
+        };
+        setpenattr_bool(
+            &mut capture,
+            crate::vterm_defs::VTermAttr::Bold,
+            true,
+        );
+        setpenattr_int(
+            &mut capture,
+            crate::vterm_defs::VTermAttr::Font,
+            4,
+        );
+        setpenattr_col(
+            &mut capture,
+            crate::vterm_defs::VTermAttr::Foreground,
+            color,
+        );
+        assert_eq!(
+            capture.0,
+            [
+                (
+                    crate::vterm_defs::VTermAttr::Bold,
+                    crate::vterm_defs::VTermValue::Boolean(1),
+                ),
+                (
+                    crate::vterm_defs::VTermAttr::Font,
+                    crate::vterm_defs::VTermValue::Number(4),
+                ),
+                (
+                    crate::vterm_defs::VTermAttr::Foreground,
+                    crate::vterm_defs::VTermValue::Color(color),
+                ),
+            ]
+        );
     }
 
     #[test]
