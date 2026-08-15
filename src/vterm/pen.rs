@@ -86,6 +86,7 @@ pub struct VTermPenState {
     pub default_fg: crate::vterm_defs::VTermColor,
     pub default_bg: crate::vterm_defs::VTermColor,
     pub palette: VTermPalette,
+    pub bold_is_highbright: bool,
 }
 
 /// Pen attribute callback from `VTermStateCallbacks::setpenattr`.
@@ -157,6 +158,7 @@ impl Default for VTermPenState {
             palette: VTermPalette {
                 colors: [crate::vterm_defs::VTermColor::default(); 16],
             },
+            bold_is_highbright: false,
         }
     }
 }
@@ -647,6 +649,7 @@ mod tests {
                         .iter()
                         .all(|color| *color == crate::vterm_defs::VTermColor::default())
                 );
+                assert!(!state.bold_is_highbright);
     }
 
     #[test]
