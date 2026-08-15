@@ -371,6 +371,24 @@ impl VTermParser {
             false
         }
     }
+
+    /// Handles one byte while parsing a plain escape sequence.
+    fn parse_escape<C: VTermParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        byte: u8,
+    ) {
+        if is_intermed(byte) {
+            if self.intermed_len < INTERMED_MAX - 1 {
+                self.intermed[self.intermed_len] = byte;
+                self.intermed_len += 1;
+            }
+        } else if (0x30..0x7F).contains(&byte) {
+            self.do_escape(callbacks, byte);
+            self.in_esc = false;
+            self.state = VTermParserState::Normal;
+        }
+    }
 }
 
 #[must_use]
@@ -969,5 +987,37 @@ mod tests {
         assert!(parser.parse_dcs_command(b'p'));
         assert_eq!(parser.state, VTermParserState::DcsVterm);
         assert!(parser.dcs.command.iter().all(|&byte| byte == b'!'));
+    }
+
+    #[test]
+    fn parser_escape_collects_intermediates_and_dispatches_final() {
+        let mut parser = VTermParser {
+            in_esc: true,
+            ..Default::default()
+        };
+        let mut capture = DispatchCapture::default();
+        parser.parse_escape(&mut capture, b'(');
+        assert!(capture.escapes.is_empty());
+        assert!(parser.in_esc);
+        parser.parse_escape(&mut capture, b'B');
+        assert_eq!(capture.escapes, [b"(B".to_vec()]);
+        assert!(!parser.in_esc);
+        assert_eq!(parser.state, VTermParserState::Normal);
+    }
+
+    #[test]
+    fn parser_escape_truncates_intermediates_and_ignores_invalid_bytes() {
+        let mut parser = VTermParser {
+            in_esc: true,
+            ..Default::default()
+        };
+        let mut capture = DispatchCapture::default();
+        for _ in 0..(INTERMED_MAX + 3) {
+            parser.parse_escape(&mut capture, b' ');
+        }
+        assert_eq!(parser.intermed_len, INTERMED_MAX - 1);
+        parser.parse_escape(&mut capture, 0x80);
+        assert!(capture.escapes.is_empty());
+        assert!(parser.in_esc);
     }
 }
