@@ -173,6 +173,52 @@ pub fn vterm_mouse_move(
     Vec::new()
 }
 
+/// Updates the pressed-button mask and emits a button report
+/// (`vterm_mouse_button`).
+pub fn vterm_mouse_button(
+    state: &mut VTermMouseState,
+    button: i32,
+    pressed: bool,
+    modifiers: crate::vterm_defs::VTermModifier,
+) -> Vec<u8> {
+    let old_buttons = state.buttons;
+
+    if (button > 0 && button <= 3) || (8..=11).contains(&button) {
+        let bit = 1 << (button - 1);
+        if pressed {
+            state.buttons |= bit;
+        } else {
+            state.buttons &= !bit;
+        }
+    }
+
+    if state.buttons == old_buttons && !(4..=7).contains(&button) {
+        return Vec::new();
+    }
+    if state.flags == 0 {
+        return Vec::new();
+    }
+
+    let code = if button < 4 {
+        button - 1
+    } else if button < 8 {
+        button - 4 + 0x40
+    } else if button < 12 {
+        button - 8 + 0x80
+    } else {
+        return Vec::new();
+    };
+    output_mouse(
+        state.protocol,
+        code,
+        pressed,
+        i32::from(modifiers),
+        state.col,
+        state.row,
+        state.ctrl8bit,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +358,74 @@ mod tests {
 
         state.buttons = 1 << 3;
         assert!(vterm_mouse_move(&mut state, 2, 4, 0).is_empty());
+    }
+
+    #[test]
+    fn mouse_button_tracks_primary_and_extended_button_bits() {
+        let mut state = VTermMouseState::default();
+        assert!(vterm_mouse_button(&mut state, 1, true, 0).is_empty());
+        assert_eq!(state.buttons, 1);
+        assert!(vterm_mouse_button(&mut state, 3, true, 0).is_empty());
+        assert_eq!(state.buttons, 0b101);
+        assert!(vterm_mouse_button(&mut state, 8, true, 0).is_empty());
+        assert_eq!(state.buttons, 0b1000_0101);
+        assert!(vterm_mouse_button(&mut state, 1, false, 0).is_empty());
+        assert_eq!(state.buttons, 0b1000_0100);
+    }
+
+    #[test]
+    fn mouse_button_reports_primary_press_and_release() {
+        let mut state = VTermMouseState {
+            col: 4,
+            row: 5,
+            flags: MOUSE_WANT_CLICK,
+            protocol: VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_mouse_button(&mut state, 2, true, 0),
+            b"\x1b[<1;5;6M"
+        );
+        assert_eq!(
+            vterm_mouse_button(&mut state, 2, false, 0),
+            b"\x1b[<1;5;6m"
+        );
+        assert!(vterm_mouse_button(&mut state, 2, false, 0).is_empty());
+    }
+
+    #[test]
+    fn mouse_button_reports_wheel_without_tracking_it() {
+        let mut state = VTermMouseState {
+            col: 1,
+            row: 2,
+            flags: MOUSE_WANT_CLICK,
+            protocol: VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_mouse_button(
+                &mut state,
+                5,
+                true,
+                crate::vterm_defs::VTERM_MOD_CTRL,
+            ),
+            b"\x1b[<81;2;3M"
+        );
+        assert_eq!(state.buttons, 0);
+    }
+
+    #[test]
+    fn mouse_button_reports_extended_buttons_and_ignores_out_of_range() {
+        let mut state = VTermMouseState {
+            flags: MOUSE_WANT_CLICK,
+            protocol: VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_mouse_button(&mut state, 9, true, 0),
+            b"\x1b[<129;1;1M"
+        );
+        assert!(vterm_mouse_button(&mut state, 12, true, 0).is_empty());
+        assert!(vterm_mouse_button(&mut state, 0, true, 0).is_empty());
     }
 }
