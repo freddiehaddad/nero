@@ -116,6 +116,63 @@ pub fn output_mouse(
     output
 }
 
+/// Updates the mouse position and emits a drag/motion report when
+/// requested (`vterm_mouse_move`).
+pub fn vterm_mouse_move(
+    state: &mut VTermMouseState,
+    row: i32,
+    col: i32,
+    modifiers: crate::vterm_defs::VTermModifier,
+) -> Vec<u8> {
+    if col == state.col && row == state.row {
+        return Vec::new();
+    }
+
+    state.col = col;
+    state.row = row;
+
+    if (state.flags & MOUSE_WANT_DRAG != 0 && state.buttons != 0)
+        || state.flags & MOUSE_WANT_MOVE != 0
+    {
+        if state.buttons != 0 {
+            let button = state.buttons.trailing_zeros() as i32 + 1;
+            if button < 4 {
+                return output_mouse(
+                    state.protocol,
+                    button - 1 + 0x20,
+                    true,
+                    i32::from(modifiers),
+                    col,
+                    row,
+                    state.ctrl8bit,
+                );
+            }
+            if (8..12).contains(&button) {
+                return output_mouse(
+                    state.protocol,
+                    button - 8 + 0x80 + 0x20,
+                    true,
+                    i32::from(modifiers),
+                    col,
+                    row,
+                    state.ctrl8bit,
+                );
+            }
+        } else {
+            return output_mouse(
+                state.protocol,
+                3 + 0x20,
+                true,
+                i32::from(modifiers),
+                col,
+                row,
+                state.ctrl8bit,
+            );
+        }
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +255,62 @@ mod tests {
             output_mouse(VTermMouseProtocol::Sgr, 0, true, 0, 0, 0, true),
             [vec![crate::vterm_defs::C1_CSI], b"<0;1;1M".to_vec()].concat()
         );
+    }
+
+    #[test]
+    fn mouse_move_updates_position_without_reporting_when_not_requested() {
+        let mut state = VTermMouseState::default();
+        assert!(vterm_mouse_move(&mut state, 5, 7, 0).is_empty());
+        assert_eq!((state.row, state.col), (5, 7));
+        assert!(vterm_mouse_move(&mut state, 5, 7, 0).is_empty());
+    }
+
+    #[test]
+    fn mouse_move_reports_motion_without_buttons() {
+        let mut state = VTermMouseState {
+            flags: MOUSE_WANT_MOVE,
+            protocol: VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_mouse_move(
+                &mut state,
+                2,
+                3,
+                crate::vterm_defs::VTERM_MOD_SHIFT,
+            ),
+            b"\x1b[<39;4;3M"
+        );
+    }
+
+    #[test]
+    fn mouse_move_reports_drag_for_the_lowest_pressed_button() {
+        let mut state = VTermMouseState {
+            buttons: (1 << 2) | (1 << 0),
+            flags: MOUSE_WANT_CLICK | MOUSE_WANT_DRAG,
+            protocol: VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_mouse_move(&mut state, 1, 4, 0),
+            b"\x1b[<32;5;2M"
+        );
+    }
+
+    #[test]
+    fn mouse_move_reports_extended_buttons_and_ignores_other_buttons() {
+        let mut state = VTermMouseState {
+            buttons: 1 << 7,
+            flags: MOUSE_WANT_DRAG,
+            protocol: VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            vterm_mouse_move(&mut state, 1, 4, 0),
+            b"\x1b[<160;5;2M"
+        );
+
+        state.buttons = 1 << 3;
+        assert!(vterm_mouse_move(&mut state, 2, 4, 0).is_empty());
     }
 }
