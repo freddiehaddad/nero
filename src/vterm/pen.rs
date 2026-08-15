@@ -37,6 +37,21 @@ const RAMP24: [u8; 24] = [
     0x85, 0x90, 0x9B, 0xA6, 0xB1, 0xBC, 0xC7, 0xD2, 0xDD, 0xE8, 0xF3, 0xFF,
 ];
 
+/// Looks up one of the fixed ANSI colors
+/// (`lookup_default_colour_ansi`).
+pub fn lookup_default_colour_ansi(
+    index: i64,
+    color: &mut crate::vterm_defs::VTermColor,
+) {
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
+    let Some(rgb) = ANSI_COLORS.get(index) else {
+        return;
+    };
+    crate::vterm_defs::vterm_color_rgb(color, rgb.red, rgb.green, rgb.blue);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +72,32 @@ mod tests {
         assert_eq!(RAMP24.last(), Some(&0xFF));
         assert_eq!(RAMP24.len(), 24);
         assert!(RAMP24.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn default_ansi_lookup_maps_all_sixteen_colors() {
+        for (index, expected) in ANSI_COLORS.iter().enumerate() {
+            let mut color = crate::vterm_defs::VTermColor::default();
+            lookup_default_colour_ansi(index as i64, &mut color);
+            assert!(color.is_rgb());
+            assert_eq!(
+                (color.red, color.green, color.blue),
+                (expected.red, expected.green, expected.blue)
+            );
+        }
+    }
+
+    #[test]
+    fn default_ansi_lookup_leaves_invalid_indices_unchanged() {
+        let original = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_INDEXED,
+            index: 42,
+            ..Default::default()
+        };
+        for index in [-1, 16, i64::MAX] {
+            let mut color = original;
+            lookup_default_colour_ansi(index, &mut color);
+            assert_eq!(color, original);
+        }
     }
 }
