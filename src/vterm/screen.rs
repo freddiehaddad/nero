@@ -129,6 +129,25 @@ pub fn alloc_buffer(screen: &VTermScreen, rows: i32, cols: i32) -> Vec<ScreenCel
     ]
 }
 
+/// Returns the first trailing blank column (`line_popcount`).
+#[must_use]
+pub fn line_popcount(
+    buffer: &[ScreenCell],
+    row: i32,
+    _rows: i32,
+    cols: i32,
+) -> i32 {
+    let mut col = cols - 1;
+    while col >= 0 {
+        let index = usize::try_from(row * cols + col).expect("valid screen index");
+        if buffer[index].schar != 0 {
+            break;
+        }
+        col -= 1;
+    }
+    col + 1
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -285,6 +304,18 @@ mod tests {
                 cell.schar == 0 && cell.pen == screen.pen
             }));
             assert!(alloc_buffer(&screen, -1, 3).is_empty());
+    }
+
+    #[test]
+    fn line_popcount_finds_first_trailing_blank_column() {
+        let mut buffer = vec![ScreenCell::default(); 8];
+        assert_eq!(line_popcount(&buffer, 0, 2, 4), 0);
+        buffer[0].schar = 1;
+        assert_eq!(line_popcount(&buffer, 0, 2, 4), 1);
+        buffer[2].schar = 1;
+        assert_eq!(line_popcount(&buffer, 0, 2, 4), 3);
+        buffer[7].schar = 1;
+        assert_eq!(line_popcount(&buffer, 1, 2, 4), 4);
     }
 
     #[test]
