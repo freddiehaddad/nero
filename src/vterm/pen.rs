@@ -513,6 +513,42 @@ pub fn vterm_state_setpen<C: VTermPenCallbacks>(
     }
 }
 
+#[allow(dead_code)]
+fn append_pen_color(
+    color: &crate::vterm_defs::VTermColor,
+    foreground: bool,
+    args: &mut Vec<crate::vterm::parser::CsiArg>,
+) {
+    if (foreground && color.is_default_fg()) || (!foreground && color.is_default_bg()) {
+        return;
+    }
+
+    if color.is_indexed() {
+        let index = color.index;
+        if index < 8 {
+            args.push(u32::from(index) + if foreground { 30 } else { 40 });
+        } else if index < 16 {
+            args.push(u32::from(index - 8) + if foreground { 90 } else { 100 });
+        } else {
+            args.push(
+                crate::vterm::parser::CSI_ARG_FLAG_MORE
+                    | if foreground { 38 } else { 48 },
+            );
+            args.push(crate::vterm::parser::CSI_ARG_FLAG_MORE | 5);
+            args.push(u32::from(index));
+        }
+    } else if color.is_rgb() {
+        args.push(
+            crate::vterm::parser::CSI_ARG_FLAG_MORE
+                | if foreground { 38 } else { 48 },
+        );
+        args.push(crate::vterm::parser::CSI_ARG_FLAG_MORE | 2);
+        args.push(crate::vterm::parser::CSI_ARG_FLAG_MORE | u32::from(color.red));
+        args.push(crate::vterm::parser::CSI_ARG_FLAG_MORE | u32::from(color.green));
+        args.push(u32::from(color.blue));
+    }
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -1287,6 +1323,53 @@ mod tests {
             &mut capture,
         );
         assert!(state.pen.dim);
+    }
+
+    #[test]
+    fn append_pen_color_serializes_indexed_color_ranges() {
+        for (index, foreground, expected) in [
+            (3, true, vec![33]),
+            (3, false, vec![43]),
+            (11, true, vec![93]),
+            (11, false, vec![103]),
+            (
+                200,
+                true,
+                vec![
+                    crate::vterm::parser::CSI_ARG_FLAG_MORE | 38,
+                    crate::vterm::parser::CSI_ARG_FLAG_MORE | 5,
+                    200,
+                ],
+            ),
+        ] {
+            let mut color = crate::vterm_defs::VTermColor::default();
+            crate::vterm_defs::vterm_color_indexed(&mut color, index);
+            let mut args = Vec::new();
+            append_pen_color(&color, foreground, &mut args);
+            assert_eq!(args, expected);
+        }
+    }
+
+    #[test]
+    fn append_pen_color_serializes_rgb_and_omits_matching_defaults() {
+        let mut color = crate::vterm_defs::VTermColor::default();
+        crate::vterm_defs::vterm_color_rgb(&mut color, 1, 2, 3);
+        let mut args = Vec::new();
+        append_pen_color(&color, true, &mut args);
+        assert_eq!(
+            args,
+            [
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 38,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 2,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 1,
+                crate::vterm::parser::CSI_ARG_FLAG_MORE | 2,
+                3,
+            ]
+        );
+        color.color_type |= crate::vterm_defs::VTERM_COLOR_DEFAULT_FG;
+        args.clear();
+        append_pen_color(&color, true, &mut args);
+        assert!(args.is_empty());
     }
 
     #[test]
