@@ -62,6 +62,20 @@ pub fn vterm_new(rows: i32, cols: i32) -> VTerm {
     })
 }
 
+/// Writes the current dimensions to requested outputs (`vterm_get_size`).
+pub fn vterm_get_size(
+    term: &VTerm,
+    rows: Option<&mut i32>,
+    cols: Option<&mut i32>,
+) {
+    if let Some(rows) = rows {
+        *rows = term.rows;
+    }
+    if let Some(cols) = cols {
+        *cols = term.cols;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +128,21 @@ mod tests {
         assert_eq!(term.outbuffer_len, 17);
         assert_eq!(term.outbuffer.capacity(), 17);
         assert_eq!(term.tmpbuffer_len, 19);
+    }
+
+    #[test]
+    fn vterm_get_size_writes_only_requested_outputs() {
+        let term = vterm_new(24, 80);
+        let mut rows = -1;
+        let mut cols = -1;
+        vterm_get_size(&term, Some(&mut rows), Some(&mut cols));
+        assert_eq!((rows, cols), (24, 80));
+
+        rows = -1;
+        cols = -1;
+        vterm_get_size(&term, Some(&mut rows), None);
+        assert_eq!((rows, cols), (24, -1));
+        vterm_get_size(&term, None, Some(&mut cols));
+        assert_eq!((rows, cols), (24, 80));
     }
 }
