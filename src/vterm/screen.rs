@@ -396,6 +396,15 @@ pub fn damagescreen<C: VTermScreenCallbacks>(
     damagerect(screen, callbacks, rect);
 }
 
+/// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
+/// portion; pending scroll emission is translated with scrollrect).
+pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+) {
+    emit_stored_damage(screen, callbacks);
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -581,6 +590,26 @@ mod tests {
             start_col: 0,
             end_col: 80,
         }]);
+    }
+
+    #[test]
+    fn screen_flush_damage_emits_once_and_resets_sentinel() {
+        let mut screen = screen_new(5, 10);
+        screen.damage_merge = crate::vterm_defs::VTermDamageSize::Screen;
+        let mut capture = DamageCapture::default();
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 1,
+            end_row: 3,
+            start_col: 2,
+            end_col: 4,
+        };
+        damagerect(&mut screen, &mut capture, rect);
+        assert!(capture.0.is_empty());
+        vterm_screen_flush_damage(&mut screen, &mut capture);
+        assert_eq!(capture.0, [rect]);
+        assert_eq!(screen.damaged.start_row, -1);
+        vterm_screen_flush_damage(&mut screen, &mut capture);
+        assert_eq!(capture.0, [rect]);
     }
 
     #[test]
