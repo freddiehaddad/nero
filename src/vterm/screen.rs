@@ -382,6 +382,20 @@ pub fn damagerect<C: VTermScreenCallbacks>(
     let _ = callbacks.damage(emit);
 }
 
+/// Damages the whole active screen (`damagescreen`).
+pub fn damagescreen<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+) {
+    let rect = crate::vterm_defs::VTermRect {
+        start_row: 0,
+        end_row: screen.rows,
+        start_col: 0,
+        end_col: screen.cols,
+    };
+    damagerect(screen, callbacks, rect);
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -554,6 +568,19 @@ mod tests {
         assert_eq!(capture.0.len(), 1);
         assert_eq!(capture.0[0].start_row, 1);
         assert_eq!(screen.damaged.start_row, 2);
+    }
+
+    #[test]
+    fn damagescreen_uses_full_current_dimensions() {
+        let mut screen = screen_new(24, 80);
+        let mut capture = DamageCapture::default();
+        damagescreen(&mut screen, &mut capture);
+        assert_eq!(capture.0, [crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 24,
+            start_col: 0,
+            end_col: 80,
+        }]);
     }
 
     #[test]
