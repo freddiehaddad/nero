@@ -151,6 +151,19 @@ pub fn vterm_state_set_palette_color(
     }
 }
 
+/// Converts a color to RGB and clears default-color metadata
+/// (`vterm_state_convert_color_to_rgb`).
+pub fn vterm_state_convert_color_to_rgb(
+    state: &VTermPenState,
+    color: &mut crate::vterm_defs::VTermColor,
+) {
+    if color.is_indexed() {
+        let index = color.index;
+        let _ = lookup_colour_palette(&state.palette, i64::from(index), color);
+    }
+    color.color_type &= crate::vterm_defs::VTERM_COLOR_TYPE_MASK;
+}
+
 impl Default for VTermPalette {
     fn default() -> Self {
         let mut colors = [crate::vterm_defs::VTermColor::default(); 16];
@@ -460,6 +473,46 @@ mod tests {
             vterm_state_set_palette_color(&mut state, index, &replacement);
         }
         assert_eq!(state.palette, original);
+    }
+
+    #[test]
+    fn convert_color_to_rgb_uses_mutable_palette_and_clears_metadata() {
+            let mut state = VTermPenState::default();
+            vterm_state_newpen(&mut state);
+            let replacement = crate::vterm_defs::VTermColor {
+                red: 1,
+                green: 2,
+                blue: 3,
+                ..Default::default()
+            };
+            vterm_state_set_palette_color(&mut state, 5, &replacement);
+            let mut color = crate::vterm_defs::VTermColor {
+                color_type: crate::vterm_defs::VTERM_COLOR_INDEXED
+                    | crate::vterm_defs::VTERM_COLOR_DEFAULT_FG,
+                index: 5,
+                ..Default::default()
+            };
+            vterm_state_convert_color_to_rgb(&state, &mut color);
+            assert!(color.is_rgb());
+            assert!(!color.is_default_fg());
+            assert!(!color.is_default_bg());
+            assert_eq!((color.red, color.green, color.blue), (1, 2, 3));
+        }
+
+    #[test]
+    fn convert_color_to_rgb_preserves_rgb_payload_while_clearing_metadata() {
+            let state = VTermPenState::default();
+            let mut color = crate::vterm_defs::VTermColor {
+                color_type: crate::vterm_defs::VTERM_COLOR_RGB
+                    | crate::vterm_defs::VTERM_COLOR_DEFAULT_BG,
+                red: 10,
+                green: 20,
+                blue: 30,
+                ..Default::default()
+            };
+            vterm_state_convert_color_to_rgb(&state, &mut color);
+            assert_eq!(color.color_type, crate::vterm_defs::VTERM_COLOR_RGB);
+            assert_eq!((color.red, color.green, color.blue), (10, 20, 30));
     }
 
     #[test]
