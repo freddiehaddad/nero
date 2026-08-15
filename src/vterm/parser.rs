@@ -272,6 +272,24 @@ impl VTermParser {
         }
         C1Action::NoString
     }
+
+    /// Handles one byte in `CSI_LEADER`. Returns true when consumed;
+    /// false means the same byte must fall through to `CSI_ARGS`.
+    fn parse_csi_leader(&mut self, byte: u8) -> bool {
+        if (0x3C..=0x3F).contains(&byte) {
+            if self.csi.leader_len < CSI_LEADER_MAX - 1 {
+                self.csi.leader[self.csi.leader_len] = byte;
+                self.csi.leader_len += 1;
+            }
+            return true;
+        }
+
+        self.csi.leader[self.csi.leader_len] = 0;
+        self.csi.argi = 0;
+        self.csi.args[0] = CSI_ARG_MISSING;
+        self.state = VTermParserState::CsiArgs;
+        false
+    }
 }
 
 #[must_use]
@@ -679,5 +697,41 @@ mod tests {
             );
             assert_eq!(parser.state, VTermParserState::Normal);
             assert_eq!(capture.controls, [0x84]);
+    }
+
+    #[test]
+    fn parser_csi_leader_collects_only_leader_bytes() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiLeader,
+            ..Default::default()
+        };
+        for byte in b"?>=" {
+            assert!(parser.parse_csi_leader(*byte));
+        }
+        assert_eq!(&parser.csi.leader[..parser.csi.leader_len], b"?>=");
+        assert_eq!(parser.state, VTermParserState::CsiLeader);
+
+        assert!(!parser.parse_csi_leader(b'1'));
+        assert_eq!(parser.state, VTermParserState::CsiArgs);
+        assert_eq!(parser.csi.argi, 0);
+        assert_eq!(parser.csi.args[0], CSI_ARG_MISSING);
+        assert_eq!(parser.csi.leader[parser.csi.leader_len], 0);
+    }
+
+    #[test]
+    fn parser_csi_leader_truncates_to_leave_a_nul_slot() {
+        let mut parser = VTermParser {
+            state: VTermParserState::CsiLeader,
+            ..Default::default()
+        };
+        for _ in 0..(CSI_LEADER_MAX + 3) {
+            assert!(parser.parse_csi_leader(b'?'));
+        }
+        assert_eq!(parser.csi.leader_len, CSI_LEADER_MAX - 1);
+        assert!(parser.csi.leader[..parser.csi.leader_len]
+            .iter()
+            .all(|&byte| byte == b'?'));
+        assert!(!parser.parse_csi_leader(b'm'));
+        assert_eq!(parser.csi.leader[CSI_LEADER_MAX - 1], 0);
     }
 }
