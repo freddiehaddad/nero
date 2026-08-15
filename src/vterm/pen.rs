@@ -179,6 +179,52 @@ pub fn vterm_state_newpen(state: &mut VTermPenState) {
     }
 }
 
+/// Resets every pen attribute and restores default colors
+/// (`vterm_state_resetpen`).
+pub fn vterm_state_resetpen<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+) {
+    state.pen.bold = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Bold, false);
+    state.pen.underline = 0;
+    setpenattr_int(callbacks, crate::vterm_defs::VTermAttr::Underline, 0);
+    state.pen.italic = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Italic, false);
+    state.pen.blink = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Blink, false);
+    state.pen.reverse = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Reverse, false);
+    state.pen.conceal = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Conceal, false);
+    state.pen.strike = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Strike, false);
+    state.pen.font = 0;
+    setpenattr_int(callbacks, crate::vterm_defs::VTermAttr::Font, 0);
+    state.pen.small = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Small, false);
+    state.pen.baseline = 0;
+    setpenattr_int(callbacks, crate::vterm_defs::VTermAttr::Baseline, 0);
+    state.pen.dim = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Dim, false);
+    state.pen.overline = false;
+    setpenattr_bool(callbacks, crate::vterm_defs::VTermAttr::Overline, false);
+    state.pen.fg = state.default_fg;
+    setpenattr_col(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Foreground,
+        state.default_fg,
+    );
+    state.pen.bg = state.default_bg;
+    setpenattr_col(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Background,
+        state.default_bg,
+    );
+    state.pen.uri = 0;
+    setpenattr_int(callbacks, crate::vterm_defs::VTermAttr::Uri, 0);
+}
+
 /// Replaces one mutable ANSI palette entry
 /// (`vterm_state_set_palette_color`).
 pub fn vterm_state_set_palette_color(
@@ -567,6 +613,62 @@ mod tests {
         vterm_state_newpen(&mut state);
         assert!(state.pen.bold);
         assert!(state.saved_pen.italic);
+    }
+
+    #[test]
+    fn resetpen_clears_attributes_and_restores_default_colors() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        state.pen = VTermPen {
+            bold: true,
+            underline: 3,
+            italic: true,
+            blink: true,
+            reverse: true,
+            conceal: true,
+            strike: true,
+            font: 9,
+            small: true,
+            baseline: 2,
+            dim: true,
+            overline: true,
+            uri: 42,
+            ..Default::default()
+        };
+        let mut capture = PenCapture::default();
+        vterm_state_resetpen(&mut state, &mut capture);
+        assert_eq!(
+            state.pen,
+            VTermPen {
+                fg: state.default_fg,
+                bg: state.default_bg,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            capture
+                .0
+                .iter()
+                .map(|(attr, _)| *attr)
+                .collect::<Vec<_>>(),
+            [
+                crate::vterm_defs::VTermAttr::Bold,
+                crate::vterm_defs::VTermAttr::Underline,
+                crate::vterm_defs::VTermAttr::Italic,
+                crate::vterm_defs::VTermAttr::Blink,
+                crate::vterm_defs::VTermAttr::Reverse,
+                crate::vterm_defs::VTermAttr::Conceal,
+                crate::vterm_defs::VTermAttr::Strike,
+                crate::vterm_defs::VTermAttr::Font,
+                crate::vterm_defs::VTermAttr::Small,
+                crate::vterm_defs::VTermAttr::Baseline,
+                crate::vterm_defs::VTermAttr::Dim,
+                crate::vterm_defs::VTermAttr::Overline,
+                crate::vterm_defs::VTermAttr::Foreground,
+                crate::vterm_defs::VTermAttr::Background,
+                crate::vterm_defs::VTermAttr::Uri,
+            ]
+        );
     }
 
     #[test]
