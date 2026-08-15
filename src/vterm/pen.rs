@@ -123,6 +123,19 @@ pub fn vterm_state_set_default_colors(
     }
 }
 
+/// Initializes default foreground/background and ANSI colors
+/// (`vterm_state_newpen`).
+pub fn vterm_state_newpen(state: &mut VTermPenState) {
+    let mut default_fg = crate::vterm_defs::VTermColor::default();
+    crate::vterm_defs::vterm_color_rgb(&mut default_fg, 240, 240, 240);
+    let mut default_bg = crate::vterm_defs::VTermColor::default();
+    crate::vterm_defs::vterm_color_rgb(&mut default_bg, 0, 0, 0);
+    vterm_state_set_default_colors(state, Some(&default_fg), Some(&default_bg));
+    for (index, color) in state.palette.colors.iter_mut().enumerate() {
+        lookup_default_colour_ansi(index as i64, color);
+    }
+}
+
 impl Default for VTermPalette {
     fn default() -> Self {
         let mut colors = [crate::vterm_defs::VTermColor::default(); 16];
@@ -360,6 +373,47 @@ mod tests {
         let original = state.clone();
         vterm_state_set_default_colors(&mut state, None, None);
         assert_eq!(state, original);
+    }
+
+    #[test]
+    fn newpen_initializes_defaults_and_all_ansi_colors() {
+        let mut state = VTermPenState::default();
+        vterm_state_newpen(&mut state);
+        assert_eq!(
+            (
+                state.default_fg.red,
+                state.default_fg.green,
+                state.default_fg.blue,
+            ),
+            (240, 240, 240)
+        );
+        assert!(state.default_fg.is_default_fg());
+        assert_eq!(
+            (
+                state.default_bg.red,
+                state.default_bg.green,
+                state.default_bg.blue,
+            ),
+            (0, 0, 0)
+        );
+        assert!(state.default_bg.is_default_bg());
+        for (color, expected) in state.palette.colors.iter().zip(ANSI_COLORS) {
+            assert_eq!(
+                (color.red, color.green, color.blue),
+                (expected.red, expected.green, expected.blue)
+            );
+            assert_eq!(color.color_type, crate::vterm_defs::VTERM_COLOR_RGB);
+        }
+    }
+
+    #[test]
+    fn newpen_does_not_modify_current_or_saved_pen() {
+        let mut state = VTermPenState::default();
+        state.pen.bold = true;
+        state.saved_pen.italic = true;
+        vterm_state_newpen(&mut state);
+        assert!(state.pen.bold);
+        assert!(state.saved_pen.italic);
     }
 
     #[test]
