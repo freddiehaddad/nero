@@ -85,6 +85,37 @@ pub fn lookup_colour_ansi(
     true
 }
 
+/// Resolves an xterm 256-color palette index
+/// (`lookup_colour_palette`).
+#[must_use]
+pub fn lookup_colour_palette(
+    palette: &VTermPalette,
+    mut index: i64,
+    color: &mut crate::vterm_defs::VTermColor,
+) -> bool {
+    if (0..16).contains(&index) {
+        return lookup_colour_ansi(palette, index, color);
+    }
+    if (16..232).contains(&index) {
+        index -= 16;
+        let index = index as usize;
+        crate::vterm_defs::vterm_color_rgb(
+            color,
+            RAMP6[index / 6 / 6 % 6],
+            RAMP6[index / 6 % 6],
+            RAMP6[index % 6],
+        );
+        return true;
+    }
+    if (232..256).contains(&index) {
+        index -= 232;
+        let value = RAMP24[index as usize];
+        crate::vterm_defs::vterm_color_rgb(color, value, value, value);
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +187,55 @@ mod tests {
             for index in [-1, 16] {
                 let original = color;
                 assert!(!lookup_colour_ansi(&palette, index, &mut color));
+                assert_eq!(color, original);
+            }
+    }
+
+    #[test]
+    fn palette_lookup_uses_mutable_ansi_entries() {
+            let mut palette = VTermPalette::default();
+            crate::vterm_defs::vterm_color_rgb(&mut palette.colors[5], 1, 2, 3);
+            let mut color = crate::vterm_defs::VTermColor::default();
+            assert!(lookup_colour_palette(&palette, 5, &mut color));
+            assert_eq!((color.red, color.green, color.blue), (1, 2, 3));
+        }
+
+    #[test]
+    fn palette_lookup_maps_color_cube_boundaries() {
+            let palette = VTermPalette::default();
+            let mut color = crate::vterm_defs::VTermColor::default();
+            for (index, expected) in [
+                (16, (0x00, 0x00, 0x00)),
+                (17, (0x00, 0x00, 0x33)),
+                (21, (0x00, 0x00, 0xFF)),
+                (22, (0x00, 0x33, 0x00)),
+                (51, (0x00, 0xFF, 0xFF)),
+                (196, (0xFF, 0x00, 0x00)),
+                (231, (0xFF, 0xFF, 0xFF)),
+            ] {
+                assert!(lookup_colour_palette(&palette, index, &mut color));
+                assert_eq!(
+                    (color.red, color.green, color.blue),
+                    expected,
+                    "index {index}"
+                );
+            }
+        }
+
+    #[test]
+    fn palette_lookup_maps_grayscale_and_rejects_invalid_indices() {
+            let palette = VTermPalette::default();
+            let mut color = crate::vterm_defs::VTermColor::default();
+            for (index, expected) in [(232, 0x00), (233, 0x0B), (254, 0xF3), (255, 0xFF)] {
+                assert!(lookup_colour_palette(&palette, index, &mut color));
+                assert_eq!(
+                    (color.red, color.green, color.blue),
+                    (expected, expected, expected)
+                );
+            }
+            let original = color;
+            for index in [-1, 256, i64::MAX] {
+                assert!(!lookup_colour_palette(&palette, index, &mut color));
                 assert_eq!(color, original);
         }
     }
