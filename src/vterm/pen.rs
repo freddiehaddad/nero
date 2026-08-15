@@ -309,6 +309,33 @@ fn apply_sgr_overline<C: VTermPenCallbacks>(
     true
 }
 
+#[allow(dead_code)]
+fn apply_sgr_baseline<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    argument: u32,
+) -> bool {
+    let baseline = match argument {
+        73 => crate::vterm_defs::VTERM_BASELINE_RAISE,
+        74 => crate::vterm_defs::VTERM_BASELINE_LOWER,
+        75 => crate::vterm_defs::VTERM_BASELINE_NORMAL,
+        _ => return false,
+    };
+    state.pen.small = argument != 75;
+    state.pen.baseline = baseline;
+    setpenattr_bool(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Small,
+        state.pen.small,
+    );
+    setpenattr_int(
+        callbacks,
+        crate::vterm_defs::VTermAttr::Baseline,
+        i32::from(baseline),
+    );
+    true
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -885,6 +912,27 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn sgr_baseline_handles_super_subscript_and_normal() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        for (argument, small, baseline) in [
+            (73, true, crate::vterm_defs::VTERM_BASELINE_RAISE),
+            (74, true, crate::vterm_defs::VTERM_BASELINE_LOWER),
+            (75, false, crate::vterm_defs::VTERM_BASELINE_NORMAL),
+        ] {
+            assert!(apply_sgr_baseline(
+                &mut state,
+                &mut capture,
+                argument,
+            ));
+            assert_eq!(state.pen.small, small);
+            assert_eq!(state.pen.baseline, baseline);
+        }
+        assert!(!apply_sgr_baseline(&mut state, &mut capture, 72));
+        assert_eq!(capture.0.len(), 6);
     }
 
     #[test]
