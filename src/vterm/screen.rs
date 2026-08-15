@@ -158,6 +158,15 @@ pub fn vterm_screen_set_reflow(screen: &mut VTermScreen, reflow: bool) {
     vterm_screen_enable_reflow(screen, reflow);
 }
 
+/// Lazily allocates the alternate screen
+/// (`vterm_screen_enable_altscreen`).
+pub fn vterm_screen_enable_altscreen(screen: &mut VTermScreen, altscreen: i32) {
+    if screen.buffers[1].is_none() && altscreen != 0 {
+        let buffer = alloc_buffer(screen, screen.rows, screen.cols);
+        screen.buffers[1] = Some(buffer);
+    }
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
@@ -345,6 +354,19 @@ mod tests {
         assert!(screen.reflow);
         vterm_screen_set_reflow(&mut screen, false);
         assert!(!screen.reflow);
+    }
+
+    #[test]
+    fn screen_enable_altscreen_allocates_once_without_switching_active_buffer() {
+        let mut screen = screen_new(2, 3);
+        vterm_screen_enable_altscreen(&mut screen, 0);
+        assert!(screen.buffers[1].is_none());
+        vterm_screen_enable_altscreen(&mut screen, 1);
+        assert_eq!(screen.buffers[1].as_ref().unwrap().len(), 6);
+        assert_eq!(screen.active_buffer, 0);
+        screen.buffers[1].as_mut().unwrap()[0].schar = 42;
+        vterm_screen_enable_altscreen(&mut screen, 1);
+        assert_eq!(screen.buffers[1].as_ref().unwrap()[0].schar, 42);
     }
 
     #[test]
