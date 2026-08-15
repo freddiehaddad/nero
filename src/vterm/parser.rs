@@ -389,6 +389,217 @@ impl VTermParser {
             self.state = VTermParserState::Normal;
         }
     }
+
+    /// Parses terminal input (`vterm_input_write`).
+    pub fn vterm_input_write<C: VTermParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        bytes: &[u8],
+        utf8: bool,
+    ) -> usize {
+        let mut pos = 0;
+        let mut string_start = match self.state {
+            VTermParserState::Osc
+            | VTermParserState::DcsVterm
+            | VTermParserState::Apc
+            | VTermParserState::Pm
+            | VTermParserState::Sos => Some(0),
+            _ => None,
+        };
+
+        while pos < bytes.len() {
+            let mut byte = bytes[pos];
+            let mut c1_allowed = !utf8;
+
+            if byte == 0x00 || byte == 0x7F {
+                if self.state.is_string() {
+                    if let Some(start) = string_start {
+                        self.string_fragment(
+                            callbacks,
+                            &bytes[start..pos],
+                            false,
+                            crate::vterm_defs::VTermTerminator::St,
+                        );
+                    }
+                    string_start = Some(pos + 1);
+                }
+                if self.emit_nul {
+                    self.do_control(callbacks, byte);
+                }
+                pos += 1;
+                continue;
+            }
+            if byte == 0x18 || byte == 0x1A {
+                self.in_esc = false;
+                self.state = VTermParserState::Normal;
+                string_start = None;
+                if self.emit_nul {
+                    self.do_control(callbacks, byte);
+                }
+                pos += 1;
+                continue;
+            }
+            if byte == 0x1B {
+                self.intermed_len = 0;
+                if !self.state.is_string() {
+                    self.state = VTermParserState::Normal;
+                }
+                self.in_esc = true;
+                pos += 1;
+                continue;
+            }
+            if byte != 0x07 && byte < 0x20 {
+                if self.state == VTermParserState::Sos {
+                    pos += 1;
+                    continue;
+                }
+                if self.state.is_string()
+                    && let Some(start) = string_start
+                {
+                    self.string_fragment(
+                        callbacks,
+                        &bytes[start..pos],
+                        false,
+                        crate::vterm_defs::VTermTerminator::St,
+                    );
+                }
+                self.do_control(callbacks, byte);
+                if self.state.is_string() {
+                    string_start = Some(pos + 1);
+                }
+                pos += 1;
+                continue;
+            }
+
+            let mut string_len = string_start.map_or(0, |start| pos - start);
+            if self.in_esc {
+                if self.intermed_len == 0
+                    && (0x40..0x60).contains(&byte)
+                    && (!self.state.is_string() || byte == b'\\')
+                {
+                    byte += 0x40;
+                    c1_allowed = true;
+                    string_len = string_len.saturating_sub(1);
+                    self.in_esc = false;
+                } else {
+                    string_start = None;
+                    self.state = VTermParserState::Normal;
+                }
+            }
+
+            match self.state {
+                VTermParserState::CsiLeader => {
+                    if self.parse_csi_leader(byte) {
+                        pos += 1;
+                        continue;
+                    }
+                    if self.parse_csi_args(byte) {
+                        pos += 1;
+                        continue;
+                    }
+                    self.parse_csi_intermed(callbacks, byte);
+                }
+                VTermParserState::CsiArgs => {
+                    if self.parse_csi_args(byte) {
+                        pos += 1;
+                        continue;
+                    }
+                    self.parse_csi_intermed(callbacks, byte);
+                }
+                VTermParserState::CsiIntermed => {
+                    self.parse_csi_intermed(callbacks, byte);
+                }
+                VTermParserState::OscCommand => {
+                    if self.parse_osc_command(byte) {
+                        string_start = Some(pos);
+                        string_len = 0;
+                    } else {
+                        if self.state == VTermParserState::Osc {
+                            string_start = Some(pos + 1);
+                        }
+                        pos += 1;
+                        continue;
+                    }
+                    if byte == 0x07 || (c1_allowed && byte == crate::vterm_defs::C1_ST) {
+                        let start = string_start.unwrap_or(pos);
+                        self.string_fragment(
+                            callbacks,
+                            &bytes[start..start + string_len],
+                            true,
+                            if byte == 0x07 {
+                                crate::vterm_defs::VTermTerminator::Bel
+                            } else {
+                                crate::vterm_defs::VTermTerminator::St
+                            },
+                        );
+                        self.state = VTermParserState::Normal;
+                        string_start = None;
+                    }
+                }
+                VTermParserState::DcsCommand => {
+                    if self.parse_dcs_command(byte) {
+                        string_start = Some(pos + 1);
+                    }
+                }
+                VTermParserState::Osc
+                | VTermParserState::DcsVterm
+                | VTermParserState::Apc
+                | VTermParserState::Pm
+                | VTermParserState::Sos => {
+                    if byte == 0x07 || (c1_allowed && byte == crate::vterm_defs::C1_ST) {
+                        let start = string_start.unwrap_or(pos);
+                        self.string_fragment(
+                            callbacks,
+                            &bytes[start..start + string_len],
+                            true,
+                            if byte == 0x07 {
+                                crate::vterm_defs::VTermTerminator::Bel
+                            } else {
+                                crate::vterm_defs::VTermTerminator::St
+                            },
+                        );
+                        self.state = VTermParserState::Normal;
+                        string_start = None;
+                    }
+                }
+                VTermParserState::Normal => {
+                    if self.in_esc {
+                        self.parse_escape(callbacks, byte);
+                    } else if c1_allowed && (0x80..0xA0).contains(&byte) {
+                        if self.do_c1(callbacks, byte) == C1Action::StartString {
+                            string_start = Some(pos + 1);
+                        }
+                    } else {
+                        let eaten = callbacks.text(&bytes[pos..]);
+                        let eaten = if eaten == 0 { 1 } else { eaten };
+                        assert!(
+                            eaten <= bytes.len() - pos,
+                            "text callback consumed beyond input"
+                        );
+                        pos += eaten;
+                        continue;
+                    }
+                }
+            }
+            pos += 1;
+        }
+
+        if let Some(start) = string_start {
+            let mut string_len = pos - start;
+            if string_len > 0 {
+                if self.in_esc {
+                    string_len -= 1;
+                }
+                self.string_fragment(
+                    callbacks,
+                    &bytes[start..start + string_len],
+                    false,
+                    crate::vterm_defs::VTermTerminator::St,
+                );
+            }
+        }
+        bytes.len()
+    }
 }
 
 #[must_use]
@@ -451,6 +662,7 @@ mod tests {
 
     #[derive(Default)]
     struct DispatchCapture {
+        texts: Vec<Vec<u8>>,
         controls: Vec<u8>,
         escapes: Vec<Vec<u8>>,
         csi: Vec<CsiCapture>,
@@ -458,6 +670,11 @@ mod tests {
     }
 
     impl VTermParserCallbacks for DispatchCapture {
+        fn text(&mut self, bytes: &[u8]) -> usize {
+            self.texts.push(bytes.to_vec());
+            bytes.len()
+        }
+
         fn control(&mut self, control: u8) -> bool {
             self.controls.push(control);
             true
@@ -1019,5 +1236,97 @@ mod tests {
         parser.parse_escape(&mut capture, 0x80);
         assert!(capture.escapes.is_empty());
         assert!(parser.in_esc);
+    }
+
+    #[test]
+    fn input_write_forwards_text_and_escape_sequences() {
+        let mut parser = VTermParser::default();
+        let mut capture = DispatchCapture::default();
+        assert_eq!(
+            parser.vterm_input_write(&mut capture, b"hello", true),
+            5
+        );
+        assert_eq!(capture.texts, [b"hello".to_vec()]);
+
+        capture.texts.clear();
+        assert_eq!(
+            parser.vterm_input_write(&mut capture, b"\x1b(Bworld", true),
+            8
+        );
+        assert_eq!(capture.escapes, [b"(B".to_vec()]);
+        assert_eq!(capture.texts, [b"world".to_vec()]);
+    }
+
+    #[test]
+    fn input_write_parses_csi_in_seven_and_eight_bit_forms() {
+        let mut parser = VTermParser::default();
+        let mut capture = DispatchCapture::default();
+        parser.vterm_input_write(&mut capture, b"\x1b[?12;3:4 m", true);
+        assert_eq!(
+            capture.csi,
+            [(
+                Some(b"?".to_vec()),
+                vec![12, CSI_ARG_FLAG_MORE | 3, 4],
+                Some(b" ".to_vec()),
+                b'm',
+            )]
+        );
+
+        capture.csi.clear();
+        parser.vterm_input_write(&mut capture, b"\x9b2J", false);
+        assert_eq!(capture.csi, [(None, vec![2], None, b'J')]);
+    }
+
+    #[test]
+    fn input_write_streams_osc_fragments_across_calls() {
+        let mut parser = VTermParser::default();
+        let mut capture = DispatchCapture::default();
+        parser.vterm_input_write(&mut capture, b"\x1b]2;hel", true);
+        assert_eq!(parser.state, VTermParserState::Osc);
+        assert_eq!(capture.strings, [StringCapture {
+            kind: StringCaptureKind::Osc(2),
+            bytes: b"hel".to_vec(),
+            initial: true,
+            final_fragment: false,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        }]);
+
+        parser.vterm_input_write(&mut capture, b"lo\x07", true);
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert_eq!(capture.strings[1], StringCapture {
+            kind: StringCaptureKind::Osc(2),
+            bytes: b"lo".to_vec(),
+            initial: false,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::Bel,
+        });
+    }
+
+    #[test]
+    fn input_write_parses_dcs_and_st_termination() {
+        let mut parser = VTermParser::default();
+        let mut capture = DispatchCapture::default();
+        parser.vterm_input_write(&mut capture, b"\x1bP+qdata\x1b\\", true);
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert_eq!(capture.strings, [StringCapture {
+            kind: StringCaptureKind::Dcs(b"+q".to_vec()),
+            bytes: b"data".to_vec(),
+            initial: true,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        }]);
+    }
+
+    #[test]
+    fn input_write_honors_emit_nul_and_cancel_controls() {
+        let mut parser = VTermParser {
+            emit_nul: true,
+            ..Default::default()
+        };
+        let mut capture = DispatchCapture::default();
+        parser.vterm_input_write(&mut capture, b"\0\x7f\x18\x1a\x01", true);
+        assert_eq!(capture.controls, [0x00, 0x7F, 0x18, 0x1A, 0x01]);
+        assert_eq!(parser.state, VTermParserState::Normal);
+        assert!(!parser.in_esc);
     }
 }
