@@ -338,6 +338,24 @@ impl VTermParser {
         }
         self.state = VTermParserState::Normal;
     }
+
+    /// Handles one byte in `OSC_COMMAND`. Returns true when the byte
+    /// becomes the first string byte.
+    fn parse_osc_command(&mut self, byte: u8) -> bool {
+        if byte.is_ascii_digit() {
+            if self.osc_command == -1 {
+                self.osc_command = 0;
+            } else {
+                self.osc_command = self.osc_command.wrapping_mul(10);
+            }
+            self.osc_command = self
+                .osc_command
+                .wrapping_add(i32::from(byte - b'0'));
+            return false;
+        }
+        self.state = VTermParserState::Osc;
+        byte != b';'
+    }
 }
 
 #[must_use]
@@ -875,5 +893,33 @@ mod tests {
         parser.parse_csi_intermed(&mut capture, 0x1B);
         assert_eq!(parser.state, VTermParserState::Normal);
         assert!(capture.csi.is_empty());
+    }
+
+    #[test]
+    fn parser_osc_command_accumulates_decimal_command() {
+        let mut parser = VTermParser {
+            state: VTermParserState::OscCommand,
+            osc_command: -1,
+            ..Default::default()
+        };
+        for byte in b"123" {
+            assert!(!parser.parse_osc_command(*byte));
+            assert_eq!(parser.state, VTermParserState::OscCommand);
+        }
+        assert_eq!(parser.osc_command, 123);
+        assert!(!parser.parse_osc_command(b';'));
+        assert_eq!(parser.state, VTermParserState::Osc);
+    }
+
+    #[test]
+    fn parser_osc_command_treats_nonseparator_as_first_payload_byte() {
+        let mut parser = VTermParser {
+            state: VTermParserState::OscCommand,
+            osc_command: -1,
+            ..Default::default()
+        };
+        assert!(parser.parse_osc_command(b't'));
+        assert_eq!(parser.state, VTermParserState::Osc);
+        assert_eq!(parser.osc_command, -1);
     }
 }
