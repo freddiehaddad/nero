@@ -186,6 +186,46 @@ impl VTermParser {
         sequence.push(command);
         let _ = callbacks.escape(&sequence);
     }
+
+    fn string_fragment<C: VTermParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        bytes: &[u8],
+        final_fragment: bool,
+        terminator: crate::vterm_defs::VTermTerminator,
+    ) {
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes,
+            initial: self.string_initial,
+            final_fragment,
+            terminator,
+        };
+
+        match self.state {
+            VTermParserState::Osc => {
+                let _ = callbacks.osc(self.osc_command, fragment);
+            }
+            VTermParserState::DcsVterm => {
+                let _ = callbacks.dcs(&self.dcs.command[..self.dcs.command_len], fragment);
+            }
+            VTermParserState::Apc => {
+                let _ = callbacks.apc(fragment);
+            }
+            VTermParserState::Pm => {
+                let _ = callbacks.pm(fragment);
+            }
+            VTermParserState::Sos => {
+                let _ = callbacks.sos(fragment);
+            }
+            VTermParserState::Normal
+            | VTermParserState::CsiLeader
+            | VTermParserState::CsiArgs
+            | VTermParserState::CsiIntermed
+            | VTermParserState::DcsCommand
+            | VTermParserState::OscCommand => return,
+        }
+        self.string_initial = false;
+    }
 }
 
 #[must_use]
@@ -228,11 +268,30 @@ mod tests {
 
     type CsiCapture = (Option<Vec<u8>>, Vec<CsiArg>, Option<Vec<u8>>, u8);
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StringCaptureKind {
+        Osc(i32),
+        Dcs(Vec<u8>),
+        Apc,
+        Pm,
+        Sos,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StringCapture {
+        kind: StringCaptureKind,
+        bytes: Vec<u8>,
+        initial: bool,
+        final_fragment: bool,
+        terminator: crate::vterm_defs::VTermTerminator,
+    }
+
     #[derive(Default)]
     struct DispatchCapture {
         controls: Vec<u8>,
         escapes: Vec<Vec<u8>>,
         csi: Vec<CsiCapture>,
+        strings: Vec<StringCapture>,
     }
 
     impl VTermParserCallbacks for DispatchCapture {
@@ -260,6 +319,55 @@ mod tests {
                 command,
             ));
             true
+        }
+
+        fn osc(
+            &mut self,
+            command: i32,
+            fragment: crate::vterm_defs::VTermStringFragment<'_>,
+        ) -> bool {
+            self.capture_string(StringCaptureKind::Osc(command), fragment);
+            true
+        }
+
+        fn dcs(
+            &mut self,
+            command: &[u8],
+            fragment: crate::vterm_defs::VTermStringFragment<'_>,
+        ) -> bool {
+            self.capture_string(StringCaptureKind::Dcs(command.to_vec()), fragment);
+            true
+        }
+
+        fn apc(&mut self, fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+            self.capture_string(StringCaptureKind::Apc, fragment);
+            true
+        }
+
+        fn pm(&mut self, fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+            self.capture_string(StringCaptureKind::Pm, fragment);
+            true
+        }
+
+        fn sos(&mut self, fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+            self.capture_string(StringCaptureKind::Sos, fragment);
+            true
+        }
+    }
+
+    impl DispatchCapture {
+        fn capture_string(
+            &mut self,
+            kind: StringCaptureKind,
+            fragment: crate::vterm_defs::VTermStringFragment<'_>,
+        ) {
+            self.strings.push(StringCapture {
+                kind,
+                bytes: fragment.bytes.to_vec(),
+                initial: fragment.initial,
+                final_fragment: fragment.final_fragment,
+                terminator: fragment.terminator,
+            });
         }
     }
 
@@ -395,5 +503,87 @@ mod tests {
             capture.csi,
             [(None, vec![CSI_ARG_MISSING], None, b'A')]
         );
+    }
+
+    #[test]
+    fn parser_string_fragment_dispatches_each_payload_state() {
+        let cases = [
+            (VTermParserState::Osc, StringCaptureKind::Osc(12)),
+            (
+                VTermParserState::DcsVterm,
+                StringCaptureKind::Dcs(b"+q".to_vec()),
+            ),
+            (VTermParserState::Apc, StringCaptureKind::Apc),
+            (VTermParserState::Pm, StringCaptureKind::Pm),
+            (VTermParserState::Sos, StringCaptureKind::Sos),
+        ];
+        for (state, expected_kind) in cases {
+            let mut parser = VTermParser {
+                state,
+                osc_command: 12,
+                string_initial: true,
+                ..Default::default()
+            };
+            parser.dcs.command[..2].copy_from_slice(b"+q");
+            parser.dcs.command_len = 2;
+            let mut capture = DispatchCapture::default();
+            parser.string_fragment(
+                &mut capture,
+                b"part",
+                false,
+                crate::vterm_defs::VTermTerminator::St,
+            );
+            parser.string_fragment(
+                &mut capture,
+                b"end",
+                true,
+                crate::vterm_defs::VTermTerminator::Bel,
+            );
+
+            assert_eq!(capture.strings, [
+                StringCapture {
+                    kind: expected_kind.clone(),
+                    bytes: b"part".to_vec(),
+                    initial: true,
+                    final_fragment: false,
+                    terminator: crate::vterm_defs::VTermTerminator::St,
+                },
+                StringCapture {
+                    kind: expected_kind,
+                    bytes: b"end".to_vec(),
+                    initial: false,
+                    final_fragment: true,
+                    terminator: crate::vterm_defs::VTermTerminator::Bel,
+                },
+            ]);
+            assert!(!parser.string_initial);
+        }
+    }
+
+    #[test]
+    fn parser_string_fragment_ignores_command_and_nonstring_states() {
+        for state in [
+            VTermParserState::Normal,
+            VTermParserState::CsiLeader,
+            VTermParserState::CsiArgs,
+            VTermParserState::CsiIntermed,
+            VTermParserState::DcsCommand,
+            VTermParserState::OscCommand,
+        ] {
+            let mut parser = VTermParser {
+                state,
+                string_initial: true,
+                ..Default::default()
+            };
+            let mut capture = DispatchCapture::default();
+            parser.string_fragment(
+                &mut capture,
+                b"ignored",
+                true,
+                crate::vterm_defs::VTermTerminator::St,
+            );
+            assert!(capture.strings.is_empty());
+            assert!(parser.string_initial);
+        }
     }
 }
