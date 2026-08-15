@@ -316,6 +316,16 @@ pub enum VTermDamageSize {
     NDamages = 4,
 }
 
+/// Glyph passed from state to screen (`VTermGlyphInfo`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermGlyphInfo {
+    pub schar: crate::types_defs::ScharT,
+    pub width: i32,
+    pub protected_cell: bool,
+    pub dwl: bool,
+    pub dhl: u8,
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -598,6 +608,17 @@ mod tests {
         assert_eq!(VTermDamageSize::Scroll as i32, 3);
         assert_eq!(VTermDamageSize::NDamages as i32, 4);
         assert_eq!(VTermDamageSize::default(), VTermDamageSize::Cell);
+    }
+
+    #[test]
+    fn glyph_info_defaults_match_zeroed_callback_payload() {
+        assert_eq!(VTermGlyphInfo::default(), VTermGlyphInfo {
+            schar: 0,
+            width: 0,
+            protected_cell: false,
+            dwl: false,
+            dhl: 0,
+        });
     }
 
     #[test]
