@@ -62,6 +62,18 @@ pub fn rect_clip(
     }
 }
 
+/// Whether two rectangles have identical edges (`rect_equal`).
+#[must_use]
+pub const fn rect_equal(
+    first: &crate::vterm_defs::VTermRect,
+    second: &crate::vterm_defs::VTermRect,
+) -> bool {
+    first.start_row == second.start_row
+        && first.start_col == second.start_col
+        && first.end_row == second.end_row
+        && first.end_col == second.end_col
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +167,24 @@ mod tests {
             start_col: 3,
             end_col: 3,
         });
+    }
+
+    #[test]
+    fn rect_equal_compares_all_four_edges() {
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 1,
+            end_row: 2,
+            start_col: 3,
+            end_col: 4,
+        };
+        assert!(rect_equal(&rect, &rect));
+        for changed in [
+            crate::vterm_defs::VTermRect { start_row: 0, ..rect },
+            crate::vterm_defs::VTermRect { end_row: 3, ..rect },
+            crate::vterm_defs::VTermRect { start_col: 2, ..rect },
+            crate::vterm_defs::VTermRect { end_col: 5, ..rect },
+        ] {
+            assert!(!rect_equal(&rect, &changed));
+        }
     }
 }
