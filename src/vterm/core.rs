@@ -15,7 +15,6 @@ pub struct VTermBuilder {
 
 /// Core terminal instance (`VTerm`).
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct VTerm {
     rows: i32,
     cols: i32,
@@ -25,7 +24,11 @@ pub struct VTerm {
     outbuffer: Vec<u8>,
     outbuffer_len: usize,
     tmpbuffer_len: usize,
+    outfunc: Option<VTermOutputCallback>,
 }
+
+/// Output callback plus its captured user data (`VTermOutputCallback`).
+pub type VTermOutputCallback = Box<dyn FnMut(&[u8])>;
 
 /// Builds a terminal from explicit options (`vterm_build`).
 #[must_use]
@@ -49,6 +52,7 @@ pub fn vterm_build(builder: &VTermBuilder) -> VTerm {
         outbuffer: Vec::with_capacity(outbuffer_len),
         outbuffer_len,
         tmpbuffer_len,
+        outfunc: None,
     }
 }
 
@@ -114,10 +118,23 @@ pub fn vterm_input_write<C: crate::vterm::parser::VTermParserCallbacks>(
 /// Appends bytes to the internal output buffer
 /// (`vterm_push_output_bytes`, buffered path).
 pub fn vterm_push_output_bytes(term: &mut VTerm, bytes: &[u8]) {
+    if let Some(callback) = term.outfunc.as_mut() {
+        callback(bytes);
+        return;
+    }
     if bytes.len() > term.outbuffer_len - term.outbuffer.len() {
         return;
     }
     term.outbuffer.extend_from_slice(bytes);
+}
+
+/// Installs or removes the output callback
+/// (`vterm_output_set_callback`).
+pub fn vterm_output_set_callback(
+    term: &mut VTerm,
+    callback: Option<VTermOutputCallback>,
+) {
+    term.outfunc = callback;
 }
 
 #[cfg(test)]
@@ -299,5 +316,29 @@ mod tests {
         assert_eq!(term.outbuffer, b"abc");
         vterm_push_output_bytes(&mut term, b"de");
         assert_eq!(term.outbuffer, b"abcde");
+    }
+
+    #[test]
+    fn output_callback_overrides_internal_buffering() {
+        let mut term = vterm_build(&VTermBuilder {
+            outbuffer_len: 1,
+            ..Default::default()
+        });
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let callback_capture = std::rc::Rc::clone(&captured);
+        vterm_output_set_callback(
+            &mut term,
+            Some(Box::new(move |bytes| {
+                callback_capture.borrow_mut().push(bytes.to_vec());
+            })),
+        );
+        vterm_push_output_bytes(&mut term, b"long");
+        vterm_push_output_bytes(&mut term, b"writes");
+        assert_eq!(&*captured.borrow(), &[b"long".to_vec(), b"writes".to_vec()]);
+        assert!(term.outbuffer.is_empty());
+
+        vterm_output_set_callback(&mut term, None);
+        vterm_push_output_bytes(&mut term, b"x");
+        assert_eq!(term.outbuffer, b"x");
     }
 }
