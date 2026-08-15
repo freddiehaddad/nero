@@ -367,6 +367,18 @@ pub struct VTermScreenCellAttrs {
     pub overline: bool,
 }
 
+/// External representation of one terminal screen cell
+/// (`VTermScreenCell`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermScreenCell {
+    pub schar: crate::types_defs::ScharT,
+    pub width: i8,
+    pub attrs: VTermScreenCellAttrs,
+    pub fg: VTermColor,
+    pub bg: VTermColor,
+    pub uri: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +410,18 @@ mod tests {
             ],
             [0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn screen_cell_defaults_match_zeroed_external_cell() {
+        assert_eq!(VTermScreenCell::default(), VTermScreenCell {
+            schar: 0,
+            width: 0,
+            attrs: VTermScreenCellAttrs::default(),
+            fg: VTermColor::default(),
+            bg: VTermColor::default(),
+            uri: 0,
+        });
     }
 
     #[test]
