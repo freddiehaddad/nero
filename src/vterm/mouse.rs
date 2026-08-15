@@ -11,6 +11,21 @@ pub enum VTermMouseProtocol {
     Rxvt = 3,
 }
 
+pub const MOUSE_WANT_CLICK: i32 = 0x01;
+pub const MOUSE_WANT_DRAG: i32 = 0x02;
+pub const MOUSE_WANT_MOVE: i32 = 0x04;
+
+/// Mouse-related fields of `VTermState`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermMouseState {
+    pub col: i32,
+    pub row: i32,
+    pub buttons: i32,
+    pub flags: i32,
+    pub protocol: VTermMouseProtocol,
+    pub ctrl8bit: bool,
+}
+
 fn push_control(output: &mut Vec<u8>, ctrl: u8, ctrl8bit: bool) {
     if ctrl >= 0x80 && !ctrl8bit {
         output.extend_from_slice(&[0x1B, ctrl - 0x40]);
@@ -104,6 +119,21 @@ pub fn output_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_state_defaults_match_vterm_state_initialization() {
+        let state = VTermMouseState::default();
+        assert_eq!(state.col, 0);
+        assert_eq!(state.row, 0);
+        assert_eq!(state.buttons, 0);
+        assert_eq!(state.flags, 0);
+        assert_eq!(state.protocol, VTermMouseProtocol::X10);
+        assert!(!state.ctrl8bit);
+        assert_eq!(
+            [MOUSE_WANT_CLICK, MOUSE_WANT_DRAG, MOUSE_WANT_MOVE],
+            [1, 2, 4]
+        );
+    }
 
     #[test]
     fn x10_mouse_reports_press_release_clamping_and_modifiers() {
