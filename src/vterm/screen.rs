@@ -26,6 +26,13 @@ pub struct ScreenPen {
     pub dhl: u8,
 }
 
+/// Internal representation of one screen cell (`ScreenCell`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScreenCell {
+    pub schar: crate::types_defs::ScharT,
+    pub pen: ScreenPen,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +61,13 @@ mod tests {
         });
         assert_eq!(UNICODE_SPACE, 0x20);
         assert_eq!(UNICODE_LINEFEED, 0x0A);
+    }
+
+    #[test]
+    fn screen_cell_defaults_to_blank_with_zeroed_pen() {
+        assert_eq!(ScreenCell::default(), ScreenCell {
+            schar: 0,
+            pen: ScreenPen::default(),
+        });
     }
 }
