@@ -131,6 +131,22 @@ fn setpenattr_col<C: VTermPenCallbacks>(
     let _ = callbacks.set_pen_attr(attr, &value);
 }
 
+#[allow(dead_code)]
+fn set_pen_col_ansi<C: VTermPenCallbacks>(
+    state: &mut VTermPenState,
+    callbacks: &mut C,
+    attr: crate::vterm_defs::VTermAttr,
+    color: i64,
+) {
+    let target = if attr == crate::vterm_defs::VTermAttr::Background {
+        &mut state.pen.bg
+    } else {
+        &mut state.pen.fg
+    };
+    crate::vterm_defs::vterm_color_indexed(target, color as u8);
+    setpenattr_col(callbacks, attr, *target);
+}
+
 impl Default for VTermPenState {
     fn default() -> Self {
         Self {
@@ -495,6 +511,41 @@ mod tests {
                 (
                     crate::vterm_defs::VTermAttr::Foreground,
                     crate::vterm_defs::VTermValue::Color(color),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_pen_col_ansi_targets_foreground_or_background_and_emits() {
+        let mut state = VTermPenState::default();
+        let mut capture = PenCapture::default();
+        set_pen_col_ansi(
+            &mut state,
+            &mut capture,
+            crate::vterm_defs::VTermAttr::Foreground,
+            5,
+        );
+        set_pen_col_ansi(
+            &mut state,
+            &mut capture,
+            crate::vterm_defs::VTermAttr::Background,
+            260,
+        );
+        assert!(state.pen.fg.is_indexed());
+        assert_eq!(state.pen.fg.index, 5);
+        assert!(state.pen.bg.is_indexed());
+        assert_eq!(state.pen.bg.index, 4);
+        assert_eq!(
+            capture.0,
+            [
+                (
+                    crate::vterm_defs::VTermAttr::Foreground,
+                    crate::vterm_defs::VTermValue::Color(state.pen.fg),
+                ),
+                (
+                    crate::vterm_defs::VTermAttr::Background,
+                    crate::vterm_defs::VTermValue::Color(state.pen.bg),
                 ),
             ]
         );
