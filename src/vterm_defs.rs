@@ -189,6 +189,43 @@ pub const VTERM_ATTR_DIM_MASK: VTermAttrMask = 1 << 13;
 pub const VTERM_ATTR_OVERLINE_MASK: VTermAttrMask = 1 << 14;
 pub const VTERM_ALL_ATTRS_MASK: VTermAttrMask = (1 << 15) - 1;
 
+/// Value kind carried by `VTermValue` (`VTermValueType`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VTermValueType {
+    #[default]
+    None = 0,
+    Bool = 1,
+    Int = 2,
+    String = 3,
+    Color = 4,
+    NValueTypes = 5,
+}
+
+/// Pen attribute identifier (`VTermAttr`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VTermAttr {
+    #[default]
+    None = 0,
+    Bold = 1,
+    Underline = 2,
+    Italic = 3,
+    Blink = 4,
+    Reverse = 5,
+    Conceal = 6,
+    Strike = 7,
+    Font = 8,
+    Foreground = 9,
+    Background = 10,
+    Small = 11,
+    Baseline = 12,
+    Uri = 13,
+    Dim = 14,
+    Overline = 15,
+    NAttrs = 16,
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -369,6 +406,22 @@ mod tests {
             ]
         );
         assert_eq!(VTERM_ALL_ATTRS_MASK, 0x7FFF);
+    }
+
+    #[test]
+    fn attribute_and_value_type_discriminants_match_header() {
+        assert_eq!(VTermValueType::None as i32, 0);
+        assert_eq!(VTermValueType::Bool as i32, 1);
+        assert_eq!(VTermValueType::Int as i32, 2);
+        assert_eq!(VTermValueType::String as i32, 3);
+        assert_eq!(VTermValueType::Color as i32, 4);
+        assert_eq!(VTermValueType::NValueTypes as i32, 5);
+
+        assert_eq!(VTermAttr::None as i32, 0);
+        assert_eq!(VTermAttr::Bold as i32, 1);
+        assert_eq!(VTermAttr::Foreground as i32, 9);
+        assert_eq!(VTermAttr::Overline as i32, 15);
+        assert_eq!(VTermAttr::NAttrs as i32, 16);
     }
 
     #[test]
