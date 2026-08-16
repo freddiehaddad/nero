@@ -1951,6 +1951,15 @@ impl VTermState {
         2
     }
 
+    pub fn escape_keypad_mode(&mut self, byte: u8) -> usize {
+        match byte {
+            b'=' => self.mode.keypad = true,
+            b'>' => self.mode.keypad = false,
+            _ => return 0,
+        }
+        1
+    }
+
     pub fn set_dec_basic_mode(&mut self, number: i32, value: i32) -> bool {
         let enabled = value != 0;
         match number {
@@ -2305,6 +2314,15 @@ mod termprop_state_tests {
             crate::vterm::encoding::VTermEncoding::DecSpecialGraphics
         );
         assert_eq!(state.escape_designate_charset(b"x0"), 0);
+    }
+    #[test]
+    fn escape_keypad_mode_toggles_application_keypad() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(state.escape_keypad_mode(b'='), 1);
+        assert!(state.mode.keypad);
+        assert_eq!(state.escape_keypad_mode(b'>'), 1);
+        assert!(!state.mode.keypad);
+        assert_eq!(state.escape_keypad_mode(b'?'), 0);
     }
     #[test]
     fn set_dec_basic_mode_handles_cursor_wrap_and_paste() {
