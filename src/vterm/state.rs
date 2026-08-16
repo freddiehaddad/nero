@@ -181,6 +181,26 @@ impl VTermState {
             && self.pos.col >= self.scrollregion_left()
             && self.pos.col < self.scrollregion_right()
     }
+
+    /// Moves across configured tab stops (`tab`).
+    pub fn tab(&mut self, mut count: i32, direction: i32) {
+        while count > 0 {
+            if direction > 0 {
+                if self.pos.col >= self.current_row_width() - 1 {
+                    return;
+                }
+                self.pos.col += 1;
+            } else if direction < 0 {
+                if self.pos.col < 1 {
+                    return;
+                }
+                self.pos.col -= 1;
+            }
+            if self.is_col_tabstop(self.pos.col) {
+                count -= 1;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,5 +365,31 @@ mod tests {
             state.pos = pos;
             assert!(!state.is_cursor_in_scrollregion());
         }
+    }
+
+    #[test]
+    fn tab_moves_forward_and_backward_between_stops() {
+            let mut state = VTermState::new(1, 20);
+            for col in [0, 4, 8, 12, 16] {
+                state.set_col_tabstop(col);
+            }
+            state.pos.col = 1;
+            state.tab(2, 1);
+            assert_eq!(state.pos.col, 8);
+            state.tab(1, -1);
+            assert_eq!(state.pos.col, 4);
+        }
+
+    #[test]
+    fn tab_stops_at_row_edges() {
+            let mut state = VTermState::new(1, 10);
+            state.pos.col = 8;
+            state.tab(1, 1);
+            assert_eq!(state.pos.col, 9);
+            state.tab(1, 1);
+            assert_eq!(state.pos.col, 9);
+            state.pos.col = 0;
+            state.tab(1, -1);
+            assert_eq!(state.pos.col, 0);
     }
 }
