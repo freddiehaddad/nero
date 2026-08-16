@@ -749,6 +749,11 @@ impl VTermState {
             _ => 0,
         }
     }
+
+    #[must_use]
+    pub const fn active_screen_index(&self) -> usize {
+        if self.mode.alt_screen { 1 } else { 0 }
+    }
 }
 
 #[cfg(test)]
@@ -805,6 +810,14 @@ mod termprop_state_tests {
             0
         );
         assert!(!state.mode.cursor_visible);
+    }
+
+    #[test]
+    fn active_screen_index_tracks_altscreen_mode() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(state.active_screen_index(), 0);
+        state.mode.alt_screen = true;
+        assert_eq!(state.active_screen_index(), 1);
     }
 }
 
