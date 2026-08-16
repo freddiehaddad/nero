@@ -1156,6 +1156,33 @@ pub fn vterm_screen_reset_damage(screen: &mut VTermScreen) {
     screen.pending_scrollrect.start_row = -1;
 }
 
+pub fn vterm_screen_reset<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    state: &mut crate::vterm::state::VTermState,
+    callbacks: &mut C,
+    hard: bool,
+) {
+    vterm_screen_reset_damage(screen);
+    state.reset(hard);
+    vterm_screen_flush_damage(screen, callbacks);
+}
+
+#[cfg(test)]
+mod screen_reset_tests {
+    use super::*;
+    #[test]
+    fn screen_reset_resets_state_and_damage() {
+        let mut screen = screen_new(2, 2);
+        let mut state = crate::vterm::state::VTermState::new(2, 2);
+        screen.damaged.start_row = 0;
+        state.pos.col = 1;
+        let mut callbacks = ();
+        vterm_screen_reset(&mut screen, &mut state, &mut callbacks, true);
+        assert_eq!(screen.damaged.start_row, -1);
+        assert_eq!(state.pos, Default::default());
+    }
+}
+
 /// Screen-form color conversion wrapper
 /// (`vterm_screen_convert_color_to_rgb`).
 pub fn vterm_screen_convert_color_to_rgb(
