@@ -703,6 +703,35 @@ mod state_reset_callback_tests {
     }
 }
 
+pub fn escape_ris<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    byte: u8,
+) -> usize {
+    if byte != b'c' {
+        return 0;
+    }
+    let old = state.pos;
+    vterm_state_reset(state, callbacks, true);
+    let _ = callbacks.move_cursor(state.pos, old, state.mode.cursor_visible);
+    1
+}
+
+#[cfg(test)]
+mod ris_tests {
+    use super::*;
+    #[test]
+    fn ris_hard_resets_terminal_state() {
+        let mut state = VTermState::new(2, 2);
+        state.initialize_pen_colors();
+        state.pos.col = 1;
+        let mut callbacks = ();
+        assert_eq!(escape_ris(&mut state, &mut callbacks, b'c'), 1);
+        assert_eq!(state.pos, Default::default());
+        assert_eq!(escape_ris(&mut state, &mut callbacks, b'x'), 0);
+    }
+}
+
 /// Emits a boolean terminal property (`settermprop_bool`).
 pub fn settermprop_bool<C: VTermStateCallbacks>(
     callbacks: &mut C,
