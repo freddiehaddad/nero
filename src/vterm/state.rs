@@ -274,6 +274,18 @@ pub fn linefeed<C: VTermStateCallbacks>(state: &mut VTermState, callbacks: &mut 
     }
 }
 
+/// Emits a boolean terminal property (`settermprop_bool`).
+pub fn settermprop_bool<C: VTermStateCallbacks>(
+    callbacks: &mut C,
+    prop: crate::vterm_defs::VTermProp,
+    value: i32,
+) -> i32 {
+    i32::from(callbacks.set_term_prop(
+        prop,
+        &crate::vterm_defs::VTermValue::Boolean(value),
+    ))
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -595,6 +607,34 @@ mod tests {
         linefeed(&mut state, &mut capture);
         assert_eq!(state.pos.row, 3);
         assert_eq!(capture.0, 1);
+    }
+
+    #[test]
+    fn settermprop_bool_forwards_boolean_value() {
+        struct Capture(Option<i32>);
+        impl VTermStateCallbacks for Capture {
+            fn set_term_prop(
+                &mut self,
+                _: crate::vterm_defs::VTermProp,
+                value: &crate::vterm_defs::VTermValue<'_>,
+            ) -> bool {
+                let crate::vterm_defs::VTermValue::Boolean(value) = value else {
+                    return false;
+                };
+                self.0 = Some(*value);
+                true
+            }
+        }
+        let mut capture = Capture(None);
+        assert_eq!(
+            settermprop_bool(
+                &mut capture,
+                crate::vterm_defs::VTermProp::CursorVisible,
+                2,
+            ),
+            1
+        );
+        assert_eq!(capture.0, Some(2));
     }
 
     #[test]
