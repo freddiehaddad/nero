@@ -1051,6 +1051,77 @@ pub fn translate_damage_for_scroll(
     }
 }
 
+pub fn scrollrect<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    rect: crate::vterm_defs::VTermRect,
+    downward: i32,
+    rightward: i32,
+) -> i32 {
+    let mut movement = None;
+    let mut erased = None;
+    crate::vterm::core::vterm_scroll_rect(
+        rect,
+        downward,
+        rightward,
+        Some(&mut |destination, source| movement = Some((destination, source))),
+        &mut |area, _| erased = Some(area),
+    );
+
+    if screen.damage_merge != crate::vterm_defs::VTermDamageSize::Scroll {
+        if let Some((destination, source)) = movement {
+            let _ = moverect_internal(screen, callbacks, destination, source);
+        }
+        if let Some(area) = erased {
+            let _ = erase_internal(screen, area, false);
+        }
+        vterm_screen_flush_damage(screen, callbacks);
+        if let Some((destination, source)) = movement {
+            let _ = moverect_user(screen, callbacks, destination, source);
+        }
+        if let Some(area) = erased {
+            let _ = erase_user(screen, callbacks, area, false);
+        }
+        return 1;
+    }
+
+    if screen.damaged.start_row != -1 && !rect_intersects(&rect, &screen.damaged) {
+        vterm_screen_flush_damage(screen, callbacks);
+    }
+    if queue_pending_scroll(screen, rect, downward, rightward) {
+        vterm_screen_flush_damage(screen, callbacks);
+        screen.pending_scrollrect = rect;
+        screen.pending_scroll_downward = downward;
+        screen.pending_scroll_rightward = rightward;
+    }
+    if let Some((destination, source)) = movement {
+        let _ = moverect_internal(screen, callbacks, destination, source);
+    }
+    if let Some(area) = erased {
+        let _ = erase_internal(screen, area, false);
+    }
+    translate_damage_for_scroll(screen, rect, downward, rightward);
+    1
+}
+
+#[cfg(test)]
+mod scrollrect_tests {
+    use super::*;
+    #[test]
+    fn scrollrect_moves_cells_and_tracks_pending_scroll() {
+        let mut screen = screen_new(2, 1);
+        getcell_mut(&mut screen, 1, 0).unwrap().schar = 42;
+        screen.damage_merge = crate::vterm_defs::VTermDamageSize::Scroll;
+        let mut callbacks = ();
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0, end_row: 2, start_col: 0, end_col: 1,
+        };
+        assert_eq!(scrollrect(&mut screen, &mut callbacks, rect, 1, 0), 1);
+        assert_eq!(getcell(&screen, 0, 0).unwrap().schar, 42);
+        assert_eq!(screen.pending_scroll_downward, 1);
+    }
+}
+
 #[cfg(test)]
 mod damage_scroll_tests {
     use super::*;
