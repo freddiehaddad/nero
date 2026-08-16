@@ -158,6 +158,12 @@ impl VTermState {
         let mask = 1u8 << (col & 7);
         self.tabstops[(col >> 3) as usize] |= mask;
     }
+
+    /// Clears one tab stop bit (`clear_col_tabstop`).
+    pub fn clear_col_tabstop(&mut self, col: i32) {
+        let mask = 1u8 << (col & 7);
+        self.tabstops[(col >> 3) as usize] &= !mask;
+    }
 }
 
 #[cfg(test)]
@@ -281,5 +287,14 @@ mod tests {
         state.set_col_tabstop(0);
         state.set_col_tabstop(9);
         assert_eq!(state.tabstops, [0b0000_0001, 0b0000_0010]);
+    }
+
+    #[test]
+    fn clear_col_tabstop_clears_only_the_matching_bit() {
+        let mut state = VTermState::new(1, 16);
+        state.tabstops = vec![0xFF, 0xFF];
+        state.clear_col_tabstop(0);
+        state.clear_col_tabstop(9);
+        assert_eq!(state.tabstops, [0xFE, 0xFD]);
     }
 }
