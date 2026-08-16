@@ -1262,6 +1262,20 @@ impl VTermState {
         self.scrollregion_left = 0;
         self.scrollregion_right = -1;
     }
+
+    pub fn reset_modes(&mut self) {
+        self.mode.keypad = false;
+        self.mode.cursor = false;
+        self.mode.autowrap = true;
+        self.mode.insert = false;
+        self.mode.newline = false;
+        self.mode.alt_screen = false;
+        self.mode.origin = false;
+        self.mode.leftrightmargin = false;
+        self.mode.bracketpaste = false;
+        self.mode.report_focus = false;
+        self.mouse_flags = 0;
+    }
 }
 
 #[cfg(test)]
@@ -1345,6 +1359,21 @@ mod termprop_state_tests {
             ),
             (0, -1, 0, -1)
         );
+    }
+    #[test]
+    fn reset_modes_restores_terminal_defaults() {
+        let mut state = VTermState::new(1, 1);
+        state.mode = VTermStateMode {
+            keypad: true,
+            report_focus: true,
+            ..Default::default()
+        };
+        state.mouse_flags = 7;
+        state.reset_modes();
+        assert!(state.mode.autowrap);
+        assert!(!state.mode.keypad);
+        assert!(!state.mode.report_focus);
+        assert_eq!(state.mouse_flags, 0);
     }
 }
 
