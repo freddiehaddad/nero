@@ -498,6 +498,74 @@ pub fn parse_selection_mask(temp: &mut VTermSelectionTemp, bytes: &[u8]) -> usiz
     consumed
 }
 
+/// Decodes one OSC 52 base64 fragment while preserving partial sextets.
+pub fn decode_selection_base64(
+    temp: &mut VTermSelectionTemp,
+    bytes: &[u8],
+    capacity: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let mut output = Vec::with_capacity(capacity);
+    let mut value = temp.recv_partial & 0x03_FFFF;
+    let mut sextets = (temp.recv_partial >> 24) as usize;
+    temp.recv_partial = 0;
+    let mut consumed = 0;
+    while capacity.saturating_sub(output.len()) >= 3 && consumed < bytes.len() {
+        if bytes[consumed] == b'=' {
+            if sextets == 2 {
+                output.push((value >> 4) as u8);
+            } else if sextets == 3 {
+                output.push((value >> 10) as u8);
+                output.push((value >> 2) as u8);
+            }
+            while consumed < bytes.len() && bytes[consumed] == b'=' {
+                consumed += 1;
+            }
+            sextets = 0;
+            value = 0;
+        } else {
+            let decoded = unbase64one(bytes[consumed]);
+            if decoded == 0xFF {
+                temp.state = VTermSelectionState::Invalid;
+                return None;
+            }
+            value = (value << 6) | u32::from(decoded);
+            sextets += 1;
+            consumed += 1;
+            if sextets == 4 {
+                output.extend_from_slice(&[
+                    (value >> 16) as u8,
+                    (value >> 8) as u8,
+                    value as u8,
+                ]);
+                value = 0;
+                sextets = 0;
+            }
+        }
+    }
+    if sextets != 0 {
+        temp.recv_partial = ((sextets as u32) << 24) | value;
+    }
+    Some((output, consumed))
+}
+
+#[cfg(test)]
+mod selection_decode_tests {
+    use super::*;
+    #[test]
+    fn selection_base64_decodes_and_preserves_partial_input() {
+        let mut temp = VTermSelectionTemp::default();
+        let (first, used) = decode_selection_base64(&mut temp, b"SG", 3).unwrap();
+        assert!(first.is_empty());
+        assert_eq!(used, 2);
+        let (second, used) = decode_selection_base64(&mut temp, b"k=", 3).unwrap();
+        assert_eq!(second, b"Hi");
+        assert_eq!(used, 2);
+        assert_eq!(temp.recv_partial, 0);
+        assert!(decode_selection_base64(&mut temp, b"?", 3).is_none());
+        assert_eq!(temp.state, VTermSelectionState::Invalid);
+    }
+}
+
 #[cfg(test)]
 mod selection_mask_tests {
     use super::*;
