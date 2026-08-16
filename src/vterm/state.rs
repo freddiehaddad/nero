@@ -106,6 +106,8 @@ pub struct VTermState {
     pub selection_buffer: Option<Vec<u8>>,
     pub selection_buflen: usize,
     pub mouse_flags: i32,
+    pub mouse_col: i32,
+    pub mouse_row: i32,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -525,6 +527,8 @@ impl VTermState {
             selection_buffer: None,
             selection_buflen: 0,
             mouse_flags: 0,
+            mouse_col: 0,
+            mouse_row: 0,
         }
     }
 
@@ -1085,6 +1089,7 @@ mod tests {
         assert_eq!(state.saved, VTermSavedState::default());
         assert!(state.selection_buffer.is_none());
         assert_eq!(state.selection_buflen, 0);
+        assert_eq!((state.mouse_row, state.mouse_col), (0, 0));
     }
 
     #[test]
