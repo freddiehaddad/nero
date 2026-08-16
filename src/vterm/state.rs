@@ -134,6 +134,61 @@ pub fn on_sos<F: VTermStateFallbacks>(
     i32::from(fallbacks.sos(fragment))
 }
 
+pub fn on_osc<C: VTermStateCallbacks, F: VTermStateFallbacks>(
+    callbacks: &mut C,
+    fallbacks: &mut F,
+    command: i32,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> i32 {
+    match command {
+        0 => {
+            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::IconName, fragment);
+            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::Title, fragment);
+        }
+        1 => {
+            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::IconName, fragment);
+        }
+        2 => {
+            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::Title, fragment);
+        }
+        _ => {}
+    }
+    on_osc_fallback(fallbacks, command, fragment)
+}
+
+#[cfg(test)]
+mod osc_title_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture(Vec<crate::vterm_defs::VTermProp>);
+    impl VTermStateCallbacks for Capture {
+        fn set_term_prop(
+            &mut self,
+            prop: crate::vterm_defs::VTermProp,
+            _: &crate::vterm_defs::VTermValue<'_>,
+        ) -> bool {
+            self.0.push(prop);
+            true
+        }
+    }
+    #[test]
+    fn osc_zero_sets_icon_and_title() {
+        let mut capture = Capture::default();
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"x", initial: true, final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::Bel,
+        };
+        assert_eq!(on_osc(&mut capture, &mut (), 0, fragment), 0);
+        assert_eq!(
+            capture.0,
+            [
+                crate::vterm_defs::VTermProp::IconName,
+                crate::vterm_defs::VTermProp::Title,
+            ]
+        );
+    }
+}
+
 pub fn on_dcs_fallback<F: VTermStateFallbacks>(
     fallbacks: &mut F,
     command: &[u8],
