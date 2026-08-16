@@ -115,6 +115,14 @@ pub trait VTermStateCallbacks {
         false
     }
 
+    fn move_rect(
+        &mut self,
+        _destination: crate::vterm_defs::VTermRect,
+        _source: crate::vterm_defs::VTermRect,
+    ) -> bool {
+        false
+    }
+
     fn erase(&mut self, _rect: crate::vterm_defs::VTermRect, _selective: bool) -> bool {
         false
     }
@@ -354,6 +362,7 @@ mod tests {
         assert!(!callbacks.put_glyph(&Default::default(), Default::default()));
         assert!(!callbacks.move_cursor(Default::default(), Default::default(), true));
         assert!(!callbacks.scroll_rect(Default::default(), 1, 0));
+        assert!(!callbacks.move_rect(Default::default(), Default::default()));
         assert!(!callbacks.erase(Default::default(), false));
         assert!(!callbacks.init_pen());
         assert!(!callbacks.set_line_info(0, &Default::default(), &Default::default()));
