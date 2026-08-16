@@ -152,6 +152,12 @@ impl VTermState {
     pub fn current_row_width(&self) -> i32 {
         self.row_width(self.pos.row)
     }
+
+    /// Sets one tab stop bit (`set_col_tabstop`).
+    pub fn set_col_tabstop(&mut self, col: i32) {
+        let mask = 1u8 << (col & 7);
+        self.tabstops[(col >> 3) as usize] |= mask;
+    }
 }
 
 #[cfg(test)]
@@ -267,5 +273,13 @@ mod tests {
         assert_eq!(state.current_row_width(), 40);
         state.pos.row = 1;
         assert_eq!(state.current_row_width(), 80);
+    }
+
+    #[test]
+    fn set_col_tabstop_sets_the_matching_bit() {
+        let mut state = VTermState::new(1, 16);
+        state.set_col_tabstop(0);
+        state.set_col_tabstop(9);
+        assert_eq!(state.tabstops, [0b0000_0001, 0b0000_0010]);
     }
 }
