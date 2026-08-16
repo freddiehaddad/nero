@@ -514,6 +514,55 @@ mod putglyph_tests {
     }
 }
 
+/// Copies a row to the scrollback callback (`sb_pushline_from_row`).
+pub fn sb_pushline_from_row<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    row: i32,
+) {
+    let mut cells = vec![
+        crate::vterm_defs::VTermScreenCell::default();
+        usize::try_from(screen.cols).unwrap_or(0)
+    ];
+    for col in 0..screen.cols {
+        let _ = vterm_screen_get_cell(
+            screen,
+            crate::vterm_defs::VTermPos { row, col },
+            &mut cells[col as usize],
+        );
+    }
+    screen.sb_buffer.clone_from(&cells);
+    let _ = callbacks.scrollback_push(&screen.sb_buffer);
+}
+
+#[cfg(test)]
+mod scrollback_push_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture(Vec<Vec<crate::vterm_defs::VTermScreenCell>>);
+
+    impl VTermScreenCallbacks for Capture {
+        fn scrollback_push(&mut self, cells: &[crate::vterm_defs::VTermScreenCell]) -> bool {
+            self.0.push(cells.to_vec());
+            true
+        }
+    }
+
+    #[test]
+    fn scrollback_push_copies_public_row_cells() {
+        let mut screen = screen_new(2, 2);
+        getcell_mut(&mut screen, 1, 0).unwrap().schar = 10;
+        getcell_mut(&mut screen, 1, 1).unwrap().schar = 20;
+        let mut capture = Capture::default();
+        sb_pushline_from_row(&mut screen, &mut capture, 1);
+        assert_eq!(capture.0.len(), 1);
+        assert_eq!(capture.0[0][0].schar, 10);
+        assert_eq!(capture.0[0][1].schar, 20);
+        assert_eq!(screen.sb_buffer, capture.0[0]);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
