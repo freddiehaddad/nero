@@ -1855,6 +1855,13 @@ impl VTermState {
         true
     }
 
+    pub fn set_leftrightmargin_mode(&mut self, value: i32) {
+        self.mode.leftrightmargin = value != 0;
+        if self.mode.leftrightmargin {
+            self.lineinfos[self.active_lineinfo].fill(Default::default());
+        }
+    }
+
     pub fn initialize_pen_colors(&mut self) {
         let mut pen_state = crate::vterm::pen::VTermPenState::default();
         crate::vterm::pen::vterm_state_newpen(&mut pen_state);
@@ -2107,6 +2114,14 @@ mod termprop_state_tests {
         assert!(state.set_dec_basic_mode(2004, 1));
         assert!(state.mode.cursor && state.mode.autowrap && state.mode.bracketpaste);
         assert!(!state.set_dec_basic_mode(2, 1));
+    }
+    #[test]
+    fn leftrightmargin_mode_clears_doublewidth_rows_on_enable() {
+        let mut state = VTermState::new(2, 10);
+        state.lineinfos[0][0].doublewidth = true;
+        state.set_leftrightmargin_mode(1);
+        assert!(state.mode.leftrightmargin);
+        assert_eq!(state.lineinfos[0][0], Default::default());
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
