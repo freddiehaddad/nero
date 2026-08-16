@@ -146,6 +146,12 @@ impl VTermState {
             self.cols
         }
     }
+
+    /// Width of the cursor's current row (`THISROWWIDTH`).
+    #[must_use]
+    pub fn current_row_width(&self) -> i32 {
+        self.row_width(self.pos.row)
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +257,15 @@ mod tests {
         assert_eq!(state.row_width(3), 81);
         state.lineinfos[0][3].doublewidth = true;
         assert_eq!(state.row_width(3), 40);
+    }
+
+    #[test]
+    fn current_row_width_uses_cursor_row() {
+        let mut state = VTermState::new(3, 80);
+        state.lineinfos[0][2].doublewidth = true;
+        state.pos.row = 2;
+        assert_eq!(state.current_row_width(), 40);
+        state.pos.row = 1;
+        assert_eq!(state.current_row_width(), 80);
     }
 }
