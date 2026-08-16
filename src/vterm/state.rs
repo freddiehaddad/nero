@@ -116,6 +116,7 @@ pub struct VTermState {
     pub grapheme_state: crate::mbyte_defs::GraphemeState,
     pub combine_width: i32,
     pub combine_pos: crate::vterm_defs::VTermPos,
+    pub encodings: [crate::vterm::encoding::VTermEncoding; 4],
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -545,6 +546,7 @@ impl VTermState {
             grapheme_state: crate::mbyte_defs::GRAPHEME_STATE_INIT,
             combine_width: 0,
             combine_pos: crate::vterm_defs::VTermPos { row: -1, col: 0 },
+            encodings: [crate::vterm::encoding::VTermEncoding::UsAscii; 4],
         }
     }
 
@@ -753,6 +755,10 @@ mod termprop_state_tests {
         );
         assert_eq!(state.combine_width, 0);
         assert_eq!(state.combine_pos.row, -1);
+        assert_eq!(
+            state.encodings,
+            [crate::vterm::encoding::VTermEncoding::UsAscii; 4]
+        );
         assert_eq!(state.grapheme_buf, [0; crate::types_defs::MAX_SCHAR_SIZE]);
         assert_eq!(state.grapheme_len, 0);
         assert_eq!(state.grapheme_last, 0);
