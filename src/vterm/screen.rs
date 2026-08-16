@@ -873,6 +873,40 @@ mod erase_tests {
     }
 }
 
+/// Forwards cursor movement to the screen callback (`movecursor`).
+pub fn movecursor<C: VTermScreenCallbacks>(
+    callbacks: &mut C,
+    position: crate::vterm_defs::VTermPos,
+    old_position: crate::vterm_defs::VTermPos,
+    visible: bool,
+) -> i32 {
+    i32::from(callbacks.move_cursor(position, old_position, visible))
+}
+
+#[cfg(test)]
+mod movecursor_tests {
+    use super::*;
+    struct Capture(bool);
+    impl VTermScreenCallbacks for Capture {
+        fn move_cursor(
+            &mut self,
+            _: crate::vterm_defs::VTermPos,
+            _: crate::vterm_defs::VTermPos,
+            visible: bool,
+        ) -> bool {
+            self.0 = visible;
+            true
+        }
+    }
+    #[test]
+    fn movecursor_returns_callback_result() {
+        assert_eq!(movecursor(&mut (), Default::default(), Default::default(), true), 0);
+        let mut capture = Capture(false);
+        assert_eq!(movecursor(&mut capture, Default::default(), Default::default(), true), 1);
+        assert!(capture.0);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
