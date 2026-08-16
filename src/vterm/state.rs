@@ -732,6 +732,50 @@ mod ris_tests {
     }
 }
 
+pub fn on_escape<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    bytes: &[u8],
+) -> usize {
+    let handled = state.escape_control_width(bytes);
+    if handled != 0 { return handled; }
+    let handled = state.escape_line_attribute(bytes);
+    if handled != 0 { return handled; }
+    if bytes == b"#8" {
+        decaln(state, callbacks);
+        return 2;
+    }
+    let handled = state.escape_designate_charset(bytes);
+    if handled != 0 { return handled; }
+    if bytes.len() != 1 { return 0; }
+    let byte = bytes[0];
+    for handled in [
+        state.escape_saved_cursor(byte),
+        state.escape_keypad_mode(byte),
+        state.escape_locking_shift(byte),
+    ] {
+        if handled != 0 { return handled; }
+    }
+    if byte == b'<' { return 1; }
+    escape_ris(state, callbacks, byte)
+}
+
+#[cfg(test)]
+mod escape_dispatch_tests {
+    use super::*;
+    #[test]
+    fn escape_dispatch_routes_known_sequences() {
+        let mut state = VTermState::new(1, 2);
+        state.initialize_pen_colors();
+        let mut callbacks = ();
+        assert_eq!(on_escape(&mut state, &mut callbacks, b" G"), 2);
+        assert!(state.ctrl8bit);
+        assert_eq!(on_escape(&mut state, &mut callbacks, b"="), 1);
+        assert!(state.mode.keypad);
+        assert_eq!(on_escape(&mut state, &mut callbacks, b"?"), 0);
+    }
+}
+
 /// Emits a boolean terminal property (`settermprop_bool`).
 pub fn settermprop_bool<C: VTermStateCallbacks>(
     callbacks: &mut C,
