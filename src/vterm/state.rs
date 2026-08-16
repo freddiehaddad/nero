@@ -1283,6 +1283,10 @@ impl VTermState {
             self.set_col_tabstop(col);
         }
     }
+
+    pub fn reset_lineinfos(&mut self) {
+        self.lineinfos[self.active_lineinfo].fill(Default::default());
+    }
 }
 
 #[cfg(test)]
@@ -1391,6 +1395,15 @@ mod termprop_state_tests {
         assert!(state.is_col_tabstop(8));
         assert!(state.is_col_tabstop(16));
         assert!(!state.is_col_tabstop(7));
+    }
+    #[test]
+    fn reset_lineinfos_clears_active_rows_only() {
+        let mut state = VTermState::new(2, 2);
+        state.lineinfos[0][0].doublewidth = true;
+        state.lineinfos[1][0].doublewidth = true;
+        state.reset_lineinfos();
+        assert!(!state.lineinfos[0][0].doublewidth);
+        assert!(state.lineinfos[1][0].doublewidth);
     }
 }
 
