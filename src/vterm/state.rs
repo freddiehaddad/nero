@@ -196,6 +196,61 @@ pub fn erase<C: VTermStateCallbacks>(
     let _ = callbacks.erase(rect, selective);
 }
 
+/// Scrolls a state rectangle and its line metadata (`scroll`).
+pub fn scroll<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    rect: crate::vterm_defs::VTermRect,
+    mut downward: i32,
+    mut rightward: i32,
+) {
+    if downward == 0 && rightward == 0 {
+        return;
+    }
+    let rows = rect.end_row - rect.start_row;
+    downward = downward.clamp(-rows, rows);
+    let cols = rect.end_col - rect.start_col;
+    rightward = rightward.clamp(-cols, cols);
+
+    if rect.start_col == 0 && rect.end_col == state.cols && rightward == 0 {
+        let lineinfo = &mut state.lineinfos[state.active_lineinfo];
+        if downward > 0 {
+            lineinfo.copy_within(
+                (rect.start_row + downward) as usize..rect.end_row as usize,
+                rect.start_row as usize,
+            );
+            lineinfo[(rect.end_row - downward) as usize..rect.end_row as usize]
+                .fill(Default::default());
+        } else if downward < 0 {
+            lineinfo.copy_within(
+                rect.start_row as usize..(rect.end_row + downward) as usize,
+                (rect.start_row - downward) as usize,
+            );
+            lineinfo[rect.start_row as usize..(rect.start_row - downward) as usize]
+                .fill(Default::default());
+        }
+    }
+
+    if callbacks.scroll_rect(rect, downward, rightward) {
+        return;
+    }
+    let mut movement = None;
+    let mut erasure = None;
+    crate::vterm::core::vterm_scroll_rect(
+        rect,
+        downward,
+        rightward,
+        Some(&mut |destination, source| movement = Some((destination, source))),
+        &mut |area, _| erasure = Some(area),
+    );
+    if let Some((destination, source)) = movement {
+        let _ = callbacks.move_rect(destination, source);
+    }
+    if let Some(area) = erasure {
+        let _ = callbacks.erase(area, false);
+    }
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -452,6 +507,43 @@ mod tests {
         assert!(state.lineinfos[0][1].continuation);
         assert!(!state.lineinfos[0][2].continuation);
         assert!(!state.lineinfos[0][3].continuation);
+    }
+
+    #[test]
+    fn state_scroll_clamps_offsets_moves_lineinfo_and_falls_back() {
+        #[derive(Default)]
+        struct Capture {
+            moved: usize,
+            erased: usize,
+        }
+        impl VTermStateCallbacks for Capture {
+            fn move_rect(&mut self, _: crate::vterm_defs::VTermRect, _: crate::vterm_defs::VTermRect) -> bool {
+                self.moved += 1;
+                true
+            }
+            fn erase(&mut self, _: crate::vterm_defs::VTermRect, _: bool) -> bool {
+                self.erased += 1;
+                true
+            }
+        }
+        let mut state = VTermState::new(4, 10);
+        state.lineinfos[0][1].continuation = true;
+        let mut capture = Capture::default();
+        scroll(
+            &mut state,
+            &mut capture,
+            crate::vterm_defs::VTermRect {
+                start_row: 0,
+                end_row: 4,
+                start_col: 0,
+                end_col: 10,
+            },
+            1,
+            0,
+        );
+        assert!(state.lineinfos[0][0].continuation);
+        assert_eq!(state.lineinfos[0][3], Default::default());
+        assert_eq!((capture.moved, capture.erased), (1, 1));
     }
 
     #[test]
