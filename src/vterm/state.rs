@@ -418,6 +418,34 @@ pub fn request_key_encoding_flags(state: &VTermState, ctrl8bit: bool) -> Vec<u8>
     [prefix, format!("?{bits}u").as_bytes()].concat()
 }
 
+/// Replaces active kitty keyboard flags (`set_key_encoding_flags`).
+pub fn set_key_encoding_flags(state: &mut VTermState, arg: i32, mode: i32) {
+    let set = mode != 3;
+    let mut flags = crate::vterm_defs::VTermKeyEncodingFlags::default();
+    let apply = |mask: u8| -> bool { arg & i32::from(mask) != 0 && set };
+    flags.disambiguate = apply(crate::vterm_defs::KEY_ENCODING_DISAMBIGUATE);
+    flags.report_events = apply(crate::vterm_defs::KEY_ENCODING_REPORT_EVENTS);
+    flags.report_alternate = apply(crate::vterm_defs::KEY_ENCODING_REPORT_ALTERNATE);
+    flags.report_all_keys = apply(crate::vterm_defs::KEY_ENCODING_REPORT_ALL_KEYS);
+    flags.report_associated = apply(crate::vterm_defs::KEY_ENCODING_REPORT_ASSOCIATED);
+    let index = state.active_screen_index();
+    let top = usize::from(state.key_encoding_stacks[index].size) - 1;
+    state.key_encoding_stacks[index].items[top] = flags;
+}
+
+#[cfg(test)]
+mod set_key_flags_tests {
+    use super::*;
+    #[test]
+    fn set_key_flags_sets_or_resets_requested_bits() {
+        let mut state = VTermState::new(1, 1);
+        set_key_encoding_flags(&mut state, 3, 1);
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 3);
+        set_key_encoding_flags(&mut state, 1, 3);
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 0);
+    }
+}
+
 #[cfg(test)]
 mod key_flag_request_tests {
     use super::*;
