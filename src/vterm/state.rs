@@ -2145,6 +2145,25 @@ impl VTermState {
         self.colors = pen_state.palette.colors;
     }
 
+    pub fn set_default_colors(
+        &mut self,
+        foreground: Option<&crate::vterm_defs::VTermColor>,
+        background: Option<&crate::vterm_defs::VTermColor>,
+    ) {
+        let mut pen_state = crate::vterm::pen::VTermPenState {
+            default_fg: self.default_fg,
+            default_bg: self.default_bg,
+            ..Default::default()
+        };
+        crate::vterm::pen::vterm_state_set_default_colors(
+            &mut pen_state,
+            foreground,
+            background,
+        );
+        self.default_fg = pen_state.default_fg;
+        self.default_bg = pen_state.default_bg;
+    }
+
     pub fn reset_pen<C: VTermStateCallbacks>(&mut self, callbacks: &mut C) {
         let mut pen_state = crate::vterm::pen::VTermPenState {
             pen: self.pen,
@@ -2492,6 +2511,16 @@ mod termprop_state_tests {
         assert!(state.default_fg.is_default_fg());
         assert!(state.default_bg.is_default_bg());
         assert_eq!((state.colors[1].red, state.colors[1].green), (224, 0));
+    }
+    #[test]
+    fn state_default_color_wrapper_sets_metadata() {
+        let mut state = VTermState::new(1, 1);
+        let color = crate::vterm_defs::VTermColor {
+            red: 1, green: 2, blue: 3, ..Default::default()
+        };
+        state.set_default_colors(Some(&color), None);
+        assert!(state.default_fg.is_default_fg());
+        assert_eq!(state.default_fg.red, 1);
     }
     #[test]
     fn reset_pen_restores_state_default_colors() {
