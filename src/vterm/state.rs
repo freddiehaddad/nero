@@ -495,6 +495,30 @@ pub fn request_cursor_style(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     [start, format!("1$r{reply} q").as_bytes(), end].concat()
 }
 
+#[must_use]
+pub fn request_protected_cell(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    let start: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_DCS] } else { b"\x1bP" };
+    let end: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_ST] } else { b"\x1b\\" };
+    [
+        start,
+        format!("1$r{}\"q", if state.protected_cell { 1 } else { 2 }).as_bytes(),
+        end,
+    ]
+    .concat()
+}
+
+#[cfg(test)]
+mod protected_cell_request_tests {
+    use super::*;
+    #[test]
+    fn protected_cell_response_maps_boolean() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(request_protected_cell(&state, false), b"\x1bP1$r2\"q\x1b\\");
+        state.protected_cell = true;
+        assert_eq!(request_protected_cell(&state, false), b"\x1bP1$r1\"q\x1b\\");
+    }
+}
+
 #[cfg(test)]
 mod cursor_style_request_tests {
     use super::*;
