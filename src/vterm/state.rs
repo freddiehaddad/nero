@@ -108,6 +108,7 @@ pub struct VTermState {
     pub mouse_flags: i32,
     pub mouse_col: i32,
     pub mouse_row: i32,
+    pub mouse_buttons: i32,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -529,6 +530,7 @@ impl VTermState {
             mouse_flags: 0,
             mouse_col: 0,
             mouse_row: 0,
+            mouse_buttons: 0,
         }
     }
 
@@ -1090,6 +1092,7 @@ mod tests {
         assert!(state.selection_buffer.is_none());
         assert_eq!(state.selection_buflen, 0);
         assert_eq!((state.mouse_row, state.mouse_col), (0, 0));
+        assert_eq!(state.mouse_buttons, 0);
     }
 
     #[test]
