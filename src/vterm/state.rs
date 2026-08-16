@@ -1873,6 +1873,15 @@ impl VTermState {
         true
     }
 
+    pub fn escape_control_width(&mut self, bytes: &[u8]) -> usize {
+        match bytes {
+            [b' ', b'F'] => self.ctrl8bit = false,
+            [b' ', b'G'] => self.ctrl8bit = true,
+            _ => return 0,
+        }
+        2
+    }
+
     pub fn set_dec_basic_mode(&mut self, number: i32, value: i32) -> bool {
         let enabled = value != 0;
         match number {
@@ -2199,6 +2208,15 @@ mod termprop_state_tests {
         assert!(state.set_mode(20, 1));
         assert!(state.mode.newline);
         assert!(!state.set_mode(99, 1));
+    }
+    #[test]
+    fn escape_control_width_handles_seven_and_eight_bit_modes() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(state.escape_control_width(b" G"), 2);
+        assert!(state.ctrl8bit);
+        assert_eq!(state.escape_control_width(b" F"), 2);
+        assert!(!state.ctrl8bit);
+        assert_eq!(state.escape_control_width(b" X"), 0);
     }
     #[test]
     fn set_dec_basic_mode_handles_cursor_wrap_and_paste() {
