@@ -105,6 +105,7 @@ pub struct VTermState {
     pub saved: VTermSavedState,
     pub selection_buffer: Option<Vec<u8>>,
     pub selection_buflen: usize,
+    pub mouse_flags: i32,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -523,6 +524,7 @@ impl VTermState {
             saved: VTermSavedState::default(),
             selection_buffer: None,
             selection_buflen: 0,
+            mouse_flags: 0,
         }
     }
 
@@ -662,6 +664,95 @@ impl VTermState {
             buffer
         };
         self.selection_buflen = buflen;
+    }
+
+    /// Stores one accepted terminal property
+    /// (`vterm_state_set_termprop`).
+    pub fn set_termprop(
+        &mut self,
+        prop: crate::vterm_defs::VTermProp,
+        value: &crate::vterm_defs::VTermValue<'_>,
+        accepted: bool,
+    ) -> i32 {
+        if !accepted {
+            return 0;
+        }
+        match (prop, value) {
+            (crate::vterm_defs::VTermProp::Title | crate::vterm_defs::VTermProp::IconName, _) => 1,
+            (crate::vterm_defs::VTermProp::CursorVisible, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.cursor_visible = *v != 0; 1
+            }
+            (crate::vterm_defs::VTermProp::CursorBlink, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.cursor_blink = *v != 0; 1
+            }
+            (crate::vterm_defs::VTermProp::CursorShape, crate::vterm_defs::VTermValue::Number(v)) => {
+                self.mode.cursor_shape = *v as u8 & 3; 1
+            }
+            (crate::vterm_defs::VTermProp::Reverse, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.screen = *v != 0; 1
+            }
+            (crate::vterm_defs::VTermProp::AltScreen, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.alt_screen = *v != 0;
+                self.active_lineinfo = usize::from(self.mode.alt_screen);
+                1
+            }
+            (crate::vterm_defs::VTermProp::Mouse, crate::vterm_defs::VTermValue::Number(v)) => {
+                self.mouse_flags = 0;
+                if *v != 0 { self.mouse_flags |= crate::vterm::mouse::MOUSE_WANT_CLICK; }
+                if *v == crate::vterm_defs::VTERM_PROP_MOUSE_DRAG { self.mouse_flags |= crate::vterm::mouse::MOUSE_WANT_DRAG; }
+                if *v == crate::vterm_defs::VTERM_PROP_MOUSE_MOVE { self.mouse_flags |= crate::vterm::mouse::MOUSE_WANT_MOVE; }
+                1
+            }
+            (crate::vterm_defs::VTermProp::FocusReport, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.report_focus = *v != 0; 1
+            }
+            (crate::vterm_defs::VTermProp::ThemeUpdates, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.theme_updates = *v != 0; 1
+            }
+            (crate::vterm_defs::VTermProp::SyncOutput, crate::vterm_defs::VTermValue::Boolean(v)) => {
+                self.mode.synchronized_output = *v != 0; 1
+            }
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod termprop_state_tests {
+    use super::*;
+    #[test]
+    fn termprop_updates_modes_mouse_and_active_lineinfo() {
+        let mut state = VTermState::new(2, 80);
+        assert_eq!(
+            state.set_termprop(
+                crate::vterm_defs::VTermProp::AltScreen,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+                true,
+            ),
+            1
+        );
+        assert!(state.mode.alt_screen);
+        assert_eq!(state.active_lineinfo, 1);
+        state.set_termprop(
+            crate::vterm_defs::VTermProp::Mouse,
+            &crate::vterm_defs::VTermValue::Number(
+                crate::vterm_defs::VTERM_PROP_MOUSE_MOVE,
+            ),
+            true,
+        );
+        assert_eq!(
+            state.mouse_flags,
+            crate::vterm::mouse::MOUSE_WANT_CLICK | crate::vterm::mouse::MOUSE_WANT_MOVE
+        );
+        assert_eq!(
+            state.set_termprop(
+                crate::vterm_defs::VTermProp::CursorVisible,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+                false,
+            ),
+            0
+        );
+        assert!(!state.mode.cursor_visible);
     }
 }
 
