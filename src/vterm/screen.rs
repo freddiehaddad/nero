@@ -1024,6 +1024,51 @@ pub fn queue_pending_scroll(
     }
 }
 
+pub fn translate_damage_for_scroll(
+    screen: &mut VTermScreen,
+    rect: crate::vterm_defs::VTermRect,
+    downward: i32,
+    rightward: i32,
+) {
+    if screen.damaged.start_row == -1 {
+        return;
+    }
+    if rect_contains(&rect, &screen.damaged) {
+        crate::vterm_defs::vterm_rect_move(&mut screen.damaged, -downward, -rightward);
+        rect_clip(&mut screen.damaged, &rect);
+    } else if rect.start_col <= screen.damaged.start_col
+        && rect.end_col >= screen.damaged.end_col
+        && rightward == 0
+    {
+        if (rect.start_row..rect.end_row).contains(&screen.damaged.start_row) {
+            screen.damaged.start_row =
+                (screen.damaged.start_row - downward).clamp(rect.start_row, rect.end_row);
+        }
+        if (rect.start_row..rect.end_row).contains(&screen.damaged.end_row) {
+            screen.damaged.end_row =
+                (screen.damaged.end_row - downward).clamp(rect.start_row, rect.end_row);
+        }
+    }
+}
+
+#[cfg(test)]
+mod damage_scroll_tests {
+    use super::*;
+    #[test]
+    fn scroll_translation_moves_contained_damage() {
+        let mut screen = screen_new(5, 5);
+        screen.damaged = crate::vterm_defs::VTermRect {
+            start_row: 2, end_row: 3, start_col: 1, end_col: 2,
+        };
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0, end_row: 5, start_col: 0, end_col: 5,
+        };
+        translate_damage_for_scroll(&mut screen, rect, 1, 0);
+        assert_eq!(screen.damaged.start_row, 1);
+        assert_eq!(screen.damaged.end_row, 2);
+    }
+}
+
 #[cfg(test)]
 mod pending_scroll_tests {
     use super::*;
