@@ -1347,6 +1347,13 @@ impl VTermState {
         self.pos.row = self.pos.row.clamp(0, rows - 1);
         self.pos.col = self.pos.col.clamp(0, cols - 1);
     }
+
+    pub fn adjust_resize_phantom(&mut self, cols: i32) {
+        if self.at_phantom && self.pos.col < cols - 1 {
+            self.at_phantom = false;
+            self.pos.col += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1393,6 +1400,24 @@ mod resize_tabstop_tests {
                 state.clamp_resize_bounds(10, 40);
                 assert_eq!((state.scrollregion_bottom, state.scrollregion_right), (10, 40));
                 assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 9, col: 0 });
+            }
+
+            #[cfg(test)]
+            mod resize_phantom_tests {
+                use super::*;
+                #[test]
+                fn resize_phantom_advances_when_new_width_has_room() {
+                    let mut state = VTermState::new(1, 10);
+                    state.pos.col = 8;
+                    state.at_phantom = true;
+                    state.adjust_resize_phantom(12);
+                    assert_eq!(state.pos.col, 9);
+                    assert!(!state.at_phantom);
+                    state.at_phantom = true;
+                    state.pos.col = 11;
+                    state.adjust_resize_phantom(12);
+                    assert!(state.at_phantom);
+                }
             }
         }
     }
