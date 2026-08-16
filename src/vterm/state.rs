@@ -120,6 +120,7 @@ pub struct VTermState {
     pub gl_set: i32,
     pub gr_set: i32,
     pub gsingle_set: i32,
+    pub protected_cell: bool,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -553,6 +554,7 @@ impl VTermState {
             gl_set: 0,
             gr_set: 1,
             gsingle_set: 0,
+            protected_cell: false,
         }
     }
 
@@ -760,6 +762,7 @@ mod termprop_state_tests {
             1
         );
         assert_eq!((state.gl_set, state.gr_set, state.gsingle_set), (0, 1, 0));
+        assert!(!state.protected_cell);
         assert_eq!(state.combine_width, 0);
         assert_eq!(state.combine_pos.row, -1);
         assert_eq!(
