@@ -106,6 +106,16 @@ impl VTermState {
             mode: VTermStateMode::default(),
         }
     }
+
+    /// Effective bottom edge (`SCROLLREGION_BOTTOM`).
+    #[must_use]
+    pub const fn scrollregion_bottom(&self) -> i32 {
+        if self.scrollregion_bottom > -1 {
+            self.scrollregion_bottom
+        } else {
+            self.rows
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +184,14 @@ mod tests {
         assert_eq!(state.lineinfos[1].len(), 24);
         assert_eq!(state.active_lineinfo, 0);
         assert_eq!(state.pos, crate::vterm_defs::VTermPos::default());
+    }
+
+    #[test]
+    fn scrollregion_bottom_uses_explicit_or_unbounded_edge() {
+        let mut state = VTermState::new(24, 80);
+        state.scrollregion_bottom = -1;
+        assert_eq!(state.scrollregion_bottom(), 24);
+        state.scrollregion_bottom = 10;
+        assert_eq!(state.scrollregion_bottom(), 10);
     }
 }
