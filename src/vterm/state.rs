@@ -112,6 +112,8 @@ pub struct VTermState {
     pub mouse_protocol: crate::vterm::mouse::VTermMouseProtocol,
     pub grapheme_buf: [u8; crate::types_defs::MAX_SCHAR_SIZE],
     pub grapheme_len: usize,
+    pub grapheme_last: u32,
+    pub grapheme_state: crate::mbyte_defs::GraphemeState,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -537,6 +539,8 @@ impl VTermState {
             mouse_protocol: crate::vterm::mouse::VTermMouseProtocol::X10,
             grapheme_buf: [0; crate::types_defs::MAX_SCHAR_SIZE],
             grapheme_len: 0,
+            grapheme_last: 0,
+            grapheme_state: crate::mbyte_defs::GRAPHEME_STATE_INIT,
         }
     }
 
@@ -745,6 +749,11 @@ mod termprop_state_tests {
         );
         assert_eq!(state.grapheme_buf, [0; crate::types_defs::MAX_SCHAR_SIZE]);
         assert_eq!(state.grapheme_len, 0);
+        assert_eq!(state.grapheme_last, 0);
+        assert_eq!(
+            state.grapheme_state,
+            crate::mbyte_defs::GRAPHEME_STATE_INIT
+        );
         assert!(state.mode.alt_screen);
         assert_eq!(state.active_lineinfo, 1);
         state.set_termprop(
