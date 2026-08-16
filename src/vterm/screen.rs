@@ -563,6 +563,85 @@ mod scrollback_push_tests {
     }
 }
 
+/// Moves cells inside the active buffer (`moverect_internal`).
+pub fn moverect_internal<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    destination: crate::vterm_defs::VTermRect,
+    source: crate::vterm_defs::VTermRect,
+) -> i32 {
+    if destination.start_row == 0
+        && destination.start_col == 0
+        && destination.end_col == screen.cols
+        && screen.active_buffer == 0
+    {
+        for row in 0..source.start_row {
+            sb_pushline_from_row(screen, callbacks, row);
+        }
+    }
+
+    let cols = source.end_col - source.start_col;
+    let downward = source.start_row - destination.start_row;
+    let rows: Box<dyn Iterator<Item = i32>> = if downward < 0 {
+        Box::new((destination.start_row..destination.end_row).rev())
+    } else {
+        Box::new(destination.start_row..destination.end_row)
+    };
+    let screen_cols = screen.cols as usize;
+    let buffer = screen.buffers[screen.active_buffer]
+        .as_mut()
+        .expect("active screen buffer");
+    for row in rows {
+        let source_start = ((row + downward) as usize * screen_cols)
+            + source.start_col as usize;
+        let destination_start =
+            (row as usize * screen_cols) + destination.start_col as usize;
+        buffer.copy_within(
+            source_start..source_start + cols as usize,
+            destination_start,
+        );
+    }
+    1
+}
+
+#[cfg(test)]
+mod moverect_internal_tests {
+    use super::*;
+
+    #[test]
+    fn moverect_internal_handles_overlapping_vertical_moves() {
+        let mut screen = screen_new(3, 2);
+        for row in 0..3 {
+            for col in 0..2 {
+                getcell_mut(&mut screen, row, col).unwrap().schar =
+                    (row * 10 + col + 1) as u32;
+            }
+        }
+        let mut callbacks = ();
+        assert_eq!(
+            moverect_internal(
+                &mut screen,
+                &mut callbacks,
+                crate::vterm_defs::VTermRect {
+                    start_row: 1,
+                    end_row: 3,
+                    start_col: 0,
+                    end_col: 2,
+                },
+                crate::vterm_defs::VTermRect {
+                    start_row: 0,
+                    end_row: 2,
+                    start_col: 0,
+                    end_col: 2,
+                },
+            ),
+            1
+        );
+        assert_eq!(getcell(&screen, 1, 0).unwrap().schar, 1);
+        assert_eq!(getcell(&screen, 2, 0).unwrap().schar, 11);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
