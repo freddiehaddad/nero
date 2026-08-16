@@ -1894,6 +1894,39 @@ impl VTermState {
         true
     }
 
+    #[must_use]
+    pub fn dec_mode_value(&self, number: i32) -> Option<bool> {
+        Some(match number {
+            1 => self.mode.cursor,
+            5 => self.mode.screen,
+            6 => self.mode.origin,
+            7 => self.mode.autowrap,
+            12 => self.mode.cursor_blink,
+            25 => self.mode.cursor_visible,
+            69 => self.mode.leftrightmargin,
+            1000 => self.mouse_flags == crate::vterm::mouse::MOUSE_WANT_CLICK,
+            1002 => {
+                self.mouse_flags
+                    == crate::vterm::mouse::MOUSE_WANT_CLICK
+                        | crate::vterm::mouse::MOUSE_WANT_DRAG
+            }
+            1003 => {
+                self.mouse_flags
+                    == crate::vterm::mouse::MOUSE_WANT_CLICK
+                        | crate::vterm::mouse::MOUSE_WANT_MOVE
+            }
+            1004 => self.mode.report_focus,
+            1005 => self.mouse_protocol == crate::vterm::mouse::VTermMouseProtocol::Utf8,
+            1006 => self.mouse_protocol == crate::vterm::mouse::VTermMouseProtocol::Sgr,
+            1015 => self.mouse_protocol == crate::vterm::mouse::VTermMouseProtocol::Rxvt,
+            1047 => self.mode.alt_screen,
+            2004 => self.mode.bracketpaste,
+            2026 => self.mode.synchronized_output,
+            2031 => self.mode.theme_updates,
+            _ => return None,
+        })
+    }
+
     pub fn initialize_pen_colors(&mut self) {
         let mut pen_state = crate::vterm::pen::VTermPenState::default();
         crate::vterm::pen::vterm_state_newpen(&mut pen_state);
@@ -2175,6 +2208,16 @@ mod termprop_state_tests {
         assert!(state.set_mouse_protocol_mode(1006, 0));
         assert_eq!(state.mouse_protocol, crate::vterm::mouse::VTermMouseProtocol::X10);
         assert!(!state.set_mouse_protocol_mode(999, 1));
+    }
+    #[test]
+    fn dec_mode_value_reports_known_modes() {
+        let mut state = VTermState::new(1, 1);
+        state.mode.autowrap = true;
+        state.mouse_flags =
+            crate::vterm::mouse::MOUSE_WANT_CLICK | crate::vterm::mouse::MOUSE_WANT_DRAG;
+        assert_eq!(state.dec_mode_value(7), Some(true));
+        assert_eq!(state.dec_mode_value(1002), Some(true));
+        assert_eq!(state.dec_mode_value(999), None);
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
