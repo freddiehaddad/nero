@@ -1937,6 +1937,20 @@ impl VTermState {
         2
     }
 
+    pub fn escape_designate_charset(&mut self, bytes: &[u8]) -> usize {
+        let [selector @ (b'(' | b')' | b'*' | b'+'), designation] = bytes else {
+            return 0;
+        };
+        let set = usize::from(*selector - b'(');
+        if let Some(encoding) = crate::vterm::encoding::vterm_lookup_encoding(
+            crate::vterm::encoding::VTermEncodingType::Single94,
+            *designation,
+        ) {
+            self.encodings[set] = encoding;
+        }
+        2
+    }
+
     pub fn set_dec_basic_mode(&mut self, number: i32, value: i32) -> bool {
         let enabled = value != 0;
         match number {
@@ -2281,6 +2295,16 @@ mod termprop_state_tests {
         assert_eq!(state.lineinfos[0][0].doubleheight, 1);
         assert_eq!(state.escape_line_attribute(b"#5"), 2);
         assert_eq!(state.lineinfos[0][0], Default::default());
+    }
+    #[test]
+    fn escape_designate_charset_updates_selected_slot() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(state.escape_designate_charset(b")0"), 2);
+        assert_eq!(
+            state.encodings[1],
+            crate::vterm::encoding::VTermEncoding::DecSpecialGraphics
+        );
+        assert_eq!(state.escape_designate_charset(b"x0"), 0);
     }
     #[test]
     fn set_dec_basic_mode_handles_cursor_wrap_and_paste() {
