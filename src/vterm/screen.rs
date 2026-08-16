@@ -1091,6 +1091,30 @@ pub fn theme<C: VTermScreenCallbacks>(
     callbacks.map_or(1, |callbacks| i32::from(callbacks.theme(dark)))
 }
 
+pub fn resize_user<C: VTermScreenCallbacks>(
+    callbacks: Option<&mut C>,
+    rows: i32,
+    cols: i32,
+) -> i32 {
+    callbacks.map_or(1, |callbacks| i32::from(callbacks.resize(rows, cols)))
+}
+
+#[cfg(test)]
+mod resize_user_tests {
+    use super::*;
+    struct Capture;
+    impl VTermScreenCallbacks for Capture {
+        fn resize(&mut self, rows: i32, cols: i32) -> bool {
+            rows == 24 && cols == 80
+        }
+    }
+    #[test]
+    fn resize_user_defaults_success_and_forwards() {
+        assert_eq!(resize_user::<Capture>(None, 1, 1), 1);
+        assert_eq!(resize_user(Some(&mut Capture), 24, 80), 1);
+    }
+}
+
 #[cfg(test)]
 mod theme_tests {
     use super::*;
