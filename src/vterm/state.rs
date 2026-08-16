@@ -446,6 +446,34 @@ pub fn push_key_encoding_flags(state: &mut VTermState, arg: i32) {
     set_key_encoding_flags(state, arg, 1);
 }
 
+/// Pops keyboard flag entries (`pop_key_encoding_flags`).
+pub fn pop_key_encoding_flags(state: &mut VTermState, arg: i32) {
+    let index = state.active_screen_index();
+    let stack = &mut state.key_encoding_stacks[index];
+    if arg >= i32::from(stack.size) {
+        stack.size = 1;
+        stack.items[0] = Default::default();
+    } else if arg > 0 {
+        stack.size -= arg as u8;
+    }
+}
+
+#[cfg(test)]
+mod pop_key_flags_tests {
+    use super::*;
+    #[test]
+    fn pop_key_flags_shrinks_or_resets_stack() {
+        let mut state = VTermState::new(1, 1);
+        state.key_encoding_stacks[0].size = 3;
+        state.key_encoding_stacks[0].items[0].disambiguate = true;
+        pop_key_encoding_flags(&mut state, 1);
+        assert_eq!(state.key_encoding_stacks[0].size, 2);
+        pop_key_encoding_flags(&mut state, 2);
+        assert_eq!(state.key_encoding_stacks[0].size, 1);
+        assert_eq!(state.key_encoding_stacks[0].items[0].bits(), 0);
+    }
+}
+
 #[cfg(test)]
 mod push_key_flags_tests {
     use super::*;
