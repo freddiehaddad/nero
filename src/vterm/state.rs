@@ -740,6 +740,35 @@ pub fn request_sgr_status(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     [start, &body, end].concat()
 }
 
+#[must_use]
+pub fn dispatch_status_request(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    match &state.decrqss[..3] {
+        [b'm', 0, 0] => request_sgr_status(state, ctrl8bit),
+        [b'r', 0, 0] => request_vertical_margins(state, ctrl8bit),
+        [b's', 0, 0] => request_horizontal_margins(state, ctrl8bit),
+        [b' ', b'q', 0] => request_cursor_style(state, ctrl8bit),
+        [b'"', b'q', 0] => request_protected_cell(state, ctrl8bit),
+        _ => {
+            let start: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_DCS] } else { b"\x1bP" };
+            let end: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_ST] } else { b"\x1b\\" };
+            [start, b"0$r", end].concat()
+        }
+    }
+}
+
+#[cfg(test)]
+mod status_dispatch_tests {
+    use super::*;
+    #[test]
+    fn status_dispatch_routes_known_and_unknown_keys() {
+        let mut state = VTermState::new(2, 80);
+        state.decrqss[..2].copy_from_slice(b" q");
+        assert!(dispatch_status_request(&state, false).ends_with(b" q\x1b\\"));
+        state.decrqss = *b"xyz\0";
+        assert_eq!(dispatch_status_request(&state, false), b"\x1bP0$r\x1b\\");
+    }
+}
+
 #[cfg(test)]
 mod sgr_status_tests {
     use super::*;
