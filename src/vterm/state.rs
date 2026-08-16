@@ -1798,6 +1798,15 @@ impl VTermState {
         }
     }
 
+    pub fn set_mode(&mut self, number: i32, value: i32) -> bool {
+        match number {
+            4 => self.mode.insert = value != 0,
+            20 => self.mode.newline = value != 0,
+            _ => return false,
+        }
+        true
+    }
+
     pub fn initialize_pen_colors(&mut self) {
         let mut pen_state = crate::vterm::pen::VTermPenState::default();
         crate::vterm::pen::vterm_state_newpen(&mut pen_state);
@@ -2032,6 +2041,15 @@ mod termprop_state_tests {
         assert!(!state.mode.keypad);
         assert!(!state.mode.report_focus);
         assert_eq!(state.mouse_flags, 0);
+    }
+    #[test]
+    fn set_mode_handles_insert_and_newline_modes() {
+        let mut state = VTermState::new(1, 1);
+        assert!(state.set_mode(4, 1));
+        assert!(state.mode.insert);
+        assert!(state.set_mode(20, 1));
+        assert!(state.mode.newline);
+        assert!(!state.set_mode(99, 1));
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
