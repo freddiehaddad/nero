@@ -338,6 +338,75 @@ pub fn setlineinfo<C: VTermScreenCallbacks>(
     1
 }
 
+pub fn settermprop<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    prop: crate::vterm_defs::VTermProp,
+    value: &crate::vterm_defs::VTermValue<'_>,
+) -> i32 {
+    match (prop, value) {
+        (
+            crate::vterm_defs::VTermProp::AltScreen,
+            crate::vterm_defs::VTermValue::Boolean(enabled),
+        ) => {
+            if *enabled != 0 && screen.buffers[1].is_none() {
+                return 0;
+            }
+            screen.active_buffer = usize::from(*enabled != 0);
+            if *enabled == 0 {
+                damagescreen(screen, callbacks);
+            }
+        }
+        (
+            crate::vterm_defs::VTermProp::Reverse,
+            crate::vterm_defs::VTermValue::Boolean(reverse),
+        ) => {
+            screen.global_reverse = *reverse != 0;
+            damagescreen(screen, callbacks);
+        }
+        _ => {}
+    }
+    let _ = callbacks.set_term_prop(prop, value);
+    1
+}
+
+#[cfg(test)]
+mod settermprop_screen_tests {
+    use super::*;
+    #[test]
+    fn screen_properties_switch_buffers_and_reverse() {
+        let mut screen = screen_new(1, 1);
+        let mut callbacks = ();
+        assert_eq!(
+            settermprop(
+                &mut screen,
+                &mut callbacks,
+                crate::vterm_defs::VTermProp::AltScreen,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+            ),
+            0
+        );
+        vterm_screen_enable_altscreen(&mut screen, 1);
+        assert_eq!(
+            settermprop(
+                &mut screen,
+                &mut callbacks,
+                crate::vterm_defs::VTermProp::AltScreen,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+            ),
+            1
+        );
+        assert_eq!(screen.active_buffer, 1);
+        settermprop(
+            &mut screen,
+            &mut callbacks,
+            crate::vterm_defs::VTermProp::Reverse,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        );
+        assert!(screen.global_reverse);
+    }
+}
+
 #[cfg(test)]
 mod setlineinfo_screen_tests {
     use super::*;
