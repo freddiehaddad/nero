@@ -1287,6 +1287,11 @@ impl VTermState {
     pub fn reset_lineinfos(&mut self) {
         self.lineinfos[self.active_lineinfo].fill(Default::default());
     }
+
+    pub fn hard_reset_cursor(&mut self) {
+        self.pos = Default::default();
+        self.at_phantom = false;
+    }
 }
 
 #[cfg(test)]
@@ -1404,6 +1409,15 @@ mod termprop_state_tests {
         state.reset_lineinfos();
         assert!(!state.lineinfos[0][0].doublewidth);
         assert!(state.lineinfos[1][0].doublewidth);
+    }
+    #[test]
+    fn hard_reset_cursor_clears_position_and_phantom() {
+        let mut state = VTermState::new(1, 1);
+        state.pos = crate::vterm_defs::VTermPos { row: 3, col: 4 };
+        state.at_phantom = true;
+        state.hard_reset_cursor();
+        assert_eq!(state.pos, Default::default());
+        assert!(!state.at_phantom);
     }
 }
 
