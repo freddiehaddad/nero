@@ -462,6 +462,36 @@ pub fn request_vertical_margins(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     .concat()
 }
 
+#[must_use]
+pub fn request_horizontal_margins(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    let start: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_DCS] } else { b"\x1bP" };
+    let end: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_ST] } else { b"\x1b\\" };
+    [
+        start,
+        format!(
+            "1$r{};{}s",
+            state.scrollregion_left() + 1,
+            state.scrollregion_right()
+        )
+        .as_bytes(),
+        end,
+    ]
+    .concat()
+}
+
+#[cfg(test)]
+mod horizontal_margin_request_tests {
+    use super::*;
+    #[test]
+    fn horizontal_margin_response_is_one_based() {
+        let mut state = VTermState::new(24, 80);
+        state.mode.leftrightmargin = true;
+        state.scrollregion_left = 4;
+        state.scrollregion_right = 70;
+        assert_eq!(request_horizontal_margins(&state, false), b"\x1bP1$r5;70s\x1b\\");
+    }
+}
+
 #[cfg(test)]
 mod vertical_margin_request_tests {
     use super::*;
