@@ -289,6 +289,72 @@ pub fn setpenattr(
     1
 }
 
+pub fn setlineinfo<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    row: i32,
+    new_info: crate::vterm_defs::VTermLineInfo,
+    old_info: crate::vterm_defs::VTermLineInfo,
+) -> i32 {
+    if new_info.doublewidth != old_info.doublewidth
+        || new_info.doubleheight != old_info.doubleheight
+    {
+        for col in 0..screen.cols {
+            let cell = getcell_mut(screen, row, col).expect("valid line cell");
+            cell.pen.dwl = new_info.doublewidth;
+            cell.pen.dhl = new_info.doubleheight;
+        }
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: row,
+            end_row: row + 1,
+            start_col: 0,
+            end_col: if new_info.doublewidth {
+                screen.cols / 2
+            } else {
+                screen.cols
+            },
+        };
+        damagerect(screen, callbacks, rect);
+        if new_info.doublewidth {
+            let _ = erase_internal(
+                screen,
+                crate::vterm_defs::VTermRect {
+                    start_col: screen.cols / 2,
+                    end_col: screen.cols,
+                    ..rect
+                },
+                false,
+            );
+        }
+    }
+    1
+}
+
+#[cfg(test)]
+mod setlineinfo_screen_tests {
+    use super::*;
+    #[test]
+    fn setlineinfo_updates_cells_and_erases_hidden_half() {
+        let mut screen = screen_new(1, 4);
+        for col in 0..4 {
+            getcell_mut(&mut screen, 0, col).unwrap().schar = 42;
+        }
+        let mut callbacks = ();
+        setlineinfo(
+            &mut screen,
+            &mut callbacks,
+            0,
+            crate::vterm_defs::VTermLineInfo {
+                doublewidth: true,
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        assert!(getcell(&screen, 0, 0).unwrap().pen.dwl);
+        assert_eq!(getcell(&screen, 0, 2).unwrap().schar, 0);
+    }
+}
+
 /// Copies one internal cell to its public representation
 /// (`vterm_screen_get_cell`).
 pub fn vterm_screen_get_cell(
