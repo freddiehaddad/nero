@@ -135,6 +135,26 @@ pub trait VTermStateCallbacks {
 
 impl VTermStateCallbacks for () {}
 
+/// Emits one glyph through state callbacks (`putglyph`).
+pub fn putglyph<C: VTermStateCallbacks>(
+    state: &VTermState,
+    callbacks: &mut C,
+    schar: crate::types_defs::ScharT,
+    width: i32,
+    position: crate::vterm_defs::VTermPos,
+    protected_cell: bool,
+) {
+    let lineinfo = state.lineinfos[state.active_lineinfo][position.row as usize];
+    let info = crate::vterm_defs::VTermGlyphInfo {
+        schar,
+        width,
+        protected_cell,
+        dwl: lineinfo.doublewidth,
+        dhl: lineinfo.doubleheight,
+    };
+    let _ = callbacks.put_glyph(&info, position);
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -304,6 +324,40 @@ mod tests {
         assert!(!callbacks.erase(Default::default(), false));
         assert!(!callbacks.init_pen());
         assert!(!callbacks.set_line_info(0, &Default::default(), &Default::default()));
+    }
+
+    #[test]
+    fn state_putglyph_builds_info_from_line_metadata() {
+        struct Capture(Option<crate::vterm_defs::VTermGlyphInfo>);
+        impl VTermStateCallbacks for Capture {
+            fn put_glyph(
+                &mut self,
+                info: &crate::vterm_defs::VTermGlyphInfo,
+                _: crate::vterm_defs::VTermPos,
+            ) -> bool {
+                self.0 = Some(*info);
+                true
+            }
+        }
+        let mut state = VTermState::new(2, 80);
+        state.lineinfos[0][1].doublewidth = true;
+        state.lineinfos[0][1].doubleheight = 2;
+        let mut capture = Capture(None);
+        putglyph(
+            &state,
+            &mut capture,
+            42,
+            2,
+            crate::vterm_defs::VTermPos { row: 1, col: 3 },
+            true,
+        );
+        assert_eq!(capture.0.unwrap(), crate::vterm_defs::VTermGlyphInfo {
+            schar: 42,
+            width: 2,
+            protected_cell: true,
+            dwl: true,
+            dhl: 2,
+        });
     }
     #[test]
     fn primary_device_attributes_match_state_c() {
