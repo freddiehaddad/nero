@@ -113,6 +113,26 @@ pub trait VTermStateFallbacks {
 
 impl VTermStateFallbacks for () {}
 
+pub fn on_apc<F: VTermStateFallbacks>(
+    fallbacks: &mut F,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> i32 {
+    i32::from(fallbacks.apc(fragment))
+}
+
+#[cfg(test)]
+mod apc_fallback_tests {
+    use super::*;
+    #[test]
+    fn apc_returns_fallback_result() {
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"x", initial: true, final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        };
+        assert_eq!(on_apc(&mut (), fragment), 0);
+    }
+}
+
 /// Core geometry and cursor fields of `VTermState`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VTermState {
