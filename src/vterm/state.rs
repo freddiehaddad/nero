@@ -126,6 +126,16 @@ impl VTermState {
             0
         }
     }
+
+    /// Effective right edge (`SCROLLREGION_RIGHT`).
+    #[must_use]
+    pub const fn scrollregion_right(&self) -> i32 {
+        if self.mode.leftrightmargin && self.scrollregion_right > -1 {
+            self.scrollregion_right
+        } else {
+            self.cols
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +222,16 @@ mod tests {
         assert_eq!(state.scrollregion_left(), 0);
         state.mode.leftrightmargin = true;
         assert_eq!(state.scrollregion_left(), 5);
+    }
+
+    #[test]
+    fn scrollregion_right_requires_mode_and_explicit_edge() {
+        let mut state = VTermState::new(24, 80);
+        state.scrollregion_right = 70;
+        assert_eq!(state.scrollregion_right(), 80);
+        state.mode.leftrightmargin = true;
+        assert_eq!(state.scrollregion_right(), 70);
+        state.scrollregion_right = -1;
+        assert_eq!(state.scrollregion_right(), 80);
     }
 }
