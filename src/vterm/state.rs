@@ -136,6 +136,16 @@ impl VTermState {
             self.cols
         }
     }
+
+    /// Width of one terminal row (`ROWWIDTH`).
+    #[must_use]
+    pub fn row_width(&self, row: i32) -> i32 {
+        if self.lineinfos[self.active_lineinfo][row as usize].doublewidth {
+            self.cols / 2
+        } else {
+            self.cols
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +243,13 @@ mod tests {
         assert_eq!(state.scrollregion_right(), 70);
         state.scrollregion_right = -1;
         assert_eq!(state.scrollregion_right(), 80);
+    }
+
+    #[test]
+    fn row_width_halves_doublewidth_rows() {
+        let mut state = VTermState::new(24, 81);
+        assert_eq!(state.row_width(3), 81);
+        state.lineinfos[0][3].doublewidth = true;
+        assert_eq!(state.row_width(3), 40);
     }
 }
