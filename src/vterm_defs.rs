@@ -316,6 +316,26 @@ pub enum VTermDamageSize {
     NDamages = 4,
 }
 
+/// Terminal property identifier (`VTermProp`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VTermProp {
+    #[default]
+    None = 0,
+    CursorVisible = 1,
+    CursorBlink = 2,
+    AltScreen = 3,
+    Title = 4,
+    IconName = 5,
+    Reverse = 6,
+    CursorShape = 7,
+    Mouse = 8,
+    FocusReport = 9,
+    ThemeUpdates = 10,
+    SyncOutput = 11,
+    NProps = 12,
+}
+
 /// Glyph passed from state to screen (`VTermGlyphInfo`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VTermGlyphInfo {
@@ -640,6 +660,16 @@ mod tests {
         assert_eq!(VTermDamageSize::Scroll as i32, 3);
         assert_eq!(VTermDamageSize::NDamages as i32, 4);
         assert_eq!(VTermDamageSize::default(), VTermDamageSize::Cell);
+    }
+
+    #[test]
+    fn terminal_property_discriminants_match_header() {
+        assert_eq!(VTermProp::None as i32, 0);
+        assert_eq!(VTermProp::CursorVisible as i32, 1);
+        assert_eq!(VTermProp::AltScreen as i32, 3);
+        assert_eq!(VTermProp::Reverse as i32, 6);
+        assert_eq!(VTermProp::SyncOutput as i32, 11);
+        assert_eq!(VTermProp::NProps as i32, 12);
     }
 
     #[test]
