@@ -62,6 +62,52 @@ pub struct VTermSelectionTemp {
     pub send_partial: u32,
 }
 
+/// Core geometry and cursor fields of `VTermState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VTermState {
+    pub rows: i32,
+    pub cols: i32,
+    pub pos: crate::vterm_defs::VTermPos,
+    pub at_phantom: bool,
+    pub scrollregion_top: i32,
+    pub scrollregion_bottom: i32,
+    pub scrollregion_left: i32,
+    pub scrollregion_right: i32,
+    pub tabstops: Vec<u8>,
+    pub lineinfos: [Vec<crate::vterm_defs::VTermLineInfo>; 2],
+    pub active_lineinfo: usize,
+    pub mode: VTermStateMode,
+}
+
+impl VTermState {
+    #[must_use]
+    pub fn new(rows: i32, cols: i32) -> Self {
+        Self {
+            rows,
+            cols,
+            pos: crate::vterm_defs::VTermPos::default(),
+            at_phantom: false,
+            scrollregion_top: 0,
+            scrollregion_bottom: 0,
+            scrollregion_left: 0,
+            scrollregion_right: 0,
+            tabstops: vec![0; usize::try_from(cols).unwrap_or(0).div_ceil(8)],
+            lineinfos: [
+                vec![
+                    crate::vterm_defs::VTermLineInfo::default();
+                    usize::try_from(rows).unwrap_or(0)
+                ],
+                vec![
+                    crate::vterm_defs::VTermLineInfo::default();
+                    usize::try_from(rows).unwrap_or(0)
+                ],
+            ],
+            active_lineinfo: 0,
+            mode: VTermStateMode::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +163,16 @@ mod tests {
             recv_partial: 0,
             send_partial: 0,
         });
+    }
+
+    #[test]
+    fn state_new_allocates_tabstops_and_both_lineinfo_arrays() {
+        let state = VTermState::new(24, 80);
+        assert_eq!((state.rows, state.cols), (24, 80));
+        assert_eq!(state.tabstops.len(), 10);
+        assert_eq!(state.lineinfos[0].len(), 24);
+        assert_eq!(state.lineinfos[1].len(), 24);
+        assert_eq!(state.active_lineinfo, 0);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos::default());
     }
 }
