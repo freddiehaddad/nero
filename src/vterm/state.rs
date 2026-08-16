@@ -344,6 +344,36 @@ pub fn vterm_state_focus_in(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     }
 }
 
+/// Emits focus-out when focus reporting is enabled
+/// (`vterm_state_focus_out`).
+#[must_use]
+pub fn vterm_state_focus_out(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    if !state.mode.report_focus {
+        return Vec::new();
+    }
+    if ctrl8bit {
+        vec![crate::vterm_defs::C1_CSI, b'O']
+    } else {
+        b"\x1b[O".to_vec()
+    }
+}
+
+#[cfg(test)]
+mod focus_out_tests {
+    use super::*;
+    #[test]
+    fn focus_out_honors_reporting_and_control_width() {
+        let mut state = VTermState::new(24, 80);
+        assert!(vterm_state_focus_out(&state, false).is_empty());
+        state.mode.report_focus = true;
+        assert_eq!(vterm_state_focus_out(&state, false), b"\x1b[O");
+        assert_eq!(
+            vterm_state_focus_out(&state, true),
+            [crate::vterm_defs::C1_CSI, b'O']
+        );
+    }
+}
+
 #[cfg(test)]
 mod focus_in_tests {
     use super::*;
