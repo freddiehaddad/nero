@@ -171,6 +171,16 @@ impl VTermState {
         let mask = 1u8 << (col & 7);
         self.tabstops[(col >> 3) as usize] & mask != 0
     }
+
+    /// Whether the cursor lies inside the effective scroll region
+    /// (`is_cursor_in_scrollregion`).
+    #[must_use]
+    pub fn is_cursor_in_scrollregion(&self) -> bool {
+        self.pos.row >= self.scrollregion_top
+            && self.pos.row < self.scrollregion_bottom()
+            && self.pos.col >= self.scrollregion_left()
+            && self.pos.col < self.scrollregion_right()
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +324,26 @@ mod tests {
         assert!(state.is_col_tabstop(8));
         assert!(!state.is_col_tabstop(6));
         assert!(!state.is_col_tabstop(9));
+    }
+
+    #[test]
+    fn cursor_scrollregion_test_checks_all_four_bounds() {
+        let mut state = VTermState::new(24, 80);
+        state.scrollregion_top = 2;
+        state.scrollregion_bottom = 20;
+        state.mode.leftrightmargin = true;
+        state.scrollregion_left = 3;
+        state.scrollregion_right = 70;
+        state.pos = crate::vterm_defs::VTermPos { row: 2, col: 3 };
+        assert!(state.is_cursor_in_scrollregion());
+        for pos in [
+            crate::vterm_defs::VTermPos { row: 1, col: 3 },
+            crate::vterm_defs::VTermPos { row: 20, col: 3 },
+            crate::vterm_defs::VTermPos { row: 2, col: 2 },
+            crate::vterm_defs::VTermPos { row: 2, col: 70 },
+        ] {
+            state.pos = pos;
+            assert!(!state.is_cursor_in_scrollregion());
+        }
     }
 }
