@@ -1292,6 +1292,22 @@ impl VTermState {
         self.pos = Default::default();
         self.at_phantom = false;
     }
+
+    pub fn reset(&mut self, hard: bool) {
+        self.reset_scrollregions();
+        self.reset_modes();
+        self.reset_tabstops();
+        self.active_lineinfo = 0;
+        self.reset_lineinfos();
+        self.encodings.fill(crate::vterm::encoding::VTermEncoding::UsAscii);
+        self.gl_set = 0;
+        self.gr_set = 1;
+        self.gsingle_set = 0;
+        self.protected_cell = false;
+        if hard {
+            self.hard_reset_cursor();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1418,6 +1434,20 @@ mod termprop_state_tests {
         state.hard_reset_cursor();
         assert_eq!(state.pos, Default::default());
         assert!(!state.at_phantom);
+    }
+    #[test]
+    fn state_reset_restores_soft_and_hard_defaults() {
+        let mut state = VTermState::new(2, 10);
+        state.pos.col = 5;
+        state.protected_cell = true;
+        state.mode.insert = true;
+        state.reset(false);
+        assert_eq!(state.pos.col, 5);
+        assert!(!state.protected_cell);
+        assert!(!state.mode.insert);
+        assert!(state.mode.autowrap);
+        state.reset(true);
+        assert_eq!(state.pos, Default::default());
     }
 }
 
