@@ -372,6 +372,13 @@ pub struct VTermLineInfo {
     pub continuation: bool,
 }
 
+/// Fields exposed to the state resize callback (`VTermStateFields`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VTermStateFields {
+    pub pos: VTermPos,
+    pub lineinfos: [Option<Vec<VTermLineInfo>>; 2],
+}
+
 /// Underline disabled (`VTERM_UNDERLINE_OFF`).
 pub const VTERM_UNDERLINE_OFF: u8 = 0;
 /// Single underline (`VTERM_UNDERLINE_SINGLE`).
@@ -748,6 +755,14 @@ mod tests {
             doublewidth: false,
             doubleheight: 0,
             continuation: false,
+        });
+    }
+
+    #[test]
+    fn state_fields_default_to_zero_position_and_null_lineinfos() {
+        assert_eq!(VTermStateFields::default(), VTermStateFields {
+            pos: VTermPos::default(),
+            lineinfos: [None, None],
         });
     }
 
