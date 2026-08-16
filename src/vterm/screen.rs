@@ -789,6 +789,46 @@ mod erase_internal_tests {
     }
 }
 
+/// Reports an erased rectangle as damage (`erase_user`).
+pub fn erase_user<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    rect: crate::vterm_defs::VTermRect,
+    _selective: bool,
+) -> i32 {
+    damagerect(screen, callbacks, rect);
+    1
+}
+
+#[cfg(test)]
+mod erase_user_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture(Vec<crate::vterm_defs::VTermRect>);
+
+    impl VTermScreenCallbacks for Capture {
+        fn damage(&mut self, rect: crate::vterm_defs::VTermRect) -> bool {
+            self.0.push(rect);
+            true
+        }
+    }
+
+    #[test]
+    fn erase_user_reports_damage_and_ignores_selective_flag() {
+        let mut screen = screen_new(2, 2);
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 1,
+            start_col: 0,
+            end_col: 2,
+        };
+        let mut capture = Capture::default();
+        assert_eq!(erase_user(&mut screen, &mut capture, rect, true), 1);
+        assert_eq!(capture.0, [rect]);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
