@@ -117,6 +117,9 @@ pub struct VTermState {
     pub combine_width: i32,
     pub combine_pos: crate::vterm_defs::VTermPos,
     pub encodings: [crate::vterm::encoding::VTermEncoding; 4],
+    pub gl_set: i32,
+    pub gr_set: i32,
+    pub gsingle_set: i32,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -547,6 +550,9 @@ impl VTermState {
             combine_width: 0,
             combine_pos: crate::vterm_defs::VTermPos { row: -1, col: 0 },
             encodings: [crate::vterm::encoding::VTermEncoding::UsAscii; 4],
+            gl_set: 0,
+            gr_set: 1,
+            gsingle_set: 0,
         }
     }
 
@@ -753,6 +759,7 @@ mod termprop_state_tests {
             ),
             1
         );
+        assert_eq!((state.gl_set, state.gr_set, state.gsingle_set), (0, 1, 0));
         assert_eq!(state.combine_width, 0);
         assert_eq!(state.combine_pos.row, -1);
         assert_eq!(
