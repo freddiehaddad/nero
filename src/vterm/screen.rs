@@ -396,6 +396,124 @@ pub fn damagescreen<C: VTermScreenCallbacks>(
     damagerect(screen, callbacks, rect);
 }
 
+/// Writes one glyph and damages its occupied cells (`putglyph`).
+pub fn putglyph<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    info: &crate::vterm_defs::VTermGlyphInfo,
+    position: crate::vterm_defs::VTermPos,
+) -> i32 {
+    if getcell(screen, position.row, position.col).is_none() {
+        return 0;
+    }
+    let current_pen = screen.pen;
+    {
+        let cell = getcell_mut(screen, position.row, position.col).expect("checked cell");
+        cell.schar = info.schar;
+        if info.schar != 0 {
+            cell.pen = current_pen;
+        }
+        cell.pen.protected_cell = info.protected_cell;
+        cell.pen.dwl = info.dwl;
+        cell.pen.dhl = info.dhl;
+    }
+    for offset in 1..info.width {
+        getcell_mut(screen, position.row, position.col + offset)
+            .expect("glyph width inside screen")
+            .schar = crate::types_defs::ScharT::MAX;
+    }
+    damagerect(
+        screen,
+        callbacks,
+        crate::vterm_defs::VTermRect {
+            start_row: position.row,
+            end_row: position.row + 1,
+            start_col: position.col,
+            end_col: position.col + info.width,
+        },
+    );
+    1
+}
+
+#[cfg(test)]
+mod putglyph_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture(Vec<crate::vterm_defs::VTermRect>);
+
+    impl VTermScreenCallbacks for Capture {
+        fn damage(&mut self, rect: crate::vterm_defs::VTermRect) -> bool {
+            self.0.push(rect);
+            true
+        }
+    }
+
+    #[test]
+    fn putglyph_writes_pen_continuations_and_damage() {
+        let mut screen = screen_new(1, 3);
+        screen.pen.bold = true;
+        let mut callbacks = Capture::default();
+        let info = crate::vterm_defs::VTermGlyphInfo {
+            schar: 42,
+            width: 2,
+            protected_cell: true,
+            dwl: true,
+            dhl: 2,
+        };
+        assert_eq!(
+            putglyph(
+                &mut screen,
+                &mut callbacks,
+                &info,
+                crate::vterm_defs::VTermPos { row: 0, col: 0 },
+            ),
+            1
+        );
+        let first = getcell(&screen, 0, 0).unwrap();
+        assert_eq!(first.schar, 42);
+        assert!(first.pen.bold);
+        assert!(first.pen.protected_cell);
+        assert!(first.pen.dwl);
+        assert_eq!(first.pen.dhl, 2);
+        assert_eq!(getcell(&screen, 0, 1).unwrap().schar, crate::types_defs::ScharT::MAX);
+        assert_eq!(callbacks.0[0].end_col, 2);
+    }
+
+    #[test]
+    fn putglyph_zero_retains_existing_pen_and_rejects_invalid_position() {
+        let mut screen = screen_new(1, 1);
+        getcell_mut(&mut screen, 0, 0).unwrap().pen.italic = true;
+        screen.pen.bold = true;
+        let mut callbacks = Capture::default();
+        let info = crate::vterm_defs::VTermGlyphInfo {
+            schar: 0,
+            width: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            putglyph(
+                &mut screen,
+                &mut callbacks,
+                &info,
+                crate::vterm_defs::VTermPos { row: 0, col: 0 },
+            ),
+            1
+        );
+        assert!(getcell(&screen, 0, 0).unwrap().pen.italic);
+        assert!(!getcell(&screen, 0, 0).unwrap().pen.bold);
+        assert_eq!(
+            putglyph(
+                &mut screen,
+                &mut callbacks,
+                &info,
+                crate::vterm_defs::VTermPos { row: 1, col: 0 },
+            ),
+            0
+        );
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
