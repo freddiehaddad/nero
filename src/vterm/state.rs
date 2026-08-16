@@ -1880,6 +1880,20 @@ impl VTermState {
         ) != 0
     }
 
+    pub fn set_mouse_protocol_mode(&mut self, number: i32, value: i32) -> bool {
+        self.mouse_protocol = if value == 0 {
+            crate::vterm::mouse::VTermMouseProtocol::X10
+        } else {
+            match number {
+                1005 => crate::vterm::mouse::VTermMouseProtocol::Utf8,
+                1006 => crate::vterm::mouse::VTermMouseProtocol::Sgr,
+                1015 => crate::vterm::mouse::VTermMouseProtocol::Rxvt,
+                _ => return false,
+            }
+        };
+        true
+    }
+
     pub fn initialize_pen_colors(&mut self) {
         let mut pen_state = crate::vterm::pen::VTermPenState::default();
         crate::vterm::pen::vterm_state_newpen(&mut pen_state);
@@ -2152,6 +2166,15 @@ mod termprop_state_tests {
         assert!(state.set_mouse_tracking_mode(1002, 0));
         assert_eq!(state.mouse_flags, 0);
         assert!(!state.set_mouse_tracking_mode(999, 1));
+    }
+    #[test]
+    fn mouse_protocol_mode_maps_extensions_and_disable() {
+        let mut state = VTermState::new(1, 1);
+        assert!(state.set_mouse_protocol_mode(1006, 1));
+        assert_eq!(state.mouse_protocol, crate::vterm::mouse::VTermMouseProtocol::Sgr);
+        assert!(state.set_mouse_protocol_mode(1006, 0));
+        assert_eq!(state.mouse_protocol, crate::vterm::mouse::VTermMouseProtocol::X10);
+        assert!(!state.set_mouse_protocol_mode(999, 1));
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
