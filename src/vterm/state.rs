@@ -767,6 +767,33 @@ pub fn request_key_encoding_flags(state: &VTermState, ctrl8bit: bool) -> Vec<u8>
     [prefix, format!("?{bits}u").as_bytes()].concat()
 }
 
+#[must_use]
+pub fn request_dec_mode(state: &VTermState, number: i32, ctrl8bit: bool) -> Vec<u8> {
+    let reply = state
+        .dec_mode_value(number)
+        .map_or(0, |enabled| if enabled { 1 } else { 2 });
+    let prefix: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_CSI]
+    } else {
+        b"\x1b["
+    };
+    [prefix, format!("?{number};{reply}$y").as_bytes()].concat()
+}
+
+#[cfg(test)]
+mod dec_mode_request_tests {
+    use super::*;
+    #[test]
+    fn dec_mode_request_encodes_set_reset_and_unknown() {
+        let mut state = VTermState::new(1, 1);
+        state.mode.autowrap = true;
+        assert_eq!(request_dec_mode(&state, 7, false), b"\x1b[?7;1$y");
+        state.mode.autowrap = false;
+        assert_eq!(request_dec_mode(&state, 7, false), b"\x1b[?7;2$y");
+        assert_eq!(request_dec_mode(&state, 999, false), b"\x1b[?999;0$y");
+    }
+}
+
 /// Builds the secondary version response (`request_version_string`).
 #[must_use]
 pub fn request_version_string(ctrl8bit: bool) -> Vec<u8> {
