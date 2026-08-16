@@ -79,6 +79,14 @@ pub trait VTermScreenCallbacks {
         false
     }
 
+    fn set_term_prop(
+        &mut self,
+        _prop: crate::vterm_defs::VTermProp,
+        _value: &crate::vterm_defs::VTermValue<'_>,
+    ) -> bool {
+        false
+    }
+
     fn resize(&mut self, _rows: i32, _cols: i32) -> bool {
         false
     }
@@ -1153,6 +1161,10 @@ mod tests {
             true,
         ));
         assert!(!callbacks.bell());
+        assert!(!callbacks.set_term_prop(
+            crate::vterm_defs::VTermProp::Reverse,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        ));
         assert!(!callbacks.resize(24, 80));
         let mut dark = false;
         assert!(!callbacks.theme(&mut dark));
