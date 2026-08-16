@@ -244,6 +244,10 @@ pub fn vterm_screen_enable_altscreen(screen: &mut VTermScreen, altscreen: i32) {
     if screen.buffers[1].is_none() && altscreen != 0 {
         let buffer = alloc_buffer(screen, screen.rows, screen.cols);
         screen.buffers[1] = Some(buffer);
+        screen.lineinfo[1] = Some(vec![
+            crate::vterm_defs::VTermLineInfo::default();
+            usize::try_from(screen.rows).unwrap_or(0)
+        ]);
     }
 }
 
@@ -1606,6 +1610,7 @@ mod tests {
         assert!(screen.buffers[1].is_none());
         vterm_screen_enable_altscreen(&mut screen, 1);
         assert_eq!(screen.buffers[1].as_ref().unwrap().len(), 6);
+        assert_eq!(screen.lineinfo[1].as_ref().unwrap().len(), 2);
         assert_eq!(screen.active_buffer, 0);
         screen.buffers[1].as_mut().unwrap()[0].schar = 42;
         vterm_screen_enable_altscreen(&mut screen, 1);
