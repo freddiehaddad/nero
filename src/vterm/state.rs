@@ -458,6 +458,36 @@ pub fn pop_key_encoding_flags(state: &mut VTermState, arg: i32) {
     }
 }
 
+/// Decodes one base64 sextet (`unbase64one`).
+#[must_use]
+pub const fn unbase64one(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' => byte - b'A',
+        b'a'..=b'z' => byte - b'a' + 26,
+        b'0'..=b'9' => byte - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => 0xFF,
+    }
+}
+
+#[cfg(test)]
+mod unbase64_tests {
+    use super::*;
+    #[test]
+    fn unbase64_decodes_all_alphabet_boundaries() {
+        assert_eq!(unbase64one(b'A'), 0);
+        assert_eq!(unbase64one(b'Z'), 25);
+        assert_eq!(unbase64one(b'a'), 26);
+        assert_eq!(unbase64one(b'z'), 51);
+        assert_eq!(unbase64one(b'0'), 52);
+        assert_eq!(unbase64one(b'9'), 61);
+        assert_eq!(unbase64one(b'+'), 62);
+        assert_eq!(unbase64one(b'/'), 63);
+        assert_eq!(unbase64one(b'?'), 0xFF);
+    }
+}
+
 #[cfg(test)]
 mod pop_key_flags_tests {
     use super::*;
