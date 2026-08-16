@@ -442,6 +442,43 @@ pub fn updatecursor<C: VTermStateCallbacks>(
     let _ = callbacks.move_cursor(state.pos, old_position, state.mode.cursor_visible);
 }
 
+pub fn set_origin_mode<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    value: i32,
+) {
+    let old = state.pos;
+    state.mode.origin = value != 0;
+    state.pos.row = if state.mode.origin {
+        state.scrollregion_top
+    } else {
+        0
+    };
+    state.pos.col = if state.mode.origin {
+        state.scrollregion_left()
+    } else {
+        0
+    };
+    updatecursor(state, callbacks, old, true);
+}
+
+#[cfg(test)]
+mod origin_mode_tests {
+    use super::*;
+    #[test]
+    fn origin_mode_moves_cursor_to_region_or_origin() {
+        let mut state = VTermState::new(10, 20);
+        state.scrollregion_top = 2;
+        state.mode.leftrightmargin = true;
+        state.scrollregion_left = 3;
+        let mut callbacks = ();
+        set_origin_mode(&mut state, &mut callbacks, 1);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 2, col: 3 });
+        set_origin_mode(&mut state, &mut callbacks, 0);
+        assert_eq!(state.pos, Default::default());
+    }
+}
+
 /// Erases through callbacks and clears following-line continuation
 /// markers when erasing line ends (`erase`).
 pub fn erase<C: VTermStateCallbacks>(
