@@ -829,6 +829,50 @@ mod erase_user_tests {
     }
 }
 
+/// Erases cells then reports non-selective damage (`erase`).
+pub fn erase<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    rect: crate::vterm_defs::VTermRect,
+    selective: bool,
+) -> i32 {
+    let _ = erase_internal(screen, rect, selective);
+    erase_user(screen, callbacks, rect, false)
+}
+
+#[cfg(test)]
+mod erase_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture(Vec<crate::vterm_defs::VTermRect>);
+
+    impl VTermScreenCallbacks for Capture {
+        fn damage(&mut self, rect: crate::vterm_defs::VTermRect) -> bool {
+            self.0.push(rect);
+            true
+        }
+    }
+
+    #[test]
+    fn erase_combines_internal_selectivity_with_unconditional_damage() {
+        let mut screen = screen_new(1, 1);
+        let cell = getcell_mut(&mut screen, 0, 0).unwrap();
+        cell.schar = 42;
+        cell.pen.protected_cell = true;
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 1,
+            start_col: 0,
+            end_col: 1,
+        };
+        let mut capture = Capture::default();
+        assert_eq!(erase(&mut screen, &mut capture, rect, true), 1);
+        assert_eq!(getcell(&screen, 0, 0).unwrap().schar, 42);
+        assert_eq!(capture.0, [rect]);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
