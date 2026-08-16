@@ -24,6 +24,14 @@ pub struct VTermStateMode {
     pub synchronized_output: bool,
 }
 
+/// Cursor-related mode fields saved by DEC 1048/1049.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermSavedMode {
+    pub cursor_visible: bool,
+    pub cursor_blink: bool,
+    pub cursor_shape: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,6 +48,15 @@ mod tests {
             cursor_shape: 0, alt_screen: false, origin: false, screen: false,
             leftrightmargin: false, bracketpaste: false, report_focus: false,
             theme_updates: false, synchronized_output: false,
+        });
+    }
+
+    #[test]
+    fn saved_modes_default_to_zeroed_bitfields() {
+        assert_eq!(VTermSavedMode::default(), VTermSavedMode {
+            cursor_visible: false,
+            cursor_blink: false,
+            cursor_shape: 0,
         });
     }
 }
