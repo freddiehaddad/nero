@@ -954,6 +954,25 @@ mod theme_tests {
     }
 }
 
+/// Forwards scrollback clearing (`sb_clear`).
+pub fn sb_clear<C: VTermScreenCallbacks>(callbacks: Option<&mut C>) -> i32 {
+    callbacks.map_or(0, |callbacks| i32::from(callbacks.scrollback_clear()))
+}
+
+#[cfg(test)]
+mod sb_clear_tests {
+    use super::*;
+    struct Capture;
+    impl VTermScreenCallbacks for Capture {
+        fn scrollback_clear(&mut self) -> bool { true }
+    }
+    #[test]
+    fn sb_clear_returns_callback_result_or_zero() {
+        assert_eq!(sb_clear::<Capture>(None), 0);
+        assert_eq!(sb_clear(Some(&mut Capture)), 1);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
