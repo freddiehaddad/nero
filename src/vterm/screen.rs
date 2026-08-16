@@ -522,6 +522,42 @@ pub fn screen_cell_from_external(
     }
 }
 
+#[must_use]
+pub fn import_scrollback_row(
+    cells: &[crate::vterm_defs::VTermScreenCell],
+    cols: usize,
+    global_reverse: bool,
+) -> Vec<ScreenCell> {
+    let mut row = vec![ScreenCell::default(); cols];
+    let mut col = 0;
+    while col < cells.len() && col < cols {
+        row[col] = screen_cell_from_external(&cells[col], global_reverse);
+        if cells[col].width == 2 && col + 1 < cols {
+            row[col + 1].schar = crate::types_defs::ScharT::MAX;
+        }
+        col += usize::try_from(cells[col].width.max(1)).unwrap_or(1);
+    }
+    row
+}
+
+#[cfg(test)]
+mod scrollback_row_import_tests {
+    use super::*;
+    #[test]
+    fn scrollback_row_import_marks_wide_continuations() {
+        let cells = [
+            crate::vterm_defs::VTermScreenCell {
+                schar: 42, width: 2, ..Default::default()
+            },
+            crate::vterm_defs::VTermScreenCell::default(),
+        ];
+        let row = import_scrollback_row(&cells, 3, false);
+        assert_eq!(row[0].schar, 42);
+        assert_eq!(row[1].schar, crate::types_defs::ScharT::MAX);
+        assert_eq!(row[2].schar, 0);
+    }
+}
+
 #[cfg(test)]
 mod external_cell_import_tests {
     use super::*;
