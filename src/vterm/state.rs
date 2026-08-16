@@ -479,6 +479,35 @@ pub fn request_horizontal_margins(state: &VTermState, ctrl8bit: bool) -> Vec<u8>
     .concat()
 }
 
+#[must_use]
+pub fn request_cursor_style(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    let mut reply = match i32::from(state.mode.cursor_shape) {
+        crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK => 2,
+        crate::vterm_defs::VTERM_PROP_CURSORSHAPE_UNDERLINE => 4,
+        crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT => 6,
+        _ => 0,
+    };
+    if state.mode.cursor_blink {
+        reply -= 1;
+    }
+    let start: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_DCS] } else { b"\x1bP" };
+    let end: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_ST] } else { b"\x1b\\" };
+    [start, format!("1$r{reply} q").as_bytes(), end].concat()
+}
+
+#[cfg(test)]
+mod cursor_style_request_tests {
+    use super::*;
+    #[test]
+    fn cursor_style_response_maps_shape_and_blink() {
+        let mut state = VTermState::new(1, 1);
+        state.mode.cursor_shape = crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT as u8;
+        assert_eq!(request_cursor_style(&state, false), b"\x1bP1$r6 q\x1b\\");
+        state.mode.cursor_blink = true;
+        assert_eq!(request_cursor_style(&state, false), b"\x1bP1$r5 q\x1b\\");
+    }
+}
+
 #[cfg(test)]
 mod horizontal_margin_request_tests {
     use super::*;
