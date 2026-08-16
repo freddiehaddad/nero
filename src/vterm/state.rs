@@ -312,6 +312,50 @@ pub fn settermprop_string<C: VTermStateCallbacks>(
     ))
 }
 
+/// Saves or restores cursor, pen, and cursor presentation
+/// (`savecursor`).
+pub fn savecursor(state: &mut VTermState, save: i32) {
+    if save != 0 {
+        state.saved.pos = state.pos;
+        state.saved.mode.cursor_visible = state.mode.cursor_visible;
+        state.saved.mode.cursor_blink = state.mode.cursor_blink;
+        state.saved.mode.cursor_shape = state.mode.cursor_shape;
+        state.saved.pen = state.pen;
+    } else {
+        state.pos = state.saved.pos;
+        state.mode.cursor_visible = state.saved.mode.cursor_visible;
+        state.mode.cursor_blink = state.saved.mode.cursor_blink;
+        state.mode.cursor_shape = state.saved.mode.cursor_shape;
+        state.pen = state.saved.pen;
+    }
+}
+
+#[cfg(test)]
+mod savecursor_tests {
+    use super::*;
+    #[test]
+    fn savecursor_roundtrips_cursor_pen_and_modes() {
+        let mut state = VTermState::new(24, 80);
+        state.pos = crate::vterm_defs::VTermPos { row: 3, col: 4 };
+        state.pen.bold = true;
+        state.mode.cursor_visible = true;
+        state.mode.cursor_blink = true;
+        state.mode.cursor_shape = 2;
+        savecursor(&mut state, 1);
+        state.pos = Default::default();
+        state.pen = Default::default();
+        state.mode.cursor_visible = false;
+        state.mode.cursor_blink = false;
+        state.mode.cursor_shape = 0;
+        savecursor(&mut state, 0);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 3, col: 4 });
+        assert!(state.pen.bold);
+        assert!(state.mode.cursor_visible);
+        assert!(state.mode.cursor_blink);
+        assert_eq!(state.mode.cursor_shape, 2);
+    }
+}
+
 #[cfg(test)]
 mod termprop_string_tests {
     use super::*;
