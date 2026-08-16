@@ -1255,6 +1255,13 @@ impl VTermState {
     pub const fn active_screen_index(&self) -> usize {
         if self.mode.alt_screen { 1 } else { 0 }
     }
+
+    pub fn reset_scrollregions(&mut self) {
+        self.scrollregion_top = 0;
+        self.scrollregion_bottom = -1;
+        self.scrollregion_left = 0;
+        self.scrollregion_right = -1;
+    }
 }
 
 #[cfg(test)]
@@ -1320,6 +1327,24 @@ mod termprop_state_tests {
         assert_eq!(state.active_screen_index(), 0);
         state.mode.alt_screen = true;
         assert_eq!(state.active_screen_index(), 1);
+    }
+    #[test]
+    fn reset_scrollregions_restores_unbounded_defaults() {
+        let mut state = VTermState::new(2, 2);
+        state.scrollregion_top = 1;
+        state.scrollregion_bottom = 1;
+        state.scrollregion_left = 1;
+        state.scrollregion_right = 1;
+        state.reset_scrollregions();
+        assert_eq!(
+            (
+                state.scrollregion_top,
+                state.scrollregion_bottom,
+                state.scrollregion_left,
+                state.scrollregion_right,
+            ),
+            (0, -1, 0, -1)
+        );
     }
 }
 
