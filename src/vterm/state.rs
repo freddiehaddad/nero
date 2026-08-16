@@ -823,6 +823,121 @@ pub fn parse_selection_mask(temp: &mut VTermSelectionTemp, bytes: &[u8]) -> usiz
     consumed
 }
 
+pub fn osc_selection<C: VTermSelectionCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) {
+    if fragment.initial {
+        state.selection_temp.mask = 0;
+        state.selection_temp.state = VTermSelectionState::Initial;
+    }
+    let consumed = parse_selection_mask(&mut state.selection_temp, fragment.bytes);
+    let payload = &fragment.bytes[consumed..];
+    if payload.is_empty() {
+        if fragment.final_fragment {
+            let _ = callbacks.set(
+                u32::from(state.selection_temp.mask),
+                crate::vterm_defs::VTermStringFragment {
+                    bytes: b"",
+                    initial: state.selection_temp.state != VTermSelectionState::Set,
+                    final_fragment: true,
+                    terminator: fragment.terminator,
+                },
+            );
+        }
+        return;
+    }
+    if state.selection_temp.state == VTermSelectionState::Selected {
+        if payload[0] == b'?' {
+            state.selection_temp.state = VTermSelectionState::Query;
+            let _ = callbacks.query(u32::from(state.selection_temp.mask));
+            return;
+        }
+        state.selection_temp.state = VTermSelectionState::SetInitial;
+        state.selection_temp.recv_partial = 0;
+    }
+    if state.selection_temp.state == VTermSelectionState::Invalid {
+        return;
+    }
+    let capacity = state.selection_buflen.max(3);
+    let Some((decoded, _)) =
+        decode_selection_base64(&mut state.selection_temp, payload, capacity)
+    else {
+        let _ = callbacks.set(
+            u32::from(state.selection_temp.mask),
+            crate::vterm_defs::VTermStringFragment {
+                bytes: b"",
+                initial: true,
+                final_fragment: true,
+                terminator: fragment.terminator,
+            },
+        );
+        return;
+    };
+    if !decoded.is_empty() {
+        let initial = state.selection_temp.state == VTermSelectionState::SetInitial;
+        let _ = callbacks.set(
+            u32::from(state.selection_temp.mask),
+            crate::vterm_defs::VTermStringFragment {
+                bytes: &decoded,
+                initial,
+                final_fragment: fragment.final_fragment,
+                terminator: fragment.terminator,
+            },
+        );
+        state.selection_temp.state = VTermSelectionState::Set;
+    }
+}
+
+#[cfg(test)]
+mod osc_selection_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture {
+        sets: Vec<Vec<u8>>,
+        queries: usize,
+    }
+    impl VTermSelectionCallbacks for Capture {
+        fn set(
+            &mut self,
+            _: crate::vterm_defs::VTermSelectionMask,
+            fragment: crate::vterm_defs::VTermStringFragment<'_>,
+        ) -> bool {
+            self.sets.push(fragment.bytes.to_vec());
+            true
+        }
+        fn query(&mut self, _: crate::vterm_defs::VTermSelectionMask) -> bool {
+            self.queries += 1;
+            true
+        }
+    }
+    #[test]
+    fn osc_selection_handles_query_and_base64_set() {
+        let mut state = VTermState::new(1, 1);
+        state.selection_buflen = 64;
+        let mut capture = Capture::default();
+        osc_selection(
+            &mut state,
+            &mut capture,
+            crate::vterm_defs::VTermStringFragment {
+                bytes: b"c;?", initial: true, final_fragment: true,
+                terminator: crate::vterm_defs::VTermTerminator::Bel,
+            },
+        );
+        assert_eq!(capture.queries, 1);
+        osc_selection(
+            &mut state,
+            &mut capture,
+            crate::vterm_defs::VTermStringFragment {
+                bytes: b"c;SGk=", initial: true, final_fragment: true,
+                terminator: crate::vterm_defs::VTermTerminator::Bel,
+            },
+        );
+        assert_eq!(capture.sets.last().unwrap(), b"Hi");
+    }
+}
+
 /// Decodes one OSC 52 base64 fragment while preserving partial sextets.
 pub fn decode_selection_base64(
     temp: &mut VTermSelectionTemp,
