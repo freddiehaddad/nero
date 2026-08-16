@@ -493,6 +493,58 @@ pub fn vterm_screen_get_cell(
     1
 }
 
+/// Converts a public scrollback cell to internal representation.
+#[must_use]
+pub fn screen_cell_from_external(
+    cell: &crate::vterm_defs::VTermScreenCell,
+    global_reverse: bool,
+) -> ScreenCell {
+    ScreenCell {
+        schar: cell.schar,
+        pen: ScreenPen {
+            bold: cell.attrs.bold,
+            underline: cell.attrs.underline,
+            italic: cell.attrs.italic,
+            blink: cell.attrs.blink,
+            reverse: cell.attrs.reverse ^ global_reverse,
+            conceal: cell.attrs.conceal,
+            strike: cell.attrs.strike,
+            font: cell.attrs.font,
+            small: cell.attrs.small,
+            baseline: cell.attrs.baseline,
+            dim: cell.attrs.dim,
+            overline: cell.attrs.overline,
+            fg: cell.fg,
+            bg: cell.bg,
+            uri: cell.uri,
+            ..Default::default()
+        },
+    }
+}
+
+#[cfg(test)]
+mod external_cell_import_tests {
+    use super::*;
+    #[test]
+    fn external_cell_import_copies_attributes_and_applies_global_reverse() {
+        let cell = crate::vterm_defs::VTermScreenCell {
+            schar: 42,
+            attrs: crate::vterm_defs::VTermScreenCellAttrs {
+                bold: true,
+                reverse: true,
+                ..Default::default()
+            },
+            uri: 7,
+            ..Default::default()
+        };
+        let internal = screen_cell_from_external(&cell, true);
+        assert_eq!(internal.schar, 42);
+        assert!(internal.pen.bold);
+        assert!(!internal.pen.reverse);
+        assert_eq!(internal.pen.uri, 7);
+    }
+}
+
 fn emit_stored_damage<C: VTermScreenCallbacks>(
     screen: &mut VTermScreen,
     callbacks: &mut C,
