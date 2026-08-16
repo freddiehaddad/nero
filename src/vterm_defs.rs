@@ -336,6 +336,11 @@ pub enum VTermProp {
     NProps = 12,
 }
 
+pub const VTERM_PROP_CURSORSHAPE_BLOCK: i32 = 1;
+pub const VTERM_PROP_CURSORSHAPE_UNDERLINE: i32 = 2;
+pub const VTERM_PROP_CURSORSHAPE_BAR_LEFT: i32 = 3;
+pub const VTERM_N_PROP_CURSORSHAPES: i32 = 4;
+
 /// Glyph passed from state to screen (`VTermGlyphInfo`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VTermGlyphInfo {
@@ -670,6 +675,19 @@ mod tests {
         assert_eq!(VTermProp::Reverse as i32, 6);
         assert_eq!(VTermProp::SyncOutput as i32, 11);
         assert_eq!(VTermProp::NProps as i32, 12);
+    }
+
+    #[test]
+    fn cursor_shape_values_match_header() {
+        assert_eq!(
+            [
+                VTERM_PROP_CURSORSHAPE_BLOCK,
+                VTERM_PROP_CURSORSHAPE_UNDERLINE,
+                VTERM_PROP_CURSORSHAPE_BAR_LEFT,
+                VTERM_N_PROP_CURSORSHAPES,
+            ],
+            [1, 2, 3, 4]
+        );
     }
 
     #[test]
