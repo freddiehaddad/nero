@@ -32,6 +32,14 @@ pub struct VTermSavedMode {
     pub cursor_shape: u8,
 }
 
+/// Saved cursor and pen state (`state->saved`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermSavedState {
+    pub pos: crate::vterm_defs::VTermPos,
+    pub pen: crate::vterm::pen::VTermPen,
+    pub mode: VTermSavedMode,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +65,15 @@ mod tests {
             cursor_visible: false,
             cursor_blink: false,
             cursor_shape: 0,
+        });
+    }
+
+    #[test]
+    fn saved_state_defaults_to_zeroed_cursor_and_pen() {
+        assert_eq!(VTermSavedState::default(), VTermSavedState {
+            pos: crate::vterm_defs::VTermPos::default(),
+            pen: crate::vterm::pen::VTermPen::default(),
+            mode: VTermSavedMode::default(),
         });
     }
 }
