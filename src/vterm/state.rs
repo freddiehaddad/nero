@@ -365,6 +365,46 @@ pub trait VTermStateCallbacks {
 
 impl VTermStateCallbacks for () {}
 
+#[allow(dead_code)]
+struct StatePenCallback<'a, C>(&'a mut C);
+
+impl<C: VTermStateCallbacks> crate::vterm::pen::VTermPenCallbacks for StatePenCallback<'_, C> {
+    fn set_pen_attr(
+        &mut self,
+        attr: crate::vterm_defs::VTermAttr,
+        value: &crate::vterm_defs::VTermValue<'_>,
+    ) -> bool {
+        self.0.set_pen_attr(attr, value)
+    }
+}
+
+#[cfg(test)]
+mod state_pen_adapter_tests {
+    use super::*;
+    struct Capture(bool);
+    impl VTermStateCallbacks for Capture {
+        fn set_pen_attr(
+            &mut self,
+            _: crate::vterm_defs::VTermAttr,
+            _: &crate::vterm_defs::VTermValue<'_>,
+        ) -> bool {
+            self.0 = true;
+            true
+        }
+    }
+    #[test]
+    fn state_pen_adapter_forwards_attribute() {
+        let mut capture = Capture(false);
+        let mut adapter = StatePenCallback(&mut capture);
+        assert!(crate::vterm::pen::VTermPenCallbacks::set_pen_attr(
+            &mut adapter,
+            crate::vterm_defs::VTermAttr::Bold,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        ));
+        assert!(capture.0);
+    }
+}
+
 /// Emits one glyph through state callbacks (`putglyph`).
 pub fn putglyph<C: VTermStateCallbacks>(
     state: &VTermState,
