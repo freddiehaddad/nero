@@ -85,6 +85,8 @@ pub struct VTermState {
     pub lineinfos: [Vec<crate::vterm_defs::VTermLineInfo>; 2],
     pub active_lineinfo: usize,
     pub mode: VTermStateMode,
+    pub pen: crate::vterm::pen::VTermPen,
+    pub saved: VTermSavedState,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -373,6 +375,8 @@ impl VTermState {
             ],
             active_lineinfo: 0,
             mode: VTermStateMode::default(),
+            pen: crate::vterm::pen::VTermPen::default(),
+            saved: VTermSavedState::default(),
         }
     }
 
@@ -816,6 +820,8 @@ mod tests {
         assert_eq!(state.lineinfos[1].len(), 24);
         assert_eq!(state.active_lineinfo, 0);
         assert_eq!(state.pos, crate::vterm_defs::VTermPos::default());
+        assert_eq!(state.pen, crate::vterm::pen::VTermPen::default());
+        assert_eq!(state.saved, VTermSavedState::default());
     }
 
     #[test]
