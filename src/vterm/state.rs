@@ -1276,6 +1276,13 @@ impl VTermState {
         self.mode.report_focus = false;
         self.mouse_flags = 0;
     }
+
+    pub fn reset_tabstops(&mut self) {
+        self.tabstops.fill(0);
+        for col in (0..self.cols).step_by(8) {
+            self.set_col_tabstop(col);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1374,6 +1381,16 @@ mod termprop_state_tests {
         assert!(!state.mode.keypad);
         assert!(!state.mode.report_focus);
         assert_eq!(state.mouse_flags, 0);
+    }
+    #[test]
+    fn reset_tabstops_sets_every_eighth_column() {
+        let mut state = VTermState::new(1, 20);
+        state.tabstops.fill(0xFF);
+        state.reset_tabstops();
+        assert!(state.is_col_tabstop(0));
+        assert!(state.is_col_tabstop(8));
+        assert!(state.is_col_tabstop(16));
+        assert!(!state.is_col_tabstop(7));
     }
 }
 
