@@ -164,6 +164,13 @@ impl VTermState {
         let mask = 1u8 << (col & 7);
         self.tabstops[(col >> 3) as usize] &= !mask;
     }
+
+    /// Tests one tab stop bit (`is_col_tabstop`).
+    #[must_use]
+    pub fn is_col_tabstop(&self, col: i32) -> bool {
+        let mask = 1u8 << (col & 7);
+        self.tabstops[(col >> 3) as usize] & mask != 0
+    }
 }
 
 #[cfg(test)]
@@ -296,5 +303,16 @@ mod tests {
         state.clear_col_tabstop(0);
         state.clear_col_tabstop(9);
         assert_eq!(state.tabstops, [0xFE, 0xFD]);
+    }
+
+    #[test]
+    fn is_col_tabstop_reads_the_matching_bit() {
+        let mut state = VTermState::new(1, 16);
+        state.set_col_tabstop(7);
+        state.set_col_tabstop(8);
+        assert!(state.is_col_tabstop(7));
+        assert!(state.is_col_tabstop(8));
+        assert!(!state.is_col_tabstop(6));
+        assert!(!state.is_col_tabstop(9));
     }
 }
