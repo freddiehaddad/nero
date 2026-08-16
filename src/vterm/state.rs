@@ -127,6 +127,13 @@ pub fn on_pm<F: VTermStateFallbacks>(
     i32::from(fallbacks.pm(fragment))
 }
 
+pub fn on_sos<F: VTermStateFallbacks>(
+    fallbacks: &mut F,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> i32 {
+    i32::from(fallbacks.sos(fragment))
+}
+
 #[cfg(test)]
 mod apc_fallback_tests {
     use super::*;
@@ -138,6 +145,7 @@ mod apc_fallback_tests {
         };
         assert_eq!(on_apc(&mut (), fragment), 0);
         assert_eq!(on_pm(&mut (), fragment), 0);
+        assert_eq!(on_sos(&mut (), fragment), 0);
     }
 }
 
