@@ -756,6 +756,41 @@ pub fn dispatch_status_request(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     }
 }
 
+pub fn on_dcs_status(
+    state: &mut VTermState,
+    command: &[u8],
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ctrl8bit: bool,
+) -> Option<Vec<u8>> {
+    if command != b"$q" {
+        return None;
+    }
+    if accumulate_decrqss(state, fragment) {
+        Some(dispatch_status_request(state, ctrl8bit))
+    } else {
+        Some(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod dcs_status_tests {
+    use super::*;
+    #[test]
+    fn dcs_status_handles_only_decrqss_command() {
+        let mut state = VTermState::new(2, 80);
+        state.reset_scrollregions();
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"r", initial: true, final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        };
+        assert!(on_dcs_status(&mut state, b"x", fragment, false).is_none());
+        assert_eq!(
+            on_dcs_status(&mut state, b"$q", fragment, false).unwrap(),
+            b"\x1bP1$r1;2r\x1b\\"
+        );
+    }
+}
+
 #[cfg(test)]
 mod status_dispatch_tests {
     use super::*;
