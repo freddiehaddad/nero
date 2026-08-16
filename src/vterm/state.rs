@@ -1686,6 +1686,14 @@ impl VTermState {
         }
     }
 
+    pub fn initialize_pen_colors(&mut self) {
+        let mut pen_state = crate::vterm::pen::VTermPenState::default();
+        crate::vterm::pen::vterm_state_newpen(&mut pen_state);
+        self.default_fg = pen_state.default_fg;
+        self.default_bg = pen_state.default_bg;
+        self.colors = pen_state.palette.colors;
+    }
+
     /// Resizes tabstop storage, preserving old columns and defaulting
     /// new columns every eight cells (`on_resize`).
     pub fn resize_tabstops(&mut self, cols: i32) {
@@ -1896,6 +1904,14 @@ mod termprop_state_tests {
         assert!(!state.mode.keypad);
         assert!(!state.mode.report_focus);
         assert_eq!(state.mouse_flags, 0);
+    }
+    #[test]
+    fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
+        let mut state = VTermState::new(1, 1);
+        state.initialize_pen_colors();
+        assert!(state.default_fg.is_default_fg());
+        assert!(state.default_bg.is_default_bg());
+        assert_eq!((state.colors[1].red, state.colors[1].green), (224, 0));
     }
     #[test]
     fn reset_tabstops_sets_every_eighth_column() {
