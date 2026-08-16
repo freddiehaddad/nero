@@ -642,6 +642,81 @@ mod moverect_internal_tests {
     }
 }
 
+/// Emits a user move callback or damages the destination
+/// (`moverect_user`).
+pub fn moverect_user<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    destination: crate::vterm_defs::VTermRect,
+    source: crate::vterm_defs::VTermRect,
+) -> i32 {
+    if screen.damage_merge != crate::vterm_defs::VTermDamageSize::Scroll {
+        vterm_screen_flush_damage(screen, callbacks);
+    }
+    if callbacks.move_rect(destination, source) {
+        return 1;
+    }
+    damagerect(screen, callbacks, destination);
+    1
+}
+
+#[cfg(test)]
+mod moverect_user_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        handle: bool,
+        moves: usize,
+        damage: Vec<crate::vterm_defs::VTermRect>,
+    }
+
+    impl VTermScreenCallbacks for Capture {
+        fn move_rect(
+            &mut self,
+            _destination: crate::vterm_defs::VTermRect,
+            _source: crate::vterm_defs::VTermRect,
+        ) -> bool {
+            self.moves += 1;
+            self.handle
+        }
+
+        fn damage(&mut self, rect: crate::vterm_defs::VTermRect) -> bool {
+            self.damage.push(rect);
+            true
+        }
+    }
+
+    #[test]
+    fn moverect_user_uses_callback_then_damage_fallback() {
+        let mut screen = screen_new(3, 3);
+        let destination = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 1,
+            start_col: 0,
+            end_col: 1,
+        };
+        let source = crate::vterm_defs::VTermRect {
+            start_row: 1,
+            end_row: 2,
+            ..destination
+        };
+        let mut capture = Capture::default();
+        assert_eq!(
+            moverect_user(&mut screen, &mut capture, destination, source),
+            1
+        );
+        assert_eq!(capture.moves, 1);
+        assert_eq!(capture.damage, [destination]);
+
+        capture.handle = true;
+        capture.damage.clear();
+        moverect_user(&mut screen, &mut capture, destination, source);
+        assert_eq!(capture.moves, 2);
+        assert!(capture.damage.is_empty());
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
