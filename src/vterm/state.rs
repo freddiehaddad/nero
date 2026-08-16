@@ -251,6 +251,21 @@ pub fn scroll<C: VTermStateCallbacks>(
     }
 }
 
+/// Advances one row or scrolls at the bottom margin (`linefeed`).
+pub fn linefeed<C: VTermStateCallbacks>(state: &mut VTermState, callbacks: &mut C) {
+    if state.pos.row == state.scrollregion_bottom() - 1 {
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: state.scrollregion_top,
+            end_row: state.scrollregion_bottom(),
+            start_col: state.scrollregion_left(),
+            end_col: state.scrollregion_right(),
+        };
+        scroll(state, callbacks, rect, 1, 0);
+    } else if state.pos.row < state.rows - 1 {
+        state.pos.row += 1;
+    }
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -516,6 +531,7 @@ mod tests {
             moved: usize,
             erased: usize,
         }
+
         impl VTermStateCallbacks for Capture {
             fn move_rect(&mut self, _: crate::vterm_defs::VTermRect, _: crate::vterm_defs::VTermRect) -> bool {
                 self.moved += 1;
@@ -544,6 +560,29 @@ mod tests {
         assert!(state.lineinfos[0][0].continuation);
         assert_eq!(state.lineinfos[0][3], Default::default());
         assert_eq!((capture.moved, capture.erased), (1, 1));
+    }
+
+    #[test]
+    fn linefeed_advances_or_scrolls_at_bottom_margin() {
+        #[derive(Default)]
+        struct Capture(usize);
+        impl VTermStateCallbacks for Capture {
+            fn scroll_rect(&mut self, _: crate::vterm_defs::VTermRect, _: i32, _: i32) -> bool {
+                self.0 += 1;
+                true
+            }
+        }
+        let mut state = VTermState::new(4, 10);
+        state.scrollregion_bottom = -1;
+        state.pos.row = 1;
+        let mut capture = Capture::default();
+        linefeed(&mut state, &mut capture);
+        assert_eq!(state.pos.row, 2);
+        assert_eq!(capture.0, 0);
+        state.pos.row = 3;
+        linefeed(&mut state, &mut capture);
+        assert_eq!(state.pos.row, 3);
+        assert_eq!(capture.0, 1);
     }
 
     #[test]
