@@ -394,6 +394,38 @@ pub fn linefeed<C: VTermStateCallbacks>(state: &mut VTermState, callbacks: &mut 
     }
 }
 
+pub fn on_resize<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    rows: i32,
+    cols: i32,
+) -> i32 {
+    let old_position = state.pos;
+    state.resize_tabstops(cols);
+    state.resize_lineinfos(rows);
+    state.rows = rows;
+    state.cols = cols;
+    state.adjust_resize_phantom(cols);
+    state.clamp_resize_bounds(rows, cols);
+    updatecursor(state, callbacks, old_position, true);
+    1
+}
+
+#[cfg(test)]
+mod on_resize_tests {
+    use super::*;
+    #[test]
+    fn on_resize_updates_storage_dimensions_and_cursor() {
+        let mut state = VTermState::new(2, 10);
+        state.pos = crate::vterm_defs::VTermPos { row: 1, col: 9 };
+        let mut callbacks = ();
+        assert_eq!(on_resize(&mut state, &mut callbacks, 4, 20), 1);
+        assert_eq!((state.rows, state.cols), (4, 20));
+        assert_eq!(state.lineinfos[0].len(), 4);
+        assert_eq!(state.tabstops.len(), 3);
+    }
+}
+
 /// Emits a boolean terminal property (`settermprop_bool`).
 pub fn settermprop_bool<C: VTermStateCallbacks>(
     callbacks: &mut C,
