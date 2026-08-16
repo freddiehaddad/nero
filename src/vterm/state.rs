@@ -87,6 +87,54 @@ pub struct VTermState {
     pub mode: VTermStateMode,
 }
 
+/// State callback surface (`VTermStateCallbacks`).
+pub trait VTermStateCallbacks {
+    fn put_glyph(
+        &mut self,
+        _info: &crate::vterm_defs::VTermGlyphInfo,
+        _position: crate::vterm_defs::VTermPos,
+    ) -> bool {
+        false
+    }
+
+    fn move_cursor(
+        &mut self,
+        _position: crate::vterm_defs::VTermPos,
+        _old_position: crate::vterm_defs::VTermPos,
+        _visible: bool,
+    ) -> bool {
+        false
+    }
+
+    fn scroll_rect(
+        &mut self,
+        _rect: crate::vterm_defs::VTermRect,
+        _downward: i32,
+        _rightward: i32,
+    ) -> bool {
+        false
+    }
+
+    fn erase(&mut self, _rect: crate::vterm_defs::VTermRect, _selective: bool) -> bool {
+        false
+    }
+
+    fn init_pen(&mut self) -> bool {
+        false
+    }
+
+    fn set_line_info(
+        &mut self,
+        _row: i32,
+        _new_info: &crate::vterm_defs::VTermLineInfo,
+        _old_info: &crate::vterm_defs::VTermLineInfo,
+    ) -> bool {
+        false
+    }
+}
+
+impl VTermStateCallbacks for () {}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -246,6 +294,17 @@ impl VTermState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_state_callbacks_decline_events() {
+        let callbacks = &mut ();
+        assert!(!callbacks.put_glyph(&Default::default(), Default::default()));
+        assert!(!callbacks.move_cursor(Default::default(), Default::default(), true));
+        assert!(!callbacks.scroll_rect(Default::default(), 1, 0));
+        assert!(!callbacks.erase(Default::default(), false));
+        assert!(!callbacks.init_pen());
+        assert!(!callbacks.set_line_info(0, &Default::default(), &Default::default()));
+    }
     #[test]
     fn primary_device_attributes_match_state_c() {
         assert_eq!(VTERM_PRIMARY_DEVICE_ATTR, b"61;22;52");
