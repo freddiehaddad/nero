@@ -3,6 +3,14 @@
 /// Primary Device Attributes response (`vterm_primary_device_attr`).
 pub static VTERM_PRIMARY_DEVICE_ATTR: &[u8] = b"61;22;52";
 
+pub const NO_FORCE: i32 = 0;
+pub const FORCE: i32 = 1;
+pub const DWL_OFF: i32 = 0;
+pub const DWL_ON: i32 = 1;
+pub const DHL_OFF: i32 = 0;
+pub const DHL_TOP: i32 = 1;
+pub const DHL_BOTTOM: i32 = 2;
+
 /// Terminal mode bitfields embedded in `VTermState`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VTermStateMode {
@@ -209,6 +217,9 @@ mod tests {
     #[test]
     fn primary_device_attributes_match_state_c() {
         assert_eq!(VTERM_PRIMARY_DEVICE_ATTR, b"61;22;52");
+        assert_eq!([NO_FORCE, FORCE], [0, 1]);
+        assert_eq!([DWL_OFF, DWL_ON], [0, 1]);
+        assert_eq!([DHL_OFF, DHL_TOP, DHL_BOTTOM], [0, 1, 2]);
     }
 
     #[test]
