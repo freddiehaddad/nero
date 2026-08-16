@@ -150,6 +150,20 @@ pub fn screen_new(rows: i32, cols: i32) -> VTermScreen {
     }
 }
 
+/// Releases all owned screen buffers (`vterm_screen_free`).
+pub fn vterm_screen_free(screen: VTermScreen) {
+    drop(screen);
+}
+
+#[cfg(test)]
+mod screen_free_tests {
+    use super::*;
+    #[test]
+    fn screen_free_consumes_owned_screen() {
+        vterm_screen_free(screen_new(2, 3));
+    }
+}
+
 /// Clears a cell with the screen's current pen (`clearcell`).
 pub fn clearcell(screen: &VTermScreen, cell: &mut ScreenCell) {
     cell.schar = 0;
