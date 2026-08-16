@@ -70,6 +70,22 @@ pub struct VTermSelectionTemp {
     pub send_partial: u32,
 }
 
+/// Selection callbacks (`VTermSelectionCallbacks`).
+pub trait VTermSelectionCallbacks {
+    fn set(
+        &mut self,
+        _mask: crate::vterm_defs::VTermSelectionMask,
+        _fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool {
+        false
+    }
+    fn query(&mut self, _mask: crate::vterm_defs::VTermSelectionMask) -> bool {
+        false
+    }
+}
+
+impl VTermSelectionCallbacks for () {}
+
 /// Core geometry and cursor fields of `VTermState`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VTermState {
@@ -935,6 +951,19 @@ mod tests {
                 send_partial: 0,
             }
         );
+    }
+
+    #[test]
+    fn default_selection_callbacks_decline_operations() {
+        let mut callbacks = ();
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"",
+            initial: true,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        };
+        assert!(!callbacks.set(0, fragment));
+        assert!(!callbacks.query(0));
     }
 
     #[test]
