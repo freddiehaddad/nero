@@ -926,6 +926,34 @@ mod bell_tests {
     }
 }
 
+/// Forwards a theme query, succeeding when no callback exists (`theme`).
+pub fn theme<C: VTermScreenCallbacks>(
+    callbacks: Option<&mut C>,
+    dark: &mut bool,
+) -> i32 {
+    callbacks.map_or(1, |callbacks| i32::from(callbacks.theme(dark)))
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    struct Capture;
+    impl VTermScreenCallbacks for Capture {
+        fn theme(&mut self, dark: &mut bool) -> bool {
+            *dark = true;
+            true
+        }
+    }
+    #[test]
+    fn theme_defaults_to_success_and_forwards_callback() {
+        let mut dark = false;
+        assert_eq!(theme::<Capture>(None, &mut dark), 1);
+        assert!(!dark);
+        assert_eq!(theme(Some(&mut Capture), &mut dark), 1);
+        assert!(dark);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
