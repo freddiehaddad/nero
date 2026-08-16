@@ -86,6 +86,33 @@ pub trait VTermSelectionCallbacks {
 
 impl VTermSelectionCallbacks for () {}
 
+/// Unrecognized parser fallbacks (`VTermStateFallbacks`).
+pub trait VTermStateFallbacks {
+    fn control(&mut self, _control: u8) -> bool { false }
+    fn csi(
+        &mut self,
+        _leader: Option<&[u8]>,
+        _args: &[crate::vterm::parser::CsiArg],
+        _intermed: Option<&[u8]>,
+        _command: u8,
+    ) -> bool { false }
+    fn osc(
+        &mut self,
+        _command: i32,
+        _fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool { false }
+    fn dcs(
+        &mut self,
+        _command: &[u8],
+        _fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool { false }
+    fn apc(&mut self, _fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool { false }
+    fn pm(&mut self, _fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool { false }
+    fn sos(&mut self, _fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool { false }
+}
+
+impl VTermStateFallbacks for () {}
+
 /// Core geometry and cursor fields of `VTermState`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VTermState {
@@ -1556,6 +1583,24 @@ mod tests {
         };
         assert!(!callbacks.set(0, fragment));
         assert!(!callbacks.query(0));
+    }
+
+    #[test]
+    fn default_state_fallbacks_decline_sequences() {
+        let mut fallbacks = ();
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"",
+            initial: true,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        };
+        assert!(!fallbacks.control(0x80));
+        assert!(!fallbacks.csi(None, &[], None, b'm'));
+        assert!(!fallbacks.osc(3, fragment));
+        assert!(!fallbacks.dcs(b"q", fragment));
+        assert!(!fallbacks.apc(fragment));
+        assert!(!fallbacks.pm(fragment));
+        assert!(!fallbacks.sos(fragment));
     }
 
     #[test]
