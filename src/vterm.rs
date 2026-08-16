@@ -6,4 +6,5 @@ pub mod mouse;
 pub mod parser;
 pub mod pen;
 pub mod screen;
+pub mod state;
 pub mod core;
