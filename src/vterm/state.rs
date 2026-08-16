@@ -103,6 +103,8 @@ pub struct VTermState {
     pub mode: VTermStateMode,
     pub pen: crate::vterm::pen::VTermPen,
     pub saved: VTermSavedState,
+    pub selection_buffer: Option<Vec<u8>>,
+    pub selection_buflen: usize,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -519,6 +521,8 @@ impl VTermState {
             mode: VTermStateMode::default(),
             pen: crate::vterm::pen::VTermPen::default(),
             saved: VTermSavedState::default(),
+            selection_buffer: None,
+            selection_buflen: 0,
         }
     }
 
@@ -647,6 +651,17 @@ impl VTermState {
         if accept(row, &info, &old) || force != 0 {
             self.lineinfos[self.active_lineinfo][row as usize] = info;
         }
+    }
+
+    /// Installs selection storage (`vterm_state_set_selection_callbacks`
+    /// buffer portion).
+    pub fn set_selection_buffer(&mut self, buffer: Option<Vec<u8>>, buflen: usize) {
+        self.selection_buffer = if buflen != 0 {
+            Some(buffer.unwrap_or_else(|| vec![0; buflen]))
+        } else {
+            buffer
+        };
+        self.selection_buflen = buflen;
     }
 }
 
@@ -977,6 +992,18 @@ mod tests {
         assert_eq!(state.pos, crate::vterm_defs::VTermPos::default());
         assert_eq!(state.pen, crate::vterm::pen::VTermPen::default());
         assert_eq!(state.saved, VTermSavedState::default());
+        assert!(state.selection_buffer.is_none());
+        assert_eq!(state.selection_buflen, 0);
+    }
+
+    #[test]
+    fn selection_buffer_uses_supplied_or_allocated_storage() {
+        let mut state = VTermState::new(1, 1);
+        state.set_selection_buffer(None, 4);
+        assert_eq!(state.selection_buffer, Some(vec![0; 4]));
+        assert_eq!(state.selection_buflen, 4);
+        state.set_selection_buffer(Some(vec![1, 2]), 2);
+        assert_eq!(state.selection_buffer, Some(vec![1, 2]));
     }
 
     #[test]
