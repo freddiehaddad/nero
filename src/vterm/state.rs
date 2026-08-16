@@ -1329,6 +1329,13 @@ impl VTermState {
         }
         self.tabstops = new_tabstops;
     }
+
+    pub fn resize_lineinfos(&mut self, rows: i32) {
+        let rows = usize::try_from(rows).unwrap_or(0);
+        for lineinfo in &mut self.lineinfos {
+            lineinfo.resize(rows, Default::default());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1346,6 +1353,22 @@ mod resize_tabstop_tests {
         state.resize_tabstops(5);
         assert!(state.is_col_tabstop(3));
         assert_eq!(state.tabstops.len(), 1);
+    }
+
+    #[cfg(test)]
+    mod resize_lineinfo_tests {
+        use super::*;
+        #[test]
+        fn resize_lineinfos_preserves_common_rows_and_clears_new_rows() {
+            let mut state = VTermState::new(2, 10);
+            state.lineinfos[0][1].doublewidth = true;
+            state.resize_lineinfos(4);
+            assert!(state.lineinfos[0][1].doublewidth);
+            assert_eq!(state.lineinfos[0][3], Default::default());
+            assert_eq!(state.lineinfos[1].len(), 4);
+            state.resize_lineinfos(1);
+            assert_eq!(state.lineinfos[0].len(), 1);
+        }
     }
 }
 
