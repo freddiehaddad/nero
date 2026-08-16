@@ -560,6 +560,70 @@ mod on_resize_tests {
     }
 }
 
+pub fn vterm_state_reset<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    hard: bool,
+) {
+    state.reset(hard);
+    let _ = callbacks.init_pen();
+    state.reset_pen(callbacks);
+    let _ = settermprop_bool(
+        callbacks,
+        crate::vterm_defs::VTermProp::CursorVisible,
+        1,
+    );
+    let _ = settermprop_bool(
+        callbacks,
+        crate::vterm_defs::VTermProp::CursorBlink,
+        1,
+    );
+    let _ = settermprop_int(
+        callbacks,
+        crate::vterm_defs::VTermProp::CursorShape,
+        crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK,
+    );
+    if hard {
+        erase(
+            state,
+            callbacks,
+            crate::vterm_defs::VTermRect {
+                start_row: 0,
+                end_row: state.rows,
+                start_col: 0,
+                end_col: state.cols,
+            },
+            false,
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_reset_callback_tests {
+    use super::*;
+    #[test]
+    fn state_reset_initializes_props_and_hard_erases() {
+        #[derive(Default)]
+        struct Capture { props: usize, erased: usize }
+        impl VTermStateCallbacks for Capture {
+            fn set_term_prop(
+                &mut self,
+                _: crate::vterm_defs::VTermProp,
+                _: &crate::vterm_defs::VTermValue<'_>,
+            ) -> bool { self.props += 1; true }
+            fn erase(&mut self, _: crate::vterm_defs::VTermRect, _: bool) -> bool {
+                self.erased += 1; true
+            }
+        }
+        let mut state = VTermState::new(2, 2);
+        state.initialize_pen_colors();
+        let mut capture = Capture::default();
+        vterm_state_reset(&mut state, &mut capture, true);
+        assert_eq!(capture.props, 3);
+        assert_eq!(capture.erased, 1);
+    }
+}
+
 /// Emits a boolean terminal property (`settermprop_bool`).
 pub fn settermprop_bool<C: VTermStateCallbacks>(
     callbacks: &mut C,
