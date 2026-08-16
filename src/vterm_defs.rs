@@ -341,6 +341,12 @@ pub const VTERM_PROP_CURSORSHAPE_UNDERLINE: i32 = 2;
 pub const VTERM_PROP_CURSORSHAPE_BAR_LEFT: i32 = 3;
 pub const VTERM_N_PROP_CURSORSHAPES: i32 = 4;
 
+pub const VTERM_PROP_MOUSE_NONE: i32 = 0;
+pub const VTERM_PROP_MOUSE_CLICK: i32 = 1;
+pub const VTERM_PROP_MOUSE_DRAG: i32 = 2;
+pub const VTERM_PROP_MOUSE_MOVE: i32 = 3;
+pub const VTERM_N_PROP_MOUSES: i32 = 4;
+
 /// Glyph passed from state to screen (`VTermGlyphInfo`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VTermGlyphInfo {
@@ -687,6 +693,20 @@ mod tests {
                 VTERM_N_PROP_CURSORSHAPES,
             ],
             [1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn mouse_property_values_match_header() {
+        assert_eq!(
+            [
+                VTERM_PROP_MOUSE_NONE,
+                VTERM_PROP_MOUSE_CLICK,
+                VTERM_PROP_MOUSE_DRAG,
+                VTERM_PROP_MOUSE_MOVE,
+                VTERM_N_PROP_MOUSES,
+            ],
+            [0, 1, 2, 3, 4]
         );
     }
 
