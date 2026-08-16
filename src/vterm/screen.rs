@@ -1324,7 +1324,58 @@ pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
     screen: &mut VTermScreen,
     callbacks: &mut C,
 ) {
+    if screen.pending_scrollrect.start_row != -1 {
+        let rect = screen.pending_scrollrect;
+        let downward = screen.pending_scroll_downward;
+        let rightward = screen.pending_scroll_rightward;
+        screen.pending_scrollrect.start_row = -1;
+        let mut movement = None;
+        let mut erased = None;
+        crate::vterm::core::vterm_scroll_rect(
+            rect,
+            downward,
+            rightward,
+            Some(&mut |destination, source| movement = Some((destination, source))),
+            &mut |area, _| erased = Some(area),
+        );
+        if let Some((destination, source)) = movement {
+            let _ = moverect_user(screen, callbacks, destination, source);
+        }
+        if let Some(area) = erased {
+            let _ = erase_user(screen, callbacks, area, false);
+        }
+    }
     emit_stored_damage(screen, callbacks);
+}
+
+#[cfg(test)]
+mod flush_pending_scroll_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture(usize);
+    impl VTermScreenCallbacks for Capture {
+        fn move_rect(
+            &mut self,
+            _: crate::vterm_defs::VTermRect,
+            _: crate::vterm_defs::VTermRect,
+        ) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+    #[test]
+    fn flush_damage_emits_and_clears_pending_scroll() {
+        let mut screen = screen_new(2, 2);
+        screen.damage_merge = crate::vterm_defs::VTermDamageSize::Scroll;
+        screen.pending_scrollrect = crate::vterm_defs::VTermRect {
+            start_row: 0, end_row: 2, start_col: 0, end_col: 2,
+        };
+        screen.pending_scroll_downward = 1;
+        let mut capture = Capture::default();
+        vterm_screen_flush_damage(&mut screen, &mut capture);
+        assert_eq!(capture.0, 1);
+        assert_eq!(screen.pending_scrollrect.start_row, -1);
+    }
 }
 
 /// Flushes pending damage and changes its merge policy
