@@ -426,6 +426,47 @@ pub fn putglyph<C: VTermStateCallbacks>(
     let _ = callbacks.put_glyph(&info, position);
 }
 
+pub fn decaln<C: VTermStateCallbacks>(state: &VTermState, callbacks: &mut C) {
+    let e = crate::grid::schar_from_ascii(b'E');
+    for row in 0..state.rows {
+        for col in 0..state.row_width(row) {
+            putglyph(
+                state,
+                callbacks,
+                e,
+                1,
+                crate::vterm_defs::VTermPos { row, col },
+                state.protected_cell,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod decaln_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture(usize);
+    impl VTermStateCallbacks for Capture {
+        fn put_glyph(
+            &mut self,
+            info: &crate::vterm_defs::VTermGlyphInfo,
+            _: crate::vterm_defs::VTermPos,
+        ) -> bool {
+            assert_eq!(info.schar, crate::grid::schar_from_ascii(b'E'));
+            self.0 += 1;
+            true
+        }
+    }
+    #[test]
+    fn decaln_fills_every_visible_cell_with_e() {
+        let state = VTermState::new(2, 3);
+        let mut capture = Capture::default();
+        decaln(&state, &mut capture);
+        assert_eq!(capture.0, 6);
+    }
+}
+
 /// Notifies cursor movement and optionally clears phantom state
 /// (`updatecursor`).
 pub fn updatecursor<C: VTermStateCallbacks>(
