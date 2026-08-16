@@ -121,6 +121,7 @@ pub struct VTermState {
     pub gr_set: i32,
     pub gsingle_set: i32,
     pub protected_cell: bool,
+    pub selection_temp: VTermSelectionTemp,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -555,6 +556,7 @@ impl VTermState {
             gr_set: 1,
             gsingle_set: 0,
             protected_cell: false,
+            selection_temp: VTermSelectionTemp::default(),
         }
     }
 
@@ -763,6 +765,7 @@ mod termprop_state_tests {
         );
         assert_eq!((state.gl_set, state.gr_set, state.gsingle_set), (0, 1, 0));
         assert!(!state.protected_cell);
+        assert_eq!(state.selection_temp, VTermSelectionTemp::default());
         assert_eq!(state.combine_width, 0);
         assert_eq!(state.combine_pos.row, -1);
         assert_eq!(
