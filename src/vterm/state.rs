@@ -403,6 +403,37 @@ pub fn vterm_state_get_lineinfo(
     state.lineinfos[state.active_lineinfo].get(row as usize)
 }
 
+/// Encodes the active kitty keyboard flags response
+/// (`request_key_encoding_flags`).
+#[must_use]
+pub fn request_key_encoding_flags(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    let bits = state.key_encoding_stacks[state.active_screen_index()]
+        .current()
+        .bits();
+    let prefix: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_CSI]
+    } else {
+        b"\x1b["
+    };
+    [prefix, format!("?{bits}u").as_bytes()].concat()
+}
+
+#[cfg(test)]
+mod key_flag_request_tests {
+    use super::*;
+    #[test]
+    fn key_flag_request_uses_active_stack_and_control_width() {
+        let mut state = VTermState::new(1, 1);
+        state.key_encoding_stacks[1].items[0].report_events = true;
+        state.mode.alt_screen = true;
+        assert_eq!(request_key_encoding_flags(&state, false), b"\x1b[?2u");
+        assert_eq!(
+            request_key_encoding_flags(&state, true),
+            [vec![crate::vterm_defs::C1_CSI], b"?2u".to_vec()].concat()
+        );
+    }
+}
+
 #[cfg(test)]
 mod get_lineinfo_tests {
     use super::*;
