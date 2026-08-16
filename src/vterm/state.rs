@@ -419,6 +419,50 @@ pub fn request_key_encoding_flags(state: &VTermState, ctrl8bit: bool) -> Vec<u8>
     [prefix, format!("?{bits}u").as_bytes()].concat()
 }
 
+/// Builds the secondary version response (`request_version_string`).
+#[must_use]
+pub fn request_version_string(ctrl8bit: bool) -> Vec<u8> {
+    let start: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_DCS]
+    } else {
+        b"\x1bP"
+    };
+    let end: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_ST]
+    } else {
+        b"\x1b\\"
+    };
+    [
+        start,
+        format!(
+            ">|libvterm({}.{})",
+            crate::vterm_defs::VTERM_VERSION_MAJOR,
+            crate::vterm_defs::VTERM_VERSION_MINOR
+        )
+        .as_bytes(),
+        end,
+    ]
+    .concat()
+}
+
+#[cfg(test)]
+mod version_request_tests {
+    use super::*;
+    #[test]
+    fn version_request_uses_vendored_version_and_control_width() {
+        assert_eq!(request_version_string(false), b"\x1bP>|libvterm(0.3)\x1b\\");
+        assert_eq!(
+            request_version_string(true),
+            [
+                vec![crate::vterm_defs::C1_DCS],
+                b">|libvterm(0.3)".to_vec(),
+                vec![crate::vterm_defs::C1_ST],
+            ]
+            .concat()
+        );
+    }
+}
+
 /// Replaces active kitty keyboard flags (`set_key_encoding_flags`).
 pub fn set_key_encoding_flags(state: &mut VTermState, arg: i32, mode: i32) {
     let set = mode != 3;
