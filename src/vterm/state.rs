@@ -298,6 +298,56 @@ pub fn settermprop_int<C: VTermStateCallbacks>(
     ))
 }
 
+/// Emits a string terminal property (`settermprop_string`).
+pub fn settermprop_string<C: VTermStateCallbacks>(
+    callbacks: &mut C,
+    prop: crate::vterm_defs::VTermProp,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> i32 {
+    i32::from(callbacks.set_term_prop(
+        prop,
+        &crate::vterm_defs::VTermValue::String(fragment),
+    ))
+}
+
+#[cfg(test)]
+mod termprop_string_tests {
+    use super::*;
+
+    #[test]
+    fn settermprop_string_forwards_fragment() {
+        struct Capture(Vec<u8>);
+        impl VTermStateCallbacks for Capture {
+            fn set_term_prop(
+                &mut self,
+                _: crate::vterm_defs::VTermProp,
+                value: &crate::vterm_defs::VTermValue<'_>,
+            ) -> bool {
+                let crate::vterm_defs::VTermValue::String(fragment) = value else {
+                    return false;
+                };
+                self.0 = fragment.bytes.to_vec();
+                true
+            }
+        }
+        let mut capture = Capture(Vec::new());
+        assert_eq!(
+            settermprop_string(
+                &mut capture,
+                crate::vterm_defs::VTermProp::Title,
+                crate::vterm_defs::VTermStringFragment {
+                    bytes: b"title",
+                    initial: true,
+                    final_fragment: true,
+                    terminator: crate::vterm_defs::VTermTerminator::Bel,
+                },
+            ),
+            1
+        );
+        assert_eq!(capture.0, b"title");
+    }
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
