@@ -53,6 +53,15 @@ pub enum VTermSelectionState {
     Invalid = 5,
 }
 
+/// Temporary selection decode fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VTermSelectionTemp {
+    pub mask: u16,
+    pub state: VTermSelectionState,
+    pub recv_partial: u32,
+    pub send_partial: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +107,15 @@ mod tests {
         assert_eq!(VTermSelectionState::SetInitial as u8, 3);
         assert_eq!(VTermSelectionState::Set as u8, 4);
         assert_eq!(VTermSelectionState::Invalid as u8, 5);
+    }
+
+    #[test]
+    fn selection_temp_defaults_to_zeroed_union_member() {
+        assert_eq!(VTermSelectionTemp::default(), VTermSelectionTemp {
+            mask: 0,
+            state: VTermSelectionState::Initial,
+            recv_partial: 0,
+            send_partial: 0,
+        });
     }
 }
