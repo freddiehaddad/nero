@@ -155,6 +155,23 @@ pub fn putglyph<C: VTermStateCallbacks>(
     let _ = callbacks.put_glyph(&info, position);
 }
 
+/// Notifies cursor movement and optionally clears phantom state
+/// (`updatecursor`).
+pub fn updatecursor<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    old_position: crate::vterm_defs::VTermPos,
+    cancel_phantom: bool,
+) {
+    if state.pos == old_position {
+        return;
+    }
+    if cancel_phantom {
+        state.at_phantom = false;
+    }
+    let _ = callbacks.move_cursor(state.pos, old_position, state.mode.cursor_visible);
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -359,6 +376,36 @@ mod tests {
             dhl: 2,
         });
     }
+
+    #[test]
+    fn updatecursor_ignores_unchanged_and_forwards_changed_position() {
+        #[derive(Default)]
+        struct Capture(usize);
+        impl VTermStateCallbacks for Capture {
+            fn move_cursor(
+                &mut self,
+                _: crate::vterm_defs::VTermPos,
+                _: crate::vterm_defs::VTermPos,
+                _: bool,
+            ) -> bool {
+                self.0 += 1;
+                true
+            }
+        }
+        let mut state = VTermState::new(2, 80);
+        state.at_phantom = true;
+        let mut capture = Capture::default();
+        let unchanged = state.pos;
+        updatecursor(&mut state, &mut capture, unchanged, true);
+        assert_eq!(capture.0, 0);
+        assert!(state.at_phantom);
+        let old = state.pos;
+        state.pos.col = 1;
+        updatecursor(&mut state, &mut capture, old, true);
+        assert_eq!(capture.0, 1);
+        assert!(!state.at_phantom);
+    }
+
     #[test]
     fn primary_device_attributes_match_state_c() {
         assert_eq!(VTERM_PRIMARY_DEVICE_ATTR, b"61;22;52");
