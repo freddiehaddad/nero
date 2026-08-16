@@ -269,6 +269,7 @@ pub struct VTermState {
     pub default_bg: crate::vterm_defs::VTermColor,
     pub colors: [crate::vterm_defs::VTermColor; 16],
     pub bold_is_highbright: bool,
+    pub ctrl8bit: bool,
     pub saved: VTermSavedState,
     pub selection_buffer: Option<Vec<u8>>,
     pub selection_buflen: usize,
@@ -1591,6 +1592,7 @@ impl VTermState {
             default_bg: crate::vterm_defs::VTermColor::default(),
             colors: [crate::vterm_defs::VTermColor::default(); 16],
             bold_is_highbright: false,
+            ctrl8bit: false,
             saved: VTermSavedState::default(),
             selection_buffer: None,
             selection_buflen: 0,
@@ -2661,6 +2663,7 @@ mod tests {
         assert_eq!(state.default_bg, crate::vterm_defs::VTermColor::default());
         assert_eq!(state.colors, [crate::vterm_defs::VTermColor::default(); 16]);
         assert!(!state.bold_is_highbright);
+        assert!(!state.ctrl8bit);
         assert_eq!(state.saved, VTermSavedState::default());
         assert!(state.selection_buffer.is_none());
         assert_eq!(state.selection_buflen, 0);
