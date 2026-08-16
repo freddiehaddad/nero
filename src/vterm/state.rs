@@ -337,6 +337,14 @@ pub trait VTermStateCallbacks {
         false
     }
 
+    fn set_pen_attr(
+        &mut self,
+        _attr: crate::vterm_defs::VTermAttr,
+        _value: &crate::vterm_defs::VTermValue<'_>,
+    ) -> bool {
+        false
+    }
+
     fn set_line_info(
         &mut self,
         _row: i32,
@@ -1970,6 +1978,10 @@ mod tests {
         assert!(!callbacks.move_rect(Default::default(), Default::default()));
         assert!(!callbacks.erase(Default::default(), false));
         assert!(!callbacks.init_pen());
+        assert!(!callbacks.set_pen_attr(
+            crate::vterm_defs::VTermAttr::Bold,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        ));
         assert!(!callbacks.set_line_info(0, &Default::default(), &Default::default()));
         assert!(!callbacks.set_term_prop(
             crate::vterm_defs::VTermProp::CursorVisible,
