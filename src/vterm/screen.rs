@@ -1142,6 +1142,30 @@ pub fn vterm_screen_reset_damage(screen: &mut VTermScreen) {
     screen.pending_scrollrect.start_row = -1;
 }
 
+/// Screen-form color conversion wrapper
+/// (`vterm_screen_convert_color_to_rgb`).
+pub fn vterm_screen_convert_color_to_rgb(
+    state: &crate::vterm::pen::VTermPenState,
+    color: &mut crate::vterm_defs::VTermColor,
+) {
+    crate::vterm::pen::vterm_state_convert_color_to_rgb(state, color);
+}
+
+#[cfg(test)]
+mod screen_color_conversion_tests {
+    use super::*;
+    #[test]
+    fn screen_color_conversion_forwards_palette_lookup() {
+        let mut state = crate::vterm::pen::VTermPenState::default();
+        crate::vterm::pen::vterm_state_newpen(&mut state);
+        let mut color = crate::vterm_defs::VTermColor::default();
+        crate::vterm_defs::vterm_color_indexed(&mut color, 1);
+        vterm_screen_convert_color_to_rgb(&state, &mut color);
+        assert!(color.is_rgb());
+        assert_eq!((color.red, color.green, color.blue), (224, 0, 0));
+    }
+}
+
 #[cfg(test)]
 mod reset_damage_tests {
     use super::*;
