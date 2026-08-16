@@ -445,6 +445,35 @@ pub fn request_version_string(ctrl8bit: bool) -> Vec<u8> {
     .concat()
 }
 
+#[must_use]
+pub fn request_vertical_margins(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    let start: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_DCS] } else { b"\x1bP" };
+    let end: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_ST] } else { b"\x1b\\" };
+    [
+        start,
+        format!(
+            "1$r{};{}r",
+            state.scrollregion_top + 1,
+            state.scrollregion_bottom()
+        )
+        .as_bytes(),
+        end,
+    ]
+    .concat()
+}
+
+#[cfg(test)]
+mod vertical_margin_request_tests {
+    use super::*;
+    #[test]
+    fn vertical_margin_response_is_one_based() {
+        let mut state = VTermState::new(24, 80);
+        state.scrollregion_top = 2;
+        state.scrollregion_bottom = 20;
+        assert_eq!(request_vertical_margins(&state, false), b"\x1bP1$r3;20r\x1b\\");
+    }
+}
+
 #[cfg(test)]
 mod version_request_tests {
     use super::*;
