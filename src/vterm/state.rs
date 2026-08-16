@@ -716,6 +716,44 @@ pub fn accumulate_decrqss(
     fragment.final_fragment
 }
 
+#[must_use]
+pub fn request_sgr_status(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    let pen_state = crate::vterm::pen::VTermPenState {
+        pen: state.pen,
+        ..Default::default()
+    };
+    let args = crate::vterm::pen::vterm_state_getpen(&pen_state);
+    let mut body = b"1$r".to_vec();
+    for (index, arg) in args.iter().enumerate() {
+        body.extend_from_slice(crate::vterm::parser::csi_arg(*arg).to_string().as_bytes());
+        if index + 1 < args.len() {
+            body.push(if crate::vterm::parser::csi_arg_has_more(*arg) {
+                b':'
+            } else {
+                b';'
+            });
+        }
+    }
+    body.push(b'm');
+    let start: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_DCS] } else { b"\x1bP" };
+    let end: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_ST] } else { b"\x1b\\" };
+    [start, &body, end].concat()
+}
+
+#[cfg(test)]
+mod sgr_status_tests {
+    use super::*;
+    #[test]
+    fn sgr_status_serializes_pen_arguments() {
+        let mut state = VTermState::new(1, 1);
+        state.pen.bold = true;
+        state.pen.underline = crate::vterm_defs::VTERM_UNDERLINE_CURLY;
+        state.pen.fg.color_type = crate::vterm_defs::VTERM_COLOR_DEFAULT_FG;
+        state.pen.bg.color_type = crate::vterm_defs::VTERM_COLOR_DEFAULT_BG;
+        assert_eq!(request_sgr_status(&state, false), b"\x1bP1$r1;4:3m\x1b\\");
+    }
+}
+
 #[cfg(test)]
 mod decrqss_accumulate_tests {
     use super::*;
