@@ -540,6 +540,65 @@ pub fn import_scrollback_row(
     row
 }
 
+pub fn resize_buffer_no_reflow(
+    screen: &mut VTermScreen,
+    buffer_index: usize,
+    new_rows: i32,
+    new_cols: i32,
+    active: bool,
+    fields: &mut crate::vterm_defs::VTermStateFields,
+) {
+    let old_rows = screen.rows.max(0) as usize;
+    let old_cols = screen.cols.max(0) as usize;
+    let new_rows_usize = new_rows.max(0) as usize;
+    let new_cols_usize = new_cols.max(0) as usize;
+    let old = screen.buffers[buffer_index].take().unwrap_or_default();
+    let old_info = fields.lineinfos[buffer_index].take().unwrap_or_default();
+    let mut new_buffer = vec![
+        ScreenCell { schar: 0, pen: screen.pen };
+        new_rows_usize * new_cols_usize
+    ];
+    let mut new_info = vec![crate::vterm_defs::VTermLineInfo::default(); new_rows_usize];
+    let copy_rows = old_rows.min(new_rows_usize);
+    let source_row = old_rows - copy_rows;
+    let destination_row = new_rows_usize - copy_rows;
+    let copy_cols = old_cols.min(new_cols_usize);
+    for offset in 0..copy_rows {
+        let src = (source_row + offset) * old_cols;
+        let dst = (destination_row + offset) * new_cols_usize;
+        new_buffer[dst..dst + copy_cols].copy_from_slice(&old[src..src + copy_cols]);
+        if let Some(info) = old_info.get(source_row + offset) {
+            new_info[destination_row + offset] = *info;
+        }
+    }
+    if active {
+        fields.pos.row += destination_row as i32 - source_row as i32;
+        fields.pos.row = fields.pos.row.clamp(0, new_rows - 1);
+        fields.pos.col = fields.pos.col.clamp(0, new_cols - 1);
+    }
+    screen.buffers[buffer_index] = Some(new_buffer);
+    fields.lineinfos[buffer_index] = Some(new_info);
+}
+
+#[cfg(test)]
+mod resize_buffer_tests {
+    use super::*;
+    #[test]
+    fn no_reflow_resize_bottom_aligns_rows_and_cursor() {
+        let mut screen = screen_new(3, 2);
+        getcell_mut(&mut screen, 2, 0).unwrap().schar = 42;
+        let mut fields = crate::vterm_defs::VTermStateFields {
+            pos: crate::vterm_defs::VTermPos { row: 2, col: 1 },
+            lineinfos: screen.lineinfo.clone(),
+        };
+        resize_buffer_no_reflow(&mut screen, 0, 2, 3, true, &mut fields);
+        screen.rows = 2;
+        screen.cols = 3;
+        assert_eq!(getcell(&screen, 1, 0).unwrap().schar, 42);
+        assert_eq!(fields.pos.row, 1);
+    }
+}
+
 #[cfg(test)]
 mod scrollback_row_import_tests {
     use super::*;
