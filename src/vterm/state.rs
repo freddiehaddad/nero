@@ -433,6 +433,37 @@ pub fn set_key_encoding_flags(state: &mut VTermState, arg: i32, mode: i32) {
     state.key_encoding_stacks[index].items[top] = flags;
 }
 
+/// Pushes keyboard flags, evicting the oldest full-stack entry
+/// (`push_key_encoding_flags`).
+pub fn push_key_encoding_flags(state: &mut VTermState, arg: i32) {
+    let index = state.active_screen_index();
+    let stack = &mut state.key_encoding_stacks[index];
+    if usize::from(stack.size) == stack.items.len() {
+        stack.items.copy_within(1.., 0);
+    } else {
+        stack.size += 1;
+    }
+    set_key_encoding_flags(state, arg, 1);
+}
+
+#[cfg(test)]
+mod push_key_flags_tests {
+    use super::*;
+    #[test]
+    fn push_key_flags_grows_then_evicts_oldest() {
+        let mut state = VTermState::new(1, 1);
+        push_key_encoding_flags(&mut state, 1);
+        assert_eq!(state.key_encoding_stacks[0].size, 2);
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 1);
+        state.key_encoding_stacks[0].size = 16;
+        state.key_encoding_stacks[0].items[0].report_events = true;
+        push_key_encoding_flags(&mut state, 4);
+        assert_eq!(state.key_encoding_stacks[0].size, 16);
+        assert!(!state.key_encoding_stacks[0].items[0].report_events);
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 4);
+    }
+}
+
 #[cfg(test)]
 mod set_key_flags_tests {
     use super::*;
