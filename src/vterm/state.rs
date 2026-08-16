@@ -358,6 +358,28 @@ pub fn vterm_state_focus_out(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     }
 }
 
+/// Returns active row metadata (`vterm_state_get_lineinfo`).
+#[must_use]
+pub fn vterm_state_get_lineinfo(
+    state: &VTermState,
+    row: i32,
+) -> Option<&crate::vterm_defs::VTermLineInfo> {
+    state.lineinfos[state.active_lineinfo].get(row as usize)
+}
+
+#[cfg(test)]
+mod get_lineinfo_tests {
+    use super::*;
+    #[test]
+    fn get_lineinfo_uses_active_array_and_bounds_checks() {
+        let mut state = VTermState::new(2, 80);
+        state.lineinfos[1][1].doublewidth = true;
+        state.active_lineinfo = 1;
+        assert!(vterm_state_get_lineinfo(&state, 1).unwrap().doublewidth);
+        assert!(vterm_state_get_lineinfo(&state, 2).is_none());
+    }
+}
+
 #[cfg(test)]
 mod focus_out_tests {
     use super::*;
