@@ -209,6 +209,38 @@ impl VTermState {
             }
         }
     }
+
+    /// Updates row double-width/height metadata (`set_lineinfo`).
+    pub fn set_lineinfo(
+        &mut self,
+        row: i32,
+        force: i32,
+        dwl: i32,
+        dhl: i32,
+        accept: impl FnOnce(
+            i32,
+            &crate::vterm_defs::VTermLineInfo,
+            &crate::vterm_defs::VTermLineInfo,
+        ) -> bool,
+    ) {
+        let old = self.lineinfos[self.active_lineinfo][row as usize];
+        let mut info = old;
+        if dwl == DWL_OFF {
+            info.doublewidth = false;
+        } else if dwl == DWL_ON {
+            info.doublewidth = true;
+        }
+        if dhl == DHL_OFF {
+            info.doubleheight = 0;
+        } else if dhl == DHL_TOP {
+            info.doubleheight = 1;
+        } else if dhl == DHL_BOTTOM {
+            info.doubleheight = 2;
+        }
+        if accept(row, &info, &old) || force != 0 {
+            self.lineinfos[self.active_lineinfo][row as usize] = info;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -224,31 +256,51 @@ mod tests {
 
     #[test]
     fn state_modes_default_to_zeroed_bitfields() {
-        assert_eq!(VTermStateMode::default(), VTermStateMode {
-            keypad: false, cursor: false, autowrap: false, insert: false,
-            newline: false, cursor_visible: false, cursor_blink: false,
-            cursor_shape: 0, alt_screen: false, origin: false, screen: false,
-            leftrightmargin: false, bracketpaste: false, report_focus: false,
-            theme_updates: false, synchronized_output: false,
-        });
+        assert_eq!(
+            VTermStateMode::default(),
+            VTermStateMode {
+                keypad: false,
+                cursor: false,
+                autowrap: false,
+                insert: false,
+                newline: false,
+                cursor_visible: false,
+                cursor_blink: false,
+                cursor_shape: 0,
+                alt_screen: false,
+                origin: false,
+                screen: false,
+                leftrightmargin: false,
+                bracketpaste: false,
+                report_focus: false,
+                theme_updates: false,
+                synchronized_output: false,
+            }
+        );
     }
 
     #[test]
     fn saved_modes_default_to_zeroed_bitfields() {
-        assert_eq!(VTermSavedMode::default(), VTermSavedMode {
-            cursor_visible: false,
-            cursor_blink: false,
-            cursor_shape: 0,
-        });
+        assert_eq!(
+            VTermSavedMode::default(),
+            VTermSavedMode {
+                cursor_visible: false,
+                cursor_blink: false,
+                cursor_shape: 0,
+            }
+        );
     }
 
     #[test]
     fn saved_state_defaults_to_zeroed_cursor_and_pen() {
-        assert_eq!(VTermSavedState::default(), VTermSavedState {
-            pos: crate::vterm_defs::VTermPos::default(),
-            pen: crate::vterm::pen::VTermPen::default(),
-            mode: VTermSavedMode::default(),
-        });
+        assert_eq!(
+            VTermSavedState::default(),
+            VTermSavedState {
+                pos: crate::vterm_defs::VTermPos::default(),
+                pen: crate::vterm::pen::VTermPen::default(),
+                mode: VTermSavedMode::default(),
+            }
+        );
     }
 
     #[test]
@@ -263,12 +315,15 @@ mod tests {
 
     #[test]
     fn selection_temp_defaults_to_zeroed_union_member() {
-        assert_eq!(VTermSelectionTemp::default(), VTermSelectionTemp {
-            mask: 0,
-            state: VTermSelectionState::Initial,
-            recv_partial: 0,
-            send_partial: 0,
-        });
+        assert_eq!(
+            VTermSelectionTemp::default(),
+            VTermSelectionTemp {
+                mask: 0,
+                state: VTermSelectionState::Initial,
+                recv_partial: 0,
+                send_partial: 0,
+            }
+        );
     }
 
     #[test]
@@ -380,27 +435,40 @@ mod tests {
 
     #[test]
     fn tab_moves_forward_and_backward_between_stops() {
-            let mut state = VTermState::new(1, 20);
-            for col in [0, 4, 8, 12, 16] {
-                state.set_col_tabstop(col);
-            }
-            state.pos.col = 1;
-            state.tab(2, 1);
-            assert_eq!(state.pos.col, 8);
-            state.tab(1, -1);
-            assert_eq!(state.pos.col, 4);
+        let mut state = VTermState::new(1, 20);
+        for col in [0, 4, 8, 12, 16] {
+            state.set_col_tabstop(col);
         }
+        state.pos.col = 1;
+        state.tab(2, 1);
+        assert_eq!(state.pos.col, 8);
+        state.tab(1, -1);
+        assert_eq!(state.pos.col, 4);
+    }
 
     #[test]
     fn tab_stops_at_row_edges() {
-            let mut state = VTermState::new(1, 10);
-            state.pos.col = 8;
-            state.tab(1, 1);
-            assert_eq!(state.pos.col, 9);
-            state.tab(1, 1);
-            assert_eq!(state.pos.col, 9);
-            state.pos.col = 0;
-            state.tab(1, -1);
-            assert_eq!(state.pos.col, 0);
+        let mut state = VTermState::new(1, 10);
+        state.pos.col = 8;
+        state.tab(1, 1);
+        assert_eq!(state.pos.col, 9);
+        state.tab(1, 1);
+        assert_eq!(state.pos.col, 9);
+        state.pos.col = 0;
+        state.tab(1, -1);
+        assert_eq!(state.pos.col, 0);
+    }
+
+    #[test]
+    fn set_lineinfo_honors_callback_or_force_and_ignore_values() {
+        let mut state = VTermState::new(2, 80);
+        state.set_lineinfo(0, NO_FORCE, DWL_ON, DHL_TOP, |_, _, _| false);
+        assert_eq!(state.lineinfos[0][0], Default::default());
+        state.set_lineinfo(0, FORCE, DWL_ON, DHL_TOP, |_, _, _| false);
+        assert!(state.lineinfos[0][0].doublewidth);
+        assert_eq!(state.lineinfos[0][0].doubleheight, 1);
+        state.set_lineinfo(0, NO_FORCE, -1, -1, |_, new, old| new == old);
+        assert!(state.lineinfos[0][0].doublewidth);
+        assert_eq!(state.lineinfos[0][0].doubleheight, 1);
     }
 }
