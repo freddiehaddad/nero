@@ -330,6 +330,36 @@ pub fn savecursor(state: &mut VTermState, save: i32) {
     }
 }
 
+/// Emits focus-in when focus reporting is enabled
+/// (`vterm_state_focus_in`).
+#[must_use]
+pub fn vterm_state_focus_in(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
+    if !state.mode.report_focus {
+        return Vec::new();
+    }
+    if ctrl8bit {
+        vec![crate::vterm_defs::C1_CSI, b'I']
+    } else {
+        b"\x1b[I".to_vec()
+    }
+}
+
+#[cfg(test)]
+mod focus_in_tests {
+    use super::*;
+    #[test]
+    fn focus_in_honors_reporting_and_control_width() {
+        let mut state = VTermState::new(24, 80);
+        assert!(vterm_state_focus_in(&state, false).is_empty());
+        state.mode.report_focus = true;
+        assert_eq!(vterm_state_focus_in(&state, false), b"\x1b[I");
+        assert_eq!(
+            vterm_state_focus_in(&state, true),
+            [crate::vterm_defs::C1_CSI, b'I']
+        );
+    }
+}
+
 #[cfg(test)]
 mod savecursor_tests {
     use super::*;
