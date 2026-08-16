@@ -109,6 +109,7 @@ pub struct VTermState {
     pub mouse_col: i32,
     pub mouse_row: i32,
     pub mouse_buttons: i32,
+    pub mouse_protocol: crate::vterm::mouse::VTermMouseProtocol,
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -531,6 +532,7 @@ impl VTermState {
             mouse_col: 0,
             mouse_row: 0,
             mouse_buttons: 0,
+            mouse_protocol: crate::vterm::mouse::VTermMouseProtocol::X10,
         }
     }
 
@@ -1093,6 +1095,10 @@ mod tests {
         assert_eq!(state.selection_buflen, 0);
         assert_eq!((state.mouse_row, state.mouse_col), (0, 0));
         assert_eq!(state.mouse_buttons, 0);
+        assert_eq!(
+            state.mouse_protocol,
+            crate::vterm::mouse::VTermMouseProtocol::X10
+        );
     }
 
     #[test]
