@@ -1336,6 +1336,17 @@ impl VTermState {
             lineinfo.resize(rows, Default::default());
         }
     }
+
+    pub fn clamp_resize_bounds(&mut self, rows: i32, cols: i32) {
+        if self.scrollregion_bottom > -1 {
+            self.scrollregion_bottom = self.scrollregion_bottom.min(rows);
+        }
+        if self.scrollregion_right > -1 {
+            self.scrollregion_right = self.scrollregion_right.min(cols);
+        }
+        self.pos.row = self.pos.row.clamp(0, rows - 1);
+        self.pos.col = self.pos.col.clamp(0, cols - 1);
+    }
 }
 
 #[cfg(test)]
@@ -1368,6 +1379,21 @@ mod resize_tabstop_tests {
             assert_eq!(state.lineinfos[1].len(), 4);
             state.resize_lineinfos(1);
             assert_eq!(state.lineinfos[0].len(), 1);
+        }
+
+        #[cfg(test)]
+        mod resize_bound_tests {
+            use super::*;
+            #[test]
+            fn resize_bounds_clamp_regions_and_cursor() {
+                let mut state = VTermState::new(24, 80);
+                state.scrollregion_bottom = 20;
+                state.scrollregion_right = 70;
+                state.pos = crate::vterm_defs::VTermPos { row: 30, col: -2 };
+                state.clamp_resize_bounds(10, 40);
+                assert_eq!((state.scrollregion_bottom, state.scrollregion_right), (10, 40));
+                assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 9, col: 0 });
+            }
         }
     }
 }
