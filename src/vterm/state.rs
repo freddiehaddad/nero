@@ -286,6 +286,18 @@ pub fn settermprop_bool<C: VTermStateCallbacks>(
     ))
 }
 
+/// Emits an integer terminal property (`settermprop_int`).
+pub fn settermprop_int<C: VTermStateCallbacks>(
+    callbacks: &mut C,
+    prop: crate::vterm_defs::VTermProp,
+    value: i32,
+) -> i32 {
+    i32::from(callbacks.set_term_prop(
+        prop,
+        &crate::vterm_defs::VTermValue::Number(value),
+    ))
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -635,6 +647,34 @@ mod tests {
             1
         );
         assert_eq!(capture.0, Some(2));
+    }
+
+    #[test]
+    fn settermprop_int_forwards_number_value() {
+        struct Capture(Option<i32>);
+        impl VTermStateCallbacks for Capture {
+            fn set_term_prop(
+                &mut self,
+                _: crate::vterm_defs::VTermProp,
+                value: &crate::vterm_defs::VTermValue<'_>,
+            ) -> bool {
+                let crate::vterm_defs::VTermValue::Number(value) = value else {
+                    return false;
+                };
+                self.0 = Some(*value);
+                true
+            }
+        }
+        let mut capture = Capture(None);
+        assert_eq!(
+            settermprop_int(
+                &mut capture,
+                crate::vterm_defs::VTermProp::CursorShape,
+                3,
+            ),
+            1
+        );
+        assert_eq!(capture.0, Some(3));
     }
 
     #[test]
