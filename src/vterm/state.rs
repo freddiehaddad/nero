@@ -1807,6 +1807,17 @@ impl VTermState {
         true
     }
 
+    pub fn set_dec_basic_mode(&mut self, number: i32, value: i32) -> bool {
+        let enabled = value != 0;
+        match number {
+            1 => self.mode.cursor = enabled,
+            7 => self.mode.autowrap = enabled,
+            2004 => self.mode.bracketpaste = enabled,
+            _ => return false,
+        }
+        true
+    }
+
     pub fn initialize_pen_colors(&mut self) {
         let mut pen_state = crate::vterm::pen::VTermPenState::default();
         crate::vterm::pen::vterm_state_newpen(&mut pen_state);
@@ -2050,6 +2061,15 @@ mod termprop_state_tests {
         assert!(state.set_mode(20, 1));
         assert!(state.mode.newline);
         assert!(!state.set_mode(99, 1));
+    }
+    #[test]
+    fn set_dec_basic_mode_handles_cursor_wrap_and_paste() {
+        let mut state = VTermState::new(1, 1);
+        assert!(state.set_dec_basic_mode(1, 1));
+        assert!(state.set_dec_basic_mode(7, 1));
+        assert!(state.set_dec_basic_mode(2004, 1));
+        assert!(state.mode.cursor && state.mode.autowrap && state.mode.bracketpaste);
+        assert!(!state.set_dec_basic_mode(2, 1));
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
