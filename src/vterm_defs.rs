@@ -347,6 +347,13 @@ pub const VTERM_PROP_MOUSE_DRAG: i32 = 2;
 pub const VTERM_PROP_MOUSE_MOVE: i32 = 3;
 pub const VTERM_N_PROP_MOUSES: i32 = 4;
 
+pub type VTermSelectionMask = u32;
+pub const VTERM_SELECTION_CLIPBOARD: VTermSelectionMask = 1 << 0;
+pub const VTERM_SELECTION_PRIMARY: VTermSelectionMask = 1 << 1;
+pub const VTERM_SELECTION_SECONDARY: VTermSelectionMask = 1 << 2;
+pub const VTERM_SELECTION_SELECT: VTermSelectionMask = 1 << 3;
+pub const VTERM_SELECTION_CUT0: VTermSelectionMask = 1 << 4;
+
 /// Glyph passed from state to screen (`VTermGlyphInfo`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VTermGlyphInfo {
@@ -707,6 +714,20 @@ mod tests {
                 VTERM_N_PROP_MOUSES,
             ],
             [0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn selection_mask_bits_match_header() {
+        assert_eq!(
+            [
+                VTERM_SELECTION_CLIPBOARD,
+                VTERM_SELECTION_PRIMARY,
+                VTERM_SELECTION_SECONDARY,
+                VTERM_SELECTION_SELECT,
+                VTERM_SELECTION_CUT0,
+            ],
+            [1, 2, 4, 8, 16]
         );
     }
 
