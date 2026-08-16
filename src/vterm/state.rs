@@ -40,6 +40,19 @@ pub struct VTermSavedState {
     pub mode: VTermSavedMode,
 }
 
+/// Selection parser state from `state->tmp.selection`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VTermSelectionState {
+    #[default]
+    Initial = 0,
+    Selected = 1,
+    Query = 2,
+    SetInitial = 3,
+    Set = 4,
+    Invalid = 5,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +88,15 @@ mod tests {
             pen: crate::vterm::pen::VTermPen::default(),
             mode: VTermSavedMode::default(),
         });
+    }
+
+    #[test]
+    fn selection_state_discriminants_match_internal_enum() {
+        assert_eq!(VTermSelectionState::Initial as u8, 0);
+        assert_eq!(VTermSelectionState::Selected as u8, 1);
+        assert_eq!(VTermSelectionState::Query as u8, 2);
+        assert_eq!(VTermSelectionState::SetInitial as u8, 3);
+        assert_eq!(VTermSelectionState::Set as u8, 4);
+        assert_eq!(VTermSelectionState::Invalid as u8, 5);
     }
 }
