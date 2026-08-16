@@ -1001,6 +1001,50 @@ pub fn erase<C: VTermScreenCallbacks>(
     erase_user(screen, callbacks, rect, false)
 }
 
+pub fn queue_pending_scroll(
+    screen: &mut VTermScreen,
+    rect: crate::vterm_defs::VTermRect,
+    downward: i32,
+    rightward: i32,
+) -> bool {
+    if screen.pending_scrollrect.start_row == -1 {
+        screen.pending_scrollrect = rect;
+        screen.pending_scroll_downward = downward;
+        screen.pending_scroll_rightward = rightward;
+        false
+    } else if rect_equal(&screen.pending_scrollrect, &rect)
+        && ((screen.pending_scroll_downward == 0 && downward == 0)
+            || (screen.pending_scroll_rightward == 0 && rightward == 0))
+    {
+        screen.pending_scroll_downward += downward;
+        screen.pending_scroll_rightward += rightward;
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod pending_scroll_tests {
+    use super::*;
+    #[test]
+    fn pending_scroll_stores_merges_or_requests_flush() {
+        let mut screen = screen_new(2, 2);
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0, end_row: 2, start_col: 0, end_col: 2,
+        };
+        assert!(!queue_pending_scroll(&mut screen, rect, 1, 0));
+        assert!(!queue_pending_scroll(&mut screen, rect, 2, 0));
+        assert_eq!(screen.pending_scroll_downward, 3);
+        assert!(queue_pending_scroll(
+            &mut screen,
+            crate::vterm_defs::VTermRect { end_row: 1, ..rect },
+            1,
+            0,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod erase_tests {
     use super::*;
