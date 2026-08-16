@@ -1308,6 +1308,45 @@ impl VTermState {
             self.hard_reset_cursor();
         }
     }
+
+    /// Resizes tabstop storage, preserving old columns and defaulting
+    /// new columns every eight cells (`on_resize`).
+    pub fn resize_tabstops(&mut self, cols: i32) {
+        if cols == self.cols {
+            return;
+        }
+        let mut new_tabstops = vec![0; usize::try_from(cols).unwrap_or(0).div_ceil(8)];
+        let common = self.cols.min(cols);
+        for col in 0..common {
+            if self.is_col_tabstop(col) {
+                new_tabstops[(col >> 3) as usize] |= 1 << (col & 7);
+            }
+        }
+        for col in common..cols {
+            if col % 8 == 0 {
+                new_tabstops[(col >> 3) as usize] |= 1 << (col & 7);
+            }
+        }
+        self.tabstops = new_tabstops;
+    }
+}
+
+#[cfg(test)]
+mod resize_tabstop_tests {
+    use super::*;
+    #[test]
+    fn resize_tabstops_preserves_old_and_initializes_new_columns() {
+        let mut state = VTermState::new(1, 10);
+        state.set_col_tabstop(3);
+        state.resize_tabstops(20);
+        assert!(state.is_col_tabstop(3));
+        assert!(state.is_col_tabstop(16));
+        assert!(!state.is_col_tabstop(15));
+        state.cols = 20;
+        state.resize_tabstops(5);
+        assert!(state.is_col_tabstop(3));
+        assert_eq!(state.tabstops.len(), 1);
+    }
 }
 
 #[cfg(test)]
