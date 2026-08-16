@@ -172,6 +172,22 @@ pub fn updatecursor<C: VTermStateCallbacks>(
     let _ = callbacks.move_cursor(state.pos, old_position, state.mode.cursor_visible);
 }
 
+/// Erases through callbacks and clears following-line continuation
+/// markers when erasing line ends (`erase`).
+pub fn erase<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    rect: crate::vterm_defs::VTermRect,
+    selective: bool,
+) {
+    if rect.end_col == state.cols {
+        for row in rect.start_row + 1..(rect.end_row + 1).min(state.rows) {
+            state.lineinfos[state.active_lineinfo][row as usize].continuation = false;
+        }
+    }
+    let _ = callbacks.erase(rect, selective);
+}
+
 impl VTermState {
     #[must_use]
     pub fn new(rows: i32, cols: i32) -> Self {
@@ -404,6 +420,29 @@ mod tests {
         updatecursor(&mut state, &mut capture, old, true);
         assert_eq!(capture.0, 1);
         assert!(!state.at_phantom);
+    }
+
+    #[test]
+    fn state_erase_clears_following_continuations_at_line_end() {
+        let mut state = VTermState::new(4, 80);
+        for info in &mut state.lineinfos[0] {
+            info.continuation = true;
+        }
+        let mut callbacks = ();
+        erase(
+            &mut state,
+            &mut callbacks,
+            crate::vterm_defs::VTermRect {
+                start_row: 1,
+                end_row: 3,
+                start_col: 4,
+                end_col: 80,
+            },
+            false,
+        );
+        assert!(state.lineinfos[0][1].continuation);
+        assert!(!state.lineinfos[0][2].continuation);
+        assert!(!state.lineinfos[0][3].continuation);
     }
 
     #[test]
