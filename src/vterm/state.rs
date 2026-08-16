@@ -139,6 +139,14 @@ pub trait VTermStateCallbacks {
     ) -> bool {
         false
     }
+
+    fn set_term_prop(
+        &mut self,
+        _prop: crate::vterm_defs::VTermProp,
+        _value: &crate::vterm_defs::VTermValue<'_>,
+    ) -> bool {
+        false
+    }
 }
 
 impl VTermStateCallbacks for () {}
@@ -436,6 +444,10 @@ mod tests {
         assert!(!callbacks.erase(Default::default(), false));
         assert!(!callbacks.init_pen());
         assert!(!callbacks.set_line_info(0, &Default::default(), &Default::default()));
+        assert!(!callbacks.set_term_prop(
+            crate::vterm_defs::VTermProp::CursorVisible,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        ));
     }
 
     #[test]
