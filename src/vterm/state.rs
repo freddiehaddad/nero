@@ -1960,6 +1960,18 @@ impl VTermState {
         1
     }
 
+    pub fn escape_locking_shift(&mut self, byte: u8) -> usize {
+        match byte {
+            b'n' => self.gl_set = 2,
+            b'o' => self.gl_set = 3,
+            b'~' => self.gr_set = 1,
+            b'}' => self.gr_set = 2,
+            b'|' => self.gr_set = 3,
+            _ => return 0,
+        }
+        1
+    }
+
     pub fn set_dec_basic_mode(&mut self, number: i32, value: i32) -> bool {
         let enabled = value != 0;
         match number {
@@ -2323,6 +2335,15 @@ mod termprop_state_tests {
         assert_eq!(state.escape_keypad_mode(b'>'), 1);
         assert!(!state.mode.keypad);
         assert_eq!(state.escape_keypad_mode(b'?'), 0);
+    }
+    #[test]
+    fn escape_locking_shift_selects_gl_and_gr_sets() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(state.escape_locking_shift(b'o'), 1);
+        assert_eq!(state.gl_set, 3);
+        assert_eq!(state.escape_locking_shift(b'}'), 1);
+        assert_eq!(state.gr_set, 2);
+        assert_eq!(state.escape_locking_shift(b'x'), 0);
     }
     #[test]
     fn set_dec_basic_mode_handles_cursor_wrap_and_paste() {
