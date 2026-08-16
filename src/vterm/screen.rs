@@ -1136,6 +1136,26 @@ pub fn vterm_screen_set_damage_merge<C: VTermScreenCallbacks>(
     screen.damage_merge = size;
 }
 
+/// Clears damage sentinels for screen reset.
+pub fn vterm_screen_reset_damage(screen: &mut VTermScreen) {
+    screen.damaged.start_row = -1;
+    screen.pending_scrollrect.start_row = -1;
+}
+
+#[cfg(test)]
+mod reset_damage_tests {
+    use super::*;
+    #[test]
+    fn reset_damage_restores_both_sentinels() {
+        let mut screen = screen_new(1, 1);
+        screen.damaged.start_row = 0;
+        screen.pending_scrollrect.start_row = 0;
+        vterm_screen_reset_damage(&mut screen);
+        assert_eq!(screen.damaged.start_row, -1);
+        assert_eq!(screen.pending_scrollrect.start_row, -1);
+    }
+}
+
 /// Expands `destination` to contain `source` (`rect_expand`).
 pub fn rect_expand(
     destination: &mut crate::vterm_defs::VTermRect,
