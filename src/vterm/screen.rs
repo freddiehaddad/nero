@@ -580,6 +580,53 @@ pub fn resize_buffer_no_reflow(
     fields.lineinfos[buffer_index] = Some(new_info);
 }
 
+pub fn resize<C: VTermScreenCallbacks>(
+    screen: &mut VTermScreen,
+    callbacks: &mut C,
+    new_rows: i32,
+    new_cols: i32,
+    fields: &mut crate::vterm_defs::VTermStateFields,
+) -> i32 {
+    let alt_active = screen.active_buffer == 1;
+    resize_buffer_no_reflow(screen, 0, new_rows, new_cols, !alt_active, fields);
+    if screen.buffers[1].is_some() {
+        resize_buffer_no_reflow(screen, 1, new_rows, new_cols, alt_active, fields);
+    } else {
+        fields.lineinfos[1] = Some(vec![
+            crate::vterm_defs::VTermLineInfo::default();
+            new_rows.max(0) as usize
+        ]);
+    }
+    screen.rows = new_rows;
+    screen.cols = new_cols;
+    screen.sb_buffer = vec![
+        crate::vterm_defs::VTermScreenCell::default();
+        new_cols.max(0) as usize
+    ];
+    damagescreen(screen, callbacks);
+    let _ = callbacks.resize(new_rows, new_cols);
+    1
+}
+
+#[cfg(test)]
+mod resize_screen_tests {
+    use super::*;
+    #[test]
+    fn screen_resize_updates_buffers_dimensions_and_scrollback() {
+        let mut screen = screen_new(2, 2);
+        let mut fields = crate::vterm_defs::VTermStateFields {
+            pos: Default::default(),
+            lineinfos: screen.lineinfo.clone(),
+        };
+        let mut callbacks = ();
+        assert_eq!(resize(&mut screen, &mut callbacks, 3, 4, &mut fields), 1);
+        assert_eq!((screen.rows, screen.cols), (3, 4));
+        assert_eq!(screen.buffers[0].as_ref().unwrap().len(), 12);
+        assert_eq!(screen.sb_buffer.len(), 4);
+        assert_eq!(fields.lineinfos[1].as_ref().unwrap().len(), 3);
+    }
+}
+
 #[cfg(test)]
 mod resize_buffer_tests {
     use super::*;
