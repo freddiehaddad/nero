@@ -156,6 +156,33 @@ pub fn on_osc<C: VTermStateCallbacks, F: VTermStateFallbacks>(
     on_osc_fallback(fallbacks, command, fragment)
 }
 
+pub fn on_osc_52<C: VTermSelectionCallbacks, F: VTermStateFallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    fallbacks: &mut F,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> i32 {
+    osc_selection(state, callbacks, fragment);
+    on_osc_fallback(fallbacks, 52, fragment)
+}
+
+#[cfg(test)]
+mod osc_52_tests {
+    use super::*;
+    #[test]
+    fn osc_52_routes_to_selection_and_fallback() {
+        let mut state = VTermState::new(1, 1);
+        state.selection_buflen = 8;
+        let mut selection = ();
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"c;?", initial: true, final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::Bel,
+        };
+        assert_eq!(on_osc_52(&mut state, &mut selection, &mut (), fragment), 0);
+        assert_eq!(state.selection_temp.state, VTermSelectionState::Query);
+    }
+}
+
 #[cfg(test)]
 mod osc_title_tests {
     use super::*;
