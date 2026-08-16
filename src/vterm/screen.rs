@@ -907,6 +907,25 @@ mod movecursor_tests {
     }
 }
 
+/// Forwards a terminal bell (`bell`).
+pub fn bell<C: VTermScreenCallbacks>(callbacks: &mut C) -> i32 {
+    i32::from(callbacks.bell())
+}
+
+#[cfg(test)]
+mod bell_tests {
+    use super::*;
+    struct Capture;
+    impl VTermScreenCallbacks for Capture {
+        fn bell(&mut self) -> bool { true }
+    }
+    #[test]
+    fn bell_returns_callback_result() {
+        assert_eq!(bell(&mut ()), 0);
+        assert_eq!(bell(&mut Capture), 1);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
