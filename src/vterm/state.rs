@@ -1862,6 +1862,24 @@ impl VTermState {
         }
     }
 
+    pub fn set_mouse_tracking_mode(&mut self, number: i32, value: i32) -> bool {
+        let mode = if value == 0 {
+            crate::vterm_defs::VTERM_PROP_MOUSE_NONE
+        } else {
+            match number {
+                1000 => crate::vterm_defs::VTERM_PROP_MOUSE_CLICK,
+                1002 => crate::vterm_defs::VTERM_PROP_MOUSE_DRAG,
+                1003 => crate::vterm_defs::VTERM_PROP_MOUSE_MOVE,
+                _ => return false,
+            }
+        };
+        self.set_termprop(
+            crate::vterm_defs::VTermProp::Mouse,
+            &crate::vterm_defs::VTermValue::Number(mode),
+            true,
+        ) != 0
+    }
+
     pub fn initialize_pen_colors(&mut self) {
         let mut pen_state = crate::vterm::pen::VTermPenState::default();
         crate::vterm::pen::vterm_state_newpen(&mut pen_state);
@@ -2122,6 +2140,18 @@ mod termprop_state_tests {
         state.set_leftrightmargin_mode(1);
         assert!(state.mode.leftrightmargin);
         assert_eq!(state.lineinfos[0][0], Default::default());
+    }
+    #[test]
+    fn mouse_tracking_mode_maps_click_drag_and_move() {
+        let mut state = VTermState::new(1, 1);
+        assert!(state.set_mouse_tracking_mode(1002, 1));
+        assert_eq!(
+            state.mouse_flags,
+            crate::vterm::mouse::MOUSE_WANT_CLICK | crate::vterm::mouse::MOUSE_WANT_DRAG
+        );
+        assert!(state.set_mouse_tracking_mode(1002, 0));
+        assert_eq!(state.mouse_flags, 0);
+        assert!(!state.set_mouse_tracking_mode(999, 1));
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
