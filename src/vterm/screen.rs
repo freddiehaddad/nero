@@ -717,6 +717,78 @@ mod moverect_user_tests {
     }
 }
 
+/// Clears cells inside a rectangle (`erase_internal`).
+pub fn erase_internal(
+    screen: &mut VTermScreen,
+    rect: crate::vterm_defs::VTermRect,
+    selective: bool,
+) -> i32 {
+    let foreground = screen.pen.fg;
+    let background = screen.pen.bg;
+    for row in rect.start_row..screen.rows.min(rect.end_row) {
+        let info = screen.lineinfo[screen.active_buffer]
+            .as_ref()
+            .and_then(|rows| rows.get(row as usize))
+            .copied()
+            .unwrap_or_default();
+        for col in rect.start_col..rect.end_col {
+            let Some(cell) = getcell_mut(screen, row, col) else {
+                continue;
+            };
+            if selective && cell.pen.protected_cell {
+                continue;
+            }
+            cell.schar = 0;
+            cell.pen = ScreenPen {
+                fg: foreground,
+                bg: background,
+                dwl: info.doublewidth,
+                dhl: info.doubleheight,
+                ..Default::default()
+            };
+        }
+    }
+    1
+}
+
+#[cfg(test)]
+mod erase_internal_tests {
+    use super::*;
+
+    #[test]
+    fn erase_internal_resets_cells_preserves_protected_and_line_layout() {
+        let mut screen = screen_new(1, 2);
+        screen.pen.fg.red = 1;
+        screen.pen.bg.blue = 2;
+        screen.lineinfo[0].as_mut().unwrap()[0] = crate::vterm_defs::VTermLineInfo {
+            doublewidth: true,
+            doubleheight: 2,
+            ..Default::default()
+        };
+        for col in 0..2 {
+            let cell = getcell_mut(&mut screen, 0, col).unwrap();
+            cell.schar = 42;
+            cell.pen.bold = true;
+        }
+        getcell_mut(&mut screen, 0, 1).unwrap().pen.protected_cell = true;
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 1,
+            start_col: 0,
+            end_col: 2,
+        };
+        assert_eq!(erase_internal(&mut screen, rect, true), 1);
+        let first = getcell(&screen, 0, 0).unwrap();
+        assert_eq!(first.schar, 0);
+        assert!(!first.pen.bold);
+        assert_eq!(first.pen.fg.red, 1);
+        assert_eq!(first.pen.bg.blue, 2);
+        assert!(first.pen.dwl);
+        assert_eq!(first.pen.dhl, 2);
+        assert_eq!(getcell(&screen, 0, 1).unwrap().schar, 42);
+    }
+}
+
 /// Flushes accumulated damage (`vterm_screen_flush_damage`, damage
 /// portion; pending scroll emission is translated with scrollrect).
 pub fn vterm_screen_flush_damage<C: VTermScreenCallbacks>(
