@@ -702,6 +702,44 @@ pub fn request_protected_cell(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     .concat()
 }
 
+/// Accumulates the three-byte DECRQSS request key.
+pub fn accumulate_decrqss(
+    state: &mut VTermState,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> bool {
+    if fragment.initial {
+        state.decrqss = [0; 4];
+    }
+    let used = state.decrqss.iter().position(|&b| b == 0).unwrap_or(3);
+    let take = (3 - used).min(fragment.bytes.len());
+    state.decrqss[used..used + take].copy_from_slice(&fragment.bytes[..take]);
+    fragment.final_fragment
+}
+
+#[cfg(test)]
+mod decrqss_accumulate_tests {
+    use super::*;
+    #[test]
+    fn decrqss_accumulates_up_to_three_bytes_across_fragments() {
+        let mut state = VTermState::new(1, 1);
+        assert!(!accumulate_decrqss(
+            &mut state,
+            crate::vterm_defs::VTermStringFragment {
+                bytes: b" ", initial: true, final_fragment: false,
+                terminator: crate::vterm_defs::VTermTerminator::St,
+            },
+        ));
+        assert!(accumulate_decrqss(
+            &mut state,
+            crate::vterm_defs::VTermStringFragment {
+                bytes: b"qextra", initial: false, final_fragment: true,
+                terminator: crate::vterm_defs::VTermTerminator::St,
+            },
+        ));
+        assert_eq!(&state.decrqss[..3], b" qe");
+    }
+}
+
 #[cfg(test)]
 mod protected_cell_request_tests {
     use super::*;
