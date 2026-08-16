@@ -1882,6 +1882,20 @@ impl VTermState {
         2
     }
 
+    pub fn escape_line_attribute(&mut self, bytes: &[u8]) -> usize {
+        let (dwl, dhl) = match bytes {
+            [b'#', b'3'] => (DWL_ON, DHL_TOP),
+            [b'#', b'4'] => (DWL_ON, DHL_BOTTOM),
+            [b'#', b'5'] => (DWL_OFF, DHL_OFF),
+            [b'#', b'6'] => (DWL_ON, DHL_OFF),
+            _ => return 0,
+        };
+        if !self.mode.leftrightmargin {
+            self.set_lineinfo(self.pos.row, NO_FORCE, dwl, dhl, |_, _, _| true);
+        }
+        2
+    }
+
     pub fn set_dec_basic_mode(&mut self, number: i32, value: i32) -> bool {
         let enabled = value != 0;
         match number {
@@ -2217,6 +2231,15 @@ mod termprop_state_tests {
         assert_eq!(state.escape_control_width(b" F"), 2);
         assert!(!state.ctrl8bit);
         assert_eq!(state.escape_control_width(b" X"), 0);
+    }
+    #[test]
+    fn escape_line_attribute_sets_doublewidth_and_height() {
+        let mut state = VTermState::new(1, 80);
+        assert_eq!(state.escape_line_attribute(b"#3"), 2);
+        assert!(state.lineinfos[0][0].doublewidth);
+        assert_eq!(state.lineinfos[0][0].doubleheight, 1);
+        assert_eq!(state.escape_line_attribute(b"#5"), 2);
+        assert_eq!(state.lineinfos[0][0], Default::default());
     }
     #[test]
     fn set_dec_basic_mode_handles_cursor_wrap_and_paste() {
