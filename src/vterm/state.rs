@@ -122,6 +122,7 @@ pub struct VTermState {
     pub gsingle_set: i32,
     pub protected_cell: bool,
     pub selection_temp: VTermSelectionTemp,
+    pub key_encoding_stacks: [crate::vterm_defs::VTermKeyEncodingStack; 2],
 }
 
 /// State callback surface (`VTermStateCallbacks`).
@@ -557,6 +558,7 @@ impl VTermState {
             gsingle_set: 0,
             protected_cell: false,
             selection_temp: VTermSelectionTemp::default(),
+            key_encoding_stacks: std::array::from_fn(|_| Default::default()),
         }
     }
 
@@ -766,6 +768,8 @@ mod termprop_state_tests {
         assert_eq!((state.gl_set, state.gr_set, state.gsingle_set), (0, 1, 0));
         assert!(!state.protected_cell);
         assert_eq!(state.selection_temp, VTermSelectionTemp::default());
+        assert_eq!(state.key_encoding_stacks[0].size, 1);
+        assert_eq!(state.key_encoding_stacks[1].size, 1);
         assert_eq!(state.combine_width, 0);
         assert_eq!(state.combine_pos.row, -1);
         assert_eq!(
