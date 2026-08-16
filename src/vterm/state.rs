@@ -471,6 +471,52 @@ pub const fn unbase64one(byte: u8) -> u8 {
     }
 }
 
+/// Parses OSC 52 selection designators.
+pub fn parse_selection_mask(temp: &mut VTermSelectionTemp, bytes: &[u8]) -> usize {
+    let mut consumed = 0;
+    while temp.state == VTermSelectionState::Initial && consumed < bytes.len() {
+        match bytes[consumed] {
+            b'c' => temp.mask |= crate::vterm_defs::VTERM_SELECTION_CLIPBOARD as u16,
+            b'p' => temp.mask |= crate::vterm_defs::VTERM_SELECTION_PRIMARY as u16,
+            b'q' => temp.mask |= crate::vterm_defs::VTERM_SELECTION_SECONDARY as u16,
+            b's' => temp.mask |= crate::vterm_defs::VTERM_SELECTION_SELECT as u16,
+            b'0'..=b'7' => {
+                temp.mask |= (crate::vterm_defs::VTERM_SELECTION_CUT0
+                    << (bytes[consumed] - b'0')) as u16;
+            }
+            b';' => {
+                temp.state = VTermSelectionState::Selected;
+                if temp.mask == 0 {
+                    temp.mask = (crate::vterm_defs::VTERM_SELECTION_SELECT
+                        | crate::vterm_defs::VTERM_SELECTION_CUT0) as u16;
+                }
+            }
+            _ => {}
+        }
+        consumed += 1;
+    }
+    consumed
+}
+
+#[cfg(test)]
+mod selection_mask_tests {
+    use super::*;
+    #[test]
+    fn selection_mask_parses_designators_and_default() {
+        let mut temp = VTermSelectionTemp::default();
+        assert_eq!(parse_selection_mask(&mut temp, b"cp3;rest"), 4);
+        assert_ne!(temp.mask & crate::vterm_defs::VTERM_SELECTION_CLIPBOARD as u16, 0);
+        assert_ne!(temp.mask & (crate::vterm_defs::VTERM_SELECTION_CUT0 << 3) as u16, 0);
+        let mut default = VTermSelectionTemp::default();
+        parse_selection_mask(&mut default, b";");
+        assert_eq!(
+            default.mask,
+            (crate::vterm_defs::VTERM_SELECTION_SELECT
+                | crate::vterm_defs::VTERM_SELECTION_CUT0) as u16
+        );
+    }
+}
+
 #[cfg(test)]
 mod unbase64_tests {
     use super::*;
