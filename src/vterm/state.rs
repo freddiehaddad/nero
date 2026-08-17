@@ -2467,6 +2467,33 @@ pub fn vterm_state_free(state: VTermState) {
     drop(state);
 }
 
+pub struct VTermStateOwner {
+    pub rows: i32,
+    pub cols: i32,
+    pub state: Option<VTermState>,
+}
+
+pub fn vterm_obtain_state(owner: &mut VTermStateOwner) -> &mut VTermState {
+    owner
+        .state
+        .get_or_insert_with(|| vterm_state_new(owner.rows, owner.cols))
+}
+
+#[cfg(test)]
+mod obtain_state_tests {
+    use super::*;
+    #[test]
+    fn obtain_state_lazily_constructs_and_reuses_state() {
+        let mut owner = VTermStateOwner {
+            rows: 2,
+            cols: 3,
+            state: None,
+        };
+        vterm_obtain_state(&mut owner).pos.col = 1;
+        assert_eq!(vterm_obtain_state(&mut owner).pos.col, 1);
+    }
+}
+
 #[cfg(test)]
 mod state_new_wrapper_tests {
     use super::*;
