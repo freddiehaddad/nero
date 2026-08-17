@@ -2533,6 +2533,48 @@ unsafe fn tv_nr_compare(
     }
 }
 
+/// Like [`utf_ptr2cells`], but limits the string to `size` bytes
+/// (`utf_ptr2cells_len`).
+///
+/// # Safety
+/// Same as [`utf_ptr2cells`].
+#[must_use]
+pub unsafe fn utf_ptr2cells_len(p: &[u8], size: i32) -> i32 {
+    if size <= 0 || p.first().is_none_or(|&byte| byte < 0x80) {
+        return 1;
+    }
+    let size = usize::try_from(size).unwrap_or(0).min(p.len());
+    let len = utf_ptr2len_len(p, size);
+    if len < i32::from(UTF8LEN_TAB[p[0] as usize]) {
+        return 1;
+    }
+    let c = utf_ptr2char(p);
+    if utf_ptr2len(p) == 1 || c == 0 {
+        return 4;
+    }
+    if c < 0x80 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::charset::char2cells(c) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let cells = unsafe { utf_char2cells(c) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_emoji = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_emoji;
+    let len = usize::try_from(len).unwrap_or(0);
+    if cells == 1
+        && p_emoji != 0
+        && size > len
+        // SAFETY: utf8proc_get_property never returns null.
+        && prop_is_emojilike(unsafe { &*utf8proc_sys::utf8proc_get_property(c) })
+        && utf_ptr2len_len(&p[len..], size - len)
+            == i32::from(UTF8LEN_TAB[p[len] as usize])
+        && utf_ptr2char(&p[len..]) == 0xFE0F
+    {
+        return 2;
+    }
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2545,6 +2587,7 @@ mod tests {
             unsafe { crate::eval::typval::tv_list_append_number(list, n) };
             list
         }
+
         let low = unsafe { number_list(i64::MIN) };
         let same = unsafe { number_list(i64::MIN) };
         let high = unsafe { number_list(i64::MAX) };
@@ -2558,6 +2601,19 @@ mod tests {
             crate::eval::typval::tv_list_unref(same);
             crate::eval::typval::tv_list_unref(high);
         }
+    }
+
+    #[test]
+    fn bounded_cells_returns_one_for_empty_ascii_and_truncated_input() {
+        assert_eq!(unsafe { utf_ptr2cells_len(b"", 0) }, 1);
+        assert_eq!(unsafe { utf_ptr2cells_len(b"A", 1) }, 1);
+        assert_eq!(unsafe { utf_ptr2cells_len("€".as_bytes(), 2) }, 1);
+    }
+
+    #[test]
+    fn bounded_cells_reports_illegal_and_wide_characters() {
+        assert_eq!(unsafe { utf_ptr2cells_len(&[0x80], 1) }, 4);
+        assert_eq!(unsafe { utf_ptr2cells_len("一".as_bytes(), 3) }, 2);
     }
 
     #[test]
