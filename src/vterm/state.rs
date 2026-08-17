@@ -2221,6 +2221,21 @@ impl VTermState {
         true
     }
 
+    pub fn csi_move_cursor(&mut self, command: u8, count: i32) -> bool {
+        let count = count.max(1);
+        match command {
+            b'A' => self.pos.row -= count,
+            b'B' | b'e' => self.pos.row += count,
+            b'C' | b'a' => self.pos.col += count,
+            b'D' | b'j' => self.pos.col -= count,
+            b'E' => { self.pos.col = 0; self.pos.row += count; }
+            b'F' => { self.pos.col = 0; self.pos.row -= count; }
+            _ => return false,
+        }
+        self.at_phantom = false;
+        true
+    }
+
     #[must_use]
     pub fn dec_mode_value(&self, number: i32) -> Option<bool> {
         Some(match number {
@@ -2718,6 +2733,16 @@ mod termprop_state_tests {
         assert_eq!(state.dec_mode_value(7), Some(true));
         assert_eq!(state.dec_mode_value(1002), Some(true));
         assert_eq!(state.dec_mode_value(999), None);
+    }
+    #[test]
+    fn csi_move_cursor_handles_relative_commands() {
+        let mut state = VTermState::new(10, 10);
+        state.pos = crate::vterm_defs::VTermPos { row: 5, col: 5 };
+        assert!(state.csi_move_cursor(b'A', 2));
+        assert_eq!(state.pos.row, 3);
+        assert!(state.csi_move_cursor(b'E', 1));
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 4, col: 0 });
+        assert!(!state.csi_move_cursor(b'Z', 1));
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
