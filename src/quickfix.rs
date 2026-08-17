@@ -2887,7 +2887,6 @@ pub unsafe fn get_qfline_items(
 /// The supplied stack/window/List pointers and every buffer pointer
 /// reachable from their entries must remain valid. Touches the global
 /// quickfix stack, global buffer list, and List/Dict GC registries.
-#[allow(dead_code)]
 unsafe fn get_errorlist(
     qi_arg: *const crate::types_defs::QfInfoT,
     wp: Option<&crate::buffer_defs::WinT>,
@@ -2940,6 +2939,38 @@ unsafe fn get_errorlist(
             return crate::vim_defs::FAIL;
         }
     }
+    crate::vim_defs::OK
+}
+
+/// Add quickfix-list entries as the `"items"` property
+/// (`qf_getprop_items`).
+///
+/// The original deliberately ignores `get_errorlist`'s status and
+/// always adds a List, so an invalid/empty selection produces an empty
+/// `"items"` value rather than failing this property request.
+///
+/// # Safety
+/// Forwarded from `get_errorlist` and the List/Dict allocation
+/// helpers.
+pub unsafe fn qf_getprop_items(
+    qi: &crate::types_defs::QfInfoT,
+    qf_idx: i32,
+    eidx: i32,
+    retdict: *mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    let list = crate::eval::typval::tv_list_alloc(0);
+    let _ = unsafe {
+        get_errorlist(
+            std::ptr::from_ref(qi),
+            None,
+            qf_idx,
+            eidx,
+            list,
+        )
+    };
+    let _ = unsafe {
+        crate::eval::typval::tv_dict_add_list(&mut *retdict, b"items", list)
+    };
     crate::vim_defs::OK
 }
 
@@ -8200,5 +8231,92 @@ mod tests {
         );
         assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 1);
         unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn qf_getprop_items_adds_all_entries_to_an_items_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT { qf_lnum: 2, ..Default::default() },
+                    QflineT { qf_lnum: 4, ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_getprop_items(&qi, 0, 0, dict) },
+            crate::vim_defs::OK
+        );
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"items")
+            .expect("items property");
+        let crate::eval::typval_defs::TypvalValue::List(list) =
+            (unsafe { &(*item).di_tv.value })
+        else {
+            panic!("items must be a list");
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(*list) }, 2);
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
+    }
+
+    #[test]
+    fn qf_getprop_items_can_select_one_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT { qf_lnum: 2, ..Default::default() },
+                    QflineT { qf_lnum: 4, ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { qf_getprop_items(&qi, 0, 2, dict) };
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"items")
+            .expect("items property");
+        let crate::eval::typval_defs::TypvalValue::List(list) =
+            (unsafe { &(*item).di_tv.value })
+        else {
+            panic!("items must be a list");
+        };
+        let entry = unsafe { crate::eval::typval::tv_list_first(*list) };
+        let crate::eval::typval_defs::TypvalValue::Dict(entry) =
+            (unsafe { &(*entry).li_tv.value })
+        else {
+            panic!("entry must be a dict");
+        };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(Some(&mut **entry), b"lnum")
+            },
+            4
+        );
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
+    }
+
+    #[test]
+    fn qf_getprop_items_adds_an_empty_list_for_an_invalid_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT::default();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_getprop_items(&qi, 0, 0, dict) },
+            crate::vim_defs::OK
+        );
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"items")
+            .expect("items property");
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 0
+        ));
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
     }
 }
