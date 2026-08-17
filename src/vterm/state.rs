@@ -1031,6 +1031,60 @@ pub fn csi_repeat<C: VTermStateCallbacks>(
     }
 }
 
+pub fn csi_dec_sgr<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    args: &[crate::vterm::parser::CsiArg],
+) {
+    for &arg in args {
+        let mapped = match crate::vterm::parser::csi_arg(arg) {
+            4 => 73,
+            5 => 74,
+            24 => 75,
+            _ => continue,
+        };
+        state.setpen(callbacks, &[mapped]);
+    }
+}
+
+#[cfg(test)]
+mod csi_dec_sgr_tests {
+    use super::*;
+
+    #[test]
+    fn dec_sgr_maps_super_subscript_and_normal_baseline() {
+        let mut state = VTermState::new(1, 1);
+        state.initialize_pen_colors();
+        csi_dec_sgr(&mut state, &mut (), &[4]);
+        assert!(state.pen.small);
+        assert_eq!(
+            state.pen.baseline,
+            crate::vterm_defs::VTERM_BASELINE_RAISE
+        );
+
+        csi_dec_sgr(&mut state, &mut (), &[5]);
+        assert_eq!(
+            state.pen.baseline,
+            crate::vterm_defs::VTERM_BASELINE_LOWER
+        );
+
+        csi_dec_sgr(&mut state, &mut (), &[24]);
+        assert!(!state.pen.small);
+        assert_eq!(
+            state.pen.baseline,
+            crate::vterm_defs::VTERM_BASELINE_NORMAL
+        );
+    }
+
+    #[test]
+    fn dec_sgr_ignores_unrecognized_arguments() {
+        let mut state = VTermState::new(1, 1);
+        state.initialize_pen_colors();
+        csi_dec_sgr(&mut state, &mut (), &[1, 2, 3]);
+        assert_eq!(state.pen, crate::vterm::pen::VTermPen::default());
+    }
+}
+
 #[cfg(test)]
 mod csi_repeat_tests {
     use super::*;
