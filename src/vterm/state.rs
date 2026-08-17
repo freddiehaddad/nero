@@ -851,6 +851,46 @@ pub fn csi_insert_chars<C: VTermStateCallbacks>(
     scroll(state, callbacks, rect, 0, -count.max(1));
 }
 
+pub fn csi_delete_chars<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    count: i32,
+) {
+    if !state.is_cursor_in_scrollregion() {
+        return;
+    }
+    let rect = crate::vterm_defs::VTermRect {
+        start_row: state.pos.row,
+        end_row: state.pos.row + 1,
+        start_col: state.pos.col,
+        end_col: if state.mode.leftrightmargin {
+            state.scrollregion_right()
+        } else {
+            state.current_row_width()
+        },
+    };
+    scroll(state, callbacks, rect, 0, count.max(1));
+}
+
+#[cfg(test)]
+mod csi_delete_chars_tests {
+    use super::*;
+    struct Capture(i32);
+    impl VTermStateCallbacks for Capture {
+        fn scroll_rect(&mut self, _: crate::vterm_defs::VTermRect, _: i32, rightward: i32) -> bool {
+            self.0 = rightward; true
+        }
+    }
+    #[test]
+    fn delete_chars_scrolls_current_line_left() {
+        let mut state = VTermState::new(2, 10);
+        state.reset_scrollregions();
+        let mut capture = Capture(0);
+        csi_delete_chars(&mut state, &mut capture, 3);
+        assert_eq!(capture.0, 3);
+    }
+}
+
 #[cfg(test)]
 mod csi_insert_chars_tests {
     use super::*;
