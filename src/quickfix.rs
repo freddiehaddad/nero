@@ -2235,6 +2235,53 @@ unsafe fn mark_quickfix_user_data(
     false
 }
 
+/// Mark quickfix list contexts and callbacks as reachable
+/// (`mark_quickfix_ctx`).
+///
+/// # Safety
+/// Every pointer reachable from context typvals and callbacks must be
+/// valid. Forwarded from `set_ref_in_item`/`set_ref_in_callback`.
+#[allow(dead_code)]
+unsafe fn mark_quickfix_ctx(
+    qi: &mut crate::types_defs::QfInfoT,
+    copy_id: i32,
+) -> bool {
+    let count = usize::try_from(qi.qf_maxcount)
+        .unwrap_or(0)
+        .min(qi.qf_lists.len());
+    for qfl in &mut qi.qf_lists[..count] {
+        if let Some(context) = qfl.qf_ctx.as_deref_mut()
+            && !matches!(
+                &context.value,
+                crate::eval::typval_defs::TypvalValue::Number(_)
+                    | crate::eval::typval_defs::TypvalValue::String(_)
+                    | crate::eval::typval_defs::TypvalValue::Float(_)
+            )
+            && unsafe {
+                crate::eval::eval::set_ref_in_item(
+                    context,
+                    copy_id,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            }
+        {
+            return true;
+        }
+        if unsafe {
+            crate::eval::eval::set_ref_in_callback(
+                &qfl.qf_qftf_cb,
+                copy_id,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse shared `setqflist()`/`setloclist()` arguments
 /// (`set_qf_ll_list`).
 ///
@@ -11120,6 +11167,73 @@ mod tests {
         assert!(!unsafe { mark_quickfix_user_data(&mut qi, 17) });
         assert_eq!(unsafe { (*user_list).lv_copy_id }, 0);
         qf_free(&mut qi.qf_lists[0]);
+    }
+
+    #[test]
+    fn mark_quickfix_ctx_marks_contexts_and_callbacks_within_maxcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        let context = crate::eval::typval::tv_list_alloc(0);
+        let outside_context = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(context);
+            crate::eval::typval::tv_list_ref(outside_context);
+        }
+        let callback = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let outside_callback = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_maxcount: 1,
+            qf_lists: vec![
+                QfListT {
+                    qf_ctx: Some(Box::new(
+                        crate::eval::typval_defs::TypvalT {
+                            value:
+                                crate::eval::typval_defs::TypvalValue::List(
+                                    context,
+                                ),
+                            ..Default::default()
+                        },
+                    )),
+                    qf_qftf_cb:
+                        crate::eval::typval_defs::Callback::Partial(callback),
+                    ..Default::default()
+                },
+                QfListT {
+                    qf_ctx: Some(Box::new(
+                        crate::eval::typval_defs::TypvalT {
+                            value:
+                                crate::eval::typval_defs::TypvalValue::List(
+                                    outside_context,
+                                ),
+                            ..Default::default()
+                        },
+                    )),
+                    qf_qftf_cb: crate::eval::typval_defs::Callback::Partial(
+                        outside_callback,
+                    ),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(!unsafe { mark_quickfix_ctx(&mut qi, 51) });
+        assert_eq!(unsafe { (*context).lv_copy_id }, 51);
+        assert_eq!(unsafe { (*callback).pt_copy_id }, 51);
+        assert_eq!(unsafe { (*outside_context).lv_copy_id }, 0);
+        assert_eq!(unsafe { (*outside_callback).pt_copy_id }, 0);
+
+        qf_free(&mut qi.qf_lists[0]);
+        qf_free(&mut qi.qf_lists[1]);
     }
 
     #[test]
