@@ -2062,6 +2062,43 @@ pub unsafe fn qf_get_size(eap: &crate::ex_cmds_defs::ExargT) -> usize {
     })
 }
 
+/// Number of valid entries or distinct files in the current list
+/// (`qf_get_valid_size`).
+///
+/// `:cdo`/`:ldo` count every valid entry; file-do commands count
+/// consecutive distinct positive buffer numbers.
+///
+/// # Safety
+/// Forwarded from `qf_cmd_get_stack`.
+#[must_use]
+pub unsafe fn qf_get_valid_size(eap: &crate::ex_cmds_defs::ExargT) -> usize {
+    let qi = unsafe { qf_cmd_get_stack(eap) };
+    if qi.is_null() {
+        return 0;
+    }
+    let Some(list) = qf_get_curlist(unsafe { &*qi }) else {
+        return 0;
+    };
+    let count_entries = matches!(
+        eap.cmdidx,
+        crate::ex_cmds_defs::CmdIdxT::cdo | crate::ex_cmds_defs::CmdIdxT::ldo
+    );
+    let mut previous_fnum = 0;
+    let mut size = 0usize;
+    for entry in &list.qf_entries {
+        if !entry.qf_valid {
+            continue;
+        }
+        if count_entries {
+            size += 1;
+        } else if entry.qf_fnum > 0 && entry.qf_fnum != previous_fnum {
+            size += 1;
+            previous_fnum = entry.qf_fnum;
+        }
+    }
+    size
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -6462,6 +6499,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unsafe { qf_get_size(&eap) }, 0);
+    }
+
+    #[test]
+    fn qf_get_valid_size_counts_entries_for_cdo_and_files_for_cfdo() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_entries = vec![
+            QflineT { qf_valid: true, qf_fnum: 1, ..Default::default() },
+            QflineT { qf_valid: true, qf_fnum: 1, ..Default::default() },
+            QflineT { qf_valid: false, qf_fnum: 2, ..Default::default() },
+            QflineT { qf_valid: true, qf_fnum: 2, ..Default::default() },
+            QflineT { qf_valid: true, qf_fnum: 0, ..Default::default() },
+        ];
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+
+        let cdo = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::cdo,
+            ..Default::default()
+        };
+        let cfdo = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::cfdo,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_valid_size(&cdo) }, 4);
+        assert_eq!(unsafe { qf_get_valid_size(&cfdo) }, 2);
+    }
+
+    #[test]
+    fn qf_get_valid_size_is_zero_without_a_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 1));
+        let mut win = WinT::default();
+        let winp = &mut win as *mut WinT;
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                winp,
+            )
+        };
+        let ldo = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::ldo,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_valid_size(&ldo) }, 0);
     }
 
     #[test]
