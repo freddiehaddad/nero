@@ -2463,6 +2463,10 @@ pub fn vterm_state_new(rows: i32, cols: i32) -> VTermState {
     state
 }
 
+pub fn vterm_state_free(state: VTermState) {
+    drop(state);
+}
+
 #[cfg(test)]
 mod state_new_wrapper_tests {
     use super::*;
@@ -2471,6 +2475,10 @@ mod state_new_wrapper_tests {
         let state = vterm_state_new(24, 80);
         assert!(state.default_fg.is_default_fg());
         assert_eq!(state.tabstops.len(), 10);
+    }
+    #[test]
+    fn state_free_consumes_owned_state() {
+        vterm_state_free(vterm_state_new(1, 1));
     }
 }
 
