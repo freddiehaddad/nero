@@ -3473,6 +3473,51 @@ pub fn find_option_end(arg: &[u8]) -> (Option<usize>, OptIndex) {
     (Some(p), find_option_len(arg, p))
 }
 
+/// Concatenate an original and new string option, inserting a comma
+/// when the option's flags require one
+/// (`stropt_concat_with_comma`).
+#[allow(dead_code)]
+fn stropt_concat_with_comma(
+    origval: &[u8],
+    newval: &mut Vec<u8>,
+    op: crate::option_defs::SetOpT,
+    flags: u32,
+) {
+    let comma = flags & crate::option_defs::opt_flags::COMMA != 0
+        && !origval.is_empty()
+        && !newval.is_empty();
+
+    if op == crate::option_defs::SetOpT::Adding {
+        let mut len = origval.len();
+        if comma
+            && len > 1
+            && flags & crate::option_defs::opt_flags::ONE_COMMA
+                == crate::option_defs::opt_flags::ONE_COMMA
+            && origval[len - 1] == b','
+            && origval[len - 2] != b'\\'
+        {
+            len -= 1;
+        }
+        let mut combined =
+            Vec::with_capacity(len + usize::from(comma) + newval.len());
+        combined.extend_from_slice(&origval[..len]);
+        if comma {
+            combined.push(b',');
+        }
+        combined.extend_from_slice(newval);
+        *newval = combined;
+    } else {
+        let mut combined =
+            Vec::with_capacity(newval.len() + usize::from(comma) + origval.len());
+        combined.extend_from_slice(newval);
+        if comma {
+            combined.push(b',');
+        }
+        combined.extend_from_slice(origval);
+        *newval = combined;
+    }
+}
+
 /// Skip to next part of an option argument: skip a leading comma and
 /// any following spaces (`skip_to_option_part`).
 ///
@@ -5980,6 +6025,78 @@ mod find_option_tests {
     #[test]
     fn skip_to_option_part_at_end_of_string_is_a_no_op() {
         assert_eq!(skip_to_option_part(b"abc", 3), 3);
+    }
+
+    #[test]
+    fn stropt_concat_with_comma_appends_and_prepends() {
+        let mut appended = b"new".to_vec();
+        stropt_concat_with_comma(
+            b"old",
+            &mut appended,
+            crate::option_defs::SetOpT::Adding,
+            crate::option_defs::opt_flags::COMMA,
+        );
+        assert_eq!(appended, b"old,new");
+
+        let mut prepended = b"new".to_vec();
+        stropt_concat_with_comma(
+            b"old",
+            &mut prepended,
+            crate::option_defs::SetOpT::Prepending,
+            crate::option_defs::opt_flags::COMMA,
+        );
+        assert_eq!(prepended, b"new,old");
+    }
+
+    #[test]
+    fn stropt_concat_with_comma_only_inserts_a_comma_between_nonempty_values() {
+        for (orig, new, expected) in [
+            (&b""[..], &b"new"[..], &b"new"[..]),
+            (&b"old"[..], &b""[..], &b"old"[..]),
+            (&b""[..], &b""[..], &b""[..]),
+        ] {
+            let mut value = new.to_vec();
+            stropt_concat_with_comma(
+                orig,
+                &mut value,
+                crate::option_defs::SetOpT::Adding,
+                crate::option_defs::opt_flags::COMMA,
+            );
+            assert_eq!(value, expected);
+        }
+    }
+
+    #[test]
+    fn stropt_concat_with_comma_strips_one_unescaped_trailing_comma() {
+        let mut value = b"new".to_vec();
+        stropt_concat_with_comma(
+            b"old,",
+            &mut value,
+            crate::option_defs::SetOpT::Adding,
+            crate::option_defs::opt_flags::ONE_COMMA,
+        );
+        assert_eq!(value, b"old,new");
+
+        let mut escaped = b"new".to_vec();
+        stropt_concat_with_comma(
+            b"old\\,",
+            &mut escaped,
+            crate::option_defs::SetOpT::Adding,
+            crate::option_defs::opt_flags::ONE_COMMA,
+        );
+        assert_eq!(escaped, b"old\\,,new");
+    }
+
+    #[test]
+    fn stropt_concat_with_comma_without_comma_flag_concatenates_directly() {
+        let mut value = b"new".to_vec();
+        stropt_concat_with_comma(
+            b"old",
+            &mut value,
+            crate::option_defs::SetOpT::Adding,
+            0,
+        );
+        assert_eq!(value, b"oldnew");
     }
 
     #[test]
