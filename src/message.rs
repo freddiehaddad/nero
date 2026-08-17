@@ -314,6 +314,32 @@ pub unsafe fn str2special_save(
     result
 }
 
+/// Convert an internal key string into a caller-provided bounded
+/// buffer (`str2specialbuf`).
+///
+/// Returns bytes written before the trailing NUL.
+///
+/// # Safety
+/// Forwarded from [`str2special`].
+pub unsafe fn str2specialbuf(input: &[u8], buf: &mut [u8]) -> usize {
+    assert!(!buf.is_empty());
+    let end = input.iter().position(|&b| b == 0).unwrap_or(input.len());
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    while src < end {
+        let (text, consumed) =
+            unsafe { str2special(&input[src..end], false, crate::types_defs::TriState::False) };
+        if buf.len() - dst <= text.len() {
+            break;
+        }
+        buf[dst..dst + text.len()].copy_from_slice(&text);
+        dst += text.len();
+        src += consumed;
+    }
+    buf[dst] = 0;
+    dst
+}
+
 /// Replace the external-message chunk array and return the old one
 /// (`msg_ext_init_chunks`).
 #[allow(dead_code)]
@@ -1246,6 +1272,31 @@ pub(crate) mod tests {
             },
             "é".as_bytes()
         );
+    }
+
+    #[test]
+    fn str2specialbuf_writes_and_nul_terminates_printable_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        let input = crate::keycodes::special_to_buf(crate::keycodes_defs::K_UP, 0, false);
+        let mut buf = [b'x'; 16];
+        let written = unsafe { str2specialbuf(&input, &mut buf) };
+        assert_eq!(written, 4);
+        assert_eq!(&buf[..=written], b"<Up>\0");
+    }
+
+    #[test]
+    fn str2specialbuf_stops_before_a_key_that_will_not_fit() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut input = b"a".to_vec();
+        input.extend_from_slice(&crate::keycodes::special_to_buf(
+            crate::keycodes_defs::K_UP,
+            0,
+            false,
+        ));
+        let mut buf = [b'x'; 5];
+        let written = unsafe { str2specialbuf(&input, &mut buf) };
+        assert_eq!(written, 1);
+        assert_eq!(&buf[..=written], b"a\0");
     }
 
     #[test]
