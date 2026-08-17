@@ -284,7 +284,8 @@ pub struct VTermState {
     pub grapheme_state: crate::mbyte_defs::GraphemeState,
     pub combine_width: i32,
     pub combine_pos: crate::vterm_defs::VTermPos,
-    pub encodings: [crate::vterm::encoding::VTermEncoding; 4],
+    pub encodings: [crate::vterm::encoding::VTermEncodingInstance; 4],
+    pub encoding_utf8: crate::vterm::encoding::VTermEncodingInstance,
     pub gl_set: i32,
     pub gr_set: i32,
     pub gsingle_set: i32,
@@ -3901,7 +3902,14 @@ impl VTermState {
             grapheme_state: crate::mbyte_defs::GRAPHEME_STATE_INIT,
             combine_width: 0,
             combine_pos: crate::vterm_defs::VTermPos { row: -1, col: 0 },
-            encodings: [crate::vterm::encoding::VTermEncoding::UsAscii; 4],
+            encodings: std::array::from_fn(|_| {
+                crate::vterm::encoding::VTermEncodingInstance::new(
+                    crate::vterm::encoding::VTermEncoding::UsAscii,
+                )
+            }),
+            encoding_utf8: crate::vterm::encoding::VTermEncodingInstance::new(
+                crate::vterm::encoding::VTermEncoding::Utf8,
+            ),
             gl_set: 0,
             gr_set: 1,
             gsingle_set: 0,
@@ -4148,7 +4156,12 @@ impl VTermState {
         self.reset_tabstops();
         self.active_lineinfo = 0;
         self.reset_lineinfos();
-        self.encodings.fill(crate::vterm::encoding::VTermEncoding::UsAscii);
+        self.encodings = std::array::from_fn(|_| {
+            crate::vterm::encoding::VTermEncodingInstance::new(
+                crate::vterm::encoding::VTermEncoding::UsAscii,
+            )
+        });
+        self.encoding_utf8.reset();
         self.gl_set = 0;
         self.gr_set = 1;
         self.gsingle_set = 0;
@@ -4199,7 +4212,8 @@ impl VTermState {
             crate::vterm::encoding::VTermEncodingType::Single94,
             *designation,
         ) {
-            self.encodings[set] = encoding;
+            self.encodings[set] =
+                crate::vterm::encoding::VTermEncodingInstance::new(encoding);
         }
         2
     }
@@ -4722,9 +4736,12 @@ mod termprop_state_tests {
         assert_eq!(state.decrqss, [0; 4]);
         assert_eq!(state.combine_width, 0);
         assert_eq!(state.combine_pos.row, -1);
+        assert!(state.encodings.iter().all(|encoding| {
+            encoding.encoding() == crate::vterm::encoding::VTermEncoding::UsAscii
+        }));
         assert_eq!(
-            state.encodings,
-            [crate::vterm::encoding::VTermEncoding::UsAscii; 4]
+            state.encoding_utf8.encoding(),
+            crate::vterm::encoding::VTermEncoding::Utf8
         );
         assert_eq!(state.grapheme_buf, [0; crate::types_defs::MAX_SCHAR_SIZE]);
         assert_eq!(state.grapheme_len, 0);
@@ -4829,7 +4846,7 @@ mod termprop_state_tests {
         let mut state = VTermState::new(1, 1);
         assert_eq!(state.escape_designate_charset(b")0"), 2);
         assert_eq!(
-            state.encodings[1],
+            state.encodings[1].encoding(),
             crate::vterm::encoding::VTermEncoding::DecSpecialGraphics
         );
         assert_eq!(state.escape_designate_charset(b"x0"), 0);

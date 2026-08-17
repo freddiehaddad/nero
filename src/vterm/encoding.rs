@@ -25,7 +25,7 @@ pub enum VTermEncoding {
 
 /// One selected encoding and its persistent decoder state
 /// (`VTermEncodingInstance`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VTermEncodingInstance {
     encoding: VTermEncoding,
     utf8_data: Utf8DecoderData,
