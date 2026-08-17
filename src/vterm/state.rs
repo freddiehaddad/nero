@@ -1037,6 +1037,97 @@ pub fn control_single_shift(state: &mut VTermState, control: u8) -> bool {
     true
 }
 
+#[must_use]
+pub fn decode_text_codepoints(
+    state: &mut VTermState,
+    bytes: &[u8],
+    utf8: bool,
+) -> (Vec<u32>, usize) {
+    if bytes.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let single_shift = state.gsingle_set != 0;
+    let capacity = if single_shift { 1 } else { bytes.len() + 1 };
+    let mut codepoints = vec![0; capacity];
+    let mut count = 0;
+    let mut consumed = 0;
+
+    let selected = if single_shift {
+        Some(state.gsingle_set as usize)
+    } else if bytes[0] & 0x80 == 0 {
+        Some(state.gl_set as usize)
+    } else if utf8 {
+        None
+    } else {
+        Some(state.gr_set as usize)
+    };
+    if let Some(index) = selected {
+        if state.encodings[index].encoding() == crate::vterm::encoding::VTermEncoding::Utf8 {
+            state
+                .encoding_utf8
+                .decode(&mut codepoints, &mut count, bytes, &mut consumed);
+        } else {
+            state.encodings[index].decode(
+                &mut codepoints,
+                &mut count,
+                bytes,
+                &mut consumed,
+            );
+        }
+    } else {
+        state
+            .encoding_utf8
+            .decode(&mut codepoints, &mut count, bytes, &mut consumed);
+    }
+    codepoints.truncate(count);
+    if single_shift && !codepoints.is_empty() {
+        state.gsingle_set = 0;
+    }
+    (codepoints, consumed)
+}
+
+#[cfg(test)]
+mod decode_text_tests {
+    use super::*;
+
+    #[test]
+    fn text_decoder_selects_gl_and_designated_charsets() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(decode_text_codepoints(&mut state, b"A", false), (vec![65], 1));
+        state.encodings[1] = crate::vterm::encoding::VTermEncodingInstance::new(
+            crate::vterm::encoding::VTermEncoding::DecSpecialGraphics,
+        );
+        state.gl_set = 1;
+        assert_eq!(
+            decode_text_codepoints(&mut state, b"q", false),
+            (vec![0x2500], 1)
+        );
+    }
+
+    #[test]
+    fn text_decoder_preserves_utf8_state_across_fragments() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(
+            decode_text_codepoints(&mut state, b"\xE2\x82", true),
+            (Vec::new(), 2)
+        );
+        assert_eq!(
+            decode_text_codepoints(&mut state, b"\xAC", true),
+            (vec![0x20AC], 1)
+        );
+    }
+
+    #[test]
+    fn text_decoder_single_shift_consumes_one_character_and_resets() {
+        let mut state = VTermState::new(1, 1);
+        state.gsingle_set = 2;
+        let (codepoints, consumed) = decode_text_codepoints(&mut state, b"AB", false);
+        assert_eq!(codepoints, [65]);
+        assert_eq!(consumed, 1);
+        assert_eq!(state.gsingle_set, 0);
+    }
+}
+
 pub fn control_reverse_index<C: VTermStateCallbacks>(
     state: &mut VTermState,
     callbacks: &mut C,
