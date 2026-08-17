@@ -2020,6 +2020,48 @@ pub unsafe fn qf_free_all(wp: Option<*mut WinT>) {
     }
 }
 
+/// Select the quickfix/location-list stack for an Ex command
+/// (`qf_cmd_get_stack`), or null when a location list is absent.
+///
+/// # Safety
+/// The global quickfix stack must be initialized and `GLOBALS.curwin`
+/// must point to a live window for a location-list command.
+unsafe fn qf_cmd_get_stack(
+    eap: &crate::ex_cmds_defs::ExargT,
+) -> *mut crate::types_defs::QfInfoT {
+    let global = unsafe { &mut *QL_INFO.as_ptr() };
+    let mut qi: *mut crate::types_defs::QfInfoT = global
+        .as_mut()
+        .map_or(std::ptr::null_mut(), |stack| stack as *mut _);
+    assert!(!qi.is_null());
+
+    if crate::ex_docmd::is_loclist_cmd(eap.cmdidx) {
+        let wp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        qi = if is_ll_window(unsafe { &*wp }) {
+            unsafe { (*wp).w_llist_ref }
+        } else {
+            unsafe { (*wp).w_llist }
+        };
+    }
+    qi
+}
+
+/// Number of entries in the current quickfix/location list
+/// (`qf_get_size`).
+///
+/// # Safety
+/// Forwarded from `qf_cmd_get_stack`.
+#[must_use]
+pub unsafe fn qf_get_size(eap: &crate::ex_cmds_defs::ExargT) -> usize {
+    let qi = unsafe { qf_cmd_get_stack(eap) };
+    if qi.is_null() {
+        return 0;
+    }
+    qf_get_curlist(unsafe { &*qi }).map_or(0, |list| {
+        usize::try_from(list.qf_count()).unwrap_or(0)
+    })
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -6358,6 +6400,68 @@ mod tests {
         unsafe { qf_free_all(Some(winp)) };
         assert!(unsafe { (*winp).w_llist }.is_null());
         assert!(unsafe { (*winp).w_llist_ref }.is_null());
+    }
+
+    #[test]
+    fn qf_get_size_reads_global_and_location_list_commands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut global = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        global.qf_listcount = 1;
+        global.qf_lists[0].qf_entries =
+            (0..3).map(|_| QflineT::default()).collect();
+        *unsafe { QL_INFO.get_mut() } = Some(global);
+
+        let quickfix_cmd = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::copen,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_size(&quickfix_cmd) }, 3);
+
+        let location = Box::into_raw(Box::new(qf_alloc_stack(QfltypeT::Location, 1)));
+        unsafe {
+            (*location).qf_listcount = 1;
+            (&mut (*location).qf_lists)[0].qf_entries =
+                (0..2).map(|_| QflineT::default()).collect();
+        }
+        let mut win = WinT {
+            w_llist: location,
+            ..Default::default()
+        };
+        let winp = &mut win as *mut WinT;
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                winp,
+            )
+        };
+        let location_cmd = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::lopen,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_size(&location_cmd) }, 2);
+        unsafe { qf_free_all(Some(winp)) };
+    }
+
+    #[test]
+    fn qf_get_size_is_zero_without_a_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 1));
+        let mut win = WinT::default();
+        let winp = &mut win as *mut WinT;
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                winp,
+            )
+        };
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::lopen,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_size(&eap) }, 0);
     }
 
     #[test]
