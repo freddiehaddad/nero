@@ -933,6 +933,44 @@ pub fn csi_scroll_region<C: VTermStateCallbacks>(
     );
 }
 
+pub fn csi_erase_chars<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    count: i32,
+) {
+    let end_col = (state.pos.col + count.max(1)).min(state.current_row_width());
+    erase(
+        state,
+        callbacks,
+        crate::vterm_defs::VTermRect {
+            start_row: state.pos.row,
+            end_row: state.pos.row + 1,
+            start_col: state.pos.col,
+            end_col,
+        },
+        false,
+    );
+}
+
+#[cfg(test)]
+mod csi_erase_chars_tests {
+    use super::*;
+    struct Capture(crate::vterm_defs::VTermRect);
+    impl VTermStateCallbacks for Capture {
+        fn erase(&mut self, rect: crate::vterm_defs::VTermRect, _: bool) -> bool {
+            self.0 = rect; true
+        }
+    }
+    #[test]
+    fn erase_chars_clamps_to_row_width() {
+        let mut state = VTermState::new(1, 5);
+        state.pos.col = 3;
+        let mut capture = Capture(Default::default());
+        csi_erase_chars(&mut state, &mut capture, 9);
+        assert_eq!((capture.0.start_col, capture.0.end_col), (3, 5));
+    }
+}
+
 #[cfg(test)]
 mod csi_scroll_region_tests {
     use super::*;
