@@ -338,6 +338,10 @@ pub trait VTermStateCallbacks {
         false
     }
 
+    fn bell(&mut self) -> bool {
+        false
+    }
+
     fn set_pen_attr(
         &mut self,
         _attr: crate::vterm_defs::VTermAttr,
@@ -3052,6 +3056,7 @@ mod tests {
         assert!(!callbacks.move_rect(Default::default(), Default::default()));
         assert!(!callbacks.erase(Default::default(), false));
         assert!(!callbacks.init_pen());
+        assert!(!callbacks.bell());
         assert!(!callbacks.set_pen_attr(
             crate::vterm_defs::VTermAttr::Bold,
             &crate::vterm_defs::VTermValue::Boolean(1),
