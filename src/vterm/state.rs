@@ -1014,6 +1014,48 @@ pub fn csi_device_status(
     }
 }
 
+pub fn csi_repeat<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    count: i32,
+) {
+    let width = state.combine_width.max(1);
+    let end = (state.pos.col + count.max(1)).min(state.current_row_width());
+    let schar = crate::grid::schar_from_buf(&state.grapheme_buf[..state.grapheme_len]);
+    while state.pos.col < end {
+        putglyph(state, callbacks, schar, width, state.pos, state.protected_cell);
+        state.pos.col += width;
+    }
+    if state.pos.col + width >= state.current_row_width() && state.mode.autowrap {
+        state.at_phantom = true;
+    }
+}
+
+#[cfg(test)]
+mod csi_repeat_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture(usize);
+    impl VTermStateCallbacks for Capture {
+        fn put_glyph(
+            &mut self,
+            _: &crate::vterm_defs::VTermGlyphInfo,
+            _: crate::vterm_defs::VTermPos,
+        ) -> bool { self.0 += 1; true }
+    }
+    #[test]
+    fn repeat_replays_last_grapheme_count() {
+        let mut state = VTermState::new(1, 10);
+        state.grapheme_buf[0] = b'x';
+        state.grapheme_len = 1;
+        state.combine_width = 1;
+        let mut capture = Capture::default();
+        csi_repeat(&mut state, &mut capture, 3);
+        assert_eq!(capture.0, 3);
+        assert_eq!(state.pos.col, 3);
+    }
+}
+
 #[cfg(test)]
 mod csi_device_status_tests {
     use super::*;
