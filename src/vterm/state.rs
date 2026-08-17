@@ -378,6 +378,32 @@ pub fn vterm_state_set_callbacks<C>(
     host.callbacks = callbacks;
 }
 
+pub struct VTermStateFallbackHost<F> {
+    pub fallbacks: Option<F>,
+}
+
+pub fn vterm_state_set_unrecognised_fallbacks<F>(
+    host: &mut VTermStateFallbackHost<F>,
+    fallbacks: Option<F>,
+) {
+    host.fallbacks = fallbacks;
+}
+
+#[cfg(test)]
+mod state_fallback_setter_tests {
+    use super::*;
+    #[test]
+    fn state_fallback_setter_installs_and_removes_fallbacks() {
+        let mut host = VTermStateFallbackHost {
+            fallbacks: None::<u8>,
+        };
+        vterm_state_set_unrecognised_fallbacks(&mut host, Some(4));
+        assert_eq!(host.fallbacks, Some(4));
+        vterm_state_set_unrecognised_fallbacks(&mut host, None);
+        assert_eq!(host.fallbacks, None);
+    }
+}
+
 #[cfg(test)]
 mod state_callback_setter_tests {
     use super::*;
