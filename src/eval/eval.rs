@@ -166,8 +166,8 @@
 //! `eval7` started deliberately minimal and has grown since: number/
 //! float/`0z`-blob literals (`eval_number`), single-quoted string
 //! literals (`eval_lit_string`), double-quoted string literals
-//! (`eval_string` - full except `\<C-...>` special-key escapes, see
-//! its own doc comment), list/dict/literal-dict literals (`eval_list`/
+//! (`eval_string`, including `\<C-...>` special-key escapes),
+//! list/dict/literal-dict literals (`eval_list`/
 //! `eval_dict`/`eval_lit_dict` - `eval_dict`'s own deferred `{expr}`-
 //! vs-dict-literal speculative pre-check aside, see its own doc
 //! comment), leading `!`/`-`/`+` (`eval7_leader`), parenthesized
@@ -1860,17 +1860,9 @@ pub fn eval_number(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, want_string:
 /// Returns `(status, bytes_consumed)`, matching this module's own
 /// established idiom.
 ///
-/// # Deferred
-/// `\<C-...>`-style special-key escapes need `find_special_key`/
-/// `trans_special`, which need the ENTIRE `keycodes.c` subsystem - key-
-/// name tables, modifier parsing, a whole generated
-/// `keycode_names.generated.h` - a substantial, separate undertaking
-/// of its own, not a small add-on. Rather than silently mishandle it,
-/// `unimplemented!()`s the MOMENT a `\<` is encountered anywhere in the
-/// string (even during the first, string-end-finding pass, exactly
-/// where the original itself would first need `find_special_key`).
-/// Every OTHER escape form (`\b`/`\e`/`\f`/`\n`/`\r`/`\t`, hex/Unicode/
-/// octal, and the literal default fallback) is translated in full.
+/// Every escape form (`\b`/`\e`/`\f`/`\n`/`\r`/`\t`,
+/// hex/Unicode/octal, special keys, and the literal default fallback)
+/// is translated in full.
 #[must_use]
 pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, interpolate: bool) -> (i32, usize) {
     use crate::ascii_defs::{ascii_isxdigit, BS, CAR, ESC, FF, NL, TAB};
@@ -1887,10 +1879,16 @@ pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, interpolate:
         if arg[p] == b'\\' && arg.get(p + 1).is_some() {
             p += 1;
             if arg[p] == b'<' {
-                unimplemented!(
-                    "eval_string: \\<C-...>-style special-key escapes need find_special_key/\
-                     trans_special, the whole keycodes.c subsystem - not yet translated"
-                );
+                let mut flags = crate::keycodes_defs::fsk::KEYCODE
+                    | crate::keycodes_defs::fsk::IN_STRING;
+                if arg.get(p + 1) != Some(&b'*') {
+                    flags |= crate::keycodes_defs::fsk::SIMPLIFY;
+                }
+                if let Some((_, _, consumed, _)) =
+                    crate::keycodes::find_special_key(&arg[p..], flags)
+                {
+                    p += consumed - 1;
+                }
             }
         } else if interpolate && matches!(arg[p], b'{' | b'}') {
             if arg[p] == b'{' && arg.get(p + 1) != Some(&b'{') {
@@ -1998,16 +1996,23 @@ pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, interpolate:
                     }
                     s.push(val as u8);
                 }
-                // Special key, e.g.: "\<C-W>" - the first pass above
-                // already unimplemented!()s before this second pass
-                // could ever be reached with a '<' here; kept only so
-                // this match stays exhaustive/documents the original's
-                // own case.
                 Some(&b'<') => {
-                    unimplemented!(
-                        "eval_string: \\<C-...>-style special-key escapes need \
-                         find_special_key/trans_special - not yet translated"
-                    );
+                    let mut flags = crate::keycodes_defs::fsk::KEYCODE
+                        | crate::keycodes_defs::fsk::IN_STRING;
+                    if arg.get(q + 1) != Some(&b'*') {
+                        flags |= crate::keycodes_defs::fsk::SIMPLIFY;
+                    }
+                    if let Some((key, modifiers, consumed, _)) =
+                        crate::keycodes::find_special_key(&arg[q..], flags)
+                    {
+                        s.extend_from_slice(&crate::keycodes::special_to_buf(
+                            key, modifiers, false,
+                        ));
+                        q += consumed;
+                    } else {
+                        s.push(b'<');
+                        q += 1;
+                    }
                 }
                 // default: copy the byte literally (see this
                 // function's own doc comment for why byte-level
@@ -7124,24 +7129,50 @@ mod tests {
     }
 
     #[test]
-    fn eval_string_special_key_escape_is_unimplemented() {
+    fn eval_string_special_key_escape_encodes_the_key() {
         let mut tv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            eval_string(b"\"\\<C-W>\"", &mut tv, true, false)
-        }));
-        assert!(result.is_err(), "expected a panic (find_special_key/trans_special not yet translated)");
+        let (ret, consumed) = eval_string(b"\"\\<C-W>\"", &mut tv, true, false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(
+            tv.value,
+            TypvalValue::String(Some(vec![crate::ascii_defs::CTRL_W]))
+        );
     }
 
     #[test]
-    fn eval_string_special_key_escape_panics_even_when_not_evaluating() {
-        // The FIRST pass (finding the string's end) also needs
-        // find_special_key whenever '\<' appears, even in parse-only
-        // mode - matching the original exactly.
+    fn eval_string_special_key_escape_is_skipped_in_parse_only_mode() {
         let mut tv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            eval_string(b"\"\\<C-W>\"", &mut tv, false, false)
-        }));
-        assert!(result.is_err());
+        let (ret, consumed) = eval_string(b"\"\\<C-W>\"", &mut tv, false, false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(tv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn eval_string_named_special_key_uses_the_internal_three_byte_form() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\<Up>\"", &mut tv, true, false);
+        assert_eq!(ret, OK);
+        assert_eq!(
+            tv.value,
+            TypvalValue::String(Some(vec![
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::key2termcap0(crate::keycodes_defs::K_UP),
+                crate::keycodes_defs::key2termcap1(crate::keycodes_defs::K_UP),
+            ]))
+        );
+    }
+
+    #[test]
+    fn eval_string_invalid_special_key_falls_through_to_literal_text() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\<NotARealKey>\"", &mut tv, true, false);
+        assert_eq!(ret, OK);
+        assert_eq!(
+            tv.value,
+            TypvalValue::String(Some(b"<NotARealKey>".to_vec()))
+        );
     }
 
     #[test]
@@ -10875,9 +10906,13 @@ mod tests {
     }
 
     #[test]
-    fn e2e_double_quoted_string_special_key_escape_is_unimplemented() {
-        let result = std::panic::catch_unwind(|| eval_str(b"\"\\<C-W>\""));
-        assert!(result.is_err(), "expected a panic (find_special_key/trans_special not yet translated)");
+    fn e2e_double_quoted_string_special_key_escape() {
+        let (ret, tv) = eval_str(b"\"\\<C-W>\"");
+        assert_eq!(ret, OK);
+        assert_eq!(
+            tv.value,
+            TypvalValue::String(Some(vec![crate::ascii_defs::CTRL_W]))
+        );
     }
 
     #[test]
