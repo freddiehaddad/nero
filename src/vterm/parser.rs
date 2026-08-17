@@ -161,6 +161,40 @@ pub trait VTermParserCallbacks {
 
 impl VTermParserCallbacks for () {}
 
+pub struct VTermParserHost<C> {
+    pub parser: VTermParser,
+    pub callbacks: Option<C>,
+}
+
+impl<C> Default for VTermParserHost<C> {
+    fn default() -> Self {
+        Self {
+            parser: VTermParser::default(),
+            callbacks: None,
+        }
+    }
+}
+
+pub fn vterm_parser_set_callbacks<C>(
+    host: &mut VTermParserHost<C>,
+    callbacks: Option<C>,
+) {
+    host.callbacks = callbacks;
+}
+
+#[cfg(test)]
+mod callback_setter_tests {
+    use super::*;
+    #[test]
+    fn parser_callback_setter_installs_and_removes_callbacks() {
+        let mut host = VTermParserHost::<u8>::default();
+        vterm_parser_set_callbacks(&mut host, Some(7));
+        assert_eq!(host.callbacks, Some(7));
+        vterm_parser_set_callbacks(&mut host, None);
+        assert_eq!(host.callbacks, None);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum C1Action {
     NoString,
