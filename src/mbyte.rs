@@ -13,10 +13,8 @@
 //! `mb_tolower`/`mb_islower`/`mb_isupper`; character *display width*:
 //! `intable`/`utf_printable` (the portable, non-`__SSE2__` reference
 //! algorithm; the SSE2 intrinsics fast path is a pure optimization
-//! producing identical results, not translated), `cw_value` (always
-//! returns 0, since the real `cw_table` is populated only by the eval
-//! engine's `setcellwidths()`, not yet translated, matching every real
-//! session's default, unconfigured state exactly), `prop_is_emojilike`,
+//! producing identical results, not translated), `cw_value` plus its
+//! real sorted [`CW_TABLE`] override storage, `prop_is_emojilike`,
 //! `utf_char2cells`, `utf_ptr2cells` (needs `charset.c`'s
 //! `vim_isprintc`/`char2cells`, themselves needing a documented
 //! default-table approximation of `g_chartab`; see `charset.rs`'s own
@@ -1183,15 +1181,41 @@ pub fn utf_printable(c: i32) -> bool {
     !intable(NONPRINT, c)
 }
 
+/// One user-configured cell-width interval (`cw_interval_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellWidthInterval {
+    pub first: i64,
+    pub last: i64,
+    pub width: u8,
+}
+
+/// Sorted table configured by `setcellwidths()` (`cw_table`).
+pub static CW_TABLE: crate::globals::GlobalCell<Vec<CellWidthInterval>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
 /// Check if `c` has a user-configured cell width via `'cellwidths'`
 /// (`cw_value`, `static` in the original - kept private here too).
-///
-/// Always returns 0 (no override): the original's `cw_table` is
-/// populated only by the eval engine's `setcellwidths()` VimL builtin
-/// (`f_setcellwidths`, `eval/funcs.c`, not yet translated) - this
-/// matches every real session's DEFAULT (nobody has called
-/// `setcellwidths()`) state exactly, not an approximation.
-fn cw_value(_c: i32) -> i32 {
+fn cw_value(c: i32) -> i32 {
+    let table = unsafe { &*CW_TABLE.as_ptr() };
+    if table.is_empty() || i64::from(c) < table[0].first {
+        return 0;
+    }
+    let mut bottom = 0usize;
+    let mut top = table.len() - 1;
+    while bottom <= top {
+        let middle = (bottom + top) / 2;
+        let interval = table[middle];
+        if interval.last < i64::from(c) {
+            bottom = middle + 1;
+        } else if interval.first > i64::from(c) {
+            if middle == 0 {
+                break;
+            }
+            top = middle - 1;
+        } else {
+            return i32::from(interval.width);
+        }
+    }
     0
 }
 
@@ -2641,6 +2665,21 @@ mod tests {
     fn bounded_cells_reports_illegal_and_wide_characters() {
         assert_eq!(unsafe { utf_ptr2cells_len(&[0x80], 1) }, 4);
         assert_eq!(unsafe { utf_ptr2cells_len("一".as_bytes(), 3) }, 2);
+    }
+
+    #[test]
+    fn cw_value_binary_searches_configured_intervals() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = std::mem::take(unsafe { CW_TABLE.get_mut() });
+        unsafe { CW_TABLE.get_mut() }.extend([
+            CellWidthInterval { first: 0x100, last: 0x10F, width: 1 },
+            CellWidthInterval { first: 0x200, last: 0x20F, width: 2 },
+        ]);
+        assert_eq!(cw_value(0x80), 0);
+        assert_eq!(cw_value(0x108), 1);
+        assert_eq!(cw_value(0x205), 2);
+        assert_eq!(cw_value(0x300), 0);
+        *unsafe { CW_TABLE.get_mut() } = saved;
     }
 
     #[test]
