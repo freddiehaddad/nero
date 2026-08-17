@@ -170,7 +170,6 @@ unsafe fn qf_set_title_var(list: &QfListT) {
 /// # Safety
 /// `qi`, the global tab/window chains, and each matching window's
 /// `w_vars` dictionary must remain valid. Touches `GLOBALS.curwin`.
-#[allow(dead_code)]
 unsafe fn qf_update_win_titlevar(qi: *const crate::types_defs::QfInfoT) {
     let qfl = qf_get_curlist(unsafe { &*qi })
         .expect("qf_update_win_titlevar: current list must exist");
@@ -1508,6 +1507,41 @@ unsafe fn qf_setprop_qftf(
     crate::vim_defs::OK
 }
 
+/// Set a quickfix/location list's title (`qf_setprop_title`).
+///
+/// # Safety
+/// `qi`, `what`, and `item` must remain valid. If the selected list
+/// is current, the global tab/window chains and matching window-scope
+/// dictionaries must satisfy [`qf_update_win_titlevar`]'s contract.
+#[allow(dead_code)]
+unsafe fn qf_setprop_title(
+    qi: *mut crate::types_defs::QfInfoT,
+    qf_idx: i32,
+    what: *mut crate::eval::typval_defs::DictT,
+    item: *const crate::eval::typval_defs::DictitemT,
+) -> i32 {
+    if !matches!(
+        unsafe { &(*item).di_tv.value },
+        crate::eval::typval_defs::TypvalValue::String(_)
+    ) {
+        return crate::vim_defs::FAIL;
+    }
+    let Ok(idx) = usize::try_from(qf_idx) else {
+        return crate::vim_defs::FAIL;
+    };
+    if idx >= unsafe { (*qi).qf_lists.len() } {
+        return crate::vim_defs::FAIL;
+    }
+    let title = unsafe {
+        crate::eval::typval::tv_dict_get_string(Some(&mut *what), b"title")
+    };
+    unsafe { (&mut (*qi).qf_lists)[idx].qf_title = title };
+    if qf_idx == unsafe { (*qi).qf_curlist } {
+        unsafe { qf_update_win_titlevar(qi) };
+    }
+    crate::vim_defs::OK
+}
+
 /// Add a quickfix list's `'quickfixtextfunc'` callback to a result
 /// dictionary (`qf_getprop_qftf`).
 ///
@@ -1670,6 +1704,102 @@ mod qf_nth_valid_tests {
         );
         crate::eval::typval::callback_free(&mut qfl.qf_qftf_cb);
         unsafe { crate::eval::typval::tv_dict_item_free(item) };
+    }
+
+    #[test]
+    fn setprop_title_replaces_the_current_lists_title() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_title: Some(b"old".to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_str(
+            unsafe { &mut *what },
+            b"title",
+            Some(b"new"),
+        );
+        let item = crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *what }),
+            b"title",
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { qf_setprop_title(qi_ptr, 0, what, item) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"new"[..]));
+        unsafe { crate::eval::typval::tv_dict_free(what) };
+    }
+
+    #[test]
+    fn setprop_title_can_update_a_noncurrent_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 2,
+            qf_curlist: 0,
+            qf_lists: vec![QfListT::default(), QfListT::default()],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_str(
+            unsafe { &mut *what },
+            b"title",
+            Some(b"second"),
+        );
+        let item = crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *what }),
+            b"title",
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { qf_setprop_title(qi_ptr, 1, what, item) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            qi.qf_lists[1].qf_title.as_deref(),
+            Some(&b"second"[..])
+        );
+        unsafe { crate::eval::typval::tv_dict_free(what) };
+    }
+
+    #[test]
+    fn setprop_title_rejects_a_non_string_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_title: Some(b"keep".to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"title", 1);
+        let item = crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *what }),
+            b"title",
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { qf_setprop_title(qi_ptr, 0, what, item) },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"keep"[..]));
+        unsafe { crate::eval::typval::tv_dict_free(what) };
     }
 
     #[test]
