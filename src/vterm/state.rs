@@ -2323,6 +2323,14 @@ impl VTermState {
         }
     }
 
+    pub fn set_character_protection(&mut self, value: i32) {
+        match value {
+            0 | 2 => self.protected_cell = false,
+            1 => self.protected_cell = true,
+            _ => {}
+        }
+    }
+
     #[must_use]
     pub fn dec_mode_value(&self, number: i32) -> Option<bool> {
         Some(match number {
@@ -2876,6 +2884,14 @@ mod termprop_state_tests {
             state.mode.cursor_shape,
             crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT as u8
         );
+    }
+    #[test]
+    fn character_protection_maps_decsca_values() {
+        let mut state = VTermState::new(1, 1);
+        state.set_character_protection(1);
+        assert!(state.protected_cell);
+        state.set_character_protection(2);
+        assert!(!state.protected_cell);
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
