@@ -946,6 +946,18 @@ pub fn did_set_messagesopt(
     }
 }
 
+/// The `'cinoptions'` option is changed (`did_set_cinoptions`).
+///
+/// # Safety
+/// `args.os_buf` must point to a live `BufT`.
+pub unsafe fn did_set_cinoptions(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = unsafe { &mut *(args.os_buf as *mut crate::buffer_defs::BufT) };
+    crate::indent_c::parse_cino(buf);
+    None
+}
+
 /// The `'helplang'` option is changed (`did_set_helplang`).
 ///
 /// Validates a comma-separated list of exactly-2-letter language
@@ -4854,6 +4866,46 @@ mod tests {
             did_set_messagesopt(&mut crate::option_defs::OptsetT::default()),
             Some(crate::errors::e_invarg.as_bytes())
         );
+    }
+
+    #[test]
+    fn did_set_cinoptions_rebuilds_the_buffers_indent_cache() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_sw: 4,
+            b_p_ts: 8,
+            b_p_cino: Some(b">2s,e-s".to_vec()),
+            ..Default::default()
+        };
+        let bufp = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: bufp as *mut c_void,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_cinoptions(&mut args) }, None);
+        assert_eq!(unsafe { (*bufp).b_ind_level }, 8);
+        assert_eq!(unsafe { (*bufp).b_ind_open_imag }, -4);
+    }
+
+    #[test]
+    fn did_set_cinoptions_restores_defaults_for_an_empty_value() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_sw: 3,
+            b_p_ts: 8,
+            b_p_cino: Some(Vec::new()),
+            b_ind_level: 99,
+            b_ind_jump_label: 99,
+            ..Default::default()
+        };
+        let bufp = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: bufp as *mut c_void,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_cinoptions(&mut args) }, None);
+        assert_eq!(unsafe { (*bufp).b_ind_level }, 3);
+        assert_eq!(unsafe { (*bufp).b_ind_jump_label }, -1);
     }
 
     // ---- did_set_backupext_or_patchmode ----
