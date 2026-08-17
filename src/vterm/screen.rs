@@ -209,6 +209,33 @@ pub fn vterm_screen_free(screen: VTermScreen) {
     drop(screen);
 }
 
+pub struct VTermScreenOwner {
+    pub rows: i32,
+    pub cols: i32,
+    pub screen: Option<VTermScreen>,
+}
+
+pub fn vterm_obtain_screen(owner: &mut VTermScreenOwner) -> &mut VTermScreen {
+    owner
+        .screen
+        .get_or_insert_with(|| screen_new(owner.rows, owner.cols))
+}
+
+#[cfg(test)]
+mod obtain_screen_tests {
+    use super::*;
+    #[test]
+    fn obtain_screen_lazily_constructs_and_reuses_screen() {
+        let mut owner = VTermScreenOwner {
+            rows: 2,
+            cols: 3,
+            screen: None,
+        };
+        vterm_obtain_screen(&mut owner).reflow = true;
+        assert!(vterm_obtain_screen(&mut owner).reflow);
+    }
+}
+
 #[cfg(test)]
 mod screen_free_tests {
     use super::*;
