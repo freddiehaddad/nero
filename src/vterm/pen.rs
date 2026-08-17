@@ -102,6 +102,18 @@ pub trait VTermPenCallbacks {
 
 impl VTermPenCallbacks for () {}
 
+pub fn setpenattr<C: VTermPenCallbacks>(
+    callbacks: &mut C,
+    attr: crate::vterm_defs::VTermAttr,
+    value: &crate::vterm_defs::VTermValue<'_>,
+) {
+    debug_assert_eq!(
+        value.value_type(),
+        crate::vterm::core::vterm_get_attr_type(attr)
+    );
+    let _ = callbacks.set_pen_attr(attr, value);
+}
+
 #[allow(dead_code)]
 fn setpenattr_bool<C: VTermPenCallbacks>(
     callbacks: &mut C,
@@ -1004,6 +1016,17 @@ mod tests {
             crate::vterm_defs::VTermAttr::Bold,
             &crate::vterm_defs::VTermValue::Boolean(1),
         ));
+    }
+
+    #[test]
+    fn generic_setpenattr_forwards_typed_value() {
+        let mut capture = PenCapture::default();
+        setpenattr(
+            &mut capture,
+            crate::vterm_defs::VTermAttr::Bold,
+            &crate::vterm_defs::VTermValue::Boolean(1),
+        );
+        assert_eq!(capture.0.len(), 1);
     }
 
     #[test]
