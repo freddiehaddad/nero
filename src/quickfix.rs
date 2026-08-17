@@ -3111,6 +3111,47 @@ pub unsafe fn qf_get_properties(
     status
 }
 
+/// Build a `getqflist()`/`getloclist()` result (`get_qf_loc_list`).
+///
+/// An omitted `what_arg` returns the entry List. Any supplied value
+/// returns a Dict; a non-Dict or null Dict leaves that result empty,
+/// matching the original after its omitted error message.
+///
+/// # Safety
+/// Forwarded from `get_errorlist` and [`qf_get_properties`].
+pub unsafe fn get_qf_loc_list(
+    is_qf: bool,
+    wp: Option<&crate::buffer_defs::WinT>,
+    what_arg: &crate::eval::typval_defs::TypvalT,
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    use crate::eval::typval_defs::TypvalValue;
+
+    if matches!(&what_arg.value, TypvalValue::Unknown) {
+        let list = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 0) };
+        if is_qf || wp.is_some() {
+            let _ = unsafe {
+                get_errorlist(
+                    std::ptr::null(),
+                    wp,
+                    INVALID_QFIDX,
+                    0,
+                    list,
+                )
+            };
+        }
+        return;
+    }
+
+    let dict = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+    if (is_qf || wp.is_some())
+        && let TypvalValue::Dict(what) = &what_arg.value
+        && !what.is_null()
+    {
+        let _ = unsafe { qf_get_properties(wp, *what, dict) };
+    }
+}
+
 /// Find the first window in the current tab page showing a normal
 /// buffer (`qf_find_win_with_normal_buf`).
 ///
@@ -8653,5 +8694,144 @@ mod tests {
             crate::eval::typval::tv_dict_free(result);
             crate::eval::typval::tv_dict_free(what);
         }
+    }
+
+    #[test]
+    fn get_qf_loc_list_returns_global_quickfix_entries_without_what() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT { qf_lnum: 2, ..Default::default() },
+                    QflineT { qf_lnum: 4, ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe {
+            get_qf_loc_list(
+                true,
+                None,
+                &crate::eval::typval_defs::TypvalT::default(),
+                &mut rettv,
+            )
+        };
+        assert!(matches!(
+            &rettv.value,
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 2
+        ));
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn get_qf_loc_list_returns_requested_properties_in_a_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default(), QflineT::default()],
+                qf_title: Some(b"title".to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"title", 1);
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"size", 1);
+        let what_tv = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Dict(what),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { get_qf_loc_list(true, None, &what_tv, &mut rettv) };
+        let crate::eval::typval_defs::TypvalValue::Dict(result) = &rettv.value else {
+            panic!("result must be a dict");
+        };
+        let result = *result;
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(&mut *result), b"size") },
+            2
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_string(Some(&mut *result), b"title") },
+            Some(b"title".to_vec())
+        );
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&rettv);
+            crate::eval::typval::tv_dict_free(what);
+        }
+    }
+
+    #[test]
+    fn get_qf_loc_list_uses_empty_results_for_invalid_or_unresolved_requests() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let number = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(1),
+            ..Default::default()
+        };
+        unsafe { get_qf_loc_list(false, None, &number, &mut rettv) };
+        assert!(matches!(
+            &rettv.value,
+            crate::eval::typval_defs::TypvalValue::Dict(dict)
+                if unsafe { &**dict }.dv_index.is_empty()
+        ));
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe {
+            get_qf_loc_list(
+                false,
+                None,
+                &crate::eval::typval_defs::TypvalT::default(),
+                &mut rettv,
+            )
+        };
+        assert!(matches!(
+            &rettv.value,
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 0
+        ));
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn get_qf_loc_list_returns_entries_from_a_window_location_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut location = Box::new(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT { qf_lnum: 8, ..Default::default() }],
+                ..Default::default()
+            }],
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let location_ptr = std::ptr::addr_of_mut!(*location);
+        let win = crate::buffer_defs::WinT {
+            w_llist: location_ptr,
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe {
+            get_qf_loc_list(
+                false,
+                Some(&win),
+                &crate::eval::typval_defs::TypvalT::default(),
+                &mut rettv,
+            )
+        };
+        assert!(matches!(
+            &rettv.value,
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 1
+        ));
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
     }
 }
