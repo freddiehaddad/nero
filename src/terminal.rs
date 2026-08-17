@@ -21,7 +21,8 @@
 //! `terminal_check_cursor` follows the terminal cursor and viewport;
 //! `get_rgb` converts a libvterm color to Neovim's packed RGB value;
 //! [`terminal_set_streamed_paste`] transitions bracketed paste state;
-//! `terminal_focus` emits libvterm focus reports.
+//! `terminal_focus` emits libvterm focus reports; `mouse_action`
+//! forwards position and button changes to libvterm.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -114,6 +115,29 @@ fn terminal_focus(
     } else {
         crate::vterm::state::vterm_state_focus_out(state, state.ctrl8bit)
     }
+}
+
+#[allow(dead_code)]
+#[must_use]
+fn mouse_action(
+    state: &mut crate::vterm::mouse::VTermMouseState,
+    button: i32,
+    row: i32,
+    col: i32,
+    pressed: bool,
+    modifiers: VTermModifier,
+) -> Vec<u8> {
+    let mut output =
+        crate::vterm::mouse::vterm_mouse_move(state, row, col, modifiers);
+    if button != 0 {
+        output.extend_from_slice(&crate::vterm::mouse::vterm_mouse_button(
+            state,
+            button,
+            pressed,
+            modifiers,
+        ));
+    }
+    output
 }
 
 /// Whether `term` is the terminal currently focused in Terminal mode
@@ -372,6 +396,21 @@ mod tests {
             terminal_focus(&state, true),
             [crate::vterm_defs::C1_CSI, b'I']
         );
+    }
+
+    #[test]
+    fn mouse_action_moves_then_reports_a_button() {
+        let mut state = crate::vterm::mouse::VTermMouseState {
+            flags: crate::vterm::mouse::MOUSE_WANT_CLICK,
+            protocol: crate::vterm::mouse::VTermMouseProtocol::Sgr,
+            ..Default::default()
+        };
+        assert_eq!(
+            mouse_action(&mut state, 1, 3, 4, true, 0),
+            b"\x1b[<0;5;4M"
+        );
+        assert_eq!((state.row, state.col), (3, 4));
+        assert_eq!(state.buttons, 1);
     }
 
     struct ModMaskGuard {
