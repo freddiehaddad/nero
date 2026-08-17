@@ -329,6 +329,7 @@ pub struct VTermState {
     pub default_bg: crate::vterm_defs::VTermColor,
     pub colors: [crate::vterm_defs::VTermColor; 16],
     pub bold_is_highbright: bool,
+    pub utf8: bool,
     pub ctrl8bit: bool,
     pub saved: VTermSavedState,
     pub selection_buffer: Option<Vec<u8>>,
@@ -496,6 +497,7 @@ where
     F: VTermStateFallbacks,
 {
     fn text(&mut self, bytes: &[u8]) -> usize {
+        self.state.utf8 = self.utf8;
         on_text(&mut self.state, &mut self.callbacks, bytes, self.utf8)
     }
 
@@ -4520,6 +4522,7 @@ impl VTermState {
             default_bg: crate::vterm_defs::VTermColor::default(),
             colors: [crate::vterm_defs::VTermColor::default(); 16],
             bold_is_highbright: false,
+            utf8: false,
             ctrl8bit: false,
             saved: VTermSavedState::default(),
             selection_buffer: None,
@@ -4765,6 +4768,7 @@ impl VTermState {
         self.mode.bracketpaste = false;
         self.mode.report_focus = false;
         self.mouse_flags = 0;
+        self.ctrl8bit = false;
     }
 
     pub fn reset_tabstops(&mut self) {
@@ -4789,9 +4793,14 @@ impl VTermState {
         self.reset_tabstops();
         self.active_lineinfo = 0;
         self.reset_lineinfos();
+        let default_encoding = if self.utf8 {
+            crate::vterm::encoding::VTermEncoding::Utf8
+        } else {
+            crate::vterm::encoding::VTermEncoding::UsAscii
+        };
         self.encodings = std::array::from_fn(|_| {
             crate::vterm::encoding::VTermEncodingInstance::new(
-                crate::vterm::encoding::VTermEncoding::UsAscii,
+                default_encoding,
             )
         });
         self.encoding_utf8.reset();
@@ -5441,11 +5450,13 @@ mod termprop_state_tests {
             ..Default::default()
         };
         state.mouse_flags = 7;
+        state.ctrl8bit = true;
         state.reset_modes();
         assert!(state.mode.autowrap);
         assert!(!state.mode.keypad);
         assert!(!state.mode.report_focus);
         assert_eq!(state.mouse_flags, 0);
+        assert!(!state.ctrl8bit);
     }
     #[test]
     fn set_mode_handles_insert_and_newline_modes() {
@@ -5740,6 +5751,16 @@ mod termprop_state_tests {
         assert!(state.mode.autowrap);
         state.reset(true);
         assert_eq!(state.pos, Default::default());
+    }
+
+    #[test]
+    fn state_reset_selects_utf8_as_the_default_when_enabled() {
+        let mut state = VTermState::new(1, 1);
+        state.utf8 = true;
+        state.reset(false);
+        assert!(state.encodings.iter().all(|encoding| {
+            encoding.encoding() == crate::vterm::encoding::VTermEncoding::Utf8
+        }));
     }
 }
 
