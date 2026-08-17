@@ -1669,6 +1669,92 @@ pub fn csi_key_encoding(
     }
 }
 
+pub fn csi_set_cursor_style<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    value: i32,
+) {
+    let (blink, shape) = match value {
+        0 | 1 => (1, crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK),
+        2 => (0, crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK),
+        3 => (1, crate::vterm_defs::VTERM_PROP_CURSORSHAPE_UNDERLINE),
+        4 => (0, crate::vterm_defs::VTERM_PROP_CURSORSHAPE_UNDERLINE),
+        5 => (1, crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT),
+        6 => (0, crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT),
+        _ => return,
+    };
+    set_state_bool_prop(
+        state,
+        callbacks,
+        crate::vterm_defs::VTermProp::CursorBlink,
+        blink,
+    );
+    set_state_int_prop(
+        state,
+        callbacks,
+        crate::vterm_defs::VTermProp::CursorShape,
+        shape,
+    );
+}
+
+pub fn csi_set_character_protection(state: &mut VTermState, value: i32) {
+    state.set_character_protection(value);
+}
+
+#[cfg(test)]
+mod csi_presentation_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture(Vec<crate::vterm_defs::VTermProp>);
+
+    impl VTermStateCallbacks for Capture {
+        fn set_term_prop(
+            &mut self,
+            prop: crate::vterm_defs::VTermProp,
+            _: &crate::vterm_defs::VTermValue<'_>,
+        ) -> bool {
+            self.0.push(prop);
+            true
+        }
+    }
+
+    #[test]
+    fn cursor_style_maps_blink_and_shape_properties() {
+        let mut state = VTermState::new(1, 1);
+        let mut capture = Capture::default();
+        csi_set_cursor_style(&mut state, &mut capture, 3);
+        assert!(state.mode.cursor_blink);
+        assert_eq!(
+            state.mode.cursor_shape,
+            crate::vterm_defs::VTERM_PROP_CURSORSHAPE_UNDERLINE as u8
+        );
+        assert_eq!(
+            capture.0,
+            [
+                crate::vterm_defs::VTermProp::CursorBlink,
+                crate::vterm_defs::VTermProp::CursorShape,
+            ]
+        );
+
+        csi_set_cursor_style(&mut state, &mut capture, 6);
+        assert!(!state.mode.cursor_blink);
+        assert_eq!(
+            state.mode.cursor_shape,
+            crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT as u8
+        );
+    }
+
+    #[test]
+    fn character_protection_maps_decsca_values() {
+        let mut state = VTermState::new(1, 1);
+        csi_set_character_protection(&mut state, 1);
+        assert!(state.protected_cell);
+        csi_set_character_protection(&mut state, 2);
+        assert!(!state.protected_cell);
+    }
+}
+
 #[cfg(test)]
 mod csi_key_encoding_tests {
     use super::*;
