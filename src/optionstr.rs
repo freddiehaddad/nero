@@ -2122,6 +2122,24 @@ pub unsafe fn did_set_spellfile(
     }
 }
 
+/// The `'spelllang'` option is changed (`did_set_spelllang`).
+///
+/// The value is validated in full. Reloading active spell wordlists
+/// remains with the not-yet-translated `did_set_spell_option` path.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_spelllang(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    if crate::spell::valid_spelllang(varp.as_deref().unwrap_or(&[])) {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
 /// The `'spelloptions'` option is changed (`did_set_spelloptions`).
 ///
 /// Unlike this file's other local-or-global callbacks (which pick ONE
@@ -6403,7 +6421,7 @@ mod tests {
         });
     }
 
-    // ---- did_set_spellfile / did_set_spelloptions ----
+    // ---- did_set_spellfile / did_set_spelllang / did_set_spelloptions ----
 
     #[test]
     fn did_set_spellfile_accepts_add_wordlists() {
@@ -6424,6 +6442,29 @@ mod tests {
         };
         assert_eq!(
             unsafe { did_set_spellfile(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_spelllang_accepts_language_names_and_punctuation() {
+        let mut value = Some(b"en_US.utf-8,de@quot".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_spelllang(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_spelllang_rejects_whitespace() {
+        let mut value = Some(b"en US".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_spelllang(&mut args) },
             Some(crate::errors::e_invarg.as_bytes())
         );
     }
