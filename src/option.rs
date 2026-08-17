@@ -1070,6 +1070,86 @@ pub unsafe fn vimrc_found(fname: Option<&[u8]>, envname: Option<&[u8]>) {
     }
 }
 
+/// Schedule redraw work required after an option changes
+/// (`check_redraw_for`).
+///
+/// # Safety
+/// `buf`/`win` must be valid whenever the selected flags use them,
+/// and global window lists must satisfy the called redraw helpers.
+pub unsafe fn check_redraw_for(
+    buf: *mut crate::buffer_defs::BufT,
+    win: *mut crate::buffer_defs::WinT,
+    flags: u32,
+) {
+    use crate::option_defs::opt_flags as flag;
+
+    let all = flags & flag::REDR_ALL == flag::REDR_ALL;
+    if flags & flag::REDR_STAT != 0 || all {
+        unsafe { crate::drawscreen::status_redraw_all() };
+    }
+    if flags & flag::REDR_TABL != 0 || all {
+        unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = true;
+    }
+    if flags & (flag::REDR_BUF | flag::REDR_WIN) != 0 || all {
+        if flags & flag::HL_ONLY != 0 {
+            unsafe { crate::drawscreen::redraw_later(win, crate::drawscreen::UPD_NOT_VALID) };
+        } else {
+            unsafe { crate::r#move::changed_window_setting(win) };
+        }
+    }
+    if flags & flag::REDR_BUF != 0 {
+        unsafe { crate::drawscreen::redraw_buf_later(buf, crate::drawscreen::UPD_NOT_VALID) };
+    }
+    if all {
+        unsafe { crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_NOT_VALID) };
+    }
+}
+
+/// [`check_redraw_for`] for the current buffer/window (`check_redraw`).
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin` and the global window lists must be valid.
+pub unsafe fn check_redraw(flags: u32) {
+    let globals = unsafe { &*crate::globals::GLOBALS.as_ptr() };
+    unsafe { check_redraw_for(globals.curbuf, globals.curwin, flags) };
+}
+
+#[cfg(test)]
+mod option_redraw_tests {
+    use super::*;
+
+    #[test]
+    fn redraw_dispatch_sets_tabline_and_highlight_only_window_redraw() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tabline = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.redraw_tabline,
+                false,
+            )
+        };
+        unsafe {
+            check_redraw_for(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                crate::option_defs::opt_flags::REDR_TABL,
+            );
+        }
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline);
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::from_mut(&mut win);
+        unsafe {
+            check_redraw_for(
+                std::ptr::null_mut(),
+                win_ptr,
+                crate::option_defs::opt_flags::REDR_WIN
+                    | crate::option_defs::opt_flags::HL_ONLY,
+            );
+        }
+        assert_eq!(unsafe { (*win_ptr).w_redr_type }, crate::drawscreen::UPD_NOT_VALID);
+    }
+}
+
 #[cfg(test)]
 mod vimrc_found_tests {
     use super::*;
