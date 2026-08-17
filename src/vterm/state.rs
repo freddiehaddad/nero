@@ -460,6 +460,154 @@ pub struct VTermSelectionHost<C> {
     pub callbacks: Option<C>,
 }
 
+pub struct VTermStateParserHost<C, S, F> {
+    pub state: VTermState,
+    pub callbacks: C,
+    pub selection_callbacks: Option<S>,
+    pub fallbacks: F,
+    pub utf8: bool,
+    output: Vec<u8>,
+}
+
+impl<C, S, F> VTermStateParserHost<C, S, F> {
+    #[must_use]
+    pub fn new(state: VTermState, callbacks: C, fallbacks: F) -> Self {
+        Self {
+            state,
+            callbacks,
+            selection_callbacks: None,
+            fallbacks,
+            utf8: false,
+            output: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.output)
+    }
+}
+
+impl<C, S, F> crate::vterm::parser::VTermParserCallbacks
+    for VTermStateParserHost<C, S, F>
+where
+    C: VTermStateCallbacks,
+    S: VTermSelectionCallbacks,
+    F: VTermStateFallbacks,
+{
+    fn text(&mut self, bytes: &[u8]) -> usize {
+        on_text(&mut self.state, &mut self.callbacks, bytes, self.utf8)
+    }
+
+    fn control(&mut self, control: u8) -> bool {
+        on_control(
+            &mut self.state,
+            &mut self.callbacks,
+            &mut self.fallbacks,
+            control,
+        ) != 0
+    }
+
+    fn escape(&mut self, bytes: &[u8]) -> bool {
+        on_escape(&mut self.state, &mut self.callbacks, bytes) != 0
+    }
+
+    fn csi(
+        &mut self,
+        leader: Option<&[u8]>,
+        args: &[crate::vterm::parser::CsiArg],
+        intermed: Option<&[u8]>,
+        command: u8,
+    ) -> bool {
+        let (handled, output) = on_csi(
+            &mut self.state,
+            &mut self.callbacks,
+            &mut self.fallbacks,
+            leader,
+            args,
+            intermed,
+            command,
+        );
+        self.output.extend_from_slice(&output);
+        handled != 0
+    }
+
+    fn osc(
+        &mut self,
+        command: i32,
+        fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool {
+        on_osc(
+            &mut self.state,
+            &mut self.callbacks,
+            self.selection_callbacks.as_mut(),
+            &mut self.fallbacks,
+            command,
+            fragment,
+        ) != 0
+    }
+
+    fn dcs(
+        &mut self,
+        command: &[u8],
+        fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ) -> bool {
+        let (handled, output) =
+            on_dcs(&mut self.state, &mut self.fallbacks, command, fragment);
+        self.output.extend_from_slice(&output);
+        handled != 0
+    }
+
+    fn apc(&mut self, fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+        on_apc(&mut self.fallbacks, fragment) != 0
+    }
+
+    fn pm(&mut self, fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+        on_pm(&mut self.fallbacks, fragment) != 0
+    }
+
+    fn sos(&mut self, fragment: crate::vterm_defs::VTermStringFragment<'_>) -> bool {
+        on_sos(&mut self.fallbacks, fragment) != 0
+    }
+
+    fn resize(&mut self, rows: i32, cols: i32) -> bool {
+        on_resize(&mut self.state, &mut self.callbacks, rows, cols) != 0
+    }
+}
+
+#[cfg(test)]
+mod state_parser_host_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture(Vec<Vec<u8>>);
+
+    impl VTermStateCallbacks for Capture {
+        fn put_glyph(
+            &mut self,
+            info: &crate::vterm_defs::VTermGlyphInfo,
+            _: crate::vterm_defs::VTermPos,
+        ) -> bool {
+            self.0.push(crate::grid::schar_get(info.schar));
+            true
+        }
+    }
+
+    #[test]
+    fn parser_host_routes_text_csi_and_terminal_responses() {
+        let mut state = VTermState::new(2, 8);
+        state.reset(false);
+        let mut host =
+            VTermStateParserHost::<_, (), _>::new(state, Capture::default(), ());
+        let mut parser = crate::vterm::parser::VTermParser::default();
+        let input = b"AB\x1b[2D\x1b[6n";
+        assert_eq!(parser.vterm_input_write(&mut host, input, false), input.len());
+        assert_eq!(host.callbacks.0, [b"A".to_vec(), b"B".to_vec()]);
+        assert_eq!(host.state.pos, crate::vterm_defs::VTermPos { row: 0, col: 0 });
+        assert_eq!(host.take_output(), b"\x1b[1;1R");
+    }
+}
+
 pub fn vterm_state_set_selection_callbacks<C>(
     host: &mut VTermSelectionHost<C>,
     callbacks: Option<C>,
