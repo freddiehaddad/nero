@@ -8015,6 +8015,87 @@ pub fn prepend_item(s: &mut Vec<u8>, item: &[u8]) {
     *s = prefixed;
 }
 
+/// Process comma-list `key:value` items individually
+/// (`stropt_handle_keymatch`).
+///
+/// Returns `false` only for a single non-keyed item, which the caller
+/// must handle through the ordinary add/remove path.
+#[allow(dead_code)]
+fn stropt_handle_keymatch(
+    origval: &[u8],
+    newval: &mut Vec<u8>,
+    op: crate::option_defs::SetOpT,
+) -> bool {
+    if !newval.contains(&b':') && !newval.contains(&b',') {
+        return false;
+    }
+
+    let items = newval.clone();
+    *newval = origval.to_vec();
+    for item in items.split(|&b| b == b',').filter(|item| !item.is_empty()) {
+        if let Some(colon) = item.iter().position(|&b| b == b':') {
+            let key_len = colon + 1;
+            match op {
+                crate::option_defs::SetOpT::Adding
+                | crate::option_defs::SetOpT::Prepending => {
+                    if let Some((found, old_len)) = find_key_item(newval, item, key_len) {
+                        if old_len == item.len()
+                            && newval[found..found + old_len] == *item
+                        {
+                            remove_key_item(newval, item, key_len, Some(found));
+                        } else {
+                            remove_key_item(newval, item, key_len, None);
+                            if op == crate::option_defs::SetOpT::Prepending {
+                                prepend_item(newval, item);
+                            } else {
+                                append_item(newval, item);
+                            }
+                        }
+                    } else if op == crate::option_defs::SetOpT::Prepending {
+                        prepend_item(newval, item);
+                    } else {
+                        append_item(newval, item);
+                    }
+                }
+                crate::option_defs::SetOpT::Removing => {
+                    remove_key_item(newval, item, key_len, None);
+                }
+                crate::option_defs::SetOpT::None => {}
+            }
+        } else {
+            match op {
+                crate::option_defs::SetOpT::Adding
+                | crate::option_defs::SetOpT::Prepending => {
+                    if find_dup_item(
+                        Some(newval),
+                        item,
+                        crate::option_defs::opt_flags::COMMA,
+                    )
+                    .is_none()
+                    {
+                        if op == crate::option_defs::SetOpT::Prepending {
+                            prepend_item(newval, item);
+                        } else {
+                            append_item(newval, item);
+                        }
+                    }
+                }
+                crate::option_defs::SetOpT::Removing => {
+                    if let Some(found) = find_dup_item(
+                        Some(newval),
+                        item,
+                        crate::option_defs::opt_flags::COMMA,
+                    ) {
+                        remove_comma_item(newval, found, item.len());
+                    }
+                }
+                crate::option_defs::SetOpT::None => {}
+            }
+        }
+    }
+    true
+}
+
 /// Recognize the `:set` operator prefixing `arg`'s `=`
 /// (`get_op`).
 ///
@@ -9330,6 +9411,72 @@ mod did_set_title_tests {
         prepend_item(&mut s, b"first");
         append_item(&mut s, b"last");
         assert_eq!(s, b"first,middle,last");
+    }
+
+    #[test]
+    fn stropt_handle_keymatch_defers_a_single_plain_item() {
+        let mut value = b"plain".to_vec();
+        assert!(!stropt_handle_keymatch(
+            b"old",
+            &mut value,
+            crate::option_defs::SetOpT::Adding,
+        ));
+        assert_eq!(value, b"plain", "the deferred path leaves it untouched");
+    }
+
+    #[test]
+    fn stropt_handle_keymatch_adds_and_replaces_keyed_items() {
+        let mut value = b"b:2,c:3".to_vec();
+        assert!(stropt_handle_keymatch(
+            b"a:1,b:old",
+            &mut value,
+            crate::option_defs::SetOpT::Adding,
+        ));
+        assert_eq!(value, b"a:1,b:2,c:3");
+    }
+
+    #[test]
+    fn stropt_handle_keymatch_exact_duplicate_keeps_one_and_removes_the_rest() {
+        let mut value = b"a:1".to_vec();
+        assert!(stropt_handle_keymatch(
+            b"a:1,b:2,a:1,a:3",
+            &mut value,
+            crate::option_defs::SetOpT::Adding,
+        ));
+        assert_eq!(value, b"a:1,b:2");
+    }
+
+    #[test]
+    fn stropt_handle_keymatch_prepends_each_item_in_processing_order() {
+        let mut value = b"a:1,b:2".to_vec();
+        assert!(stropt_handle_keymatch(
+            b"old:0",
+            &mut value,
+            crate::option_defs::SetOpT::Prepending,
+        ));
+        assert_eq!(value, b"b:2,a:1,old:0");
+    }
+
+    #[test]
+    fn stropt_handle_keymatch_removes_keyed_and_plain_items() {
+        let mut value = b"a:any,plain".to_vec();
+        assert!(stropt_handle_keymatch(
+            b"a:1,b:2,a:3,plain,keep",
+            &mut value,
+            crate::option_defs::SetOpT::Removing,
+        ));
+        assert_eq!(value, b"b:2,keep");
+    }
+
+    #[test]
+    fn stropt_handle_keymatch_skips_empty_items() {
+        let mut value = b",a:1,,plain,".to_vec();
+        assert!(stropt_handle_keymatch(
+            b"old:0",
+            &mut value,
+            crate::option_defs::SetOpT::Adding,
+        ));
+        assert_eq!(value, b"old:0,a:1,plain");
     }
 
     #[test]
