@@ -1539,9 +1539,8 @@ pub unsafe fn did_set_option(
         curwin_ref.w_set_curswant = true;
     }
 
-    // check_redraw(opt.flags) omitted: pure redraw-scheduling dispatch
-    // (redraw_buf_later/redraw_all_later), matching this crate's
-    // established `redraw_later`-omission precedent.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_redraw(opt.flags) };
 
     if errmsg.is_none() {
         set_option_was_set(opt_idx);
