@@ -1053,6 +1053,50 @@ pub unsafe fn was_set_insecurely(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u3
 static OPTION_WAS_SET: crate::globals::GlobalCell<[bool; crate::option_defs::OPT_COUNT]> =
     crate::globals::GlobalCell::new([false; crate::option_defs::OPT_COUNT]);
 
+/// Record the first vimrc path in an environment variable
+/// (`vimrc_found`).
+///
+/// # Safety
+/// Must satisfy [`crate::os::env::vim_getenv`] and
+/// [`crate::os::env::os_setenv`]'s environment-state contracts.
+pub unsafe fn vimrc_found(fname: Option<&[u8]>, envname: Option<&[u8]>) {
+    let (Some(fname), Some(envname)) = (fname, envname) else {
+        return;
+    };
+    if unsafe { crate::os::env::vim_getenv(envname) }.is_none()
+        && let Some(fullname) = crate::path::full_name_save(Some(fname), false)
+    {
+        let _ = unsafe { crate::os::env::os_setenv(envname, &fullname, 1) };
+    }
+}
+
+#[cfg(test)]
+mod vimrc_found_tests {
+    use super::*;
+
+    #[test]
+    fn vimrc_found_sets_only_an_absent_environment_variable() {
+        let name = "NERO_TEST_FIRST_VIMRC";
+        let old = std::env::var_os(name);
+        unsafe { std::env::remove_var(name) };
+        let expected = crate::path::full_name_save(Some(b"first.vim"), false).unwrap();
+        unsafe { vimrc_found(Some(b"first.vim"), Some(name.as_bytes())) };
+        assert_eq!(
+            std::env::var_os(name).unwrap().as_encoded_bytes(),
+            expected
+        );
+
+        unsafe { std::env::set_var(name, "existing.vim") };
+        unsafe { vimrc_found(Some(b"second.vim"), Some(name.as_bytes())) };
+        assert_eq!(std::env::var_os(name).unwrap(), "existing.vim");
+
+        match old {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+}
+
 /// Whether option `opt_idx` has ever been explicitly `:set`
 /// (`option_was_set`). Set for real by [`did_set_option`] (via
 /// [`set_option_was_set`], below) whenever an option is successfully
