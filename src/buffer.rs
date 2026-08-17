@@ -829,9 +829,69 @@ pub fn buf_get_fname(buf: &BufT) -> &[u8] {
     buf.b_fname.as_deref().unwrap_or(b"[No Name]")
 }
 
+/// Return a special display name for `buf`, or `None` for a normal
+/// named file (`buf_spname`).
+///
+/// # Safety
+/// Must satisfy [`bt_cmdwin`]'s and
+/// [`crate::quickfix::qf_stack_get_bufnr`]'s global-state contracts.
+#[must_use]
+pub unsafe fn buf_spname(buf: &BufT) -> Option<&[u8]> {
+    if bt_quickfix(Some(buf)) {
+        return Some(if buf.handle == unsafe { crate::quickfix::qf_stack_get_bufnr() } {
+            b"[Quickfix List]"
+        } else {
+            b"[Location List]"
+        });
+    }
+    if bt_nofilename(Some(buf)) {
+        if let Some(name) = buf.b_fname.as_deref() {
+            return Some(name);
+        }
+        if unsafe { bt_cmdwin(Some(buf)) } {
+            return Some(b"[Command Line]");
+        }
+        if bt_prompt(Some(buf)) {
+            return Some(b"[Prompt]");
+        }
+        return Some(b"[Scratch]");
+    }
+    if buf.b_fname.is_none() {
+        return Some(buf_get_fname(buf));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buf_spname_reports_scratch_prompt_and_normal_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let scratch = BufT {
+            b_p_bt: Some(b"nofile".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { buf_spname(&scratch) }, Some(&b"[Scratch]"[..]));
+
+        let prompt = BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { buf_spname(&prompt) }, Some(&b"[Prompt]"[..]));
+
+        let named = BufT {
+            b_fname: Some(b"main.c".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { buf_spname(&named) }, None);
+        let unnamed = BufT::default();
+        assert_eq!(
+            unsafe { buf_spname(&unnamed) },
+            Some(&b"[No Name]"[..])
+        );
+    }
 
     struct TitlesGuard {
         title: Option<Vec<u8>>,
