@@ -952,6 +952,32 @@ pub fn csi_erase_chars<C: VTermStateCallbacks>(
     );
 }
 
+pub fn csi_tab_clear(state: &mut VTermState, value: i32) -> bool {
+    match value {
+        0 => state.clear_col_tabstop(state.pos.col),
+        3 | 5 => state.tabstops.fill(0),
+        1 | 2 | 4 => {}
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod csi_tab_clear_tests {
+    use super::*;
+    #[test]
+    fn tab_clear_removes_current_or_all_stops() {
+        let mut state = VTermState::new(1, 10);
+        state.set_col_tabstop(3);
+        state.pos.col = 3;
+        assert!(csi_tab_clear(&mut state, 0));
+        assert!(!state.is_col_tabstop(3));
+        state.set_col_tabstop(4);
+        assert!(csi_tab_clear(&mut state, 3));
+        assert!(state.tabstops.iter().all(|&byte| byte == 0));
+    }
+}
+
 #[cfg(test)]
 mod csi_erase_chars_tests {
     use super::*;
