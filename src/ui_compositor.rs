@@ -29,6 +29,31 @@ static LAYERS: crate::globals::GlobalCell<
 /// Grid currently receiving composed drawing (`curgrid`).
 static CURGRID: crate::globals::GlobalCell<*mut crate::grid_defs::ScreenGrid> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
+/// Debug highlight groups used while composing grids.
+static DBGHL_NORMAL: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static DBGHL_CLEAR: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static DBGHL_COMPOSED: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static DBGHL_RECOMPOSE: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Initialize the compositor's debug highlight groups
+/// (`ui_comp_syn_init`).
+///
+/// # Safety
+/// Must not run concurrently with highlight-group or compositor state.
+pub unsafe fn ui_comp_syn_init() {
+    *unsafe { DBGHL_NORMAL.get_mut() } =
+        unsafe { crate::highlight_group::syn_check_group(b"RedrawDebugNormal") };
+    *unsafe { DBGHL_CLEAR.get_mut() } =
+        unsafe { crate::highlight_group::syn_check_group(b"RedrawDebugClear") };
+    *unsafe { DBGHL_COMPOSED.get_mut() } =
+        unsafe { crate::highlight_group::syn_check_group(b"RedrawDebugComposed") };
+    *unsafe { DBGHL_RECOMPOSE.get_mut() } =
+        unsafe { crate::highlight_group::syn_check_group(b"RedrawDebugRecompose") };
+}
 
 /// Initialize compositor layers (`ui_comp_init`).
 pub fn ui_comp_init() {
@@ -187,6 +212,40 @@ pub fn ui_comp_set_screen_valid(valid: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compositor_syntax_init_creates_all_debug_groups() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved_table =
+            std::mem::take(&mut unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items);
+        let saved_names =
+            std::mem::take(unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() });
+        let saved_debug = (
+            *unsafe { DBGHL_NORMAL.get_mut() },
+            *unsafe { DBGHL_CLEAR.get_mut() },
+            *unsafe { DBGHL_COMPOSED.get_mut() },
+            *unsafe { DBGHL_RECOMPOSE.get_mut() },
+        );
+
+        unsafe { ui_comp_syn_init() };
+        let got = (
+            *unsafe { DBGHL_NORMAL.get_mut() },
+            *unsafe { DBGHL_CLEAR.get_mut() },
+            *unsafe { DBGHL_COMPOSED.get_mut() },
+            *unsafe { DBGHL_RECOMPOSE.get_mut() },
+        );
+
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items = saved_table;
+        *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } = saved_names;
+        (
+            *unsafe { DBGHL_NORMAL.get_mut() },
+            *unsafe { DBGHL_CLEAR.get_mut() },
+            *unsafe { DBGHL_COMPOSED.get_mut() },
+            *unsafe { DBGHL_RECOMPOSE.get_mut() },
+        ) = saved_debug;
+
+        assert_eq!(got, (1, 2, 3, 4));
+    }
 
     struct CompositorStateGuard {
         composed: i32,
