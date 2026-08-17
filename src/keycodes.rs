@@ -267,6 +267,81 @@ pub fn find_special_key(src: &[u8], flags: i32) -> Option<(i32, i32, usize, bool
     Some((key, modifiers, consumed, did_simplify))
 }
 
+/// Return the printable `<...>` name for a key and modifiers
+/// (`get_special_key_name`).
+///
+/// # Safety
+/// May consult the current character table through
+/// `charset::vim_isprintc`/`transchar`.
+#[must_use]
+pub unsafe fn get_special_key_name(mut key: i32, mut modifiers: i32) -> Vec<u8> {
+    let mut result = vec![b'<'];
+
+    if crate::keycodes_defs::is_special(key)
+        && crate::keycodes_defs::key2termcap0(key) == crate::keycodes_defs::KS_KEY
+    {
+        key = i32::from(crate::keycodes_defs::key2termcap1(key));
+    }
+
+    if crate::keycodes_defs::is_special(key) {
+        for &(mask, key0, key1, base0, base1) in crate::keycodes_defs::MODIFIER_KEYS_TABLE {
+            if crate::keycodes_defs::key2termcap0(key) == key0
+                && crate::keycodes_defs::key2termcap1(key) == key1
+            {
+                modifiers |= i32::from(mask);
+                key = crate::keycodes_defs::termcap2key(base0, base1);
+                break;
+            }
+        }
+    }
+
+    let table_idx = find_special_key_in_table(key);
+    if key > 0
+        && crate::mbyte::utf_char2len(key) == 1
+        && table_idx < 0
+        && !unsafe { crate::charset::vim_isprintc(key) }
+        && key < i32::from(b' ')
+    {
+        key += i32::from(b'@');
+        modifiers |= i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+    }
+
+    for entry in crate::keycodes_defs::MOD_MASK_TABLE
+        .iter()
+        .take_while(|entry| entry.name != b'A')
+    {
+        if modifiers & i32::from(entry.mod_mask) == i32::from(entry.mod_flag) {
+            result.extend_from_slice(&[entry.name, b'-']);
+        }
+    }
+
+    if table_idx < 0 {
+        if crate::keycodes_defs::is_special(key) {
+            result.extend_from_slice(&[
+                b't',
+                b'_',
+                crate::keycodes_defs::key2termcap0(key),
+                crate::keycodes_defs::key2termcap1(key),
+            ]);
+        } else {
+            let len = crate::mbyte::utf_char2len(key);
+            if len == 1 && unsafe { crate::charset::vim_isprintc(key) } {
+                result.push(key as u8);
+            } else if len > 1 {
+                let mut encoded = [0; crate::mbyte_defs::MB_MAXCHAR];
+                let written = crate::mbyte::utf_char2bytes(key, &mut encoded) as usize;
+                result.extend_from_slice(&encoded[..written]);
+            } else {
+                result.extend_from_slice(&unsafe { crate::charset::transchar(key) });
+            }
+        }
+    } else {
+        result.extend_from_slice(KEY_NAMES_TABLE[table_idx as usize].name.as_bytes());
+    }
+    result.push(b'>');
+    result
+}
+
 macro_rules! mouse_entry {
     ($code:ident, $button:ident, $click:literal, $drag:literal) => {
         MouseTableEntry {
@@ -1285,6 +1360,49 @@ mod tests {
         assert_eq!(find_special_key(b"<Up", 0), None);
         assert_eq!(find_special_key(b"<NotARealKey>", 0), None);
         assert_eq!(find_special_key(b"<Q-Up>", 0), None);
+    }
+
+    // --- get_special_key_name ---
+
+    #[test]
+    fn get_special_key_name_formats_named_and_shifted_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { get_special_key_name(K_UP, 0) }, b"<Up>");
+        assert_eq!(
+            unsafe { get_special_key_name(crate::keycodes_defs::K_S_UP, 0) },
+            b"<S-Up>"
+        );
+    }
+
+    #[test]
+    fn get_special_key_name_extracts_control_and_alt_modifiers() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { get_special_key_name(i32::from(crate::ascii_defs::CTRL_A), 0) },
+            b"<C-A>"
+        );
+        assert_eq!(
+            unsafe {
+                get_special_key_name(
+                    i32::from(b'a'),
+                    i32::from(crate::keycodes_defs::MOD_MASK_ALT),
+                )
+            },
+            b"<M-a>"
+        );
+    }
+
+    #[test]
+    fn get_special_key_name_formats_unknown_termcap_and_multibyte_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { get_special_key_name(termcap2key(b'a', b'b'), 0) },
+            b"<t_ab>"
+        );
+        assert_eq!(
+            unsafe { get_special_key_name('é' as i32, 0) },
+            "<é>".as_bytes()
+        );
     }
 
     // --- extract_modifiers ---
