@@ -416,6 +416,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"strgetchar"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_strgetchar });
         m.insert(&b"strpart"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_strpart });
         m.insert(&b"strtrans"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strtrans });
+        m.insert(&b"keytrans"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_keytrans });
         m.insert(&b"byteidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_byteidx });
         m.insert(&b"byteidxcomp"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_byteidxcomp });
         m.insert(&b"charidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_charidx });
@@ -4817,6 +4818,30 @@ unsafe fn f_strtrans(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(out));
 }
 
+/// `keytrans({string})` - internal key bytes rendered as printable
+/// `<...>` notation (`f_keytrans`).
+///
+/// # Safety
+/// Forwarded from `message::str2special_save`.
+unsafe fn f_keytrans(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+    if crate::eval::typval::tv_check_for_string_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+    let TypvalValue::String(Some(input)) = &argvars[0].value else {
+        return;
+    };
+    let escaped = crate::keycodes::vim_strsave_escape_ks(input);
+    let output = unsafe {
+        crate::message::str2special_save(
+            &escaped,
+            true,
+            crate::types_defs::TriState::True,
+        )
+    };
+    rettv.value = TypvalValue::String(Some(output));
+}
+
 /// Shared core of `byteidx()`/`byteidxcomp()` (`byteidx_common`,
 /// `strings.c`): the byte index of the `{nr}`th character of
 /// `{string}`. `comp = true` (`byteidxcomp()`) counts composing
@@ -8723,6 +8748,7 @@ mod tests {
             "strgetchar",
             "strpart",
             "strtrans",
+            "keytrans",
             "byteidx",
             "byteidxcomp",
             "charidx",
@@ -13419,6 +13445,52 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_strtrans(&[string(b"\x01")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"^A".to_vec())));
+    }
+
+    // --- f_keytrans ---
+
+    #[test]
+    fn keytrans_renders_internal_named_and_control_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut input = crate::keycodes::special_to_buf(
+            crate::keycodes_defs::K_UP,
+            0,
+            false,
+        );
+        input.push(crate::ascii_defs::CTRL_A);
+        let mut rettv = TypvalT::default();
+        unsafe { f_keytrans(&[string(&input)], &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"<Up><C-A>".to_vec()))
+        );
+    }
+
+    #[test]
+    fn keytrans_replaces_spaces_and_special_punctuation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_keytrans(&[string(b" <|\\")], &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"<Space><lt><Bar><Bslash>".to_vec()))
+        );
+    }
+
+    #[test]
+    fn keytrans_null_and_wrong_type_return_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        for value in [
+            TypvalT {
+                value: TypvalValue::String(None),
+                ..Default::default()
+            },
+            num(1),
+        ] {
+            let mut rettv = TypvalT::default();
+            unsafe { f_keytrans(&[value], &mut rettv) };
+            assert_eq!(rettv.value, TypvalValue::String(None));
+        }
     }
 
     // --- f_byteidx / f_byteidxcomp ---

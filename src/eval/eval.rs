@@ -10916,6 +10916,17 @@ mod tests {
     }
 
     #[test]
+    fn e2e_keytrans_round_trips_a_special_key_escape() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"keytrans(\"\\<Up>\")");
+        assert_eq!(ret, OK);
+        assert_eq!(
+            tv.value,
+            TypvalValue::String(Some(b"<Up>".to_vec()))
+        );
+    }
+
+    #[test]
     fn e2e_option_value_boolean() {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = crate::buffer_defs::BufT::default();
