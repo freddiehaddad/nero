@@ -84,6 +84,9 @@
 //! truncating output buffer/OK-FAIL return the same way as
 //! [`onecap_copy`]/[`allcap_copy`] above, since a growing `Vec` has no
 //! caller-buffer-capacity concept to fail against).
+//! Also [`spell_cat_line`] - append the useful start of a following
+//! line to a spell-check buffer while blanking indentation and common
+//! comment leaders.
 //!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/
@@ -888,9 +891,65 @@ pub unsafe fn no_spell_checking(wp: &crate::buffer_defs::WinT) -> bool {
     false
 }
 
+/// Append the useful start of the next line to a spell-check buffer
+/// (`spell_cat_line`), blanking indentation and comment leaders.
+///
+/// `maxlen` is the writable C-string capacity and must not exceed
+/// `buf.len()`.
+pub fn spell_cat_line(buf: &mut [u8], line: &[u8], maxlen: usize) {
+    assert!(maxlen <= buf.len());
+    let end = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    let mut p = crate::charset::skipwhite(&line[..end]);
+    while p < end && b"*#/\"\t".contains(&line[p]) {
+        p += 1;
+        p += crate::charset::skipwhite(&line[p..end]);
+    }
+    if p == end {
+        return;
+    }
+
+    let n = p + 1;
+    if n >= maxlen.saturating_sub(1) {
+        return;
+    }
+    buf[..n].fill(b' ');
+    let copy_len = (maxlen - n - 1).min(end - p);
+    buf[n..n + copy_len].copy_from_slice(&line[p..p + copy_len]);
+    buf[n + copy_len] = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spell_cat_line_blanks_indentation_and_comment_leaders() {
+        let mut buf = [b'x'; 32];
+        spell_cat_line(&mut buf, b"  * / \tword rest\0", 32);
+        assert_eq!(&buf[..9], b"        w");
+        assert_eq!(&buf[8..18], b"word rest\0");
+    }
+
+    #[test]
+    fn spell_cat_line_leaves_the_buffer_untouched_for_blank_input() {
+        let mut buf = [b'x'; 16];
+        spell_cat_line(&mut buf, b"   \t\0", 16);
+        assert_eq!(buf, [b'x'; 16]);
+    }
+
+    #[test]
+    fn spell_cat_line_leaves_the_buffer_untouched_when_it_will_not_fit() {
+        let mut buf = [b'x'; 8];
+        spell_cat_line(&mut buf, b"      word\0", 8);
+        assert_eq!(buf, [b'x'; 8]);
+    }
+
+    #[test]
+    fn spell_cat_line_truncates_and_nul_terminates_at_maxlen() {
+        let mut buf = [b'x'; 8];
+        spell_cat_line(&mut buf, b"word-longer\0", 8);
+        assert_eq!(&buf, b" word-l\0");
+    }
 
     #[test]
     fn free_fromto_clears_both_owned_strings() {
