@@ -110,12 +110,11 @@
 //! already-real `BufT.b_p_bomb`/`b_p_bin`/`b_p_fenc` fields).
 //!
 //! Also translated: `ENC_CANON_TABLE`/`enc_canon_search`/
-//! `enc_canon_props` (the canonical-encoding-name lookup table and its
-//! 2 pure query functions - `enc_canonize`'s own further name-aliasing/
-//! normalization logic, `enc_alias_table`, is NOT translated, since
-//! nothing needs it yet; `codepage`, this table's own 3rd field in the
-//! original, is likewise omitted - see `EncCanonEntry`'s own doc
-//! comment for why). This directly unblocks `bufwrite.c`'s
+//! `enc_canon_props`/`ENC_ALIAS_TABLE`/`enc_skip`/`enc_canonize`
+//! (canonical encoding-name lookup, aliasing and normalization).
+//! `codepage`, the canonical table's 3rd field in the original, is
+//! still omitted - see `EncCanonEntry`'s own doc comment for why.
+//! This directly unblocks `bufwrite.c`'s
 //! `get_fio_flags`/`make_bom` as a follow-up, once `FIO_*`/
 //! `ucs2bytes` also exist.
 //!
@@ -2371,9 +2370,9 @@ pub fn remove_bom(s: &mut Vec<u8>) {
 /// `struct { const char *name; int prop; int codepage; }`).
 ///
 /// `codepage` is deliberately NOT modeled: nothing in this crate
-/// consumes it yet (it's only used by `enc_canonize`'s own DOS/
-/// Windows-codepage detection path and a handful of `os_win_console.c`
-/// call sites, none translated) - a documented, narrow omission,
+/// consumes it yet (it is used by DOS/Windows-codepage detection and
+/// a handful of `os_win_console.c` call sites, none translated) - a
+/// documented, narrow omission,
 /// re-addable field-for-field from the real table (already viewed in
 /// full during translation) the moment a real consumer needs it,
 /// rather than risking a transcription mistake on ~20 `DBCS_*`
@@ -2548,6 +2547,116 @@ pub fn enc_canon_props(name: &[u8]) -> i32 {
         return crate::mbyte_defs::enc::ENC_8BIT;
     }
     0
+}
+
+/// Encoding aliases and their canonical names (`enc_alias_table`).
+pub const ENC_ALIAS_TABLE: &[(&[u8], &[u8])] = &[
+    (b"ansi", b"latin1"),
+    (b"iso-8859-1", b"latin1"),
+    (b"latin2", b"iso-8859-2"),
+    (b"latin3", b"iso-8859-3"),
+    (b"latin4", b"iso-8859-4"),
+    (b"cyrillic", b"iso-8859-5"),
+    (b"arabic", b"iso-8859-6"),
+    (b"greek", b"iso-8859-7"),
+    (b"hebrew", b"iso-8859-8"),
+    (b"latin5", b"iso-8859-9"),
+    (b"turkish", b"iso-8859-9"),
+    (b"latin6", b"iso-8859-10"),
+    (b"nordic", b"iso-8859-10"),
+    (b"thai", b"iso-8859-11"),
+    (b"latin7", b"iso-8859-13"),
+    (b"latin8", b"iso-8859-14"),
+    (b"latin9", b"iso-8859-15"),
+    (b"utf8", b"utf-8"),
+    (b"unicode", b"ucs-2"),
+    (b"ucs2", b"ucs-2"),
+    (b"ucs2be", b"ucs-2"),
+    (b"ucs-2be", b"ucs-2"),
+    (b"ucs2le", b"ucs-2le"),
+    (b"utf16", b"utf-16"),
+    (b"utf16be", b"utf-16be"),
+    (b"utf-16be", b"utf-16be"),
+    (b"utf16le", b"utf-16le"),
+    (b"ucs4", b"ucs-4"),
+    (b"ucs4be", b"ucs-4"),
+    (b"ucs-4be", b"ucs-4"),
+    (b"ucs4le", b"ucs-4le"),
+    (b"utf32", b"ucs-4"),
+    (b"utf-32", b"ucs-4"),
+    (b"utf32be", b"ucs-4"),
+    (b"utf-32be", b"ucs-4"),
+    (b"utf32le", b"ucs-4le"),
+    (b"utf-32le", b"ucs-4le"),
+    (b"932", b"cp932"),
+    (b"949", b"cp949"),
+    (b"936", b"cp936"),
+    (b"gbk", b"cp936"),
+    (b"950", b"cp950"),
+    (b"eucjp", b"euc-jp"),
+    (b"unix-jis", b"euc-jp"),
+    (b"ujis", b"euc-jp"),
+    (b"shift-jis", b"sjis"),
+    (b"pck", b"sjis"),
+    (b"euckr", b"euc-kr"),
+    (b"5601", b"euc-kr"),
+    (b"euccn", b"euc-cn"),
+    (b"gb2312", b"euc-cn"),
+    (b"euctw", b"euc-tw"),
+    (b"japan", b"euc-jp"),
+    (b"korea", b"euc-kr"),
+    (b"prc", b"euc-cn"),
+    (b"zh-cn", b"euc-cn"),
+    (b"chinese", b"euc-cn"),
+    (b"zh-tw", b"euc-tw"),
+    (b"taiwan", b"euc-tw"),
+    (b"cp950", b"big5"),
+    (b"950", b"big5"),
+    (b"mac", b"macroman"),
+    (b"mac-roman", b"macroman"),
+];
+
+/// Return the canonical spelling of an encoding name
+/// (`enc_canonize`).
+#[must_use]
+pub fn enc_canonize(enc: &[u8]) -> Vec<u8> {
+    if enc == b"default" {
+        return unsafe { crate::globals::GLOBALS.get_mut() }
+            .fenc_default
+            .clone()
+            .unwrap_or_default();
+    }
+
+    let mut normalized: Vec<u8> = enc
+        .iter()
+        .map(|&b| if b == b'_' { b'-' } else { b.to_ascii_lowercase() })
+        .collect();
+    let prefix_len = enc_skip(&normalized);
+    let mut name = normalized[prefix_len..].to_vec();
+
+    if name.starts_with(b"microsoft-cp") {
+        name.drain(..10);
+    }
+    if name.starts_with(b"iso8859") {
+        name.insert(3, b'-');
+    }
+    if name.starts_with(b"iso-8859") && name.get(8) != Some(&b'-') {
+        name.insert(8, b'-');
+    }
+    if name.starts_with(b"latin-") {
+        name.remove(5);
+    }
+
+    if enc_canon_search(&name).is_some() {
+        return name;
+    }
+    if let Some((_, canon)) = ENC_ALIAS_TABLE.iter().find(|(alias, _)| *alias == name) {
+        return canon.to_vec();
+    }
+
+    normalized.truncate(prefix_len);
+    normalized.extend_from_slice(&name);
+    normalized
 }
 
 /// Compare two lists by the number in their first item
@@ -2779,8 +2888,8 @@ mod tests {
     #[test]
     fn enc_canon_props_falls_back_to_iso_8859_prefix() {
         // "iso-8859-1" isn't literally in ENC_CANON_TABLE (that's
-        // "latin1" instead, aliased via the NOT-translated
-        // enc_alias_table/enc_canonize) - enc_canon_props itself,
+        // "latin1" instead, aliased via enc_canonize) -
+        // enc_canon_props itself,
         // called directly with an "iso-8859-N" string, falls through
         // to this generic prefix match, matching the real source.
         assert_eq!(enc_canon_props(b"iso-8859-1"), crate::mbyte_defs::enc::ENC_8BIT);
@@ -2790,6 +2899,62 @@ mod tests {
     #[test]
     fn enc_canon_props_returns_zero_for_a_completely_unknown_name() {
         assert_eq!(enc_canon_props(b"not-a-real-encoding"), 0);
+    }
+
+    #[test]
+    fn enc_alias_table_matches_the_real_source_boundaries() {
+        assert_eq!(ENC_ALIAS_TABLE.len(), 63);
+        assert_eq!(ENC_ALIAS_TABLE[0], (&b"ansi"[..], &b"latin1"[..]));
+        assert_eq!(
+            ENC_ALIAS_TABLE[62],
+            (&b"mac-roman"[..], &b"macroman"[..])
+        );
+    }
+
+    #[test]
+    fn enc_skip_removes_only_vims_two_special_prefixes() {
+        assert_eq!(enc_skip(b"2byte-cp932"), 6);
+        assert_eq!(enc_skip(b"8bit-latin1"), 5);
+        assert_eq!(enc_skip(b"utf-8"), 0);
+    }
+
+    #[test]
+    fn enc_canonize_lowercases_and_replaces_underscores() {
+        assert_eq!(enc_canonize(b"Unknown_Name"), b"unknown-name");
+    }
+
+    #[test]
+    fn enc_canonize_resolves_aliases_and_special_spellfile_names() {
+        assert_eq!(enc_canonize(b"UTF8"), b"utf-8");
+        assert_eq!(enc_canonize(b"microsoft-cp1252"), b"cp1252");
+        assert_eq!(enc_canonize(b"iso88591"), b"latin1");
+        assert_eq!(enc_canonize(b"latin-2"), b"iso-8859-2");
+    }
+
+    #[test]
+    fn enc_canonize_drops_a_recognized_special_prefix_only() {
+        assert_eq!(enc_canonize(b"2byte-utf8"), b"utf-8");
+        assert_eq!(
+            enc_canonize(b"2byte-Unknown_Name"),
+            b"2byte-unknown-name"
+        );
+    }
+
+    #[test]
+    fn enc_canonize_default_uses_fenc_default() {
+        struct FencDefaultGuard(Option<Vec<u8>>);
+
+        impl Drop for FencDefaultGuard {
+            fn drop(&mut self) {
+                unsafe { crate::globals::GLOBALS.get_mut() }.fenc_default = self.0.take();
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let old = globals.fenc_default.replace(b"utf-8".to_vec());
+        let _restore = FencDefaultGuard(old);
+        assert_eq!(enc_canonize(b"default"), b"utf-8");
     }
 
     #[test]
