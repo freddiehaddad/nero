@@ -445,11 +445,14 @@ pub struct VTermStateHost<C> {
     pub callbacks: Option<C>,
 }
 
-pub fn vterm_state_set_callbacks<C>(
+pub fn vterm_state_set_callbacks<C: VTermStateCallbacks>(
     host: &mut VTermStateHost<C>,
     callbacks: Option<C>,
 ) {
     host.callbacks = callbacks;
+    if let Some(callbacks) = host.callbacks.as_mut() {
+        let _ = callbacks.init_pen();
+    }
 }
 
 pub struct VTermStateFallbackHost<F> {
@@ -693,16 +696,27 @@ mod state_fallback_setter_tests {
 #[cfg(test)]
 mod state_callback_setter_tests {
     use super::*;
+
+    #[derive(Default)]
+    struct Capture(usize);
+
+    impl VTermStateCallbacks for Capture {
+        fn init_pen(&mut self) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+
     #[test]
-    fn state_callback_setter_installs_and_removes_callbacks() {
+    fn state_callback_setter_initializes_installs_and_removes_callbacks() {
         let mut host = VTermStateHost {
             state: VTermState::new(1, 1),
-            callbacks: None::<u8>,
+            callbacks: None::<Capture>,
         };
-        vterm_state_set_callbacks(&mut host, Some(7));
-        assert_eq!(host.callbacks, Some(7));
+        vterm_state_set_callbacks(&mut host, Some(Capture::default()));
+        assert_eq!(host.callbacks.as_ref().unwrap().0, 1);
         vterm_state_set_callbacks(&mut host, None);
-        assert_eq!(host.callbacks, None);
+        assert!(host.callbacks.is_none());
     }
 }
 
