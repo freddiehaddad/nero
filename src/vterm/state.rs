@@ -799,6 +799,50 @@ pub fn control_next_line<C: VTermStateCallbacks>(
     state.pos.col = 0;
 }
 
+pub fn on_control<C: VTermStateCallbacks, F: VTermStateFallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    fallbacks: &mut F,
+    control: u8,
+) -> i32 {
+    let old = state.pos;
+    match control {
+        0x07 => {
+            let _ = callbacks.bell();
+        }
+        0x08 => control_backspace(state),
+        0x09 => control_horizontal_tab(state),
+        0x0A..=0x0C => control_linefeed(state, callbacks),
+        0x0D => control_carriage_return(state),
+        0x0E | 0x0F => {
+            control_locking_shift(state, control);
+        }
+        0x84 => linefeed(state, callbacks),
+        0x85 => control_next_line(state, callbacks),
+        0x88 => control_tabstop(state),
+        0x8D => control_reverse_index(state, callbacks),
+        0x8E | 0x8F => {
+            control_single_shift(state, control);
+        }
+        _ => return i32::from(fallbacks.control(control)),
+    }
+    updatecursor(state, callbacks, old, true);
+    1
+}
+
+#[cfg(test)]
+mod control_dispatch_tests {
+    use super::*;
+    #[test]
+    fn control_dispatch_routes_standard_controls_and_fallback() {
+        let mut state = VTermState::new(2, 10);
+        state.pos.col = 3;
+        assert_eq!(on_control(&mut state, &mut (), &mut (), 0x08), 1);
+        assert_eq!(state.pos.col, 2);
+        assert_eq!(on_control(&mut state, &mut (), &mut (), 0x01), 0);
+    }
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
