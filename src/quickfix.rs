@@ -1277,6 +1277,42 @@ fn qf_getprop_keys2flags(
     flags
 }
 
+/// Select a quickfix-list index from the `"nr"`/`"id"` request keys
+/// (`qf_getprop_qfidx`).
+#[allow(dead_code)]
+fn qf_getprop_qfidx(
+    qi: &crate::types_defs::QfInfoT,
+    what: &mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    use crate::eval::typval_defs::TypvalValue;
+
+    let mut index = qi.qf_curlist;
+    if let Some(item) = crate::eval::typval::tv_dict_find(Some(what), b"nr") {
+        match unsafe { &(*item).di_tv.value } {
+            TypvalValue::Number(0) => {}
+            TypvalValue::Number(number) => {
+                index = *number as i32 - 1;
+                if index < 0 || index >= qi.qf_listcount {
+                    index = INVALID_QFIDX;
+                }
+            }
+            TypvalValue::String(Some(value)) if value.as_slice() == b"$" => {
+                index = qi.qf_listcount - 1;
+            }
+            _ => index = INVALID_QFIDX,
+        }
+    }
+
+    if let Some(item) = crate::eval::typval::tv_dict_find(Some(what), b"id") {
+        match unsafe { &(*item).di_tv.value } {
+            TypvalValue::Number(0) => {}
+            TypvalValue::Number(id) => index = qf_id2nr(qi, *id as u32),
+            _ => index = INVALID_QFIDX,
+        }
+    }
+    index
+}
+
 #[cfg(test)]
 mod qf_nth_valid_tests {
     use super::*;
@@ -1326,6 +1362,36 @@ mod qf_nth_valid_tests {
         );
         assert_eq!(qf_getprop_keys2flags(all_ref, true), qf_getlist_flag::ALL);
         unsafe { crate::eval::typval::tv_dict_free(all) };
+    }
+
+    #[test]
+    fn getprop_qfidx_resolves_number_last_and_id_requests() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_curlist: 1,
+            qf_listcount: 3,
+            qf_lists: vec![
+                QfListT { qf_id: 10, ..Default::default() },
+                QfListT { qf_id: 20, ..Default::default() },
+                QfListT { qf_id: 30, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+
+        let nr = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *nr }, b"nr", 3);
+        assert_eq!(qf_getprop_qfidx(&qi, unsafe { &mut *nr }), 2);
+        unsafe { crate::eval::typval::tv_dict_free(nr) };
+
+        let last = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_str(unsafe { &mut *last }, b"nr", Some(b"$"));
+        assert_eq!(qf_getprop_qfidx(&qi, unsafe { &mut *last }), 2);
+        unsafe { crate::eval::typval::tv_dict_free(last) };
+
+        let id = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *id }, b"id", 20);
+        assert_eq!(qf_getprop_qfidx(&qi, unsafe { &mut *id }), 1);
+        unsafe { crate::eval::typval::tv_dict_free(id) };
     }
 }
 
