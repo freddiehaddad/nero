@@ -1022,6 +1022,25 @@ pub fn primary_device_attributes(ctrl8bit: bool) -> Vec<u8> {
     [prefix, b"?", VTERM_PRIMARY_DEVICE_ATTR, b"c"].concat()
 }
 
+#[must_use]
+pub fn secondary_device_attributes(ctrl8bit: bool) -> Vec<u8> {
+    let prefix: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_CSI]
+    } else {
+        b"\x1b["
+    };
+    [prefix, b">0;100;0c"].concat()
+}
+
+#[cfg(test)]
+mod secondary_device_response_tests {
+    use super::*;
+    #[test]
+    fn secondary_device_response_matches_state_c() {
+        assert_eq!(secondary_device_attributes(false), b"\x1b[>0;100;0c");
+    }
+}
+
 #[cfg(test)]
 mod primary_device_response_tests {
     use super::*;
