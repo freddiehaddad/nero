@@ -1108,6 +1108,107 @@ impl QfListT {
     }
 }
 
+/// Append one owned error entry to a quickfix/location list
+/// (`qf_add_entry`).
+///
+/// The buffer-number path and entries without filenames are complete.
+/// A non-null filename remains deferred because it requires
+/// `qf_get_fnum`/`buflist_new` plus `fix_fname`, which are not yet
+/// translated.
+///
+/// # Safety
+/// Touches the global buffer list and character-class table. Any
+/// pointers reachable from `user_data` must remain valid while copied.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn qf_add_entry(
+    qfl: &mut QfListT,
+    _directory: Option<&[u8]>,
+    filename: Option<&[u8]>,
+    module: Option<&[u8]>,
+    bufnum: i32,
+    text: &[u8],
+    lnum: crate::pos_defs::LinenrT,
+    end_lnum: crate::pos_defs::LinenrT,
+    col: i32,
+    end_col: i32,
+    vis_col: bool,
+    pattern: Option<&[u8]>,
+    nr: i32,
+    entry_type: u8,
+    user_data: Option<&crate::eval::typval_defs::TypvalT>,
+    valid: bool,
+) -> i32 {
+    if filename.is_some() {
+        unimplemented!(
+            "qf_add_entry: filenames need qf_get_fnum/buflist_new/fix_fname"
+        );
+    }
+
+    if bufnum != 0 {
+        let buf = unsafe { crate::buffer::buflist_findnr(bufnum) };
+        if !buf.is_null() {
+            let flag = if is_qf_list(qfl) {
+                BUF_HAS_QF_ENTRY
+            } else {
+                BUF_HAS_LL_ENTRY
+            };
+            unsafe { (*buf).b_has_qf_entry |= flag };
+        }
+    }
+
+    let mut copied_user_data = crate::eval::typval_defs::TypvalT::default();
+    if let Some(user_data) = user_data
+        && !matches!(
+            &user_data.value,
+            crate::eval::typval_defs::TypvalValue::Unknown
+        )
+    {
+        unsafe {
+            crate::eval::typval::tv_copy(
+                user_data,
+                &mut copied_user_data,
+            )
+        };
+        qfl.qf_has_user_data = true;
+    }
+    let entry_type = if entry_type == 1
+        || unsafe { crate::charset::vim_isprintc(i32::from(entry_type)) }
+    {
+        entry_type
+    } else {
+        0
+    };
+    let was_empty = qfl.qf_entries.is_empty();
+    qfl.qf_entries.push(QflineT {
+        qf_lnum: lnum,
+        qf_end_lnum: end_lnum,
+        qf_fnum: bufnum,
+        qf_col: col,
+        qf_end_col: end_col,
+        qf_nr: nr,
+        qf_module: module
+            .filter(|value| !value.is_empty())
+            .map(<[u8]>::to_vec),
+        qf_fname: None,
+        qf_pattern: pattern
+            .filter(|value| !value.is_empty())
+            .map(<[u8]>::to_vec),
+        qf_text: Some(text.to_vec()),
+        qf_viscol: vis_col,
+        qf_cleared: false,
+        qf_type: entry_type,
+        qf_user_data: copied_user_data,
+        qf_valid: valid,
+    });
+    if was_empty {
+        qfl.qf_index = 0;
+    }
+    if qfl.qf_index == 0 && valid {
+        qfl.qf_index = qfl.qf_count();
+    }
+    qf_status::QF_OK
+}
+
 /// Whether an entry is still present in a quickfix list
 /// (`is_qf_entry_present`).
 #[allow(dead_code)]
@@ -9857,5 +9958,178 @@ mod tests {
         );
         assert_eq!(qi.qf_lists[0].qf_changedtick, 0);
         unsafe { crate::eval::typval::tv_dict_free(what) };
+    }
+
+    #[test]
+    fn qf_add_entry_copies_fields_and_marks_the_target_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            handle: 7,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                buf_ptr,
+            )
+        };
+        let mut qfl = QfListT::default();
+        let user_data = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(9),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                qf_add_entry(
+                    &mut qfl,
+                    None,
+                    None,
+                    Some(b"compiler"),
+                    7,
+                    b"message",
+                    10,
+                    12,
+                    3,
+                    8,
+                    true,
+                    Some(b"needle"),
+                    42,
+                    b'E',
+                    Some(&user_data),
+                    true,
+                )
+            },
+            qf_status::QF_OK
+        );
+        assert_eq!(
+            unsafe { (*buf_ptr).b_has_qf_entry },
+            BUF_HAS_QF_ENTRY
+        );
+        assert_eq!(qfl.qf_index, 1);
+        assert!(qfl.qf_has_user_data);
+        let entry = &qfl.qf_entries[0];
+        assert_eq!(entry.qf_fnum, 7);
+        assert_eq!(entry.qf_lnum, 10);
+        assert_eq!(entry.qf_end_lnum, 12);
+        assert_eq!(entry.qf_col, 3);
+        assert_eq!(entry.qf_end_col, 8);
+        assert_eq!(entry.qf_module.as_deref(), Some(&b"compiler"[..]));
+        assert_eq!(entry.qf_pattern.as_deref(), Some(&b"needle"[..]));
+        assert_eq!(entry.qf_text.as_deref(), Some(&b"message"[..]));
+        assert_eq!(entry.qf_type, b'E');
+        assert!(entry.qf_viscol);
+        assert!(entry.qf_valid);
+        assert!(matches!(
+            &entry.qf_user_data.value,
+            crate::eval::typval_defs::TypvalValue::Number(9)
+        ));
+        qf_free_items(&mut qfl);
+    }
+
+    #[test]
+    fn qf_add_entry_selects_the_first_valid_entry_and_owns_user_data() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            handle: 8,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                buf_ptr,
+            )
+        };
+        let mut qfl = QfListT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        };
+        unsafe {
+            qf_add_entry(
+                &mut qfl,
+                None,
+                None,
+                Some(b""),
+                8,
+                b"invalid",
+                0,
+                0,
+                0,
+                0,
+                false,
+                Some(b""),
+                0,
+                2,
+                None,
+                false,
+            )
+        };
+        assert_eq!(qfl.qf_index, 0);
+        assert_eq!(qfl.qf_entries[0].qf_type, 0);
+        assert!(qfl.qf_entries[0].qf_module.is_none());
+        assert!(qfl.qf_entries[0].qf_pattern.is_none());
+
+        let user_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(user_list) };
+        let user_data = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::List(user_list),
+            ..Default::default()
+        };
+        unsafe {
+            qf_add_entry(
+                &mut qfl,
+                None,
+                None,
+                None,
+                8,
+                b"valid",
+                5,
+                0,
+                1,
+                0,
+                false,
+                None,
+                0,
+                1,
+                Some(&user_data),
+                true,
+            )
+        };
+        assert_eq!(unsafe { (*buf_ptr).b_has_qf_entry }, BUF_HAS_LL_ENTRY);
+        assert_eq!(qfl.qf_index, 2);
+        assert_eq!(qfl.qf_entries[1].qf_type, 1);
+        assert_eq!(unsafe { (*user_list).lv_refcount }, 2);
+
+        qf_free_items(&mut qfl);
+        assert_eq!(unsafe { (*user_list).lv_refcount }, 1);
+        unsafe { crate::eval::typval::tv_clear_simple(&user_data) };
+    }
+
+    #[test]
+    #[should_panic(expected = "filenames need qf_get_fnum")]
+    fn qf_add_entry_defers_filename_to_buffer_resolution() {
+        let mut qfl = QfListT::default();
+        unsafe {
+            qf_add_entry(
+                &mut qfl,
+                None,
+                Some(b"file.c"),
+                None,
+                0,
+                b"message",
+                1,
+                0,
+                0,
+                0,
+                false,
+                None,
+                0,
+                b'E',
+                None,
+                true,
+            )
+        };
     }
 }
