@@ -6071,6 +6071,36 @@ mod tests {
     }
 
     #[test]
+    fn did_set_xhistory_resizes_the_global_chistory_stack() {
+        struct ChistoryGuard(crate::types_defs::OptInt);
+        impl Drop for ChistoryGuard {
+            fn drop(&mut self) {
+                unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_chi = self.0 };
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = stack_with(3);
+        stack.qf_maxcount = 3;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let old = unsafe { (*options).p_chi };
+        let _chistory = ChistoryGuard(old);
+        unsafe { (*options).p_chi = 5 };
+        let varp = unsafe { std::ptr::addr_of_mut!((*options).p_chi) };
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: varp.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { crate::option::did_set_xhistory(&mut args) }, None);
+        let qi = unsafe { QL_INFO.get_mut() }.as_ref().unwrap();
+        assert_eq!(qi.qf_maxcount, 5);
+        assert_eq!(qi.qf_lists.len(), 5);
+    }
+
+    #[test]
     fn qf_new_list_appends_and_hands_out_increasing_ids() {
         let _lock = crate::globals::global_state_test_lock();
         let _ids = LastQfIdGuard::new();
