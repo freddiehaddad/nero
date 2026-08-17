@@ -389,6 +389,39 @@ pub fn vterm_state_set_unrecognised_fallbacks<F>(
     host.fallbacks = fallbacks;
 }
 
+pub fn vterm_state_set_termprop<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: Option<&mut C>,
+    prop: crate::vterm_defs::VTermProp,
+    value: &crate::vterm_defs::VTermValue<'_>,
+) -> i32 {
+    if let Some(callbacks) = callbacks
+        && !callbacks.set_term_prop(prop, value)
+    {
+        return 0;
+    }
+    state.set_termprop(prop, value, true)
+}
+
+#[cfg(test)]
+mod state_termprop_entry_tests {
+    use super::*;
+    #[test]
+    fn state_termprop_entry_gates_storage_on_callback() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(
+            vterm_state_set_termprop::<()>(
+                &mut state,
+                None,
+                crate::vterm_defs::VTermProp::CursorVisible,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+            ),
+            1
+        );
+        assert!(state.mode.cursor_visible);
+    }
+}
+
 #[cfg(test)]
 mod state_fallback_setter_tests {
     use super::*;
