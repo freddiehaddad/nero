@@ -1053,6 +1053,85 @@ pub unsafe fn was_set_insecurely(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u3
 static OPTION_WAS_SET: crate::globals::GlobalCell<[bool; crate::option_defs::OPT_COUNT]> =
     crate::globals::GlobalCell::new([false; crate::option_defs::OPT_COUNT]);
 
+static P_ET_NOBIN: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static P_ML_NOBIN: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static P_TW_NOBIN: crate::globals::GlobalCell<crate::types_defs::OptInt> =
+    crate::globals::GlobalCell::new(0);
+static P_WM_NOBIN: crate::globals::GlobalCell<crate::types_defs::OptInt> =
+    crate::globals::GlobalCell::new(0);
+
+/// Save, clear, or restore the options coupled to `'binary'`
+/// (`set_options_bin`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer and option/global state
+/// must not be mutated concurrently.
+pub unsafe fn set_options_bin(old_value: i32, new_value: i32, opt_flags: u32) {
+    use crate::option_defs::{opt_set_flags as scope, OptIndex};
+
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.as_ptr() }.curbuf;
+    let buf = unsafe { &mut *curbuf };
+    let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+
+    if new_value != 0 {
+        if old_value == 0 {
+            if opt_flags & scope::OPT_GLOBAL == 0 {
+                buf.b_p_tw_nobin = buf.b_p_tw;
+                buf.b_p_wm_nobin = buf.b_p_wm;
+                buf.b_p_ml_nobin = buf.b_p_ml;
+                buf.b_p_et_nobin = buf.b_p_et;
+            }
+            if opt_flags & scope::OPT_LOCAL == 0 {
+                *unsafe { P_TW_NOBIN.get_mut() } = options.p_tw;
+                *unsafe { P_WM_NOBIN.get_mut() } = options.p_wm;
+                *unsafe { P_ML_NOBIN.get_mut() } = options.p_ml;
+                *unsafe { P_ET_NOBIN.get_mut() } = options.p_et;
+            }
+        }
+        if opt_flags & scope::OPT_GLOBAL == 0 {
+            buf.b_p_tw = 0;
+            buf.b_p_wm = 0;
+            buf.b_p_ml = 0;
+            buf.b_p_et = 0;
+        }
+        if opt_flags & scope::OPT_LOCAL == 0 {
+            options.p_tw = 0;
+            options.p_wm = 0;
+            options.p_ml = 0;
+            options.p_et = 0;
+            options.p_bin = 1;
+        }
+    } else if old_value != 0 {
+        if opt_flags & scope::OPT_GLOBAL == 0 {
+            buf.b_p_tw = buf.b_p_tw_nobin;
+            buf.b_p_wm = buf.b_p_wm_nobin;
+            buf.b_p_ml = buf.b_p_ml_nobin;
+            buf.b_p_et = buf.b_p_et_nobin;
+        }
+        if opt_flags & scope::OPT_LOCAL == 0 {
+            options.p_tw = *unsafe { P_TW_NOBIN.get_mut() };
+            options.p_wm = *unsafe { P_WM_NOBIN.get_mut() };
+            options.p_ml = *unsafe { P_ML_NOBIN.get_mut() };
+            options.p_et = *unsafe { P_ET_NOBIN.get_mut() };
+        }
+    }
+
+    unsafe {
+        didset_options_sctx(
+            opt_flags,
+            &[
+                OptIndex::Textwidth,
+                OptIndex::Wrapmargin,
+                OptIndex::Modeline,
+                OptIndex::Expandtab,
+                OptIndex::Invalid,
+            ],
+        )
+    };
+}
+
 /// Record the first vimrc path in an environment variable
 /// (`vimrc_found`).
 ///
@@ -1147,6 +1226,63 @@ mod option_redraw_tests {
             );
         }
         assert_eq!(unsafe { (*win_ptr).w_redr_type }, crate::drawscreen::UPD_NOT_VALID);
+    }
+}
+
+#[cfg(test)]
+mod binary_option_tests {
+    use super::*;
+
+    #[test]
+    fn binary_mode_saves_clears_and_restores_dependent_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_tw: 10,
+            b_p_wm: 2,
+            b_p_ml: 1,
+            b_p_et: 1,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let saved_options = {
+            let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = (options.p_tw, options.p_wm, options.p_ml, options.p_et, options.p_bin);
+            (options.p_tw, options.p_wm, options.p_ml, options.p_et, options.p_bin) =
+                (20, 3, 1, 1, 0);
+            saved
+        };
+        let saved_nobin = (
+            *unsafe { P_TW_NOBIN.get_mut() },
+            *unsafe { P_WM_NOBIN.get_mut() },
+            *unsafe { P_ML_NOBIN.get_mut() },
+            *unsafe { P_ET_NOBIN.get_mut() },
+        );
+        let saved_context = *unsafe { OPTION_SCRIPT_CTX.get_mut() };
+
+        unsafe { set_options_bin(0, 1, 0) };
+        assert_eq!((buf.b_p_tw, buf.b_p_wm, buf.b_p_ml, buf.b_p_et), (0, 0, 0, 0));
+        {
+            let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            assert_eq!((options.p_tw, options.p_wm, options.p_ml, options.p_et, options.p_bin), (0, 0, 0, 0, 1));
+        }
+        unsafe { set_options_bin(1, 0, 0) };
+        assert_eq!((buf.b_p_tw, buf.b_p_wm, buf.b_p_ml, buf.b_p_et), (10, 2, 1, 1));
+        {
+            let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            assert_eq!((options.p_tw, options.p_wm, options.p_ml, options.p_et), (20, 3, 1, 1));
+            (options.p_tw, options.p_wm, options.p_ml, options.p_et, options.p_bin) =
+                saved_options;
+        }
+        (
+            *unsafe { P_TW_NOBIN.get_mut() },
+            *unsafe { P_WM_NOBIN.get_mut() },
+            *unsafe { P_ML_NOBIN.get_mut() },
+            *unsafe { P_ET_NOBIN.get_mut() },
+        ) = saved_nobin;
+        *unsafe { OPTION_SCRIPT_CTX.get_mut() } = saved_context;
     }
 }
 
