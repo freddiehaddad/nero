@@ -55,6 +55,50 @@ pub const LSIZE: usize = 512;
 /// Treat the tag pattern as a regular expression (`TAG_REGEXP`).
 const TAG_REGEXP: i32 = 4;
 
+/// Byte offsets into one tags-file line (`tagptrs_T`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TagPtrsT {
+    tagname: Option<usize>,
+    tagname_end: Option<usize>,
+    fname: Option<usize>,
+    fname_end: Option<usize>,
+    command: Option<usize>,
+    command_end: Option<usize>,
+    tag_fname: Option<usize>,
+    tagkind: Option<usize>,
+    tagkind_end: Option<usize>,
+    user_data: Option<usize>,
+    user_data_end: Option<usize>,
+    tagline: crate::pos_defs::LinenrT,
+}
+
+/// Parse tag-name, file-name and command boundaries from one tags-file
+/// line (`parse_tag_line`).
+#[allow(dead_code)]
+fn parse_tag_line(line: &[u8], tag: &mut TagPtrsT) -> i32 {
+    tag.tagname = Some(0);
+    let Some(first_tab) = line.iter().position(|&byte| byte == b'\t') else {
+        return crate::vim_defs::FAIL;
+    };
+    tag.tagname_end = Some(first_tab);
+
+    let fname = first_tab + 1;
+    tag.fname = Some(fname);
+    let Some(second_rel) = line[fname..].iter().position(|&byte| byte == b'\t') else {
+        return crate::vim_defs::FAIL;
+    };
+    let second_tab = fname + second_rel;
+    tag.fname_end = Some(second_tab);
+
+    let command = second_tab + 1;
+    if command >= line.len() || line[command] == 0 {
+        return crate::vim_defs::FAIL;
+    }
+    tag.command = Some(command);
+    crate::vim_defs::OK
+}
+
 /// Arguments used for matching one tags-file line
 /// (`findtags_match_args_T`).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -447,6 +491,28 @@ pub unsafe fn set_tagstack(wp: &mut WinT, d: *mut crate::eval::typval_defs::Dict
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tag_line_finds_name_file_and_command_boundaries() {
+        let line = b"main\tsrc/main.c\t/^fn main()$/\0";
+        let mut tag = TagPtrsT::default();
+        assert_eq!(parse_tag_line(line, &mut tag), crate::vim_defs::OK);
+        assert_eq!(&line[tag.tagname.unwrap()..tag.tagname_end.unwrap()], b"main");
+        assert_eq!(&line[tag.fname.unwrap()..tag.fname_end.unwrap()], b"src/main.c");
+        assert_eq!(&line[tag.command.unwrap()..line.len() - 1], b"/^fn main()$/");
+    }
+
+    #[test]
+    fn parse_tag_line_rejects_missing_fields_or_command() {
+        assert_eq!(
+            parse_tag_line(b"main src/main.c", &mut TagPtrsT::default()),
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(
+            parse_tag_line(b"main\tsrc/main.c\t\0", &mut TagPtrsT::default()),
+            crate::vim_defs::FAIL
+        );
+    }
 
     struct TfuGuard {
         saved: Option<crate::eval::typval_defs::Callback>,
