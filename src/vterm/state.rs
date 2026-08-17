@@ -633,6 +633,264 @@ pub fn set_origin_mode<C: VTermStateCallbacks>(
     updatecursor(state, callbacks, old, true);
 }
 
+fn set_state_bool_prop<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    prop: crate::vterm_defs::VTermProp,
+    value: i32,
+) -> i32 {
+    vterm_state_set_termprop(
+        state,
+        Some(callbacks),
+        prop,
+        &crate::vterm_defs::VTermValue::Boolean(value),
+    )
+}
+
+fn set_state_int_prop<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    prop: crate::vterm_defs::VTermProp,
+    value: i32,
+) -> i32 {
+    vterm_state_set_termprop(
+        state,
+        Some(callbacks),
+        prop,
+        &crate::vterm_defs::VTermValue::Number(value),
+    )
+}
+
+pub fn set_dec_mode<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    number: i32,
+    value: i32,
+) -> bool {
+    match number {
+        1 | 7 | 2004 => {
+            state.set_dec_basic_mode(number, value);
+        }
+        5 => {
+            set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::Reverse,
+                value,
+            );
+        }
+        6 => set_origin_mode(state, callbacks, value),
+        12 => {
+            set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::CursorBlink,
+                value,
+            );
+        }
+        25 => {
+            set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::CursorVisible,
+                value,
+            );
+        }
+        69 => {
+            state.mode.leftrightmargin = value != 0;
+            if value != 0 {
+                for row in 0..state.rows {
+                    state.set_lineinfo(row, FORCE, DWL_OFF, DHL_OFF, |row, new, old| {
+                        callbacks.set_line_info(row, new, old)
+                    });
+                }
+            }
+        }
+        1000 | 1002 | 1003 => {
+            let mouse = if value == 0 {
+                crate::vterm_defs::VTERM_PROP_MOUSE_NONE
+            } else if number == 1000 {
+                crate::vterm_defs::VTERM_PROP_MOUSE_CLICK
+            } else if number == 1002 {
+                crate::vterm_defs::VTERM_PROP_MOUSE_DRAG
+            } else {
+                crate::vterm_defs::VTERM_PROP_MOUSE_MOVE
+            };
+            set_state_int_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::Mouse,
+                mouse,
+            );
+        }
+        1004 => {
+            set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::FocusReport,
+                value,
+            );
+            state.mode.report_focus = value != 0;
+        }
+        1005 | 1006 | 1015 => {
+            state.set_mouse_protocol_mode(number, value);
+        }
+        1047 | 1049 => {
+            if set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::AltScreen,
+                value,
+            ) != 0
+                && value != 0
+            {
+                erase(
+                    state,
+                    callbacks,
+                    crate::vterm_defs::VTermRect {
+                        start_row: 0,
+                        end_row: state.rows,
+                        start_col: 0,
+                        end_col: state.cols,
+                    },
+                    false,
+                );
+            }
+            if number == 1049 {
+                savecursor(state, value);
+            }
+        }
+        1048 => savecursor(state, value),
+        2026 => {
+            set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::SyncOutput,
+                value,
+            );
+        }
+        2031 => {
+            set_state_bool_prop(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermProp::ThemeUpdates,
+                value,
+            );
+        }
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod set_dec_mode_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        props: Vec<crate::vterm_defs::VTermProp>,
+        moves: usize,
+        erases: usize,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn set_term_prop(
+            &mut self,
+            prop: crate::vterm_defs::VTermProp,
+            _: &crate::vterm_defs::VTermValue<'_>,
+        ) -> bool {
+            self.props.push(prop);
+            true
+        }
+
+        fn move_cursor(
+            &mut self,
+            _: crate::vterm_defs::VTermPos,
+            _: crate::vterm_defs::VTermPos,
+            _: bool,
+        ) -> bool {
+            self.moves += 1;
+            true
+        }
+
+        fn erase(&mut self, _: crate::vterm_defs::VTermRect, _: bool) -> bool {
+            self.erases += 1;
+            true
+        }
+    }
+
+    #[test]
+    fn dec_modes_update_screen_origin_cursor_and_input_modes() {
+        let mut state = VTermState::new(5, 8);
+        state.scrollregion_top = 2;
+        state.pos = crate::vterm_defs::VTermPos { row: 4, col: 3 };
+        let mut capture = Capture::default();
+
+        assert!(set_dec_mode(&mut state, &mut capture, 5, 1));
+        assert!(state.mode.screen);
+        assert!(set_dec_mode(&mut state, &mut capture, 6, 1));
+        assert_eq!(state.pos.row, 2);
+        assert_eq!(capture.moves, 1);
+        assert!(set_dec_mode(&mut state, &mut capture, 7, 0));
+        assert!(!state.mode.autowrap);
+        assert!(set_dec_mode(&mut state, &mut capture, 12, 1));
+        assert!(state.mode.cursor_blink);
+        assert!(set_dec_mode(&mut state, &mut capture, 25, 1));
+        assert!(state.mode.cursor_visible);
+        assert!(set_dec_mode(&mut state, &mut capture, 2004, 1));
+        assert!(state.mode.bracketpaste);
+    }
+
+    #[test]
+    fn dec_modes_update_margins_mouse_and_reporting() {
+        let mut state = VTermState::new(3, 8);
+        state.lineinfos[0][1].doublewidth = true;
+        let mut capture = Capture::default();
+
+        assert!(set_dec_mode(&mut state, &mut capture, 69, 1));
+        assert!(state.mode.leftrightmargin);
+        assert!(!state.lineinfos[0][1].doublewidth);
+        assert!(set_dec_mode(&mut state, &mut capture, 1002, 1));
+        assert_eq!(
+            state.mouse_flags,
+            crate::vterm::mouse::MOUSE_WANT_CLICK | crate::vterm::mouse::MOUSE_WANT_DRAG
+        );
+        assert!(set_dec_mode(&mut state, &mut capture, 1006, 1));
+        assert_eq!(
+            state.mouse_protocol,
+            crate::vterm::mouse::VTermMouseProtocol::Sgr
+        );
+        assert!(set_dec_mode(&mut state, &mut capture, 1004, 1));
+        assert!(state.mode.report_focus);
+        assert!(set_dec_mode(&mut state, &mut capture, 2026, 1));
+        assert!(state.mode.synchronized_output);
+        assert!(set_dec_mode(&mut state, &mut capture, 2031, 1));
+        assert!(state.mode.theme_updates);
+    }
+
+    #[test]
+    fn dec_alt_screen_and_saved_cursor_modes_roundtrip() {
+        let mut state = VTermState::new(3, 8);
+        state.pos = crate::vterm_defs::VTermPos { row: 1, col: 2 };
+        let mut capture = Capture::default();
+
+        assert!(set_dec_mode(&mut state, &mut capture, 1049, 1));
+        assert!(state.mode.alt_screen);
+        assert_eq!(state.saved.pos, crate::vterm_defs::VTermPos { row: 1, col: 2 });
+        assert_eq!(capture.erases, 1);
+        state.pos = crate::vterm_defs::VTermPos { row: 2, col: 5 };
+        assert!(set_dec_mode(&mut state, &mut capture, 1049, 0));
+        assert!(!state.mode.alt_screen);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 2 });
+    }
+
+    #[test]
+    fn dec_mode_rejects_unknown_numbers() {
+        let mut state = VTermState::new(1, 1);
+        assert!(!set_dec_mode(&mut state, &mut (), 9999, 1));
+    }
+}
+
 #[cfg(test)]
 mod origin_mode_tests {
     use super::*;
