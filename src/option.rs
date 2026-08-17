@@ -8140,6 +8140,52 @@ pub fn get_op(arg: &[u8]) -> crate::option_defs::SetOpT {
     SetOpT::None
 }
 
+/// Translate a key name of known shape (`find_key_len`).
+#[must_use]
+fn find_key_len(arg: &[u8], has_lt: bool) -> i32 {
+    if has_lt
+        && arg.len() >= 6
+        && arg.starts_with(b"<t_")
+        && arg.get(5) == Some(&b'>')
+    {
+        return crate::keycodes_defs::termcap2key(arg[3], arg[4]);
+    }
+    if !has_lt && arg.len() >= 4 && arg.starts_with(b"t_") {
+        return crate::keycodes_defs::termcap2key(arg[2], arg[3]);
+    }
+    if has_lt
+        && let Some((key, modifiers, _, _)) = crate::keycodes::find_special_key(
+            arg,
+            crate::keycodes_defs::fsk::KEYCODE
+                | crate::keycodes_defs::fsk::KEEP_X_KEY
+                | crate::keycodes_defs::fsk::SIMPLIFY,
+        )
+        && modifiers == 0
+    {
+        return key;
+    }
+    0
+}
+
+/// Convert a key name or string to one key value (`string_to_key`).
+#[must_use]
+pub fn string_to_key(arg: &[u8]) -> i32 {
+    if arg.first() == Some(&b'<') && arg.get(1).is_some() {
+        return find_key_len(arg, true);
+    }
+    if arg.first() == Some(&b'^')
+        && let Some(&next) = arg.get(1)
+    {
+        let key = crate::ascii_defs::ctrl_chr(i32::from(next));
+        return if key == 0 {
+            crate::keycodes_defs::K_ZERO
+        } else {
+            key
+        };
+    }
+    arg.first().copied().map_or(0, i32::from)
+}
+
 /// Recognize and consume a `:set` boolean-option prefix
 /// (`get_option_prefix`).
 ///
@@ -9536,6 +9582,28 @@ mod did_set_title_tests {
         assert_eq!(get_op(b""), SetOpT::None);
         // A recognized operator character but no '=' is still None.
         assert_eq!(get_op(b"-x"), SetOpT::None);
+    }
+
+    #[test]
+    fn string_to_key_parses_named_termcap_control_and_plain_keys() {
+        assert_eq!(string_to_key(b"<Up>"), crate::keycodes_defs::K_UP);
+        assert_eq!(
+            string_to_key(b"<t_ab>"),
+            crate::keycodes_defs::termcap2key(b'a', b'b')
+        );
+        assert_eq!(
+            string_to_key(b"^A"),
+            i32::from(crate::ascii_defs::CTRL_A)
+        );
+        assert_eq!(string_to_key(b"^@"), crate::keycodes_defs::K_ZERO);
+        assert_eq!(string_to_key(b"x"), i32::from(b'x'));
+        assert_eq!(string_to_key(b""), 0);
+    }
+
+    #[test]
+    fn string_to_key_rejects_unrecognized_and_unabsorbed_modifiers() {
+        assert_eq!(string_to_key(b"<NotARealKey>"), 0);
+        assert_eq!(string_to_key(b"<M-a>"), 0);
     }
 
     #[test]
