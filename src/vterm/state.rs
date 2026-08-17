@@ -2176,6 +2176,16 @@ impl VTermState {
         }
     }
 
+    pub fn convert_color_to_rgb(&self, color: &mut crate::vterm_defs::VTermColor) {
+        let state = crate::vterm::pen::VTermPenState {
+            palette: crate::vterm::pen::VTermPalette {
+                colors: self.colors,
+            },
+            ..Default::default()
+        };
+        crate::vterm::pen::vterm_state_convert_color_to_rgb(&state, color);
+    }
+
     pub fn reset_pen<C: VTermStateCallbacks>(&mut self, callbacks: &mut C) {
         let mut pen_state = crate::vterm::pen::VTermPenState {
             pen: self.pen,
@@ -2544,6 +2554,15 @@ mod termprop_state_tests {
         assert_eq!(state.colors[3].red, 9);
         state.set_palette_color(16, &Default::default());
         assert_eq!(state.colors[3].red, 9);
+    }
+    #[test]
+    fn state_color_conversion_uses_state_palette() {
+        let mut state = VTermState::new(1, 1);
+        state.initialize_pen_colors();
+        let mut color = crate::vterm_defs::VTermColor::default();
+        crate::vterm_defs::vterm_color_indexed(&mut color, 2);
+        state.convert_color_to_rgb(&mut color);
+        assert_eq!((color.red, color.green, color.blue), (0, 224, 0));
     }
     #[test]
     fn reset_pen_restores_state_default_colors() {
