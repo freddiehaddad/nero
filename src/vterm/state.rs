@@ -734,6 +734,10 @@ pub fn control_backspace(state: &mut VTermState) {
     }
 }
 
+pub fn control_horizontal_tab(state: &mut VTermState) {
+    state.tab(1, 1);
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -746,6 +750,13 @@ mod control_backspace_tests {
         state.pos.col = 0;
         control_backspace(&mut state);
         assert_eq!(state.pos.col, 0);
+    }
+    #[test]
+    fn horizontal_tab_moves_to_next_stop() {
+        let mut state = VTermState::new(1, 10);
+        state.set_col_tabstop(4);
+        control_horizontal_tab(&mut state);
+        assert_eq!(state.pos.col, 4);
     }
 }
 
