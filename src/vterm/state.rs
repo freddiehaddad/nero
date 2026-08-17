@@ -2456,6 +2456,24 @@ mod resize_tabstop_tests {
     }
 }
 
+#[must_use]
+pub fn vterm_state_new(rows: i32, cols: i32) -> VTermState {
+    let mut state = VTermState::new(rows, cols);
+    state.initialize_pen_colors();
+    state
+}
+
+#[cfg(test)]
+mod state_new_wrapper_tests {
+    use super::*;
+    #[test]
+    fn state_new_wrapper_initializes_pen_colors() {
+        let state = vterm_state_new(24, 80);
+        assert!(state.default_fg.is_default_fg());
+        assert_eq!(state.tabstops.len(), 10);
+    }
+}
+
 #[cfg(test)]
 mod termprop_state_tests {
     use super::*;
