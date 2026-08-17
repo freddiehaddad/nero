@@ -333,6 +333,57 @@ pub static DECOR_STATE: crate::globals::GlobalCell<DecorState> =
         itr_valid: false,
     });
 
+/// Global extended sign/highlight storage (`decor_items`).
+static DECOR_ITEMS: crate::globals::GlobalCell<Vec<crate::decoration_defs::DecorSignHighlight>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
+/// Return the extmark-type bits represented by one inline decoration
+/// (`decor_type_flags`).
+///
+/// # Safety
+/// Every non-invalid `sh_idx`/`next` index must address `DECOR_ITEMS`,
+/// and decoration state must not be mutated concurrently.
+#[must_use]
+pub unsafe fn decor_type_flags(decor: &crate::decoration_defs::DecorInline) -> u16 {
+    use crate::decoration_defs::{SH_IS_SIGN, VT_IS_LINES};
+    use crate::extmark_defs::extmark_type;
+
+    match decor {
+        crate::decoration_defs::DecorInline::Highlight(highlight) => {
+            if highlight.flags & SH_IS_SIGN != 0 {
+                extmark_type::SIGN as u16
+            } else {
+                extmark_type::HIGHLIGHT as u16
+            }
+        }
+        crate::decoration_defs::DecorInline::Ext(ext) => {
+            let mut flags = extmark_type::NONE as u16;
+            let mut virt_text = ext.vt.as_deref();
+            while let Some(item) = virt_text {
+                flags |= if item.flags & VT_IS_LINES != 0 {
+                    extmark_type::VIRT_LINES as u16
+                } else {
+                    extmark_type::VIRT_TEXT as u16
+                };
+                virt_text = item.next.as_deref();
+            }
+
+            let items = unsafe { &*DECOR_ITEMS.as_ptr() };
+            let mut index = ext.sh_idx;
+            while index != crate::decoration_defs::DECOR_ID_INVALID {
+                let highlight = &items[index as usize];
+                flags |= if highlight.flags & SH_IS_SIGN != 0 {
+                    extmark_type::SIGN as u16
+                } else {
+                    extmark_type::HIGHLIGHT as u16
+                };
+                index = highlight.next;
+            }
+            flags
+        }
+    }
+}
+
 /// Whether the current row likely has another decoration to process
 /// (`decor_has_more_decorations`).
 #[must_use]
@@ -640,6 +691,52 @@ mod tests {
 
         state.future_begin = 1;
         assert!(!decor_has_more_decorations(&state, 0));
+    }
+
+    #[test]
+    fn decor_type_flags_classifies_inline_and_extended_payloads() {
+        let _lock = crate::globals::global_state_test_lock();
+        let inline = crate::decoration_defs::DecorInline::Highlight(
+            crate::decoration_defs::DecorHighlightInline::default(),
+        );
+        assert_eq!(
+            unsafe { decor_type_flags(&inline) },
+            crate::extmark_defs::extmark_type::HIGHLIGHT as u16
+        );
+
+        let saved = std::mem::take(unsafe { DECOR_ITEMS.get_mut() });
+        let first = crate::decoration_defs::DecorSignHighlight {
+            flags: crate::decoration_defs::SH_IS_SIGN,
+            next: 1,
+            ..Default::default()
+        };
+        let second = crate::decoration_defs::DecorSignHighlight::default();
+        unsafe { DECOR_ITEMS.get_mut() }.extend([first, second]);
+        let virt_lines = crate::decoration_defs::DecorVirtText {
+            flags: crate::decoration_defs::VT_IS_LINES,
+            ..Default::default()
+        };
+        let virt_text = crate::decoration_defs::DecorVirtText {
+            next: Some(Box::new(virt_lines)),
+            ..Default::default()
+        };
+        let extended = crate::decoration_defs::DecorInline::Ext(
+            crate::decoration_defs::DecorExt {
+                sh_idx: 0,
+                vt: Some(Box::new(virt_text)),
+            },
+        );
+        let got = unsafe { decor_type_flags(&extended) };
+        *unsafe { DECOR_ITEMS.get_mut() } = saved;
+
+        assert_eq!(
+            got,
+            (crate::extmark_defs::extmark_type::NONE
+                | crate::extmark_defs::extmark_type::SIGN
+                | crate::extmark_defs::extmark_type::HIGHLIGHT
+                | crate::extmark_defs::extmark_type::VIRT_TEXT
+                | crate::extmark_defs::extmark_type::VIRT_LINES) as u16
+        );
     }
     use crate::buffer_defs::{BufT, WinoptT};
     use crate::decoration_defs::{DecorSignHighlight, DecorVirtText, VirtTextPos};
