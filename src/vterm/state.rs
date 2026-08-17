@@ -382,6 +382,36 @@ pub struct VTermStateFallbackHost<F> {
     pub fallbacks: Option<F>,
 }
 
+pub struct VTermSelectionHost<C> {
+    pub state: VTermState,
+    pub callbacks: Option<C>,
+}
+
+pub fn vterm_state_set_selection_callbacks<C>(
+    host: &mut VTermSelectionHost<C>,
+    callbacks: Option<C>,
+    buffer: Option<Vec<u8>>,
+    buflen: usize,
+) {
+    host.state.set_selection_buffer(buffer, buflen);
+    host.callbacks = callbacks;
+}
+
+#[cfg(test)]
+mod selection_callback_setter_tests {
+    use super::*;
+    #[test]
+    fn selection_callback_setter_installs_callback_and_buffer() {
+        let mut host = VTermSelectionHost {
+            state: VTermState::new(1, 1),
+            callbacks: None::<u8>,
+        };
+        vterm_state_set_selection_callbacks(&mut host, Some(3), None, 4);
+        assert_eq!(host.callbacks, Some(3));
+        assert_eq!(host.state.selection_buffer, Some(vec![0; 4]));
+    }
+}
+
 pub fn vterm_state_set_unrecognised_fallbacks<F>(
     host: &mut VTermStateFallbackHost<F>,
     fallbacks: Option<F>,
