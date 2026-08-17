@@ -111,6 +111,25 @@ const KEYCODES_KP_CSIU: [Keycode; 18] = [
     Keycode { key_type: KeycodeType::Keypad, literal: 57415, csi_num: b'X' as i32 },
 ];
 
+#[must_use]
+pub fn vterm_state_get_key_encoding_flags(
+    state: &crate::vterm::state::VTermState,
+) -> crate::vterm_defs::VTermKeyEncodingFlags {
+    state.key_encoding_stacks[state.active_screen_index()].current()
+}
+
+#[cfg(test)]
+mod state_flag_tests {
+    use super::*;
+    #[test]
+    fn state_key_flags_come_from_active_screen_stack() {
+        let mut state = crate::vterm::state::VTermState::new(1, 1);
+        state.key_encoding_stacks[1].items[0].report_events = true;
+        state.mode.alt_screen = true;
+        assert!(vterm_state_get_key_encoding_flags(&state).report_events);
+    }
+}
+
 /// Whether a Unicode key bypasses modifier encoding and is emitted as
 /// plain UTF-8 (`vterm_keyboard_unichar`'s `passthru` test).
 #[allow(dead_code)]
