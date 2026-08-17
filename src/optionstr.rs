@@ -2156,6 +2156,62 @@ pub unsafe fn did_set_spelllang(
     }
 }
 
+/// The `'shada'` option is changed (`did_set_shada`).
+///
+/// The original writes a more specific diagnostic into `os_errbuf`;
+/// message text is not modeled here, so every invalid form returns
+/// `e_invarg` while preserving the exact accepted/rejected grammar.
+pub fn did_set_shada(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let shada = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_shada
+        .clone()
+        .unwrap_or_default();
+    let mut pos = 0;
+
+    while pos < shada.len() {
+        let kind = shada[pos];
+        if !b"!\"%'/:<@cfhnrs".contains(&kind) {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        pos += 1;
+
+        if kind == b'n' {
+            break;
+        } else if kind == b'r' {
+            while pos < shada.len() && shada[pos] != b',' {
+                pos += 1;
+            }
+        } else if kind == b'%' {
+            while pos < shada.len() && shada[pos].is_ascii_digit() {
+                pos += 1;
+            }
+        } else if matches!(kind, b'!' | b'h' | b'c') {
+            // No value follows these boolean parameters.
+        } else {
+            let digits_start = pos;
+            while pos < shada.len() && shada[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos == digits_start {
+                return Some(crate::errors::e_invarg.as_bytes());
+            }
+        }
+
+        if pos < shada.len() {
+            if shada[pos] != b',' {
+                return Some(crate::errors::e_invarg.as_bytes());
+            }
+            pos += 1;
+        }
+    }
+
+    if !shada.is_empty() && crate::shada::get_shada_parameter(&shada, b'\'') < 0 {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
+
 /// The `'spelloptions'` option is changed (`did_set_spelloptions`).
 ///
 /// Unlike this file's other local-or-global callbacks (which pick ONE
@@ -6509,7 +6565,78 @@ mod tests {
         });
     }
 
-    // ---- did_set_spellfile / did_set_spelllang / did_set_spelloptions ----
+    // ---- did_set_shada / did_set_spellfile / did_set_spelllang / did_set_spelloptions ----
+
+    struct ShadaGuard(Option<Vec<u8>>);
+
+    impl ShadaGuard {
+        fn set(value: &[u8]) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let old = opts.p_shada.replace(value.to_vec());
+            Self(old)
+        }
+    }
+
+    impl Drop for ShadaGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shada = self.0.take();
+        }
+    }
+
+    fn check_shada(value: &[u8]) -> Option<&'static [u8]> {
+        let _lock = crate::globals::global_state_test_lock();
+        let _shada = ShadaGuard::set(value);
+        did_set_shada(&mut crate::option_defs::OptsetT::default())
+    }
+
+    #[test]
+    fn did_set_shada_accepts_empty_and_numbered_parameters() {
+        assert_eq!(check_shada(b""), None);
+        assert_eq!(check_shada(b"'100,<50,s10,h"), None);
+    }
+
+    #[test]
+    fn did_set_shada_accepts_optional_percent_and_text_parameters() {
+        assert_eq!(check_shada(b"'10,%,r/tmp,nshada.file"), None);
+        assert_eq!(check_shada(b"'10,%20,r/tmp"), None);
+    }
+
+    #[test]
+    fn did_set_shada_stops_parsing_after_the_n_parameter() {
+        assert_eq!(check_shada(b"'10,nshada.file,<not-parsed"), None);
+    }
+
+    #[test]
+    fn did_set_shada_rejects_an_illegal_parameter_character() {
+        assert_eq!(
+            check_shada(b"'10,x20"),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_shada_rejects_a_missing_required_number() {
+        assert_eq!(
+            check_shada(b"',<50"),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_shada_rejects_a_missing_comma() {
+        assert_eq!(
+            check_shada(b"'10<50"),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_shada_requires_the_quote_parameter_when_nonempty() {
+        assert_eq!(
+            check_shada(b"<50,s10"),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
 
     #[test]
     fn did_set_spellfile_accepts_add_wordlists() {
