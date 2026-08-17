@@ -1975,6 +1975,33 @@ pub unsafe fn mb_string2cells(str: &[u8]) -> usize {
     clen
 }
 
+/// The number of display cells occupied by at most `size` bytes of a
+/// NUL-terminated string (`mb_string2cells_len`).
+///
+/// # Safety
+/// Same as [`mb_string2cells`].
+#[must_use]
+pub unsafe fn mb_string2cells_len(str: &[u8], size: usize) -> usize {
+    let limit = size.min(str.len());
+    let mut cells = 0usize;
+    let mut pos = 0usize;
+    while pos < limit && str[pos] != 0 {
+        let remaining = limit - pos;
+        // SAFETY: forwarded from this function's own safety doc.
+        cells += usize::try_from(unsafe {
+            utf_ptr2cells_len(&str[pos..], remaining as i32)
+        })
+        .unwrap_or(0);
+        // SAFETY: forwarded from this function's own safety doc.
+        let advance = usize::try_from(unsafe {
+            utfc_ptr2len_len(&str[pos..], remaining)
+        })
+        .unwrap_or(0);
+        pos += advance.max(1);
+    }
+    cells
+}
+
 /// Count the number of characters in a NUL-terminated Vimscript
 /// string byte slice - composing marks are grouped with their base
 /// character into one unit, matching [`utfc_ptr2len`]'s own grouping
@@ -3720,6 +3747,20 @@ mod tests {
     fn mb_string2cells_empty_string_is_zero() {
         let _guard = option_vars_test_lock();
         assert_eq!(unsafe { mb_string2cells(b"") }, 0);
+    }
+
+    #[test]
+    fn mb_string2cells_len_stops_at_size_or_nul() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_string2cells_len(b"hello", 3) }, 3);
+        assert_eq!(unsafe { mb_string2cells_len(b"ab\0cd", 5) }, 2);
+    }
+
+    #[test]
+    fn mb_string2cells_len_counts_complete_wide_characters() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_string2cells_len("一x".as_bytes(), 3) }, 2);
+        assert_eq!(unsafe { mb_string2cells_len("一x".as_bytes(), 4) }, 3);
     }
 
     #[test]
