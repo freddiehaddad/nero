@@ -1132,6 +1132,25 @@ pub unsafe fn set_options_bin(old_value: i32, new_value: i32, opt_flags: u32) {
     };
 }
 
+/// Process an updated `'binary'` option (`did_set_binary`).
+///
+/// # Safety
+/// `args.os_buf` and `GLOBALS.curbuf` must point to the same live
+/// buffer, matching the option-setting context established by the
+/// caller.
+pub unsafe fn did_set_binary(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = unsafe { &*(args.os_buf as *const crate::buffer_defs::BufT) };
+    let old = match &args.os_oldval {
+        crate::option_defs::OptVal::Boolean(value) => *value as i32,
+        _ => 0,
+    };
+    unsafe { set_options_bin(old, buf.b_p_bin, args.os_flags as u32) };
+    // `redraw_titles()` is redraw scheduling only.
+    None
+}
+
 /// Record the first vimrc path in an environment variable
 /// (`vimrc_found`).
 ///
@@ -1283,6 +1302,36 @@ mod binary_option_tests {
             *unsafe { P_ET_NOBIN.get_mut() },
         ) = saved_nobin;
         *unsafe { OPTION_SCRIPT_CTX.get_mut() } = saved_context;
+    }
+
+    #[test]
+    fn did_set_binary_applies_buffer_local_binary_defaults() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bin: 1,
+            b_p_tw: 10,
+            b_p_wm: 2,
+            b_p_ml: 1,
+            b_p_et: 1,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_oldval: crate::option_defs::OptVal::Boolean(
+                crate::types_defs::TriState::False,
+            ),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_binary(&mut args) }, None);
+        assert_eq!(
+            (buf.b_p_tw, buf.b_p_wm, buf.b_p_ml, buf.b_p_et),
+            (0, 0, 0, 0)
+        );
     }
 }
 
