@@ -914,6 +914,110 @@ pub fn csi_delete_lines<C: VTermStateCallbacks>(
     }
 }
 
+pub fn csi_insert_columns<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    count: i32,
+) {
+    if state.is_cursor_in_scrollregion() {
+        scroll(
+            state,
+            callbacks,
+            crate::vterm_defs::VTermRect {
+                start_row: state.scrollregion_top,
+                end_row: state.scrollregion_bottom(),
+                start_col: state.pos.col,
+                end_col: state.scrollregion_right(),
+            },
+            0,
+            -count.max(1),
+        );
+    }
+}
+
+pub fn csi_delete_columns<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    count: i32,
+) {
+    if state.is_cursor_in_scrollregion() {
+        scroll(
+            state,
+            callbacks,
+            crate::vterm_defs::VTermRect {
+                start_row: state.scrollregion_top,
+                end_row: state.scrollregion_bottom(),
+                start_col: state.pos.col,
+                end_col: state.scrollregion_right(),
+            },
+            0,
+            count.max(1),
+        );
+    }
+}
+
+#[cfg(test)]
+mod csi_column_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        rect: Option<crate::vterm_defs::VTermRect>,
+        rightward: i32,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn scroll_rect(
+            &mut self,
+            rect: crate::vterm_defs::VTermRect,
+            _: i32,
+            rightward: i32,
+        ) -> bool {
+            self.rect = Some(rect);
+            self.rightward = rightward;
+            true
+        }
+    }
+
+    #[test]
+    fn insert_and_delete_columns_scroll_the_vertical_region() {
+        let mut state = VTermState::new(10, 20);
+        state.scrollregion_top = 2;
+        state.scrollregion_bottom = 8;
+        state.scrollregion_left = 1;
+        state.scrollregion_right = 18;
+        state.mode.leftrightmargin = true;
+        state.pos = crate::vterm_defs::VTermPos { row: 4, col: 5 };
+        let expected = crate::vterm_defs::VTermRect {
+            start_row: 2,
+            end_row: 8,
+            start_col: 5,
+            end_col: 18,
+        };
+
+        let mut capture = Capture::default();
+        csi_insert_columns(&mut state, &mut capture, 3);
+        assert_eq!(capture.rect, Some(expected));
+        assert_eq!(capture.rightward, -3);
+
+        csi_delete_columns(&mut state, &mut capture, 2);
+        assert_eq!(capture.rect, Some(expected));
+        assert_eq!(capture.rightward, 2);
+    }
+
+    #[test]
+    fn column_operations_ignore_a_cursor_outside_the_scroll_region() {
+        let mut state = VTermState::new(10, 20);
+        state.scrollregion_top = 2;
+        state.scrollregion_bottom = 8;
+        state.pos = crate::vterm_defs::VTermPos { row: 1, col: 5 };
+        let mut capture = Capture::default();
+        csi_insert_columns(&mut state, &mut capture, 1);
+        csi_delete_columns(&mut state, &mut capture, 1);
+        assert_eq!(capture.rect, None);
+    }
+}
+
 pub fn csi_scroll_region<C: VTermStateCallbacks>(
     state: &mut VTermState,
     callbacks: &mut C,
