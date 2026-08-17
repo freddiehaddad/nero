@@ -893,6 +893,43 @@ pub unsafe fn did_set_eventignore(
     }
 }
 
+/// One of `'encoding'`, `'fileencoding'` or `'makeencoding'` changed
+/// (`did_set_encoding`).
+///
+/// Redrawing titles, updating swap-file flags and reloading spell
+/// data are deferred with those subsystems; validation and stored
+/// value canonicalization are complete.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`.
+/// `args.os_buf` must point to a live `BufT` for `'fileencoding'`.
+pub unsafe fn did_set_encoding(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let varp = unsafe { &mut *(args.os_varp as *mut Option<Vec<u8>>) };
+    if args.os_idx == crate::option_defs::OptIndex::Fileencoding {
+        let buf = unsafe { &*(args.os_buf as *const crate::buffer_defs::BufT) };
+        if buf.b_p_ma == 0
+            && args.os_flags as u32 & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0
+        {
+            return Some(crate::errors::e_modifiable.as_bytes());
+        }
+        if varp.as_deref().unwrap_or(&[]).contains(&b',') {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+    }
+
+    *varp = Some(crate::mbyte::enc_canonize(
+        varp.as_deref().unwrap_or(&[]),
+    ));
+    if args.os_idx == crate::option_defs::OptIndex::Encoding
+        && varp.as_deref() != Some(&b"utf-8"[..])
+    {
+        return Some(crate::errors::e_unsupportedoption.as_bytes());
+    }
+    None
+}
+
 /// The `'helplang'` option is changed (`did_set_helplang`).
 ///
 /// Validates a comma-separated list of exactly-2-letter language
@@ -4674,6 +4711,96 @@ mod tests {
             unsafe { did_set_eventignore(&mut args) },
             Some(crate::errors::e_invarg.as_bytes())
         );
+    }
+
+    #[test]
+    fn did_set_encoding_canonicalizes_utf8() {
+        let mut value = Some(b"UTF8".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Encoding,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_encoding(&mut args) }, None);
+        assert_eq!(value, Some(b"utf-8".to_vec()));
+    }
+
+    #[test]
+    fn did_set_encoding_rejects_non_utf8_after_canonicalizing_it() {
+        let mut value = Some(b"ISO88591".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Encoding,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_encoding(&mut args) },
+            Some(crate::errors::e_unsupportedoption.as_bytes())
+        );
+        assert_eq!(value, Some(b"latin1".to_vec()));
+    }
+
+    #[test]
+    fn did_set_fileencoding_rejects_a_comma() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_ma: 1,
+            ..Default::default()
+        };
+        let mut value = Some(b"utf-8,latin1".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Fileencoding,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_encoding(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_fileencoding_requires_a_modifiable_buffer_for_local_changes() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut value = Some(b"utf8".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Fileencoding,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_encoding(&mut args) },
+            Some(crate::errors::e_modifiable.as_bytes())
+        );
+        assert_eq!(value, Some(b"utf8".to_vec()));
+    }
+
+    #[test]
+    fn did_set_fileencoding_allows_a_global_change_on_an_unmodifiable_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut value = Some(b"UTF16LE".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Fileencoding,
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_encoding(&mut args) }, None);
+        assert_eq!(value, Some(b"utf-16le".to_vec()));
+    }
+
+    #[test]
+    fn did_set_makeencoding_canonicalizes_aliases_without_a_buffer() {
+        let mut value = Some(b"mac-roman".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Makeencoding,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_encoding(&mut args) }, None);
+        assert_eq!(value, Some(b"macroman".to_vec()));
     }
 
     // ---- did_set_backupext_or_patchmode ----
