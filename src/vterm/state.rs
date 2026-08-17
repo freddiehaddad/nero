@@ -1592,6 +1592,72 @@ pub fn csi_device_status(
     }
 }
 
+#[must_use]
+pub fn csi_theme_status<C: VTermStateCallbacks>(
+    callbacks: &mut C,
+    ctrl8bit: bool,
+) -> Vec<u8> {
+    let mut dark = false;
+    if !callbacks.theme(&mut dark) {
+        return Vec::new();
+    }
+    let prefix: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_CSI]
+    } else {
+        b"\x1b["
+    };
+    [prefix, format!("?997;{}n", if dark { 1 } else { 2 }).as_bytes()].concat()
+}
+
+#[cfg(test)]
+mod csi_theme_status_tests {
+    use super::*;
+
+    struct Capture {
+        handled: bool,
+        dark: bool,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn theme(&mut self, dark: &mut bool) -> bool {
+            *dark = self.dark;
+            self.handled
+        }
+    }
+
+    #[test]
+    fn theme_status_reports_dark_light_or_no_response() {
+        assert_eq!(
+            csi_theme_status(
+                &mut Capture {
+                    handled: true,
+                    dark: true,
+                },
+                false,
+            ),
+            b"\x1b[?997;1n"
+        );
+        assert_eq!(
+            csi_theme_status(
+                &mut Capture {
+                    handled: true,
+                    dark: false,
+                },
+                true,
+            ),
+            [vec![crate::vterm_defs::C1_CSI], b"?997;2n".to_vec()].concat()
+        );
+        assert!(csi_theme_status(
+            &mut Capture {
+                handled: false,
+                dark: true,
+            },
+            false,
+        )
+        .is_empty());
+    }
+}
+
 pub fn csi_repeat<C: VTermStateCallbacks>(
     state: &mut VTermState,
     callbacks: &mut C,
