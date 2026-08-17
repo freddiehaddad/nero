@@ -1313,6 +1313,61 @@ fn qf_getprop_qfidx(
     index
 }
 
+/// Select a quickfix-list index for `setqflist()`/`setloclist()`
+/// (`qf_setprop_get_qfidx`).
+#[allow(dead_code)]
+fn qf_setprop_get_qfidx(
+    qi: &crate::types_defs::QfInfoT,
+    what: &mut crate::eval::typval_defs::DictT,
+    action: u8,
+    newlist: &mut bool,
+) -> i32 {
+    use crate::eval::typval_defs::TypvalValue;
+
+    let mut index = qi.qf_curlist;
+    if let Some(item) = crate::eval::typval::tv_dict_find(Some(what), b"nr") {
+        match unsafe { &(*item).di_tv.value } {
+            TypvalValue::Number(number) => {
+                if *number != 0 {
+                    index = *number as i32 - 1;
+                }
+                if matches!(action, b' ' | b'a') && index == qi.qf_listcount {
+                    *newlist = true;
+                    index = if qf_stack_empty(Some(qi)) {
+                        0
+                    } else {
+                        qi.qf_listcount - 1
+                    };
+                } else if index < 0 || index >= qi.qf_listcount {
+                    return INVALID_QFIDX;
+                } else if action != b' ' {
+                    *newlist = false;
+                }
+            }
+            TypvalValue::String(Some(value)) if value.as_slice() == b"$" => {
+                if !qf_stack_empty(Some(qi)) {
+                    index = qi.qf_listcount - 1;
+                } else if *newlist {
+                    index = 0;
+                } else {
+                    return INVALID_QFIDX;
+                }
+            }
+            _ => return INVALID_QFIDX,
+        }
+    }
+
+    if !*newlist
+        && let Some(item) = crate::eval::typval::tv_dict_find(Some(what), b"id")
+    {
+        let TypvalValue::Number(id) = (unsafe { &(*item).di_tv.value }) else {
+            return INVALID_QFIDX;
+        };
+        return qf_id2nr(qi, *id as u32);
+    }
+    index
+}
+
 #[cfg(test)]
 mod qf_nth_valid_tests {
     use super::*;
@@ -1391,6 +1446,40 @@ mod qf_nth_valid_tests {
         let id = crate::eval::typval::tv_dict_alloc();
         crate::eval::typval::tv_dict_add_nr(unsafe { &mut *id }, b"id", 20);
         assert_eq!(qf_getprop_qfidx(&qi, unsafe { &mut *id }), 1);
+        unsafe { crate::eval::typval::tv_dict_free(id) };
+    }
+
+    #[test]
+    fn setprop_qfidx_accepts_new_list_boundary_and_existing_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_curlist: 0,
+            qf_listcount: 2,
+            qf_lists: vec![
+                QfListT { qf_id: 10, ..Default::default() },
+                QfListT { qf_id: 20, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+
+        let nr = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *nr }, b"nr", 3);
+        let mut newlist = false;
+        assert_eq!(
+            qf_setprop_get_qfidx(&qi, unsafe { &mut *nr }, b'a', &mut newlist),
+            1
+        );
+        assert!(newlist);
+        unsafe { crate::eval::typval::tv_dict_free(nr) };
+
+        let id = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *id }, b"id", 20);
+        newlist = false;
+        assert_eq!(
+            qf_setprop_get_qfidx(&qi, unsafe { &mut *id }, b'r', &mut newlist),
+            1
+        );
+        assert!(!newlist);
         unsafe { crate::eval::typval::tv_dict_free(id) };
     }
 }
