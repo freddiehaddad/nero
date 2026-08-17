@@ -44,6 +44,8 @@
 //! `'messagesopt'` flags and numeric limits. Trimming an existing
 //! message history to the new maximum remains deferred with the
 //! history/display pipeline.
+//! Also [`str2special`]/[`str2special_save`] - printable rendering of
+//! Neovim's internal special-key byte sequences.
 //!
 //! `crate::grid::DEFAULT_GRID` is the original's own file-static
 //! `ScreenGrid default_grid` (declared in `grid.c`, `SCREEN_GRID_INIT`-
@@ -219,6 +221,97 @@ pub unsafe fn msg_cursor_goto(row: i32, mut col: i32) {
     let (grid, row, col) = crate::grid::grid_adjust(view, row, col);
     debug_assert!(!grid.is_null());
     unsafe { crate::ui::ui_grid_cursor_goto((*grid).handle, row, col) };
+}
+
+/// Convert one internal key sequence to printable notation
+/// (`str2special`), returning bytes plus input consumed.
+///
+/// # Safety
+/// Forwarded from `keycodes::get_special_key_name`.
+#[must_use]
+pub unsafe fn str2special(
+    input: &[u8],
+    replace_spaces: bool,
+    replace_others: crate::types_defs::TriState,
+) -> (Vec<u8>, usize) {
+    if let Some((bytes, consumed)) = crate::mbyte::mb_unescape(input) {
+        return (bytes, consumed);
+    }
+
+    let mut pos = 0usize;
+    let mut key = i32::from(input.first().copied().unwrap_or(0));
+    let mut modifiers = 0i32;
+    let mut special = false;
+    if key == i32::from(crate::keycodes_defs::K_SPECIAL)
+        && input.get(1).copied().unwrap_or(0) != 0
+        && input.get(2).copied().unwrap_or(0) != 0
+    {
+        if input[1] == crate::keycodes_defs::KS_MODIFIER {
+            modifiers = i32::from(input[2]);
+            pos = 3;
+            key = i32::from(input.get(pos).copied().unwrap_or(0));
+        }
+        if key == i32::from(crate::keycodes_defs::K_SPECIAL)
+            && input.get(pos + 1).copied().unwrap_or(0) != 0
+            && input.get(pos + 2).copied().unwrap_or(0) != 0
+        {
+            key = crate::keycodes_defs::to_special(input[pos + 1], input[pos + 2]);
+            pos += 2;
+        }
+        special = crate::keycodes_defs::is_special(key) || modifiers != 0;
+    }
+
+    if !crate::keycodes_defs::is_special(key)
+        && crate::mbyte::utf_byte2len(key as u8) > 1
+    {
+        if let Some((bytes, consumed)) = crate::mbyte::mb_unescape(&input[pos..]) {
+            key = crate::mbyte::utf_ptr2char(&bytes);
+            pos += consumed;
+        } else {
+            pos += usize::from(input.get(pos).copied().unwrap_or(0) != 0);
+        }
+    } else {
+        pos += usize::from(input.get(pos).copied().unwrap_or(0) != 0);
+    }
+
+    let display_special = special
+        || key < i32::from(b' ')
+        || (replace_spaces && key == i32::from(b' '))
+        || (replace_others != crate::types_defs::TriState::False
+            && key == i32::from(b'<'))
+        || (replace_others == crate::types_defs::TriState::True
+            && matches!(key, x if x == i32::from(b'|') || x == i32::from(b'\\')));
+    if display_special {
+        (unsafe { crate::keycodes::get_special_key_name(key, modifiers) }, pos)
+    } else {
+        (vec![key as u8], pos)
+    }
+}
+
+/// Convert a whole internal key string to printable notation
+/// (`str2special_save`).
+///
+/// # Safety
+/// Forwarded from [`str2special`].
+#[must_use]
+pub unsafe fn str2special_save(
+    input: &[u8],
+    replace_spaces: bool,
+    replace_others: crate::types_defs::TriState,
+) -> Vec<u8> {
+    let end = input.iter().position(|&b| b == 0).unwrap_or(input.len());
+    let mut pos = 0;
+    let mut result = Vec::new();
+    while pos < end {
+        let (text, consumed) =
+            unsafe { str2special(&input[pos..end], replace_spaces, replace_others) };
+        if consumed == 0 {
+            break;
+        }
+        result.extend_from_slice(&text);
+        pos += consumed;
+    }
+    result
 }
 
 /// Replace the external-message chunk array and return the old one
@@ -1067,6 +1160,92 @@ pub(crate) mod tests {
 
         unsafe { msg_cursor_goto(4, 7) };
         assert_eq!(unsafe { crate::ui::ui_test_cursor_state() }, (88, 4, 72, true));
+    }
+
+    #[test]
+    fn str2special_save_keeps_plain_text_and_formats_controls() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                str2special_save(
+                    b"abc",
+                    true,
+                    crate::types_defs::TriState::True,
+                )
+            },
+            b"abc"
+        );
+        assert_eq!(
+            unsafe {
+                str2special_save(
+                    &[crate::ascii_defs::CTRL_A],
+                    true,
+                    crate::types_defs::TriState::True,
+                )
+            },
+            b"<C-A>"
+        );
+    }
+
+    #[test]
+    fn str2special_save_formats_named_keys_and_modifiers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let input = crate::keycodes::special_to_buf(
+            crate::keycodes_defs::K_UP,
+            i32::from(crate::keycodes_defs::MOD_MASK_SHIFT),
+            false,
+        );
+        assert_eq!(
+            unsafe {
+                str2special_save(
+                    &input,
+                    true,
+                    crate::types_defs::TriState::True,
+                )
+            },
+            b"<S-Up>"
+        );
+    }
+
+    #[test]
+    fn str2special_save_replaces_spaces_and_selected_punctuation() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                str2special_save(
+                    b" <|\\",
+                    true,
+                    crate::types_defs::TriState::True,
+                )
+            },
+            b"<Space><lt><Bar><Bslash>"
+        );
+        assert_eq!(
+            unsafe {
+                str2special_save(
+                    b" <|\\",
+                    false,
+                    crate::types_defs::TriState::False,
+                )
+            },
+            b" <|\\"
+        );
+    }
+
+    #[test]
+    fn str2special_save_unescapes_a_multibyte_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let escaped = crate::keycodes::vim_strsave_escape_ks("é".as_bytes());
+        assert_eq!(
+            unsafe {
+                str2special_save(
+                    &escaped,
+                    true,
+                    crate::types_defs::TriState::True,
+                )
+            },
+            "é".as_bytes()
+        );
     }
 
     #[test]
