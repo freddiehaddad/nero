@@ -728,6 +728,27 @@ pub fn linefeed<C: VTermStateCallbacks>(state: &mut VTermState, callbacks: &mut 
     }
 }
 
+pub fn control_backspace(state: &mut VTermState) {
+    if state.pos.col > 0 {
+        state.pos.col -= 1;
+    }
+}
+
+#[cfg(test)]
+mod control_backspace_tests {
+    use super::*;
+    #[test]
+    fn backspace_moves_left_without_underflow() {
+        let mut state = VTermState::new(1, 10);
+        state.pos.col = 2;
+        control_backspace(&mut state);
+        assert_eq!(state.pos.col, 1);
+        state.pos.col = 0;
+        control_backspace(&mut state);
+        assert_eq!(state.pos.col, 0);
+    }
+}
+
 pub fn on_resize<C: VTermStateCallbacks>(
     state: &mut VTermState,
     callbacks: &mut C,
