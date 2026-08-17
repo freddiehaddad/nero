@@ -1369,6 +1369,30 @@ pub fn callback_free(callback: &mut Callback) {
     *callback = Callback::None;
 }
 
+/// Copy a callback into a typval, incrementing held references
+/// (`callback_put`).
+///
+/// # Safety
+/// A non-null partial pointer must point to a live [`PartialT`], and
+/// function-registry state must not be mutated concurrently.
+pub unsafe fn callback_put(callback: &Callback, tv: &mut TypvalT) {
+    tv.value = match callback {
+        Callback::Partial(partial) => {
+            if !partial.is_null() {
+                unsafe { (**partial).pt_refcount += 1 };
+            }
+            TypvalValue::Partial(*partial)
+        }
+        Callback::Funcref(name) => {
+            crate::eval::userfunc::func_ref(Some(name));
+            TypvalValue::Func(Some(name.clone()))
+        }
+        Callback::Lua(_) | Callback::None => {
+            TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null)
+        }
+    };
+}
+
 /// Get a function from a dictionary, storing it into `result`, and
 /// return whether this succeeded (`tv_dict_get_callback`).
 ///
@@ -6606,6 +6630,35 @@ mod tests {
         let mut cb = Callback::None;
         callback_free(&mut cb);
         assert_eq!(cb.kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn callback_put_copies_funcref_partial_and_none_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tv = TypvalT::default();
+        unsafe { callback_put(&Callback::Funcref(b"MyFunc".to_vec()), &mut tv) };
+        assert!(matches!(
+            &tv.value,
+            TypvalValue::Func(Some(name)) if name == b"MyFunc"
+        ));
+
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            ..Default::default()
+        }));
+        let mut partial_tv = TypvalT::default();
+        let mut callback = Callback::Partial(partial);
+        unsafe { callback_put(&callback, &mut partial_tv) };
+        assert_eq!(unsafe { (*partial).pt_refcount }, 2);
+        unsafe { tv_clear_simple(&partial_tv) };
+        callback_free(&mut callback);
+
+        let mut none_tv = TypvalT::default();
+        unsafe { callback_put(&Callback::None, &mut none_tv) };
+        assert_eq!(
+            none_tv.value,
+            TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null)
+        );
     }
 
     // ---- tv_dict_get_callback -----------------------------------------
