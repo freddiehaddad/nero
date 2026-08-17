@@ -2158,6 +2158,46 @@ pub unsafe fn qf_get_cur_valid_idx(eap: &crate::ex_cmds_defs::ExargT) -> i32 {
     index.max(1)
 }
 
+/// Move older/newer in the quickfix or location-list stack
+/// (`qf_age`).
+///
+/// The original's boundary messages and quickfix display-buffer
+/// refresh are omitted; stack selection, count handling, and movement
+/// are complete.
+///
+/// # Safety
+/// Forwarded from `qf_cmd_get_stack`.
+pub unsafe fn qf_age(eap: &crate::ex_cmds_defs::ExargT) {
+    let qi = unsafe { qf_cmd_get_stack(eap) };
+    if qi.is_null() {
+        return;
+    }
+    let qi = unsafe { &mut *qi };
+    let mut count = if eap.addr_count != 0 {
+        eap.line2
+    } else {
+        1
+    };
+    while count > 0 {
+        count -= 1;
+        if matches!(
+            eap.cmdidx,
+            crate::ex_cmds_defs::CmdIdxT::colder
+                | crate::ex_cmds_defs::CmdIdxT::lolder
+        ) {
+            if qi.qf_curlist == 0 {
+                break;
+            }
+            qi.qf_curlist -= 1;
+        } else {
+            if qi.qf_curlist >= qi.qf_listcount - 1 {
+                break;
+            }
+            qi.qf_curlist += 1;
+        }
+    }
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -6700,6 +6740,60 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unsafe { qf_get_cur_valid_idx(&eap) }, 1);
+    }
+
+    #[test]
+    fn qf_age_moves_older_newer_and_stops_at_stack_boundaries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 3);
+        stack.qf_listcount = 3;
+        stack.qf_curlist = 1;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+
+        let older = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::colder,
+            ..Default::default()
+        };
+        unsafe { qf_age(&older) };
+        assert_eq!(unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_curlist, 0);
+
+        let newer_two = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::cnewer,
+            addr_count: 1,
+            line2: 2,
+            ..Default::default()
+        };
+        unsafe { qf_age(&newer_two) };
+        assert_eq!(unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_curlist, 2);
+
+        unsafe { qf_age(&newer_two) };
+        assert_eq!(
+            unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_curlist,
+            2,
+            "newer stops at the top"
+        );
+    }
+
+    #[test]
+    fn qf_age_is_a_noop_without_a_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 1));
+        let mut win = WinT::default();
+        let winp = &mut win as *mut WinT;
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                winp,
+            )
+        };
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::lolder,
+            ..Default::default()
+        };
+        unsafe { qf_age(&eap) };
     }
 
     #[test]
