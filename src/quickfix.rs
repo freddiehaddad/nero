@@ -1299,6 +1299,69 @@ fn qf_getprop_keys2flags(
     flags
 }
 
+/// Add default quickfix property values to `retdict`
+/// (`qf_getprop_defaults`).
+///
+/// # Safety
+/// Touches list/dict GC state and, for window/buffer properties, the
+/// global window and buffer lists.
+#[allow(dead_code)]
+unsafe fn qf_getprop_defaults(
+    qi: Option<&crate::types_defs::QfInfoT>,
+    flags: i32,
+    locstack: bool,
+    retdict: &mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    use qf_getlist_flag as flag;
+    let mut status = crate::vim_defs::OK;
+    if flags & flag::TITLE != 0 {
+        status = crate::eval::typval::tv_dict_add_str(retdict, b"title", Some(b""));
+    }
+    if status == crate::vim_defs::OK && flags & flag::ITEMS != 0 {
+        let list = crate::eval::typval::tv_list_alloc(0);
+        status = unsafe { crate::eval::typval::tv_dict_add_list(retdict, b"items", list) };
+        if status != crate::vim_defs::OK {
+            unsafe { crate::eval::typval::tv_list_unref(list) };
+        }
+    }
+    for (bit, key, value) in [
+        (flag::NR, &b"nr"[..], 0),
+        (
+            flag::WINID,
+            &b"winid"[..],
+            i64::from(unsafe {
+                qf_winid(qi.map_or(std::ptr::null(), |q| q as *const _))
+            }),
+        ),
+        (flag::ID, &b"id"[..], 0),
+        (flag::IDX, &b"idx"[..], 0),
+        (flag::SIZE, &b"size"[..], 0),
+        (flag::TICK, &b"changedtick"[..], 0),
+    ] {
+        if status == crate::vim_defs::OK && flags & bit != 0 {
+            status = crate::eval::typval::tv_dict_add_nr(retdict, key, value);
+        }
+    }
+    if status == crate::vim_defs::OK && flags & flag::CONTEXT != 0 {
+        status = crate::eval::typval::tv_dict_add_str(retdict, b"context", Some(b""));
+    }
+    if status == crate::vim_defs::OK && locstack && flags & flag::FILEWINID != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(retdict, b"filewinid", 0);
+    }
+    if status == crate::vim_defs::OK && flags & flag::QFBUFNR != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            retdict,
+            b"qfbufnr",
+            i64::from(unsafe { qf_getprop_qfbufnr(qi) }),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::QFTF != 0 {
+        status =
+            crate::eval::typval::tv_dict_add_str(retdict, b"quickfixtextfunc", Some(b""));
+    }
+    status
+}
+
 /// Select a quickfix-list index from the `"nr"`/`"id"` request keys
 /// (`qf_getprop_qfidx`).
 #[allow(dead_code)]
@@ -1614,6 +1677,41 @@ mod qf_nth_valid_tests {
             crate::eval::typval_defs::TypvalValue::Func(Some(name)) if name == b"MyFunc"
         ));
         unsafe { crate::eval::typval::tv_dict_free(result) };
+    }
+
+    #[test]
+    fn qf_getprop_defaults_populates_every_requested_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let dict_ref = unsafe { &mut *dict };
+        assert_eq!(
+            unsafe {
+                qf_getprop_defaults(
+                    None,
+                    qf_getlist_flag::ALL,
+                    true,
+                    dict_ref,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(dict_ref.dv_index.len(), 12);
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_string(Some(dict_ref), b"title") },
+            Some(Vec::new())
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(dict_ref), b"nr") },
+            0
+        );
+        let items = crate::eval::typval::tv_dict_find(Some(dict_ref), b"items").unwrap();
+        assert!(matches!(
+            unsafe { &(*items).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::List(list) if !list.is_null()
+        ));
+        assert!(crate::eval::typval::tv_dict_find(Some(dict_ref), b"filewinid").is_some());
+        assert!(crate::eval::typval::tv_dict_find(Some(dict_ref), b"quickfixtextfunc").is_some());
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
     }
 }
 
