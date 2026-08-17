@@ -7488,6 +7488,36 @@ pub unsafe fn did_set_smoothscroll(
     None
 }
 
+/// Process an updated terminal `'scrollback'` value
+/// (`did_set_scrollback`).
+///
+/// Decreasing scrollback on a live terminal needs
+/// `on_scrollback_option_changed`, still part of terminal-buffer
+/// integration. Every other path is complete.
+///
+/// # Safety
+/// `args.os_buf` must point to a live `BufT`.
+pub unsafe fn did_set_scrollback(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = unsafe { &*(args.os_buf as *const crate::buffer_defs::BufT) };
+    let old_value = match args.os_oldval {
+        crate::option_defs::OptVal::Number(value) => value,
+        _ => 0,
+    };
+    let value = match args.os_newval {
+        crate::option_defs::OptVal::Number(value) => value,
+        _ => 0,
+    };
+    if !buf.terminal.is_null() && value < old_value {
+        unimplemented!(
+            "did_set_scrollback: shrinking a live terminal needs \
+             on_scrollback_option_changed"
+        );
+    }
+    None
+}
+
 /// Process the updated `'textwidth'` option value
 /// (`did_set_textwidth`).
 ///
@@ -8596,6 +8626,48 @@ mod did_set_title_tests {
         let mut args = fold_args(crate::option_defs::OptIndex::Smoothscroll, &mut win);
         assert_eq!(unsafe { did_set_smoothscroll(&mut args) }, None);
         assert_eq!(win.w_skipcol, 12, "w_skipcol must survive turning it ON");
+    }
+
+    #[test]
+    fn did_set_scrollback_ignores_nonterminal_buffers_and_increases() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut std::ffi::c_void,
+            os_oldval: crate::option_defs::OptVal::Number(100),
+            os_newval: crate::option_defs::OptVal::Number(50),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_scrollback(&mut args) }, None);
+
+        let mut terminal = crate::types_defs::TerminalT::default();
+        let mut buf = crate::buffer_defs::BufT {
+            terminal: &mut terminal,
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut std::ffi::c_void,
+            os_oldval: crate::option_defs::OptVal::Number(50),
+            os_newval: crate::option_defs::OptVal::Number(100),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_scrollback(&mut args) }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "on_scrollback_option_changed")]
+    fn did_set_scrollback_shrinking_a_live_terminal_needs_terminal_integration() {
+        let mut terminal = crate::types_defs::TerminalT::default();
+        let mut buf = crate::buffer_defs::BufT {
+            terminal: &mut terminal,
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut std::ffi::c_void,
+            os_oldval: crate::option_defs::OptVal::Number(100),
+            os_newval: crate::option_defs::OptVal::Number(50),
+            ..Default::default()
+        };
+        let _ = unsafe { did_set_scrollback(&mut args) };
     }
 
     #[test]
