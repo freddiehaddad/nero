@@ -791,6 +791,14 @@ pub fn control_tabstop(state: &mut VTermState) {
     state.set_col_tabstop(state.pos.col);
 }
 
+pub fn control_next_line<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+) {
+    linefeed(state, callbacks);
+    state.pos.col = 0;
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -859,6 +867,13 @@ mod control_backspace_tests {
         state.pos.col = 3;
         control_tabstop(&mut state);
         assert!(state.is_col_tabstop(3));
+    }
+    #[test]
+    fn next_line_control_moves_down_and_returns() {
+        let mut state = VTermState::new(2, 10);
+        state.pos.col = 4;
+        control_next_line(&mut state, &mut ());
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 0 });
     }
 }
 
