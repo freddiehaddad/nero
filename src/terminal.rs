@@ -19,7 +19,8 @@
 //! `convert_modifiers` translates Neovim's key modifier state and
 //! modifier-encoded key codes to libvterm's modifier mask;
 //! `terminal_check_cursor` follows the terminal cursor and viewport;
-//! `get_rgb` converts a libvterm color to Neovim's packed RGB value.
+//! `get_rgb` converts a libvterm color to Neovim's packed RGB value;
+//! [`terminal_set_streamed_paste`] transitions bracketed paste state.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -48,6 +49,23 @@ pub fn terminal_running(term: &TerminalT) -> bool {
 #[must_use]
 pub fn terminal_suspended(term: &TerminalT) -> bool {
     term.suspended
+}
+
+#[must_use]
+pub fn terminal_set_streamed_paste(
+    term: &mut TerminalT,
+    mode: crate::vterm_defs::VTermKeyboardMode,
+    streamed: bool,
+) -> Vec<u8> {
+    let output = if term.streamed_paste == streamed {
+        Vec::new()
+    } else if streamed {
+        crate::vterm::keyboard::vterm_keyboard_start_paste(mode)
+    } else {
+        crate::vterm::keyboard::vterm_keyboard_end_paste(mode)
+    };
+    term.streamed_paste = streamed;
+    output
 }
 
 /// Converts a terminal screen row to its buffer line number
@@ -306,6 +324,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(get_rgb(&state, indexed), 0x00AA_BBCC);
+    }
+
+    #[test]
+    fn streamed_paste_emits_markers_only_when_state_changes() {
+        let mut term = TerminalT::default();
+        let mode = crate::vterm_defs::VTermKeyboardMode {
+            bracketpaste: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            terminal_set_streamed_paste(&mut term, mode, true),
+            b"\x1b[200~"
+        );
+        assert!(term.streamed_paste);
+        assert!(terminal_set_streamed_paste(&mut term, mode, true).is_empty());
+        assert_eq!(
+            terminal_set_streamed_paste(&mut term, mode, false),
+            b"\x1b[201~"
+        );
+        assert!(!term.streamed_paste);
     }
 
     struct ModMaskGuard {

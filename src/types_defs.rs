@@ -244,6 +244,8 @@ pub struct TerminalT {
     pub suspended: bool,
     /// Whether the terminal has closed (`closed`).
     pub closed: bool,
+    /// Whether a streamed paste is currently active (`streamed_paste`).
+    pub streamed_paste: bool,
     /// Cursor position and presentation requested by libvterm (`cursor`).
     pub cursor: TerminalCursorT,
 }
