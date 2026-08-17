@@ -930,6 +930,22 @@ pub unsafe fn did_set_encoding(
     None
 }
 
+/// Process an updated `'messagesopt'` value
+/// (`did_set_messagesopt`).
+pub fn did_set_messagesopt(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_mopt
+        .clone()
+        .unwrap_or_default();
+    if crate::message::messagesopt_changed(&value) {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
 /// The `'helplang'` option is changed (`did_set_helplang`).
 ///
 /// Validates a comma-separated list of exactly-2-letter language
@@ -4801,6 +4817,43 @@ mod tests {
         };
         assert_eq!(unsafe { did_set_encoding(&mut args) }, None);
         assert_eq!(value, Some(b"macroman".to_vec()));
+    }
+
+    struct MessagesoptValueGuard(Option<Vec<u8>>);
+
+    impl MessagesoptValueGuard {
+        fn set(value: &[u8]) -> Self {
+            let old = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                .p_mopt
+                .replace(value.to_vec());
+            Self(old)
+        }
+    }
+
+    impl Drop for MessagesoptValueGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mopt = self.0.take();
+        }
+    }
+
+    #[test]
+    fn did_set_messagesopt_accepts_the_default_shape() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _value = MessagesoptValueGuard::set(b"hit-enter,history:500,progress:c");
+        assert_eq!(
+            did_set_messagesopt(&mut crate::option_defs::OptsetT::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn did_set_messagesopt_rejects_a_value_without_history() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _value = MessagesoptValueGuard::set(b"wait:10");
+        assert_eq!(
+            did_set_messagesopt(&mut crate::option_defs::OptsetT::default()),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
     }
 
     // ---- did_set_backupext_or_patchmode ----
