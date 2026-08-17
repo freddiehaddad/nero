@@ -580,6 +580,39 @@ pub fn resize_buffer_no_reflow(
     fields.lineinfos[buffer_index] = Some(new_info);
 }
 
+pub fn resize_buffer(
+    screen: &mut VTermScreen,
+    buffer_index: usize,
+    new_rows: i32,
+    new_cols: i32,
+    active: bool,
+    fields: &mut crate::vterm_defs::VTermStateFields,
+) {
+    resize_buffer_no_reflow(
+        screen,
+        buffer_index,
+        new_rows,
+        new_cols,
+        active,
+        fields,
+    );
+}
+
+#[cfg(test)]
+mod resize_buffer_wrapper_tests {
+    use super::*;
+    #[test]
+    fn resize_buffer_wrapper_resizes_owned_buffer() {
+        let mut screen = screen_new(1, 1);
+        let mut fields = crate::vterm_defs::VTermStateFields {
+            pos: Default::default(),
+            lineinfos: screen.lineinfo.clone(),
+        };
+        resize_buffer(&mut screen, 0, 2, 2, true, &mut fields);
+        assert_eq!(screen.buffers[0].as_ref().unwrap().len(), 4);
+    }
+}
+
 pub fn resize<C: VTermScreenCallbacks>(
     screen: &mut VTermScreen,
     callbacks: &mut C,
