@@ -2876,6 +2876,73 @@ pub unsafe fn get_qfline_items(
     crate::vim_defs::OK
 }
 
+/// Add quickfix/location-list entries to `list` (`get_errorlist`).
+///
+/// A null `qi_arg` selects the global quickfix stack, unless `wp` is
+/// supplied, in which case that window's location-list stack is used.
+/// `qf_idx == INVALID_QFIDX` selects the current list. A positive
+/// `eidx` selects one 1-based entry; zero returns every entry.
+///
+/// # Safety
+/// The supplied stack/window/List pointers and every buffer pointer
+/// reachable from their entries must remain valid. Touches the global
+/// quickfix stack, global buffer list, and List/Dict GC registries.
+#[allow(dead_code)]
+unsafe fn get_errorlist(
+    qi_arg: *const crate::types_defs::QfInfoT,
+    wp: Option<&crate::buffer_defs::WinT>,
+    mut qf_idx: i32,
+    eidx: i32,
+    list: *mut crate::eval::typval_defs::ListT,
+) -> i32 {
+    let mut qi = qi_arg;
+    if qi.is_null() {
+        let global = unsafe { &*QL_INFO.as_ptr() };
+        qi = global
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        if let Some(wp) = wp {
+            qi = if is_ll_window(wp) {
+                wp.w_llist_ref
+            } else {
+                wp.w_llist
+            };
+        }
+        if qi.is_null() {
+            return crate::vim_defs::FAIL;
+        }
+    }
+
+    if eidx < 0 {
+        return crate::vim_defs::OK;
+    }
+
+    let qi = unsafe { &*qi };
+    if qf_idx == INVALID_QFIDX {
+        qf_idx = qi.qf_curlist;
+    }
+    if qf_idx >= qi.qf_listcount {
+        return crate::vim_defs::FAIL;
+    }
+    let Some(qfl) = qf_get_list(qi, qf_idx) else {
+        return crate::vim_defs::FAIL;
+    };
+    if qf_list_empty(Some(qfl)) {
+        return crate::vim_defs::FAIL;
+    }
+
+    for (idx, entry) in (1_i32..).zip(&qfl.qf_entries) {
+        if eidx > 0 {
+            if eidx == idx {
+                return unsafe { get_qfline_items(entry, list) };
+            }
+        } else if unsafe { get_qfline_items(entry, list) } == crate::vim_defs::FAIL {
+            return crate::vim_defs::FAIL;
+        }
+    }
+    crate::vim_defs::OK
+}
+
 /// Find the first window in the current tab page showing a normal
 /// buffer (`qf_find_win_with_normal_buf`).
 ///
@@ -7981,6 +8048,157 @@ mod tests {
             0
         );
         assert!(crate::eval::typval::tv_dict_find(Some(dict), b"user_data").is_none());
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_errorlist_appends_every_entry_from_the_current_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_curlist: 0,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT { qf_lnum: 3, ..Default::default() },
+                    QflineT { qf_lnum: 7, ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        assert_eq!(
+            unsafe {
+                get_errorlist(
+                    std::ptr::from_ref(&qi),
+                    None,
+                    INVALID_QFIDX,
+                    0,
+                    list,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_errorlist_selects_one_entry_by_its_one_based_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT { qf_lnum: 3, ..Default::default() },
+                    QflineT { qf_lnum: 7, ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::from_ref(&qi), None, 0, 2, list) },
+            crate::vim_defs::OK
+        );
+        let item = unsafe { crate::eval::typval::tv_list_first(list) };
+        let crate::eval::typval_defs::TypvalValue::Dict(dict) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            panic!("entry must be a dict");
+        };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(Some(&mut **dict), b"lnum")
+            },
+            7
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_errorlist_handles_negative_entries_and_invalid_lists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::from_ref(&qi), None, 0, -1, list) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 0);
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::from_ref(&qi), None, 1, 0, list) },
+            crate::vim_defs::FAIL
+        );
+        let empty = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT::default()],
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::from_ref(&empty), None, 0, 0, list) },
+            crate::vim_defs::FAIL
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_errorlist_uses_a_windows_location_list_when_no_stack_is_supplied() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT { qf_lnum: 11, ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+        let win = crate::buffer_defs::WinT {
+            w_llist: qi_ptr,
+            ..Default::default()
+        };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::null(), Some(&win), 0, 0, list) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 1);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_errorlist_uses_the_global_stack_or_fails_before_initialization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = QlInfoGuard::save();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        *unsafe { QL_INFO.get_mut() } = None;
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::null(), None, 0, 0, list) },
+            crate::vim_defs::FAIL
+        );
+
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT { qf_lnum: 15, ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(
+            unsafe { get_errorlist(std::ptr::null(), None, 0, 0, list) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 1);
         unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 }
