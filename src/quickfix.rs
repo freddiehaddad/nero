@@ -2279,6 +2279,26 @@ pub unsafe fn f_setqflist(
     unsafe { set_qf_ll_list(None, argvars, rettv) };
 }
 
+/// `setloclist({nr}, {list} [, {action} [, {what}]])`
+/// (`f_setloclist`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`] and
+/// `set_qf_ll_list`.
+pub unsafe fn f_setloclist(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(-1);
+    let Some(win_arg) = argvars.first() else {
+        return;
+    };
+    let win = unsafe { crate::window::find_win_by_nr_or_id(win_arg) };
+    if !win.is_null() {
+        unsafe { set_qf_ll_list(Some(win), &argvars[1..], rettv) };
+    }
+}
+
 /// Add a quickfix list's `'quickfixtextfunc'` callback to a result
 /// dictionary (`qf_getprop_qftf`).
 ///
@@ -10269,6 +10289,102 @@ mod tests {
             unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_listcount,
             0
         );
+    }
+
+    #[test]
+    fn setloclist_builtin_populates_the_current_windows_location_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_onebuf_opt.wo_lhi = 3;
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 11, 1, Some(true)),
+            )
+        };
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(0),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(list),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                crate::eval::funcs::call_internal_func(
+                    b"setloclist",
+                    &args,
+                    &mut rettv,
+                )
+            },
+            crate::eval::userfunc::FnameTransError::None
+        );
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::Number(0)
+        );
+        let location = unsafe { (*win_ptr).w_llist };
+        assert!(!location.is_null());
+        assert_eq!(
+            unsafe { (&(*location).qf_lists)[0].qf_entries[0].qf_lnum },
+            11
+        );
+        assert_eq!(
+            unsafe { (&(*location).qf_lists)[0].qf_title.as_deref() },
+            Some(&b":setloclist()"[..])
+        );
+
+        unsafe {
+            qf_free_all(Some(win_ptr));
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn setloclist_builtin_returns_minus_one_for_an_unknown_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(-1),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(list),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                crate::eval::funcs::call_internal_func(
+                    b"setloclist",
+                    &args,
+                    &mut rettv,
+                )
+            },
+            crate::eval::userfunc::FnameTransError::None
+        );
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::Number(-1)
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 
     #[test]

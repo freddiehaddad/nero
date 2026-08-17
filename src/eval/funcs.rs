@@ -479,6 +479,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getqflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: crate::quickfix::f_getqflist });
         m.insert(&b"setqflist"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: crate::quickfix::f_setqflist });
         m.insert(&b"getloclist"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: BASE_NONE, func: crate::quickfix::f_getloclist });
+        m.insert(&b"setloclist"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 2, func: crate::quickfix::f_setloclist });
         m.insert(&b"getjumplist"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_getjumplist });
         m.insert(&b"getmarklist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getmarklist });
         m.insert(&b"getchangelist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getchangelist });
@@ -8675,6 +8676,7 @@ mod tests {
             "getqflist",
             "setqflist",
             "getloclist",
+            "setloclist",
             "executable",
             "exepath",
             "and",
