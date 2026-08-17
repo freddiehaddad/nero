@@ -1391,6 +1391,34 @@ unsafe fn qf_setprop_qftf(
     crate::vim_defs::OK
 }
 
+/// Add a quickfix list's `'quickfixtextfunc'` callback to a result
+/// dictionary (`qf_getprop_qftf`).
+///
+/// # Safety
+/// Callback-held partial/function references must be live, and
+/// function-registry state must not be mutated concurrently.
+#[allow(dead_code)]
+unsafe fn qf_getprop_qftf(
+    qfl: &QfListT,
+    result: &mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    if qfl.qf_qftf_cb.kind() == crate::eval::typval_defs::CallbackType::None {
+        return crate::eval::typval::tv_dict_add_str(
+            result,
+            b"quickfixtextfunc",
+            Some(b""),
+        );
+    }
+
+    let mut value = crate::eval::typval_defs::TypvalT::default();
+    unsafe { crate::eval::typval::callback_put(&qfl.qf_qftf_cb, &mut value) };
+    let status = unsafe {
+        crate::eval::typval::tv_dict_add_tv(result, b"quickfixtextfunc", &value)
+    };
+    unsafe { crate::eval::typval::tv_clear_simple(&value) };
+    status
+}
+
 #[cfg(test)]
 mod qf_nth_valid_tests {
     use super::*;
@@ -1525,6 +1553,45 @@ mod qf_nth_valid_tests {
         );
         crate::eval::typval::callback_free(&mut qfl.qf_qftf_cb);
         unsafe { crate::eval::typval::tv_dict_item_free(item) };
+    }
+
+    #[test]
+    fn getprop_qftf_adds_empty_or_function_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let result = crate::eval::typval::tv_dict_alloc();
+        let mut qfl = QfListT::default();
+        assert_eq!(
+            unsafe { qf_getprop_qftf(&qfl, &mut *result) },
+            crate::vim_defs::OK
+        );
+        let empty = crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *result }),
+            b"quickfixtextfunc",
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*empty).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::String(Some(value)) if value.is_empty()
+        ));
+        unsafe { crate::eval::typval::tv_dict_free(result) };
+
+        qfl.qf_qftf_cb =
+            crate::eval::typval_defs::Callback::Funcref(b"MyFunc".to_vec());
+        let result = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_getprop_qftf(&qfl, &mut *result) },
+            crate::vim_defs::OK
+        );
+        let function = crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *result }),
+            b"quickfixtextfunc",
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*function).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::Func(Some(name)) if name == b"MyFunc"
+        ));
+        unsafe { crate::eval::typval::tv_dict_free(result) };
     }
 }
 
