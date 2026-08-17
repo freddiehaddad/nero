@@ -1762,6 +1762,21 @@ pub fn qf_getprop_title(
     )
 }
 
+/// Add the quickfix list context to `retdict` (`qf_getprop_ctx`).
+///
+/// # Safety
+/// Forwarded from `tv_dict_add_tv` for a present context.
+pub unsafe fn qf_getprop_ctx(
+    qfl: &QfListT,
+    retdict: &mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    if let Some(context) = qfl.qf_ctx.as_deref() {
+        unsafe { crate::eval::typval::tv_dict_add_tv(retdict, b"context", context) }
+    } else {
+        crate::eval::typval::tv_dict_add_str(retdict, b"context", Some(b""))
+    }
+}
+
 /// Adds the file-window id associated with a location-list window to
 /// `retdict` (`qf_getprop_filewinid`).
 ///
@@ -5954,6 +5969,46 @@ mod tests {
         assert!(matches!(
             unsafe { &(*item).di_tv.value },
             crate::eval::typval_defs::TypvalValue::String(None)
+        ));
+    }
+
+    #[test]
+    fn qf_getprop_ctx_copies_a_present_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+        let qfl = QfListT {
+            qf_ctx: Some(Box::new(crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(42),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { qf_getprop_ctx(&qfl, dict.get()) },
+            crate::vim_defs::OK
+        );
+        let item =
+            crate::eval::typval::tv_dict_find(Some(dict.get()), b"context").unwrap();
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::Number(42)
+        ));
+    }
+
+    #[test]
+    fn qf_getprop_ctx_uses_an_empty_string_when_absent() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+        assert_eq!(
+            unsafe { qf_getprop_ctx(&QfListT::default(), dict.get()) },
+            crate::vim_defs::OK
+        );
+        let item =
+            crate::eval::typval::tv_dict_find(Some(dict.get()), b"context").unwrap();
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::String(Some(value))
+                if value.is_empty()
         ));
     }
 
