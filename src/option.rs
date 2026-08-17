@@ -7770,12 +7770,9 @@ pub unsafe fn did_set_scrollback(
 /// Process an updated `'chistory'` or `'lhistory'` value
 /// (`did_set_xhistory`).
 ///
-/// The global quickfix stack (`'chistory'`) path is complete.
-/// Location-list resizing still needs `ll_get_or_alloc_list` and its
-/// location-list lifetime management.
-///
 /// # Safety
-/// `args.os_varp` must point to the live option value.
+/// `args.os_varp` must point to the live option value; `args.os_win`
+/// must point to a live `WinT` for `'lhistory'`.
 pub unsafe fn did_set_xhistory(
     args: &mut crate::option_defs::OptsetT,
 ) -> Option<&'static [u8]> {
@@ -7792,9 +7789,12 @@ pub unsafe fn did_set_xhistory(
             )
         };
     } else {
-        unimplemented!(
-            "did_set_xhistory: lhistory resizing needs ll_get_or_alloc_list"
-        );
+        unsafe {
+            crate::quickfix::ll_resize_stack(
+                args.os_win as *mut crate::buffer_defs::WinT,
+                i32::try_from(value).expect("validated lhistory fits i32"),
+            )
+        };
     }
     None
 }
@@ -9176,17 +9176,6 @@ mod did_set_title_tests {
             ..Default::default()
         };
         let _ = unsafe { did_set_scrollback(&mut args) };
-    }
-
-    #[test]
-    #[should_panic(expected = "ll_get_or_alloc_list")]
-    fn did_set_xhistory_local_path_needs_location_list_lifetime_management() {
-        let mut value: crate::types_defs::OptInt = 5;
-        let mut args = crate::option_defs::OptsetT {
-            os_varp: (&mut value as *mut crate::types_defs::OptInt).cast(),
-            ..Default::default()
-        };
-        let _ = unsafe { did_set_xhistory(&mut args) };
     }
 
     #[test]

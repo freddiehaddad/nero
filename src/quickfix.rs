@@ -112,6 +112,12 @@ use crate::garray_defs::GarrayT;
 static QUICKFIX_BUSY: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 
+/// Location-list stacks whose deletion was requested while quickfix
+/// processing was active (`qf_delq_head`, represented as a Vec).
+static QF_DELETE_QUEUE: std::sync::LazyLock<
+    crate::globals::GlobalCell<Vec<*mut crate::types_defs::QfInfoT>>,
+> = std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Vec::new()));
+
 /// Delay location-list destruction while quickfix code holds references
 /// (`incr_quickfix_busy`).
 ///
@@ -1928,6 +1934,55 @@ pub fn qf_free_lists(qi: &mut crate::types_defs::QfInfoT) {
     qi.qf_curlist = 0;
 }
 
+/// Release one location-list stack reference (`ll_free_all`).
+///
+/// # Safety
+/// `slot` must point to a live stack pointer allocated via
+/// `Box::into_raw`. A stack with a live quickfix display buffer still
+/// needs `wipe_qf_buffer` and is explicitly deferred.
+unsafe fn ll_free_all(slot: *mut *mut crate::types_defs::QfInfoT) {
+    let qi = unsafe { *slot };
+    if qi.is_null() {
+        return;
+    }
+    unsafe { *slot = std::ptr::null_mut() };
+    if unsafe { *QUICKFIX_BUSY.get_mut() } > 0 {
+        unsafe { QF_DELETE_QUEUE.get_mut() }.push(qi);
+        return;
+    }
+
+    unsafe { (*qi).qf_refcount -= 1 };
+    if unsafe { (*qi).qf_refcount } < 1 {
+        if unsafe { (*qi).qf_bufnr } != INVALID_QFBUFNR {
+            unimplemented!(
+                "ll_free_all: releasing a displayed location list needs wipe_qf_buffer"
+            );
+        }
+        let mut stack = unsafe { Box::from_raw(qi) };
+        qf_free_lists(&mut stack);
+    }
+}
+
+/// Get or allocate a window's location-list stack
+/// (`ll_get_or_alloc_list`).
+///
+/// # Safety
+/// `wp` must point to a live `WinT`; any existing location-list
+/// pointer must satisfy [`ll_free_all`]'s requirements.
+unsafe fn ll_get_or_alloc_list(wp: *mut WinT) -> *mut crate::types_defs::QfInfoT {
+    if is_ll_window(unsafe { &*wp }) {
+        return unsafe { (*wp).w_llist_ref };
+    }
+
+    unsafe { ll_free_all(std::ptr::addr_of_mut!((*wp).w_llist_ref)) };
+    if unsafe { (*wp).w_llist }.is_null() {
+        let count = i32::try_from(unsafe { (*wp).w_onebuf_opt.wo_lhi }).unwrap_or(0);
+        let stack = Box::new(qf_alloc_stack(QfltypeT::Location, count));
+        unsafe { (*wp).w_llist = Box::into_raw(stack) };
+    }
+    unsafe { (*wp).w_llist }
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -1937,7 +1992,7 @@ pub fn qf_free_lists(qi: &mut crate::types_defs::QfInfoT) {
 /// one for a location list. That choice is a storage decision
 /// belonging to the caller - [`qf_init_stack`] now makes it for the
 /// quickfix stack by installing the result into `QL_INFO`, while the
-/// location-list side still awaits the per-window `w_llist` wiring.
+/// location-list side is wired by `ll_get_or_alloc_list`.
 /// The refcount difference between the two IS preserved here, since it
 /// is part of the returned value rather than of where it lives.
 #[must_use]
@@ -2139,6 +2194,21 @@ pub unsafe fn qf_resize_stack(n: i32) {
         .as_mut()
         .expect("qf_resize_stack: the global quickfix stack is not initialized");
     qf_resize_stack_base(qi, n);
+}
+
+/// Resize a window's location-list stack (`ll_resize_stack`).
+///
+/// # Safety
+/// `wp` must point to a live `WinT`; the global window list must be
+/// valid for the lhistory synchronization helpers.
+pub unsafe fn ll_resize_stack(wp: *mut WinT, n: i32) {
+    if is_ll_window(unsafe { &*wp }) {
+        unsafe { qf_sync_llw_to_win(wp) };
+    } else {
+        unsafe { qf_sync_win_to_llw(wp) };
+    }
+    let qi = unsafe { ll_get_or_alloc_list(wp) };
+    qf_resize_stack_base(unsafe { &mut *qi }, n);
 }
 
 /// Prepare a new, empty list at the top of the stack (`qf_new_list`).
@@ -5949,6 +6019,81 @@ mod tests {
         let qi = qf_alloc_stack(QfltypeT::Quickfix, 0);
         assert!(qi.qf_lists.is_empty());
         assert!(qf_stack_empty(Some(&qi)));
+    }
+
+    #[test]
+    fn ll_get_or_alloc_list_allocates_and_reuses_a_normal_windows_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_lhi: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let winp = &mut win as *mut WinT;
+
+        let first = unsafe { ll_get_or_alloc_list(winp) };
+        let second = unsafe { ll_get_or_alloc_list(winp) };
+        assert_eq!(first, second);
+        assert_eq!(unsafe { (*first).qf_maxcount }, 4);
+        assert_eq!(unsafe { (*first).qf_refcount }, 1);
+
+        unsafe { ll_free_all(std::ptr::addr_of_mut!((*winp).w_llist)) };
+        assert!(unsafe { (*winp).w_llist }.is_null());
+    }
+
+    #[test]
+    fn ll_get_or_alloc_list_uses_a_location_list_windows_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        let stackp = Box::into_raw(Box::new(qf_alloc_stack(QfltypeT::Location, 3)));
+        let mut buf = BufT {
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        };
+        let bufp = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: bufp,
+            w_llist_ref: stackp,
+            ..Default::default()
+        };
+        let winp = &mut win as *mut WinT;
+
+        assert_eq!(unsafe { ll_get_or_alloc_list(winp) }, stackp);
+        assert!(unsafe { (*winp).w_llist }.is_null());
+        unsafe { drop(Box::from_raw(stackp)) };
+    }
+
+    #[test]
+    fn ll_resize_stack_and_xhistory_callback_resize_a_windows_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _windows = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_lhi: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let winp = &mut win as *mut WinT;
+        unsafe { ll_resize_stack(winp, 4) };
+        assert_eq!(unsafe { (*(*winp).w_llist).qf_maxcount }, 4);
+
+        let mut value: crate::types_defs::OptInt = 6;
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: (&mut value as *mut crate::types_defs::OptInt).cast(),
+            os_win: winp.cast(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { crate::option::did_set_xhistory(&mut args) }, None);
+        assert_eq!(unsafe { (*(*winp).w_llist).qf_maxcount }, 6);
+
+        unsafe { ll_free_all(std::ptr::addr_of_mut!((*winp).w_llist)) };
     }
 
     #[test]
