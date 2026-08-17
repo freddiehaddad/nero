@@ -473,6 +473,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"diff_filler"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::diff::f_diff_filler });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
+        m.insert(&b"getcellwidths"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcellwidths });
         m.insert(&b"getjumplist"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_getjumplist });
         m.insert(&b"getmarklist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getmarklist });
         m.insert(&b"getchangelist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getchangelist });
@@ -646,6 +647,7 @@ unsafe fn f_len(argvars: &[TypvalT], rettv: &mut TypvalT) {
         TypvalValue::String(_) | TypvalValue::Number(_) => {
             crate::eval::typval::tv_get_string(&argvars[0]).len() as crate::eval::typval_defs::VarnumberT
         }
+
         // SAFETY: forwarded from this function's own safety doc.
         TypvalValue::Blob(b) => crate::eval::typval_defs::VarnumberT::from(unsafe { crate::eval::typval::tv_blob_len(*b) }),
         // SAFETY: forwarded from this function's own safety doc.
@@ -656,6 +658,24 @@ unsafe fn f_len(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
         _ => return,
     });
+}
+
+/// Return the user-configured character-width intervals
+/// (`f_getcellwidths`).
+unsafe fn f_getcellwidths(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let table = unsafe { &*crate::mbyte::CW_TABLE.as_ptr() };
+    let result = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, table.len() as isize)
+    };
+    for interval in table {
+        let entry = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(entry, interval.first);
+            crate::eval::typval::tv_list_append_number(entry, interval.last);
+            crate::eval::typval::tv_list_append_number(entry, i64::from(interval.width));
+            crate::eval::typval::tv_list_append_list(result, entry);
+        }
+    }
 }
 
 /// `type({expr})` - a number identifying `{expr}`'s own type
@@ -8427,9 +8447,42 @@ mod tests {
     // --- new-builtin table registration ---
 
     #[test]
+    fn getcellwidths_returns_configured_interval_lists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = std::mem::take(unsafe { crate::mbyte::CW_TABLE.get_mut() });
+        unsafe { crate::mbyte::CW_TABLE.get_mut() }.extend([
+            crate::mbyte::CellWidthInterval { first: 0x100, last: 0x10F, width: 1 },
+            crate::mbyte::CellWidthInterval { first: 0x200, last: 0x20F, width: 2 },
+        ]);
+        let mut result = TypvalT::default();
+        unsafe { f_getcellwidths(&[], &mut result) };
+        let list = match &result.value {
+            TypvalValue::List(list) => *list,
+            _ => panic!("expected list"),
+        };
+        assert_eq!(unsafe { (*list).lv_len }, 2);
+        let first = unsafe { (*list).lv_first };
+        let inner = match unsafe { &(*first).li_tv.value } {
+            TypvalValue::List(inner) => *inner,
+            _ => panic!("expected interval list"),
+        };
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_list_find_nr(inner, 0, None) },
+            0x100
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_list_find_nr(inner, 2, None) },
+            1
+        );
+        *unsafe { crate::mbyte::CW_TABLE.get_mut() } = saved;
+        unsafe { crate::eval::typval::tv_clear_simple(&result) };
+    }
+
+    #[test]
     fn new_builtins_are_all_registered() {
         for name in [
             "getcharmod",
+            "getcellwidths",
             "executable",
             "exepath",
             "and",
