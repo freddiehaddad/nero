@@ -90,7 +90,9 @@
 //! Also [`cin_isinit`] - `"[typedef] [static|public|protected|
 //! private] enum"`, falling back to [`cin_is_compound_init`].
 //! Also [`parse_cino`] - the complete `'cinoptions'` parser and
-//! buffer-local indentation-cache initializer.
+//! buffer-local indentation-cache initializer - plus
+//! [`did_set_shiftwidth_tabstop`], its real option callback shared by
+//! `'shiftwidth'` and `'tabstop'`.
 //!
 //! Deferred: everything else - `cin_iswhileofdo_end`/
 //! `cin_is_cpp_baseclass`/`cin_isfuncdecl` (need `find_match_paren`
@@ -250,6 +252,26 @@ pub fn parse_cino(buf: &mut crate::buffer_defs::BufT) {
         }
         pos += usize::from(cino.get(pos) == Some(&b','));
     }
+}
+
+/// Process a changed `'shiftwidth'` or `'tabstop'` option
+/// (`did_set_shiftwidth_tabstop`).
+///
+/// # Safety
+/// `args.os_buf` and `args.os_win` must point to live `BufT` and
+/// `WinT` values. The latter is forwarded to `fold_update_all`.
+pub unsafe fn did_set_shiftwidth_tabstop(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let bufp = args.os_buf as *mut crate::buffer_defs::BufT;
+    let winp = args.os_win as *mut crate::buffer_defs::WinT;
+    if crate::fold::foldmethod_is_indent(unsafe { &*winp }) {
+        unsafe { crate::fold::fold_update_all(winp) };
+    }
+    if args.os_idx == crate::option_defs::OptIndex::Shiftwidth || unsafe { (*bufp).b_p_sw } == 0 {
+        unsafe { parse_cino(&mut *bufp) };
+    }
+    None
 }
 
 /// Correct `'cinkeys'` maximum paren search distance for a start
@@ -1693,6 +1715,109 @@ mod tests {
         let buf = parsed_cino(b"x99,e");
         assert_eq!(buf.b_ind_level, 4);
         assert_eq!(buf.b_ind_open_imag, 0);
+    }
+
+    #[test]
+    fn did_set_shiftwidth_reparses_cinoptions() {
+        let mut buf = BufT {
+            b_p_sw: 4,
+            b_p_ts: 8,
+            b_p_cino: Some(b">2s".to_vec()),
+            b_ind_level: 99,
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let bufp = &mut buf as *mut BufT;
+        let winp = &mut win as *mut crate::buffer_defs::WinT;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Shiftwidth,
+            os_buf: bufp.cast(),
+            os_win: winp.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_shiftwidth_tabstop(&mut args) }, None);
+        assert_eq!(unsafe { (*bufp).b_ind_level }, 8);
+    }
+
+    #[test]
+    fn did_set_tabstop_skips_reparse_when_shiftwidth_is_nonzero() {
+        let mut buf = BufT {
+            b_p_sw: 4,
+            b_p_ts: 8,
+            b_p_cino: Some(b">2s".to_vec()),
+            b_ind_level: 99,
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let bufp = &mut buf as *mut BufT;
+        let winp = &mut win as *mut crate::buffer_defs::WinT;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Tabstop,
+            os_buf: bufp.cast(),
+            os_win: winp.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_shiftwidth_tabstop(&mut args) }, None);
+        assert_eq!(unsafe { (*bufp).b_ind_level }, 99);
+    }
+
+    #[test]
+    fn did_set_tabstop_reparses_when_shiftwidth_uses_tabstop() {
+        let mut buf = BufT {
+            b_p_sw: 0,
+            b_p_ts: 8,
+            b_p_cino: Some(b">2s".to_vec()),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let bufp = &mut buf as *mut BufT;
+        let winp = &mut win as *mut crate::buffer_defs::WinT;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Tabstop,
+            os_buf: bufp.cast(),
+            os_win: winp.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_shiftwidth_tabstop(&mut args) }, None);
+        assert_eq!(unsafe { (*bufp).b_ind_level }, 16);
+    }
+
+    #[test]
+    fn did_set_shiftwidth_invalidates_indent_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _must_redraw = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.must_redraw,
+                0,
+            )
+        };
+        let mut buf = BufT {
+            b_p_sw: 4,
+            b_p_ts: 8,
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdm: Some(b"indent".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bufp = &mut buf as *mut BufT;
+        let winp = &mut win as *mut crate::buffer_defs::WinT;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Shiftwidth,
+            os_buf: bufp.cast(),
+            os_win: winp.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_shiftwidth_tabstop(&mut args) }, None);
+        assert!(unsafe { (*winp).w_foldinvalid });
+        assert_eq!(unsafe { (*winp).w_redr_type }, crate::drawscreen::UPD_NOT_VALID);
     }
 
     #[test]
