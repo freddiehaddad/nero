@@ -7903,6 +7903,51 @@ pub fn remove_comma_item(s: &mut Vec<u8>, item: usize, item_len: usize) {
     }
 }
 
+/// Find an exact item in a comma-separated option value
+/// (`find_dup_item`).
+///
+/// Commas preceded by an odd number of backslashes are literal;
+/// commas preceded by an even number are separators.
+#[must_use]
+pub fn find_dup_item(
+    origval: Option<&[u8]>,
+    newval: &[u8],
+    flags: u32,
+) -> Option<usize> {
+    let origval = origval?;
+    let end = origval
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(origval.len());
+    let mut backslashes = 0usize;
+
+    for pos in 0..end {
+        let starts_item = flags & crate::option_defs::opt_flags::COMMA == 0
+            || pos == 0
+            || (origval[pos - 1] == b',' && backslashes.is_multiple_of(2));
+        let after = pos + newval.len();
+        let ends_item = flags & crate::option_defs::opt_flags::COMMA == 0
+            || after == end
+            || origval.get(after) == Some(&b',');
+        if starts_item
+            && after <= end
+            && origval[pos..after] == *newval
+            && ends_item
+        {
+            return Some(pos);
+        }
+
+        if (pos > 1 && origval[pos - 1] == b'\\' && origval[pos - 2] != b',')
+            || (pos == 1 && origval[0] == b'\\')
+        {
+            backslashes += 1;
+        } else {
+            backslashes = 0;
+        }
+    }
+    None
+}
+
 /// Find a comma-separated item matching `key[..key_len]`
 /// (`find_key_item`), returning its offset and full item length.
 #[must_use]
@@ -9163,6 +9208,63 @@ mod did_set_title_tests {
         let mut s = b"/a,/b,/c".to_vec();
         remove_comma_item(&mut s, 0, 2);
         assert_eq!(s, b"/b,/c");
+    }
+
+    #[test]
+    fn find_dup_item_matches_whole_comma_separated_items() {
+        assert_eq!(
+            find_dup_item(
+                Some(b"alpha,beta,gamma"),
+                b"beta",
+                crate::option_defs::opt_flags::COMMA,
+            ),
+            Some(6)
+        );
+        assert_eq!(
+            find_dup_item(
+                Some(b"alphabet,beta"),
+                b"alpha",
+                crate::option_defs::opt_flags::COMMA,
+            ),
+            None
+        );
+        assert_eq!(
+            find_dup_item(None, b"alpha", crate::option_defs::opt_flags::COMMA),
+            None
+        );
+    }
+
+    #[test]
+    fn find_dup_item_respects_escaped_comma_parity() {
+        assert_eq!(
+            find_dup_item(
+                Some(b"a\\,b,c"),
+                b"b",
+                crate::option_defs::opt_flags::COMMA,
+            ),
+            None
+        );
+        assert_eq!(
+            find_dup_item(
+                Some(b"a\\,b,c"),
+                b"c",
+                crate::option_defs::opt_flags::COMMA,
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            find_dup_item(
+                Some(b"a\\\\,b"),
+                b"b",
+                crate::option_defs::opt_flags::COMMA,
+            ),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn find_dup_item_without_comma_flag_matches_substrings() {
+        assert_eq!(find_dup_item(Some(b"alphabet"), b"pha", 0), Some(2));
     }
 
     #[test]
