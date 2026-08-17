@@ -134,22 +134,39 @@ pub fn on_sos<F: VTermStateFallbacks>(
     i32::from(fallbacks.sos(fragment))
 }
 
-pub fn on_osc<C: VTermStateCallbacks, F: VTermStateFallbacks>(
+pub fn on_osc<
+    C: VTermStateCallbacks,
+    S: VTermSelectionCallbacks,
+    F: VTermStateFallbacks,
+>(
+    state: &mut VTermState,
     callbacks: &mut C,
+    selection_callbacks: Option<&mut S>,
     fallbacks: &mut F,
     command: i32,
     fragment: crate::vterm_defs::VTermStringFragment<'_>,
 ) -> i32 {
+    let set_string = |state: &mut VTermState,
+                      callbacks: &mut C,
+                      prop: crate::vterm_defs::VTermProp| {
+        let value = crate::vterm_defs::VTermValue::String(fragment);
+        let _ = vterm_state_set_termprop(state, Some(callbacks), prop, &value);
+    };
     match command {
         0 => {
-            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::IconName, fragment);
-            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::Title, fragment);
+            set_string(state, callbacks, crate::vterm_defs::VTermProp::IconName);
+            set_string(state, callbacks, crate::vterm_defs::VTermProp::Title);
         }
         1 => {
-            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::IconName, fragment);
+            set_string(state, callbacks, crate::vterm_defs::VTermProp::IconName);
         }
         2 => {
-            let _ = settermprop_string(callbacks, crate::vterm_defs::VTermProp::Title, fragment);
+            set_string(state, callbacks, crate::vterm_defs::VTermProp::Title);
+        }
+        52 => {
+            if let Some(selection_callbacks) = selection_callbacks {
+                osc_selection(state, selection_callbacks, fragment);
+            }
         }
         _ => {}
     }
@@ -200,12 +217,23 @@ mod osc_title_tests {
     }
     #[test]
     fn osc_zero_sets_icon_and_title() {
+        let mut state = VTermState::new(1, 1);
         let mut capture = Capture::default();
         let fragment = crate::vterm_defs::VTermStringFragment {
             bytes: b"x", initial: true, final_fragment: true,
             terminator: crate::vterm_defs::VTermTerminator::Bel,
         };
-        assert_eq!(on_osc(&mut capture, &mut (), 0, fragment), 0);
+        assert_eq!(
+            on_osc(
+                &mut state,
+                &mut capture,
+                None::<&mut ()>,
+                &mut (),
+                0,
+                fragment,
+            ),
+            0
+        );
         assert_eq!(
             capture.0,
             [
@@ -213,6 +241,38 @@ mod osc_title_tests {
                 crate::vterm_defs::VTermProp::Title,
             ]
         );
+    }
+
+    #[test]
+    fn osc_fifty_two_routes_to_selection_before_fallback() {
+        #[derive(Default)]
+        struct Selection(bool);
+        impl VTermSelectionCallbacks for Selection {
+            fn query(&mut self, _: crate::vterm_defs::VTermSelectionMask) -> bool {
+                self.0 = true;
+                true
+            }
+        }
+        let mut state = VTermState::new(1, 1);
+        let mut selection = Selection::default();
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"c;?",
+            initial: true,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::Bel,
+        };
+        assert_eq!(
+            on_osc(
+                &mut state,
+                &mut (),
+                Some(&mut selection),
+                &mut (),
+                52,
+                fragment,
+            ),
+            0
+        );
+        assert!(selection.0);
     }
 }
 
