@@ -122,6 +122,32 @@ pub fn vterm_screen_set_callbacks<C>(
     host.callbacks = callbacks;
 }
 
+pub struct VTermScreenFallbackHost<F> {
+    pub fallbacks: Option<F>,
+}
+
+pub fn vterm_screen_set_unrecognised_fallbacks<F>(
+    host: &mut VTermScreenFallbackHost<F>,
+    fallbacks: Option<F>,
+) {
+    host.fallbacks = fallbacks;
+}
+
+#[cfg(test)]
+mod screen_fallback_setter_tests {
+    use super::*;
+    #[test]
+    fn screen_fallback_setter_installs_and_removes_fallbacks() {
+        let mut host = VTermScreenFallbackHost {
+            fallbacks: None::<u8>,
+        };
+        vterm_screen_set_unrecognised_fallbacks(&mut host, Some(9));
+        assert_eq!(host.fallbacks, Some(9));
+        vterm_screen_set_unrecognised_fallbacks(&mut host, None);
+        assert_eq!(host.fallbacks, None);
+    }
+}
+
 #[cfg(test)]
 mod screen_callback_setter_tests {
     use super::*;
