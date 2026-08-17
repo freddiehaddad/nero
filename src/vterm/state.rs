@@ -3356,7 +3356,13 @@ pub fn vterm_state_reset<C: VTermStateCallbacks>(
     callbacks: &mut C,
     hard: bool,
 ) {
+    let old_lineinfos = state.lineinfos[state.active_lineinfo].clone();
     state.reset(hard);
+    for row in 0..state.rows {
+        let new = state.lineinfos[state.active_lineinfo][row as usize];
+        let old = old_lineinfos.get(row as usize).copied().unwrap_or_default();
+        let _ = callbacks.set_line_info(row, &new, &old);
+    }
     let _ = callbacks.init_pen();
     state.reset_pen(callbacks);
     let _ = settermprop_bool(
@@ -3450,7 +3456,7 @@ mod state_reset_callback_tests {
     #[test]
     fn state_reset_initializes_props_and_hard_erases() {
         #[derive(Default)]
-        struct Capture { props: usize, erased: usize }
+        struct Capture { props: usize, erased: usize, lineinfos: usize }
         impl VTermStateCallbacks for Capture {
             fn set_term_prop(
                 &mut self,
@@ -3460,6 +3466,15 @@ mod state_reset_callback_tests {
             fn erase(&mut self, _: crate::vterm_defs::VTermRect, _: bool) -> bool {
                 self.erased += 1; true
             }
+            fn set_line_info(
+                &mut self,
+                _: i32,
+                _: &crate::vterm_defs::VTermLineInfo,
+                _: &crate::vterm_defs::VTermLineInfo,
+            ) -> bool {
+                self.lineinfos += 1;
+                true
+            }
         }
         let mut state = VTermState::new(2, 2);
         state.initialize_pen_colors();
@@ -3467,6 +3482,7 @@ mod state_reset_callback_tests {
         vterm_state_reset(&mut state, &mut capture, true);
         assert_eq!(capture.props, 3);
         assert_eq!(capture.erased, 1);
+        assert_eq!(capture.lineinfos, 2);
     }
 }
 
