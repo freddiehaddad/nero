@@ -29,8 +29,9 @@ use crate::extmark_defs::{
     BcountT, ExtmarkOp, ExtmarkSavePos, ExtmarkSplice, ExtmarkUndoObject, ExtmarkUndoVecT,
 };
 use crate::marktree::{
-    marktree_get_altpos, marktree_itr_current, marktree_itr_get, marktree_itr_next, marktree_splice,
-    mt_end, mt_invalid, mt_invalidate, mt_lookup_key, mt_no_undo, mt_paired, mt_right,
+    marktree_get_alt, marktree_get_altpos, marktree_itr_current, marktree_itr_get,
+    marktree_itr_next, marktree_lookup_ns, marktree_splice, mt_end, mt_invalid, mt_invalidate,
+    mt_lookup_key, mt_no_undo, mt_paired, mt_right, mtpair_from,
 };
 use crate::marktree_defs::MarkTreeIter;
 use crate::pos_defs::{ColnrT, LinenrT};
@@ -40,6 +41,19 @@ use crate::types_defs::TriState;
 /// `inserted_bytes` must not do one itself (`curbuf_splice_pending`).
 pub static CURBUF_SPLICE_PENDING: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
+
+/// Look up an extmark and its paired end mark by namespace and id
+/// (`extmark_from_id`).
+#[must_use]
+pub fn extmark_from_id(buf: &BufT, ns_id: u32, id: u32) -> crate::marktree_defs::MtPair {
+    let mark = marktree_lookup_ns(&buf.b_marktree, ns_id, id, false, None);
+    if mark.id == 0 {
+        return mtpair_from(mark.clone(), &mark);
+    }
+    debug_assert!(mark.pos.row >= 0);
+    let end = marktree_get_alt(&buf.b_marktree, &mark, None);
+    mtpair_from(mark, &end)
+}
 
 /// Invalidate extmarks between a range and copy them to the undo
 /// header (`extmark_splice_delete`).
@@ -432,6 +446,28 @@ pub unsafe fn extmark_splice_cols(
 mod tests {
     use super::*;
     use crate::undo_defs::UHeader;
+
+    #[test]
+    fn extmark_from_id_returns_invalid_or_paired_positions() {
+        let mut buf = BufT::default();
+        let missing = extmark_from_id(&buf, 2, 7);
+        assert_eq!(missing.start.id, 0);
+        assert_eq!(missing.end_pos.row, -1);
+
+        let key = crate::marktree_defs::MtKey {
+            pos: crate::marktree_defs::MtPos::new(1, 2),
+            ns: 2,
+            id: 7,
+            flags: crate::marktree::mt_flags(false, false, false, false),
+            decor_data: crate::decoration_defs::DecorInlineData {
+                hl: crate::decoration_defs::DecorHighlightInline::default(),
+            },
+        };
+        crate::marktree::marktree_put(&mut buf.b_marktree, key, 3, 4, false);
+        let pair = extmark_from_id(&buf, 2, 7);
+        assert_eq!(pair.start.pos, crate::marktree_defs::MtPos::new(1, 2));
+        assert_eq!(pair.end_pos, crate::marktree_defs::MtPos::new(3, 4));
+    }
 
     fn new_header() -> *mut UHeader {
         Box::into_raw(Box::new(UHeader::default()))
