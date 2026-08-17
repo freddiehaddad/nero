@@ -384,6 +384,30 @@ pub unsafe fn decor_type_flags(decor: &crate::decoration_defs::DecorInline) -> u
     }
 }
 
+/// Replace cached sign/conceal glyphs with their first codepoint
+/// (`decor_check_invalid_glyphs`).
+///
+/// # Safety
+/// Must not run concurrently with decoration or glyph-cache state.
+pub unsafe fn decor_check_invalid_glyphs() {
+    for item in unsafe { DECOR_ITEMS.get_mut() } {
+        let width = if item.flags & crate::decoration_defs::SH_IS_SIGN != 0 {
+            crate::types_defs::SIGN_WIDTH as usize
+        } else if item.flags & crate::decoration_defs::SH_CONCEAL != 0 {
+            1
+        } else {
+            0
+        };
+        for glyph in &mut item.text[..width] {
+            if crate::grid::schar_high(*glyph) {
+                *glyph = crate::grid::schar_from_char(
+                    crate::grid::schar_get_first_codepoint(*glyph),
+                );
+            }
+        }
+    }
+}
+
 /// Find inline virtual text at `row`, optionally restricted to a
 /// namespace (`decor_find_virttext`).
 ///
@@ -803,6 +827,27 @@ mod tests {
 
         assert_eq!(decor_find_virttext(&buf, 3, 9).unwrap().col, 7);
         assert!(decor_find_virttext(&buf, 3, 8).is_none());
+    }
+
+    #[test]
+    fn decor_check_invalid_glyphs_replaces_cached_sign_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = std::mem::take(unsafe { DECOR_ITEMS.get_mut() });
+        let cached = crate::grid::schar_from_buf("A\u{301}\u{302}".as_bytes());
+        assert!(crate::grid::schar_high(cached));
+        let mut item = DecorSignHighlight {
+            flags: crate::decoration_defs::SH_IS_SIGN,
+            ..Default::default()
+        };
+        item.text[0] = cached;
+        unsafe { DECOR_ITEMS.get_mut() }.push(item);
+
+        unsafe { decor_check_invalid_glyphs() };
+        let got = unsafe { DECOR_ITEMS.get_mut() }[0].text[0];
+        *unsafe { DECOR_ITEMS.get_mut() } = saved;
+
+        assert!(!crate::grid::schar_high(got));
+        assert_eq!(crate::grid::schar_get_first_codepoint(got), i32::from(b'A'));
     }
     use crate::buffer_defs::{BufT, WinoptT};
     use crate::decoration_defs::{DecorSignHighlight, DecorVirtText, VirtTextPos};
