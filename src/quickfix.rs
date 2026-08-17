@@ -3165,6 +3165,23 @@ pub unsafe fn f_getqflist(
     unsafe { get_qf_loc_list(true, None, what, rettv) };
 }
 
+/// `getloclist({nr} [, {what}])` (`f_getloclist`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`] and
+/// [`get_qf_loc_list`].
+pub unsafe fn f_getloclist(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let unknown = crate::eval::typval_defs::TypvalT::default();
+    let wp = argvars.first().map_or(std::ptr::null_mut(), |arg| {
+        unsafe { crate::window::find_win_by_nr_or_id(arg) }
+    });
+    let what = argvars.get(1).unwrap_or(&unknown);
+    unsafe { get_qf_loc_list(false, wp.as_ref(), what, rettv) };
+}
+
 /// Find the first window in the current tab page showing a normal
 /// buffer (`qf_find_win_with_normal_buf`).
 ///
@@ -8921,5 +8938,133 @@ mod tests {
             crate::eval::typval::tv_clear_simple(&rettv);
             crate::eval::typval::tv_dict_free(what);
         }
+    }
+
+    #[test]
+    fn getloclist_builtin_returns_the_current_windows_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut location = Box::new(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT { qf_lnum: 12, ..Default::default() }],
+                ..Default::default()
+            }],
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let location_ptr = std::ptr::addr_of_mut!(*location);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_llist: location_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let win_nr = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                crate::eval::funcs::call_internal_func(
+                    b"getloclist",
+                    &[win_nr],
+                    &mut rettv,
+                )
+            },
+            crate::eval::userfunc::FnameTransError::None
+        );
+        assert!(matches!(
+            &rettv.value,
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 1
+        ));
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn getloclist_builtin_accepts_a_property_request_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT::default());
+        let mut location = Box::new(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default(), QflineT::default()],
+                ..Default::default()
+            }],
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let location_ptr = std::ptr::addr_of_mut!(*location);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_llist: location_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"size", 1);
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(0),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Dict(what),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        assert_eq!(
+            unsafe {
+                crate::eval::funcs::call_internal_func(
+                    b"getloclist",
+                    &args,
+                    &mut rettv,
+                )
+            },
+            crate::eval::userfunc::FnameTransError::None
+        );
+        let crate::eval::typval_defs::TypvalValue::Dict(result) = &rettv.value else {
+            panic!("result must be a dict");
+        };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(Some(&mut **result), b"size")
+            },
+            2
+        );
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&rettv);
+            crate::eval::typval::tv_dict_free(what);
+        }
+    }
+
+    #[test]
+    fn getloclist_builtin_returns_an_empty_list_for_an_unknown_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let win_nr = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(-1),
+            ..Default::default()
+        };
+        unsafe { f_getloclist(&[win_nr], &mut rettv) };
+        assert!(matches!(
+            &rettv.value,
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 0
+        ));
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
     }
 }
