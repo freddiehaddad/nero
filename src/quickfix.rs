@@ -2203,7 +2203,6 @@ pub unsafe fn set_errorlist(
 /// # Safety
 /// `wp` and every pointer reachable from `args` must remain valid.
 /// Forwarded from [`set_errorlist`].
-#[allow(dead_code)]
 unsafe fn set_qf_ll_list(
     wp: Option<*mut WinT>,
     args: &[crate::eval::typval_defs::TypvalT],
@@ -2267,6 +2266,17 @@ unsafe fn set_qf_ll_list(
     {
         rettv.value = TypvalValue::Number(0);
     }
+}
+
+/// `setqflist({list} [, {action} [, {what}]])` (`f_setqflist`).
+///
+/// # Safety
+/// Forwarded from `set_qf_ll_list`.
+pub unsafe fn f_setqflist(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    unsafe { set_qf_ll_list(None, argvars, rettv) };
 }
 
 /// Add a quickfix list's `'quickfixtextfunc'` callback to a result
@@ -10182,6 +10192,83 @@ mod tests {
             crate::eval::typval::tv_clear_simple(&rettv);
             crate::eval::typval::tv_dict_free(what);
         }
+    }
+
+    #[test]
+    fn setqflist_builtin_populates_the_global_quickfix_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _ids = LastQfIdGuard::new();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 3));
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 7, 1, Some(true)),
+            )
+        };
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::List(list),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                crate::eval::funcs::call_internal_func(
+                    b"setqflist",
+                    &[arg],
+                    &mut rettv,
+                )
+            },
+            crate::eval::userfunc::FnameTransError::None
+        );
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::Number(0)
+        );
+        let qi = unsafe { QL_INFO.get_mut() }.as_mut().unwrap();
+        assert_eq!(qi.qf_lists[0].qf_entries[0].qf_lnum, 7);
+        assert_eq!(
+            qi.qf_lists[0].qf_title.as_deref(),
+            Some(&b":setqflist()"[..])
+        );
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn setqflist_builtin_returns_minus_one_for_a_non_list_argument() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 3));
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(1),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                crate::eval::funcs::call_internal_func(
+                    b"setqflist",
+                    &[arg],
+                    &mut rettv,
+                )
+            },
+            crate::eval::userfunc::FnameTransError::None
+        );
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::Number(-1)
+        );
+        assert_eq!(
+            unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_listcount,
+            0
+        );
     }
 
     #[test]
