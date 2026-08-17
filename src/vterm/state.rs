@@ -657,16 +657,34 @@ pub fn vterm_state_set_unrecognised_fallbacks<F>(
 
 pub fn vterm_state_set_termprop<C: VTermStateCallbacks>(
     state: &mut VTermState,
-    callbacks: Option<&mut C>,
+    mut callbacks: Option<&mut C>,
     prop: crate::vterm_defs::VTermProp,
     value: &crate::vterm_defs::VTermValue<'_>,
 ) -> i32 {
-    if let Some(callbacks) = callbacks
+    if let Some(callbacks) = callbacks.as_deref_mut()
         && !callbacks.set_term_prop(prop, value)
     {
         return 0;
     }
-    state.set_termprop(prop, value, true)
+    let result = state.set_termprop(prop, value, true);
+    if result != 0
+        && prop == crate::vterm_defs::VTermProp::AltScreen
+        && matches!(value, crate::vterm_defs::VTermValue::Boolean(v) if *v != 0)
+        && let Some(callbacks) = callbacks
+    {
+        erase(
+            state,
+            callbacks,
+            crate::vterm_defs::VTermRect {
+                start_row: 0,
+                end_row: state.rows,
+                start_col: 0,
+                end_col: state.cols,
+            },
+            false,
+        );
+    }
+    result
 }
 
 #[cfg(test)]
@@ -685,6 +703,41 @@ mod state_termprop_entry_tests {
             1
         );
         assert!(state.mode.cursor_visible);
+    }
+
+    #[test]
+    fn state_termprop_entry_erases_when_entering_alt_screen() {
+        #[derive(Default)]
+        struct Capture(usize);
+        impl VTermStateCallbacks for Capture {
+            fn set_term_prop(
+                &mut self,
+                _: crate::vterm_defs::VTermProp,
+                _: &crate::vterm_defs::VTermValue<'_>,
+            ) -> bool {
+                true
+            }
+
+            fn erase(&mut self, _: crate::vterm_defs::VTermRect, _: bool) -> bool {
+                self.0 += 1;
+                true
+            }
+        }
+
+        let mut state = VTermState::new(2, 3);
+        let mut capture = Capture::default();
+        assert_eq!(
+            vterm_state_set_termprop(
+                &mut state,
+                Some(&mut capture),
+                crate::vterm_defs::VTermProp::AltScreen,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+            ),
+            1
+        );
+        assert!(state.mode.alt_screen);
+        assert_eq!(state.active_lineinfo, 1);
+        assert_eq!(capture.0, 1);
     }
 }
 
@@ -971,26 +1024,12 @@ pub fn set_dec_mode<C: VTermStateCallbacks>(
             state.set_mouse_protocol_mode(number, value);
         }
         1047 | 1049 => {
-            if set_state_bool_prop(
+            set_state_bool_prop(
                 state,
                 callbacks,
                 crate::vterm_defs::VTermProp::AltScreen,
                 value,
-            ) != 0
-                && value != 0
-            {
-                erase(
-                    state,
-                    callbacks,
-                    crate::vterm_defs::VTermRect {
-                        start_row: 0,
-                        end_row: state.rows,
-                        start_col: 0,
-                        end_col: state.cols,
-                    },
-                    false,
-                );
-            }
+            );
             if number == 1049 {
                 savecursor(state, value);
             }
