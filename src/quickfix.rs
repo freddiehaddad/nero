@@ -1221,6 +1221,62 @@ fn qf_get_nth_valid_entry(qfl: &QfListT, n: usize, fdo: bool) -> usize {
     1
 }
 
+mod qf_getlist_flag {
+    pub const NONE: i32 = 0;
+    pub const TITLE: i32 = 0x001;
+    pub const ITEMS: i32 = 0x002;
+    pub const NR: i32 = 0x004;
+    pub const WINID: i32 = 0x008;
+    pub const CONTEXT: i32 = 0x010;
+    pub const ID: i32 = 0x020;
+    pub const IDX: i32 = 0x040;
+    pub const SIZE: i32 = 0x080;
+    pub const TICK: i32 = 0x100;
+    pub const FILEWINID: i32 = 0x200;
+    pub const QFBUFNR: i32 = 0x400;
+    pub const QFTF: i32 = 0x800;
+    pub const ALL: i32 = 0xFFF;
+}
+
+/// Convert requested dictionary keys to quickfix property flags
+/// (`qf_getprop_keys2flags`).
+#[allow(dead_code)]
+fn qf_getprop_keys2flags(
+    what: &mut crate::eval::typval_defs::DictT,
+    loclist: bool,
+) -> i32 {
+    use qf_getlist_flag as flag;
+    if crate::eval::typval::tv_dict_find(Some(what), b"all").is_some() {
+        return if loclist {
+            flag::ALL
+        } else {
+            flag::ALL & !flag::FILEWINID
+        };
+    }
+    let mut flags = flag::NONE;
+    for (key, bit, location_only) in [
+        (b"title".as_slice(), flag::TITLE, false),
+        (b"nr".as_slice(), flag::NR, false),
+        (b"winid".as_slice(), flag::WINID, false),
+        (b"context".as_slice(), flag::CONTEXT, false),
+        (b"id".as_slice(), flag::ID, false),
+        (b"items".as_slice(), flag::ITEMS, false),
+        (b"idx".as_slice(), flag::IDX, false),
+        (b"size".as_slice(), flag::SIZE, false),
+        (b"changedtick".as_slice(), flag::TICK, false),
+        (b"filewinid".as_slice(), flag::FILEWINID, true),
+        (b"qfbufnr".as_slice(), flag::QFBUFNR, false),
+        (b"quickfixtextfunc".as_slice(), flag::QFTF, false),
+    ] {
+        if (!location_only || loclist)
+            && crate::eval::typval::tv_dict_find(Some(what), key).is_some()
+        {
+            flags |= bit;
+        }
+    }
+    flags
+}
+
 #[cfg(test)]
 mod qf_nth_valid_tests {
     use super::*;
@@ -1239,6 +1295,37 @@ mod qf_nth_valid_tests {
         assert_eq!(qf_get_nth_valid_entry(&qfl, 2, false), 3);
         assert_eq!(qf_get_nth_valid_entry(&qfl, 2, true), 4);
         assert_eq!(qf_get_nth_valid_entry(&qfl, 99, false), 1);
+    }
+
+    #[test]
+    fn getprop_keys_map_to_individual_and_all_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let dict_ref = unsafe { &mut *dict };
+        crate::eval::typval::tv_dict_add_nr(dict_ref, b"title", 1);
+        crate::eval::typval::tv_dict_add_nr(dict_ref, b"items", 1);
+        crate::eval::typval::tv_dict_add_nr(dict_ref, b"filewinid", 1);
+        assert_eq!(
+            qf_getprop_keys2flags(dict_ref, false),
+            qf_getlist_flag::TITLE | qf_getlist_flag::ITEMS
+        );
+        assert_eq!(
+            qf_getprop_keys2flags(dict_ref, true),
+            qf_getlist_flag::TITLE
+                | qf_getlist_flag::ITEMS
+                | qf_getlist_flag::FILEWINID
+        );
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
+
+        let all = crate::eval::typval::tv_dict_alloc();
+        let all_ref = unsafe { &mut *all };
+        crate::eval::typval::tv_dict_add_nr(all_ref, b"all", 1);
+        assert_eq!(
+            qf_getprop_keys2flags(all_ref, false),
+            qf_getlist_flag::ALL & !qf_getlist_flag::FILEWINID
+        );
+        assert_eq!(qf_getprop_keys2flags(all_ref, true), qf_getlist_flag::ALL);
+        unsafe { crate::eval::typval::tv_dict_free(all) };
     }
 }
 
