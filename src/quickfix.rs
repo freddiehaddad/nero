@@ -2099,6 +2099,22 @@ pub unsafe fn qf_get_valid_size(eap: &crate::ex_cmds_defs::ExargT) -> usize {
     size
 }
 
+/// Current index of the selected quickfix/location list
+/// (`qf_get_cur_idx`), or zero on an absent stack/list.
+///
+/// # Safety
+/// Forwarded from `qf_cmd_get_stack`.
+#[must_use]
+pub unsafe fn qf_get_cur_idx(eap: &crate::ex_cmds_defs::ExargT) -> usize {
+    let qi = unsafe { qf_cmd_get_stack(eap) };
+    if qi.is_null() {
+        return 0;
+    }
+    qf_get_curlist(unsafe { &*qi }).map_or(0, |list| {
+        usize::try_from(list.qf_index).unwrap_or(0)
+    })
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -6547,6 +6563,42 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unsafe { qf_get_valid_size(&ldo) }, 0);
+    }
+
+    #[test]
+    fn qf_get_cur_idx_reads_the_current_list_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_index = 7;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::copen,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_cur_idx(&eap) }, 7);
+    }
+
+    #[test]
+    fn qf_get_cur_idx_is_zero_without_a_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 1));
+        let mut win = WinT::default();
+        let winp = &mut win as *mut WinT;
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                winp,
+            )
+        };
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::lopen,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_cur_idx(&eap) }, 0);
     }
 
     #[test]
