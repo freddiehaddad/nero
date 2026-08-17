@@ -2257,6 +2257,26 @@ impl VTermState {
         true
     }
 
+    pub fn set_vertical_margins(&mut self, top: i32, bottom: Option<i32>) {
+        self.scrollregion_top = (top.max(1) - 1).clamp(0, self.rows);
+        self.scrollregion_bottom = bottom.unwrap_or(-1).clamp(-1, self.rows);
+        if self.scrollregion_top == 0 && self.scrollregion_bottom == self.rows {
+            self.scrollregion_bottom = -1;
+        }
+        if self.scrollregion_bottom() <= self.scrollregion_top {
+            self.scrollregion_top = 0;
+            self.scrollregion_bottom = -1;
+        }
+        self.pos = if self.mode.origin {
+            crate::vterm_defs::VTermPos {
+                row: self.scrollregion_top,
+                col: self.scrollregion_left(),
+            }
+        } else {
+            Default::default()
+        };
+    }
+
     #[must_use]
     pub fn dec_mode_value(&self, number: i32) -> Option<bool> {
         Some(match number {
@@ -2776,6 +2796,16 @@ mod termprop_state_tests {
         state.scrollregion_left = 1;
         state.csi_position(b'f', 1, 1);
         assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 2, col: 1 });
+    }
+    #[test]
+    fn vertical_margins_validate_and_home_cursor() {
+        let mut state = VTermState::new(24, 80);
+        state.pos.col = 4;
+        state.set_vertical_margins(3, Some(20));
+        assert_eq!((state.scrollregion_top, state.scrollregion_bottom), (2, 20));
+        assert_eq!(state.pos, Default::default());
+        state.set_vertical_margins(20, Some(10));
+        assert_eq!((state.scrollregion_top, state.scrollregion_bottom), (0, -1));
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
