@@ -4077,9 +4077,78 @@ pub unsafe fn win_find_tabpage(win: *const WinT) -> *mut crate::buffer_defs::Tab
     std::ptr::null_mut()
 }
 
+/// Remove a window from a tabpage's doubly-linked window list
+/// (`win_remove`).
+///
+/// # Safety
+/// `wp` and non-null `tp` must point to live values whose window-list
+/// links are well formed. For the current tab (`tp == NULL`),
+/// `GLOBALS.curtab` must point to a live tabpage.
+pub unsafe fn win_remove(
+    wp: *mut crate::buffer_defs::WinT,
+    tp: *mut crate::buffer_defs::TabpageT,
+) {
+    let globals = unsafe { &mut *crate::globals::GLOBALS.as_ptr() };
+    debug_assert!(tp.is_null() || tp != globals.curtab);
+    let prev = unsafe { (*wp).w_prev };
+    let next = unsafe { (*wp).w_next };
+
+    if !prev.is_null() {
+        unsafe { (*prev).w_next = next };
+    } else if tp.is_null() {
+        globals.firstwin = next;
+        unsafe { (*globals.curtab).tp_firstwin = next };
+    } else {
+        unsafe { (*tp).tp_firstwin = next };
+    }
+
+    if !next.is_null() {
+        unsafe { (*next).w_prev = prev };
+    } else if tp.is_null() {
+        globals.lastwin = prev;
+        unsafe { (*globals.curtab).tp_lastwin = prev };
+    } else {
+        unsafe { (*tp).tp_lastwin = prev };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win_remove_unlinks_current_tab_first_and_last_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let mut first = WinT::default();
+        let mut last = WinT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let first_ptr = std::ptr::from_mut(&mut first);
+        let last_ptr = std::ptr::from_mut(&mut last);
+        unsafe {
+            (*first_ptr).w_next = last_ptr;
+            (*last_ptr).w_prev = first_ptr;
+            (*tab_ptr).tp_firstwin = first_ptr;
+            (*tab_ptr).tp_lastwin = last_ptr;
+        }
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, first_ptr)
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastwin, last_ptr)
+        };
+
+        unsafe { win_remove(first_ptr, std::ptr::null_mut()) };
+        assert_eq!(unsafe { (*tab_ptr).tp_firstwin }, last_ptr);
+        assert_eq!(unsafe { (*last_ptr).w_prev }, std::ptr::null_mut());
+
+        unsafe { win_remove(last_ptr, std::ptr::null_mut()) };
+        assert!(unsafe { (*tab_ptr).tp_firstwin }.is_null());
+        assert!(unsafe { (*tab_ptr).tp_lastwin }.is_null());
+    }
 
     // ---- make_snapshot / win_unclose_buffer ----
 
