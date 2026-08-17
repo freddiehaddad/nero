@@ -761,6 +761,15 @@ pub fn control_locking_shift(state: &mut VTermState, control: u8) -> bool {
     true
 }
 
+pub fn control_single_shift(state: &mut VTermState, control: u8) -> bool {
+    match control {
+        0x8E => state.gsingle_set = 2,
+        0x8F => state.gsingle_set = 3,
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -803,6 +812,14 @@ mod control_backspace_tests {
         assert_eq!(state.gl_set, 1);
         assert!(control_locking_shift(&mut state, 0x0F));
         assert_eq!(state.gl_set, 0);
+    }
+    #[test]
+    fn control_single_shift_selects_g2_or_g3() {
+        let mut state = VTermState::new(1, 1);
+        assert!(control_single_shift(&mut state, 0x8E));
+        assert_eq!(state.gsingle_set, 2);
+        assert!(control_single_shift(&mut state, 0x8F));
+        assert_eq!(state.gsingle_set, 3);
     }
 }
 
