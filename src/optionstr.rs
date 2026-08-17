@@ -258,19 +258,18 @@
 //! then updates the folds when `'foldmethod'` is `"expr"`, the same
 //! shape as [`did_set_foldignore`].
 //!
-//! Also [`did_set_winbar`]/[`did_set_tabline`]/
+//! Also [`did_set_statusline`]/[`did_set_winbar`]/[`did_set_tabline`]/
 //! [`did_set_statuscolumn`]/[`did_set_rulerformat`], built on a new
 //! private `did_set_statustabline_rulerformat` shared helper
 //! (unlocked by `check_stl_option` landing earlier in this segment;
 //! the `'rulerformat'` path additionally needed `ui.rs`'s `ui_has`,
 //! `globals.rs`'s `ru_wid` and `drawscreen.rs`'s `comp_col`, all of
 //! which already existed). All five options in that family share one
-//! body in the original; only the `'statusline'` branches remain
-//! untranslated (they need `get_option_default`/`win_config_float`)
-//! and panic if reached, which is provably impossible from these
-//! four wrappers since none of them passes
-//! `OptIndex::Statusline`. `did_set_statusline` is therefore
-//! deliberately NOT exposed yet.
+//! body in the original. Two narrow `'statusline'` branches remain
+//! deferred: resetting an empty global value needs
+//! `get_option_default`, and changing a floating window needs
+//! `win_config_float`. Ordinary nonempty statusline validation is
+//! fully working.
 //!
 //! Also [`did_set_verbosefile`] - closes any currently-open verbose
 //! log file and reopens it when `'verbosefile'` is non-empty, built
@@ -2755,15 +2754,14 @@ pub unsafe fn did_set_foldexpr(args: &mut crate::option_defs::OptsetT) -> Option
 ///   `get_option_default`/`win_config_float`, neither translated;
 /// - the `rulerformat` branch needs `ui_has`, not translated.
 ///
-/// Both are provably unreachable from the three wrappers exposed
-/// today ([`did_set_winbar`], [`did_set_tabline`],
-/// [`did_set_statuscolumn`]), each of which passes
-/// `rulerformat == false` and an `os_idx` that is never
-/// `OptIndex::Statusline` - so those three are fully working.
+/// The two statusline-only branches panic only when their exact
+/// conditions are reached. Ordinary nonempty statusline values on
+/// non-floating windows are validated in full.
 ///
 /// # Safety
 /// `args.os_win` must be a valid, non-null pointer to a live `WinT`
-/// when `statuscolumn` is true. `args.os_varp` must point to a live
+/// when `statuscolumn` is true, and any non-null statusline window
+/// pointer must likewise be valid. `args.os_varp` must point to a live
 /// `Option<Vec<u8>>`. When `rulerformat` is true,
 /// `crate::globals::GLOBALS.firstwin`'s own `w_next` chain must
 /// consist of valid, live `WinT` pointers (forwarded to `comp_col`).
@@ -2787,10 +2785,25 @@ unsafe fn did_set_statustabline_rulerformat(
     let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
     let s: &[u8] = varp.as_deref().unwrap_or(&[]);
 
-    if args.os_idx == crate::option_defs::OptIndex::Statusline {
+    let is_stl = args.os_idx == crate::option_defs::OptIndex::Statusline;
+    let flags = args.os_flags as u32;
+    if is_stl
+        && (flags & crate::option_defs::opt_set_flags::OPT_GLOBAL != 0
+            || flags & crate::option_defs::opt_set_flags::OPT_LOCAL == 0)
+        && s.is_empty()
+    {
         unimplemented!(
-            "did_set_statustabline_rulerformat: the 'statusline' branches need \
-             get_option_default/win_config_float, not translated"
+            "did_set_statustabline_rulerformat: an empty global 'statusline' \
+             needs get_option_default, not translated"
+        );
+    }
+    if is_stl
+        && !args.os_win.is_null()
+        && unsafe { &*(args.os_win as *const crate::buffer_defs::WinT) }.w_floating
+    {
+        unimplemented!(
+            "did_set_statustabline_rulerformat: a floating 'statusline' needs \
+             win_config_float, not translated"
         );
     }
 
@@ -2842,6 +2855,17 @@ unsafe fn did_set_statustabline_rulerformat(
     }
 
     errmsg
+}
+
+/// The `'statusline'` option is changed (`did_set_statusline`).
+///
+/// # Safety
+/// Forwarded from `did_set_statustabline_rulerformat`'s own safety
+/// doc.
+pub unsafe fn did_set_statusline(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    unsafe { did_set_statustabline_rulerformat(args, false, false) }
 }
 
 /// The `'winbar'` option is changed (`did_set_winbar`).
@@ -8171,17 +8195,65 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "get_option_default")]
-    fn statustabline_helper_panics_for_the_statusline_index() {
+    fn did_set_statusline_validates_a_nonempty_local_value() {
         let mut win = crate::buffer_defs::WinT::default();
         let mut val: Option<Vec<u8>> = Some(b"%f".to_vec());
         let mut args = crate::option_defs::OptsetT {
             os_idx: crate::option_defs::OptIndex::Statusline,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
             os_win: &mut win as *mut crate::buffer_defs::WinT as *mut c_void,
             os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
             ..Default::default()
         };
-        let _ = unsafe { did_set_winbar(&mut args) };
+        assert_eq!(unsafe { did_set_statusline(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_statusline_rejects_invalid_statusline_syntax() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"%z".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Statusline,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            os_win: &mut win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_statusline(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "get_option_default")]
+    fn did_set_statusline_empty_global_value_needs_the_default() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Statusline,
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        let _ = unsafe { did_set_statusline(&mut args) };
+    }
+
+    #[test]
+    #[should_panic(expected = "win_config_float")]
+    fn did_set_statusline_floating_window_needs_reconfiguration() {
+        let mut win = crate::buffer_defs::WinT {
+            w_floating: true,
+            ..Default::default()
+        };
+        let mut val: Option<Vec<u8>> = Some(b"%f".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Statusline,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            os_win: &mut win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        let _ = unsafe { did_set_statusline(&mut args) };
     }
 
     // ---- did_set_rulerformat ----
