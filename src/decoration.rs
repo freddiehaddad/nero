@@ -384,6 +384,42 @@ pub unsafe fn decor_type_flags(decor: &crate::decoration_defs::DecorInline) -> u
     }
 }
 
+/// Find inline virtual text at `row`, optionally restricted to a
+/// namespace (`decor_find_virttext`).
+///
+/// The original returns a borrowed pointer into marktree-owned
+/// decoration storage. `marktree_itr_current` returns an owned key in
+/// this translation, so this returns an owned clone instead.
+#[must_use]
+pub fn decor_find_virttext(
+    buf: &BufT,
+    row: i32,
+    ns_id: u64,
+) -> Option<crate::decoration_defs::DecorVirtText> {
+    let mut itr = crate::marktree_defs::MarkTreeIter::default();
+    crate::marktree::marktree_itr_get(&buf.b_marktree, row, 0, &mut itr);
+    loop {
+        let mark = crate::marktree::marktree_itr_current(&itr);
+        if mark.pos.row < 0 || mark.pos.row > row {
+            return None;
+        }
+        if !crate::marktree::mt_invalid(&mark) {
+            let mut decor = crate::marktree::mt_decor_virt(&mark);
+            while decor.is_some_and(|item| {
+                item.flags & crate::decoration_defs::VT_IS_LINES != 0
+            }) {
+                decor = decor.and_then(|item| item.next.as_deref());
+            }
+            if (ns_id == 0 || ns_id == u64::from(mark.ns))
+                && let Some(decor) = decor
+            {
+                return Some(decor.clone());
+            }
+        }
+        crate::marktree::marktree_itr_next(&buf.b_marktree, &mut itr);
+    }
+}
+
 /// Whether the current row likely has another decoration to process
 /// (`decor_has_more_decorations`).
 #[must_use]
@@ -737,6 +773,36 @@ mod tests {
                 | crate::extmark_defs::extmark_type::VIRT_TEXT
                 | crate::extmark_defs::extmark_type::VIRT_LINES) as u16
         );
+    }
+
+    #[test]
+    fn decor_find_virttext_skips_virtual_lines_and_filters_namespace() {
+        let mut buf = BufT::default();
+        let text = DecorVirtText {
+            col: 7,
+            ..Default::default()
+        };
+        let lines = DecorVirtText {
+            flags: crate::decoration_defs::VT_IS_LINES,
+            next: Some(Box::new(text)),
+            ..Default::default()
+        };
+        let key = crate::marktree_defs::MtKey {
+            pos: crate::marktree_defs::MtPos::new(3, 0),
+            ns: 9,
+            id: 1,
+            flags: crate::marktree::mt_flags(false, false, false, true),
+            decor_data: crate::decoration_defs::DecorInlineData {
+                ext: std::mem::ManuallyDrop::new(crate::decoration_defs::DecorExt {
+                    sh_idx: crate::decoration_defs::DECOR_ID_INVALID,
+                    vt: Some(Box::new(lines)),
+                }),
+            },
+        };
+        crate::marktree::marktree_put(&mut buf.b_marktree, key, -1, -1, false);
+
+        assert_eq!(decor_find_virttext(&buf, 3, 9).unwrap().col, 7);
+        assert!(decor_find_virttext(&buf, 3, 8).is_none());
     }
     use crate::buffer_defs::{BufT, WinoptT};
     use crate::decoration_defs::{DecorSignHighlight, DecorVirtText, VirtTextPos};
