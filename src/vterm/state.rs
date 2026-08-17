@@ -962,6 +962,53 @@ pub fn csi_tab_clear(state: &mut VTermState, value: i32) -> bool {
     true
 }
 
+pub fn csi_erase_line<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    value: i32,
+    selective: bool,
+) -> bool {
+    let (start_col, end_col) = match value {
+        0 => (state.pos.col, state.current_row_width()),
+        1 => (0, state.pos.col + 1),
+        2 => (0, state.current_row_width()),
+        _ => return false,
+    };
+    if end_col > start_col {
+        erase(
+            state,
+            callbacks,
+            crate::vterm_defs::VTermRect {
+                start_row: state.pos.row,
+                end_row: state.pos.row + 1,
+                start_col,
+                end_col,
+            },
+            selective,
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod csi_erase_line_tests {
+    use super::*;
+    struct Capture(i32, i32);
+    impl VTermStateCallbacks for Capture {
+        fn erase(&mut self, rect: crate::vterm_defs::VTermRect, _: bool) -> bool {
+            self.0 = rect.start_col; self.1 = rect.end_col; true
+        }
+    }
+    #[test]
+    fn erase_line_selects_requested_range() {
+        let mut state = VTermState::new(1, 10);
+        state.pos.col = 4;
+        let mut capture = Capture(0, 0);
+        assert!(csi_erase_line(&mut state, &mut capture, 1, false));
+        assert_eq!((capture.0, capture.1), (0, 5));
+    }
+}
+
 #[cfg(test)]
 mod csi_tab_clear_tests {
     use super::*;
