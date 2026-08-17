@@ -2164,6 +2164,18 @@ impl VTermState {
         self.default_bg = pen_state.default_bg;
     }
 
+    pub fn set_palette_color(
+        &mut self,
+        index: i32,
+        color: &crate::vterm_defs::VTermColor,
+    ) {
+        if let Ok(index) = usize::try_from(index)
+            && let Some(slot) = self.colors.get_mut(index)
+        {
+            *slot = *color;
+        }
+    }
+
     pub fn reset_pen<C: VTermStateCallbacks>(&mut self, callbacks: &mut C) {
         let mut pen_state = crate::vterm::pen::VTermPenState {
             pen: self.pen,
@@ -2521,6 +2533,17 @@ mod termprop_state_tests {
         state.set_default_colors(Some(&color), None);
         assert!(state.default_fg.is_default_fg());
         assert_eq!(state.default_fg.red, 1);
+    }
+    #[test]
+    fn state_palette_color_wrapper_bounds_checks() {
+        let mut state = VTermState::new(1, 1);
+        let color = crate::vterm_defs::VTermColor {
+            red: 9, ..Default::default()
+        };
+        state.set_palette_color(3, &color);
+        assert_eq!(state.colors[3].red, 9);
+        state.set_palette_color(16, &Default::default());
+        assert_eq!(state.colors[3].red, 9);
     }
     #[test]
     fn reset_pen_restores_state_default_colors() {
