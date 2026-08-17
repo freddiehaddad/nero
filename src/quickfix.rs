@@ -1542,6 +1542,25 @@ unsafe fn qf_setprop_title(
     crate::vim_defs::OK
 }
 
+/// Set a quickfix/location list's context (`qf_setprop_context`).
+///
+/// # Safety
+/// `item` and every pointer reachable from its typval must remain
+/// valid while the value is copied.
+#[allow(dead_code)]
+unsafe fn qf_setprop_context(
+    qfl: &mut QfListT,
+    item: *const crate::eval::typval_defs::DictitemT,
+) -> i32 {
+    if let Some(old) = qfl.qf_ctx.take() {
+        unsafe { crate::eval::typval::tv_clear_simple(&old) };
+    }
+    let mut context = Box::new(crate::eval::typval_defs::TypvalT::default());
+    unsafe { crate::eval::typval::tv_copy(&(*item).di_tv, &mut context) };
+    qfl.qf_ctx = Some(context);
+    crate::vim_defs::OK
+}
+
 /// Add a quickfix list's `'quickfixtextfunc'` callback to a result
 /// dictionary (`qf_getprop_qftf`).
 ///
@@ -1800,6 +1819,59 @@ mod qf_nth_valid_tests {
         );
         assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"keep"[..]));
         unsafe { crate::eval::typval::tv_dict_free(what) };
+    }
+
+    #[test]
+    fn setprop_context_releases_the_old_value_and_copies_the_new_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(old_list);
+            crate::eval::typval::tv_list_ref(old_list);
+        }
+        let mut qfl = QfListT {
+            qf_ctx: Some(Box::new(crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(old_list),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let new_dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*new_dict).dv_refcount += 1 };
+        let what = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *what,
+                b"context",
+                new_dict,
+            )
+        };
+        let item = crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *what }),
+            b"context",
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { qf_setprop_context(&mut qfl, item) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(unsafe { (*old_list).lv_refcount }, 1);
+        assert_eq!(unsafe { (*new_dict).dv_refcount }, 3);
+        assert!(matches!(
+            qfl.qf_ctx.as_deref().map(|context| &context.value),
+            Some(crate::eval::typval_defs::TypvalValue::Dict(dict))
+                if std::ptr::eq(*dict, new_dict)
+        ));
+
+        unsafe { crate::eval::typval::tv_dict_free(what) };
+        qf_free(&mut qfl);
+        assert_eq!(unsafe { (*new_dict).dv_refcount }, 1);
+        unsafe {
+            crate::eval::typval::tv_list_unref(old_list);
+            crate::eval::typval::tv_dict_unref(new_dict);
+        }
     }
 
     #[test]
