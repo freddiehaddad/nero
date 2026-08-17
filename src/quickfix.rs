@@ -1209,6 +1209,134 @@ pub unsafe fn qf_add_entry(
     qf_status::QF_OK
 }
 
+/// Add one quickfix entry from a Vimscript item dictionary
+/// (`qf_add_entry_from_dict`).
+///
+/// Existing-buffer and bufferless entries are complete. Dictionary
+/// `"filename"` values remain behind [`qf_add_entry`]'s documented
+/// filename-to-buffer blocker. The original's once-per-batch E92
+/// message for a missing buffer is deferred with message display; the
+/// entry is still invalidated and its buffer number cleared.
+///
+/// # Safety
+/// Touches the global buffer list, character-class table, and
+/// List/Dict/Partial reference counts reachable from `dict`.
+pub unsafe fn qf_add_entry_from_dict(
+    qfl: &mut QfListT,
+    dict: *mut crate::eval::typval_defs::DictT,
+    _first_entry: bool,
+    valid_entry: &mut bool,
+) -> i32 {
+    let filename = unsafe {
+        crate::eval::typval::tv_dict_get_string(Some(&mut *dict), b"filename")
+    };
+    if filename.is_some() {
+        unimplemented!(
+            "qf_add_entry_from_dict: filenames need qf_get_fnum/buflist_new/fix_fname"
+        );
+    }
+    let module = unsafe {
+        crate::eval::typval::tv_dict_get_string(Some(&mut *dict), b"module")
+    };
+    let mut bufnum = unsafe {
+        crate::eval::typval::tv_dict_get_number(Some(&mut *dict), b"bufnr")
+    } as i32;
+    let lnum = unsafe {
+        crate::eval::typval::tv_dict_get_number(Some(&mut *dict), b"lnum")
+    } as crate::pos_defs::LinenrT;
+    let end_lnum = unsafe {
+        crate::eval::typval::tv_dict_get_number(
+            Some(&mut *dict),
+            b"end_lnum",
+        )
+    } as crate::pos_defs::LinenrT;
+    let col = unsafe {
+        crate::eval::typval::tv_dict_get_number(Some(&mut *dict), b"col")
+    } as i32;
+    let end_col = unsafe {
+        crate::eval::typval::tv_dict_get_number(
+            Some(&mut *dict),
+            b"end_col",
+        )
+    } as i32;
+    let vis_col = (unsafe {
+        crate::eval::typval::tv_dict_get_number(Some(&mut *dict), b"vcol")
+    } as u8)
+        != 0;
+    let nr = unsafe {
+        crate::eval::typval::tv_dict_get_number(Some(&mut *dict), b"nr")
+    } as i32;
+    let entry_type = unsafe {
+        crate::eval::typval::tv_dict_get_string(Some(&mut *dict), b"type")
+    }
+    .and_then(|value| value.first().copied())
+    .unwrap_or(0);
+    let pattern = unsafe {
+        crate::eval::typval::tv_dict_get_string(Some(&mut *dict), b"pattern")
+    };
+    let text = unsafe {
+        crate::eval::typval::tv_dict_get_string(Some(&mut *dict), b"text")
+    }
+    .unwrap_or_default();
+    let mut user_data = crate::eval::typval_defs::TypvalT::default();
+    let _ = unsafe {
+        crate::eval::typval::tv_dict_get_tv(
+            Some(&mut *dict),
+            b"user_data",
+            &mut user_data,
+        )
+    };
+
+    let mut valid =
+        !((filename.is_none() && bufnum == 0) || (lnum == 0 && pattern.is_none()));
+    if bufnum != 0
+        && unsafe { crate::buffer::buflist_findnr(bufnum) }.is_null()
+    {
+        valid = false;
+        bufnum = 0;
+    }
+    if crate::eval::typval::tv_dict_find(
+        Some(unsafe { &mut *dict }),
+        b"valid",
+    )
+    .is_some()
+    {
+        valid = unsafe {
+            crate::eval::typval::tv_dict_get_bool(
+                Some(&mut *dict),
+                b"valid",
+                0,
+            )
+        } != 0;
+    }
+
+    let status = unsafe {
+        qf_add_entry(
+            qfl,
+            None,
+            filename.as_deref(),
+            module.as_deref(),
+            bufnum,
+            &text,
+            lnum,
+            end_lnum,
+            col,
+            end_col,
+            vis_col,
+            pattern.as_deref(),
+            nr,
+            entry_type,
+            Some(&user_data),
+            valid,
+        )
+    };
+    unsafe { crate::eval::typval::tv_clear_simple(&user_data) };
+    if valid {
+        *valid_entry = true;
+    }
+    status
+}
+
 /// Whether an entry is still present in a quickfix list
 /// (`is_qf_entry_present`).
 #[allow(dead_code)]
@@ -10129,6 +10257,178 @@ mod tests {
                 b'E',
                 None,
                 true,
+            )
+        };
+    }
+
+    #[test]
+    fn qf_add_entry_from_dict_converts_all_supported_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            handle: 7,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                buf_ptr,
+            )
+        };
+        let mut dict = TestDict::new();
+        for (key, value) in [
+            (&b"bufnr"[..], 7),
+            (&b"lnum"[..], 10),
+            (&b"end_lnum"[..], 12),
+            (&b"col"[..], 3),
+            (&b"end_col"[..], 8),
+            (&b"vcol"[..], 1),
+            (&b"nr"[..], 42),
+            (&b"user_data"[..], 9),
+        ] {
+            crate::eval::typval::tv_dict_add_nr(dict.get(), key, value);
+        }
+        for (key, value) in [
+            (&b"module"[..], &b"compiler"[..]),
+            (&b"type"[..], &b"E"[..]),
+            (&b"pattern"[..], &b"needle"[..]),
+            (&b"text"[..], &b"message"[..]),
+        ] {
+            crate::eval::typval::tv_dict_add_str(
+                dict.get(),
+                key,
+                Some(value),
+            );
+        }
+        let mut qfl = QfListT::default();
+        let mut valid_entry = false;
+        assert_eq!(
+            unsafe {
+                qf_add_entry_from_dict(
+                    &mut qfl,
+                    dict.0,
+                    true,
+                    &mut valid_entry,
+                )
+            },
+            qf_status::QF_OK
+        );
+        assert!(valid_entry);
+        let entry = &qfl.qf_entries[0];
+        assert_eq!(entry.qf_fnum, 7);
+        assert_eq!(entry.qf_lnum, 10);
+        assert_eq!(entry.qf_end_lnum, 12);
+        assert_eq!(entry.qf_col, 3);
+        assert_eq!(entry.qf_end_col, 8);
+        assert_eq!(entry.qf_nr, 42);
+        assert!(entry.qf_viscol);
+        assert_eq!(entry.qf_type, b'E');
+        assert_eq!(entry.qf_module.as_deref(), Some(&b"compiler"[..]));
+        assert_eq!(entry.qf_pattern.as_deref(), Some(&b"needle"[..]));
+        assert_eq!(entry.qf_text.as_deref(), Some(&b"message"[..]));
+        assert!(matches!(
+            &entry.qf_user_data.value,
+            crate::eval::typval_defs::TypvalValue::Number(9)
+        ));
+        qf_free_items(&mut qfl);
+    }
+
+    #[test]
+    fn qf_add_entry_from_dict_detects_and_overrides_validity() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut qfl = QfListT::default();
+
+        let mut invalid = TestDict::new();
+        crate::eval::typval::tv_dict_add_str(
+            invalid.get(),
+            b"text",
+            Some(b"invalid"),
+        );
+        let mut any_valid = false;
+        unsafe {
+            qf_add_entry_from_dict(
+                &mut qfl,
+                invalid.0,
+                true,
+                &mut any_valid,
+            )
+        };
+        assert!(!qfl.qf_entries[0].qf_valid);
+        assert!(!any_valid);
+
+        let mut overridden = TestDict::new();
+        crate::eval::typval::tv_dict_add_str(
+            overridden.get(),
+            b"text",
+            Some(b"forced"),
+        );
+        crate::eval::typval::tv_dict_add_nr(
+            overridden.get(),
+            b"valid",
+            1,
+        );
+        unsafe {
+            qf_add_entry_from_dict(
+                &mut qfl,
+                overridden.0,
+                false,
+                &mut any_valid,
+            )
+        };
+        assert!(qfl.qf_entries[1].qf_valid);
+        assert!(any_valid);
+        assert_eq!(qfl.qf_index, 2);
+
+        let mut missing_buffer = TestDict::new();
+        crate::eval::typval::tv_dict_add_nr(
+            missing_buffer.get(),
+            b"bufnr",
+            99,
+        );
+        crate::eval::typval::tv_dict_add_nr(
+            missing_buffer.get(),
+            b"lnum",
+            1,
+        );
+        let mut missing_valid = false;
+        unsafe {
+            qf_add_entry_from_dict(
+                &mut qfl,
+                missing_buffer.0,
+                false,
+                &mut missing_valid,
+            )
+        };
+        assert_eq!(qfl.qf_entries[2].qf_fnum, 0);
+        assert!(!qfl.qf_entries[2].qf_valid);
+        assert!(!missing_valid);
+        qf_free_items(&mut qfl);
+    }
+
+    #[test]
+    #[should_panic(expected = "filenames need qf_get_fnum")]
+    fn qf_add_entry_from_dict_defers_filename_resolution() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+        crate::eval::typval::tv_dict_add_str(
+            dict.get(),
+            b"filename",
+            Some(b"file.c"),
+        );
+        let mut qfl = QfListT::default();
+        let mut valid = false;
+        unsafe {
+            qf_add_entry_from_dict(
+                &mut qfl,
+                dict.0,
+                true,
+                &mut valid,
             )
         };
     }
