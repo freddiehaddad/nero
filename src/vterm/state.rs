@@ -787,6 +787,10 @@ pub fn control_reverse_index<C: VTermStateCallbacks>(
     }
 }
 
+pub fn control_tabstop(state: &mut VTermState) {
+    state.set_col_tabstop(state.pos.col);
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -848,6 +852,13 @@ mod control_backspace_tests {
         state.pos.row = 0;
         control_reverse_index(&mut state, &mut ());
         assert_eq!(state.pos.row, 0);
+    }
+    #[test]
+    fn tabstop_control_sets_current_column() {
+        let mut state = VTermState::new(1, 10);
+        state.pos.col = 3;
+        control_tabstop(&mut state);
+        assert!(state.is_col_tabstop(3));
     }
 }
 
