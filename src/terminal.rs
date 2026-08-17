@@ -18,7 +18,8 @@
 //! conversion; `is_focused` - current terminal focus detection.
 //! `convert_modifiers` translates Neovim's key modifier state and
 //! modifier-encoded key codes to libvterm's modifier mask;
-//! `terminal_check_cursor` follows the terminal cursor and viewport.
+//! `terminal_check_cursor` follows the terminal cursor and viewport;
+//! `get_rgb` converts a libvterm color to Neovim's packed RGB value.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -67,6 +68,20 @@ fn row_to_linenr(term: &TerminalT, row: i32) -> i32 {
 #[must_use]
 fn linenr_to_row(term: &TerminalT, linenr: i32) -> i32 {
     linenr.wrapping_sub(term.sb_current as i32).wrapping_sub(1)
+}
+
+#[allow(dead_code)]
+#[must_use]
+fn get_rgb(
+    state: &crate::vterm::state::VTermState,
+    mut color: crate::vterm_defs::VTermColor,
+) -> i32 {
+    state.convert_color_to_rgb(&mut color);
+    crate::macros_defs::rgb_(
+        u32::from(color.red),
+        u32::from(color.green),
+        u32::from(color.blue),
+    ) as i32
 }
 
 /// Whether `term` is the terminal currently focused in Terminal mode
@@ -265,6 +280,33 @@ pub unsafe fn term_theme() -> (bool, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_rgb_packs_direct_and_palette_colors() {
+        let mut state = crate::vterm::state::VTermState::new(1, 1);
+        let direct = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_RGB,
+            red: 0x12,
+            green: 0x34,
+            blue: 0x56,
+            index: 0,
+        };
+        assert_eq!(get_rgb(&state, direct), 0x0012_3456);
+
+        state.colors[3] = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_RGB,
+            red: 0xAA,
+            green: 0xBB,
+            blue: 0xCC,
+            index: 0,
+        };
+        let indexed = crate::vterm_defs::VTermColor {
+            color_type: crate::vterm_defs::VTERM_COLOR_INDEXED,
+            index: 3,
+            ..Default::default()
+        };
+        assert_eq!(get_rgb(&state, indexed), 0x00AA_BBCC);
+    }
 
     struct ModMaskGuard {
         old: i32,
