@@ -404,6 +404,16 @@ pub trait VTermStateCallbacks {
         false
     }
 
+    fn resize(
+        &mut self,
+        _rows: i32,
+        _cols: i32,
+        _position: &mut crate::vterm_defs::VTermPos,
+        _lineinfos: &mut [Vec<crate::vterm_defs::VTermLineInfo>; 2],
+    ) -> bool {
+        false
+    }
+
     fn set_pen_attr(
         &mut self,
         _attr: crate::vterm_defs::VTermAttr,
@@ -3286,9 +3296,11 @@ pub fn on_resize<C: VTermStateCallbacks>(
 ) -> i32 {
     let old_position = state.pos;
     state.resize_tabstops(cols);
-    state.resize_lineinfos(rows);
     state.rows = rows;
     state.cols = cols;
+    if !callbacks.resize(rows, cols, &mut state.pos, &mut state.lineinfos) {
+        state.resize_lineinfos(rows);
+    }
     state.adjust_resize_phantom(cols);
     state.clamp_resize_bounds(rows, cols);
     updatecursor(state, callbacks, old_position, true);
@@ -3307,6 +3319,35 @@ mod on_resize_tests {
         assert_eq!((state.rows, state.cols), (4, 20));
         assert_eq!(state.lineinfos[0].len(), 4);
         assert_eq!(state.tabstops.len(), 3);
+    }
+
+    #[test]
+    fn on_resize_accepts_callback_replacement_fields() {
+        struct Capture;
+        impl VTermStateCallbacks for Capture {
+            fn resize(
+                &mut self,
+                rows: i32,
+                _: i32,
+                position: &mut crate::vterm_defs::VTermPos,
+                lineinfos: &mut [Vec<crate::vterm_defs::VTermLineInfo>; 2],
+            ) -> bool {
+                *position = crate::vterm_defs::VTermPos { row: 1, col: 2 };
+                for buffer in lineinfos {
+                    *buffer = vec![
+                        crate::vterm_defs::VTermLineInfo::default();
+                        rows as usize
+                    ];
+                }
+                true
+            }
+        }
+
+        let mut state = VTermState::new(2, 10);
+        assert_eq!(on_resize(&mut state, &mut Capture, 4, 20), 1);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 2 });
+        assert_eq!(state.lineinfos[0].len(), 4);
+        assert_eq!(state.lineinfos[1].len(), 4);
     }
 }
 
