@@ -2193,6 +2193,48 @@ pub unsafe fn set_errorlist(
     }
 }
 
+/// Mark container-valued quickfix entry user data as reachable
+/// (`mark_quickfix_user_data`).
+///
+/// # Safety
+/// Every typval pointer reachable from live quickfix entries must be
+/// valid. Forwarded from [`crate::eval::eval::set_ref_in_item`].
+#[allow(dead_code)]
+unsafe fn mark_quickfix_user_data(
+    qi: &mut crate::types_defs::QfInfoT,
+    copy_id: i32,
+) -> bool {
+    let count = usize::try_from(qi.qf_maxcount)
+        .unwrap_or(0)
+        .min(qi.qf_lists.len());
+    for qfl in &mut qi.qf_lists[..count] {
+        if !qfl.qf_has_user_data {
+            continue;
+        }
+        for entry in &mut qfl.qf_entries {
+            if matches!(
+                &entry.qf_user_data.value,
+                crate::eval::typval_defs::TypvalValue::Number(_)
+                    | crate::eval::typval_defs::TypvalValue::String(_)
+                    | crate::eval::typval_defs::TypvalValue::Float(_)
+            ) {
+                continue;
+            }
+            if unsafe {
+                crate::eval::eval::set_ref_in_item(
+                    &mut entry.qf_user_data,
+                    copy_id,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Parse shared `setqflist()`/`setloclist()` arguments
 /// (`set_qf_ll_list`).
 ///
@@ -11000,6 +11042,84 @@ mod tests {
             0
         );
         unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn mark_quickfix_user_data_marks_container_values_within_maxcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        let marked = crate::eval::typval::tv_list_alloc(0);
+        let outside = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(marked);
+            crate::eval::typval::tv_list_ref(outside);
+        }
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_maxcount: 1,
+            qf_lists: vec![
+                QfListT {
+                    qf_entries: vec![QflineT {
+                        qf_user_data: crate::eval::typval_defs::TypvalT {
+                            value: crate::eval::typval_defs::TypvalValue::List(
+                                marked,
+                            ),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }],
+                    qf_has_user_data: true,
+                    ..Default::default()
+                },
+                QfListT {
+                    qf_entries: vec![QflineT {
+                        qf_user_data: crate::eval::typval_defs::TypvalT {
+                            value: crate::eval::typval_defs::TypvalValue::List(
+                                outside,
+                            ),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }],
+                    qf_has_user_data: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(!unsafe { mark_quickfix_user_data(&mut qi, 42) });
+        assert_eq!(unsafe { (*marked).lv_copy_id }, 42);
+        assert_eq!(unsafe { (*outside).lv_copy_id }, 0);
+
+        qf_free(&mut qi.qf_lists[0]);
+        qf_free(&mut qi.qf_lists[1]);
+    }
+
+    #[test]
+    fn mark_quickfix_user_data_skips_lists_without_user_data_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let user_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(user_list) };
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_maxcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT {
+                    qf_user_data: crate::eval::typval_defs::TypvalT {
+                        value: crate::eval::typval_defs::TypvalValue::List(
+                            user_list,
+                        ),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                qf_has_user_data: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!unsafe { mark_quickfix_user_data(&mut qi, 17) });
+        assert_eq!(unsafe { (*user_list).lv_copy_id }, 0);
+        qf_free(&mut qi.qf_lists[0]);
     }
 
     #[test]
