@@ -366,6 +366,34 @@ pub trait VTermStateCallbacks {
 
 impl VTermStateCallbacks for () {}
 
+pub struct VTermStateHost<C> {
+    pub state: VTermState,
+    pub callbacks: Option<C>,
+}
+
+pub fn vterm_state_set_callbacks<C>(
+    host: &mut VTermStateHost<C>,
+    callbacks: Option<C>,
+) {
+    host.callbacks = callbacks;
+}
+
+#[cfg(test)]
+mod state_callback_setter_tests {
+    use super::*;
+    #[test]
+    fn state_callback_setter_installs_and_removes_callbacks() {
+        let mut host = VTermStateHost {
+            state: VTermState::new(1, 1),
+            callbacks: None::<u8>,
+        };
+        vterm_state_set_callbacks(&mut host, Some(7));
+        assert_eq!(host.callbacks, Some(7));
+        vterm_state_set_callbacks(&mut host, None);
+        assert_eq!(host.callbacks, None);
+    }
+}
+
 #[allow(dead_code)]
 struct StatePenCallback<'a, C>(&'a mut C);
 
