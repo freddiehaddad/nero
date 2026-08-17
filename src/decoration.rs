@@ -333,6 +333,17 @@ pub static DECOR_STATE: crate::globals::GlobalCell<DecorState> =
         itr_valid: false,
     });
 
+/// Whether the current row likely has another decoration to process
+/// (`decor_has_more_decorations`).
+#[must_use]
+pub fn decor_has_more_decorations(state: &DecorState, row: i32) -> bool {
+    if state.current_end != 0 || state.future_begin != state.ranges_i.len() as i32 {
+        return true;
+    }
+    let key = crate::marktree::marktree_itr_current(&state.itr);
+    key.pos.row >= 0 && key.pos.row <= row
+}
+
 /// Invalidate the cached marktree iterator if the decoration state is
 /// currently pointed at `buf` (`decor_state_invalidate`).
 ///
@@ -614,6 +625,22 @@ pub unsafe fn hl_group_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decor_has_more_detects_active_future_or_iterator_ranges() {
+        let mut state = DecorState {
+            current_end: 1,
+            ..Default::default()
+        };
+        assert!(decor_has_more_decorations(&state, 0));
+
+        state.current_end = 0;
+        state.ranges_i.push(0);
+        assert!(decor_has_more_decorations(&state, 0));
+
+        state.future_begin = 1;
+        assert!(!decor_has_more_decorations(&state, 0));
+    }
     use crate::buffer_defs::{BufT, WinoptT};
     use crate::decoration_defs::{DecorSignHighlight, DecorVirtText, VirtTextPos};
 
