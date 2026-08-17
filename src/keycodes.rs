@@ -342,6 +342,25 @@ pub unsafe fn get_special_key_name(mut key: i32, mut modifiers: i32) -> Vec<u8> 
     result
 }
 
+/// Translate one `<...>` key name into Neovim's internal byte
+/// sequence (`trans_special`).
+///
+/// Returns `(bytes, consumed, did_simplify)`, or `None` for no match.
+#[must_use]
+pub fn trans_special(
+    src: &[u8],
+    flags: i32,
+    escape_ks: bool,
+) -> Option<(Vec<u8>, usize, bool)> {
+    let (key, modifiers, consumed, did_simplify) =
+        find_special_key(src, flags)?;
+    Some((
+        special_to_buf(key, modifiers, escape_ks),
+        consumed,
+        did_simplify,
+    ))
+}
+
 macro_rules! mouse_entry {
     ($code:ident, $button:ident, $click:literal, $drag:literal) => {
         MouseTableEntry {
@@ -1403,6 +1422,68 @@ mod tests {
             unsafe { get_special_key_name('é' as i32, 0) },
             "<é>".as_bytes()
         );
+    }
+
+    // --- trans_special ---
+
+    #[test]
+    fn trans_special_encodes_named_and_modifier_keys() {
+        assert_eq!(
+            trans_special(b"<Up>tail", crate::keycodes_defs::fsk::KEYCODE, false),
+            Some((
+                vec![
+                    crate::keycodes_defs::K_SPECIAL,
+                    crate::keycodes_defs::key2termcap0(K_UP),
+                    crate::keycodes_defs::key2termcap1(K_UP),
+                ],
+                4,
+                false,
+            ))
+        );
+        assert_eq!(
+            trans_special(b"<M-a>", crate::keycodes_defs::fsk::KEYCODE, false),
+            Some((
+                vec![
+                    crate::keycodes_defs::K_SPECIAL,
+                    crate::keycodes_defs::KS_MODIFIER,
+                    crate::keycodes_defs::MOD_MASK_ALT as u8,
+                    b'a',
+                ],
+                5,
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn trans_special_reports_simplification_and_can_escape_k_special() {
+        assert_eq!(
+            trans_special(
+                b"<C-A>",
+                crate::keycodes_defs::fsk::KEYCODE | crate::keycodes_defs::fsk::SIMPLIFY,
+                false,
+            ),
+            Some((vec![crate::ascii_defs::CTRL_A], 5, true))
+        );
+        assert_eq!(
+            trans_special(b"<Char-128>", crate::keycodes_defs::fsk::KEYCODE, true),
+            Some((
+                vec![
+                    0xC2,
+                    crate::keycodes_defs::K_SPECIAL,
+                    crate::keycodes_defs::KS_SPECIAL,
+                    crate::keycodes_defs::KE_FILLER,
+                ],
+                10,
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn trans_special_returns_none_without_a_valid_key_name() {
+        assert_eq!(trans_special(b"Up", 0, false), None);
+        assert_eq!(trans_special(b"<NotARealKey>", 0, false), None);
     }
 
     // --- extract_modifiers ---
