@@ -994,6 +994,38 @@ pub fn csi_tab(state: &mut VTermState, count: i32, forward: bool) {
     state.tab(count.max(1), if forward { 1 } else { -1 });
 }
 
+#[must_use]
+pub fn csi_device_status(
+    state: &VTermState,
+    value: i32,
+    private: bool,
+    ctrl8bit: bool,
+) -> Vec<u8> {
+    let prefix: &[u8] = if ctrl8bit { &[crate::vterm_defs::C1_CSI] } else { b"\x1b[" };
+    let question = if private { "?" } else { "" };
+    match value {
+        5 => [prefix, format!("{question}0n").as_bytes()].concat(),
+        6 => [
+            prefix,
+            format!("{question}{};{}R", state.pos.row + 1, state.pos.col + 1).as_bytes(),
+        ]
+        .concat(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod csi_device_status_tests {
+    use super::*;
+    #[test]
+    fn device_status_reports_ok_and_cursor_position() {
+        let mut state = VTermState::new(10, 10);
+        state.pos = crate::vterm_defs::VTermPos { row: 2, col: 3 };
+        assert_eq!(csi_device_status(&state, 5, false, false), b"\x1b[0n");
+        assert_eq!(csi_device_status(&state, 6, true, false), b"\x1b[?3;4R");
+    }
+}
+
 #[cfg(test)]
 mod csi_tab_tests {
     use super::*;
