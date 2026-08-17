@@ -1447,6 +1447,58 @@ pub fn vterm_state_reset<C: VTermStateCallbacks>(
     }
 }
 
+pub fn csi_soft_reset<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+) {
+    vterm_state_reset(state, callbacks, false);
+}
+
+#[cfg(test)]
+mod csi_soft_reset_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        initialized: usize,
+        erased: usize,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn init_pen(&mut self) -> bool {
+            self.initialized += 1;
+            true
+        }
+
+        fn erase(&mut self, _: crate::vterm_defs::VTermRect, _: bool) -> bool {
+            self.erased += 1;
+            true
+        }
+    }
+
+    #[test]
+    fn soft_reset_resets_modes_without_moving_or_erasing() {
+        let mut state = VTermState::new(4, 8);
+        state.initialize_pen_colors();
+        state.pos = crate::vterm_defs::VTermPos { row: 2, col: 3 };
+        state.mode.insert = true;
+        state.mode.autowrap = false;
+        state.scrollregion_top = 1;
+        state.scrollregion_bottom = 3;
+        let mut capture = Capture::default();
+
+        csi_soft_reset(&mut state, &mut capture);
+
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 2, col: 3 });
+        assert!(!state.mode.insert);
+        assert!(state.mode.autowrap);
+        assert_eq!(state.scrollregion_top, 0);
+        assert_eq!(state.scrollregion_bottom, -1);
+        assert_eq!(capture.initialized, 1);
+        assert_eq!(capture.erased, 0);
+    }
+}
+
 #[cfg(test)]
 mod state_reset_callback_tests {
     use super::*;
