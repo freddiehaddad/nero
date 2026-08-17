@@ -101,6 +101,172 @@ pub fn special_to_buf(key: i32, modifiers: i32, escape_ks: bool) -> Vec<u8> {
     result
 }
 
+/// Parse one `<...>` special-key name (`find_special_key`).
+///
+/// Returns `(key, modifiers, bytes_consumed, did_simplify)`, or
+/// `None` when the opening text is not a valid special key.
+#[must_use]
+pub fn find_special_key(src: &[u8], flags: i32) -> Option<(i32, i32, usize, bool)> {
+    if src.first() != Some(&b'<') {
+        return None;
+    }
+
+    let end = src.len().checked_sub(1)?;
+    let in_string = flags & crate::keycodes_defs::fsk::IN_STRING != 0;
+    let start = usize::from(src.get(1) == Some(&b'*'));
+    let effective_start = start;
+    let mut last_dash = effective_start;
+    let mut bp = effective_start + 1;
+
+    while bp <= end
+        && (src[bp] == b'-' || crate::ascii_defs::ascii_isident(i32::from(src[bp])))
+    {
+        if src[bp] == b'-' {
+            last_dash = bp;
+            if bp < end {
+                let remaining = end - bp;
+                let len = usize::try_from(unsafe {
+                    crate::mbyte::utfc_ptr2len_len(&src[bp + 1..], remaining)
+                })
+                .unwrap_or(1)
+                .max(1);
+                if end - bp > len
+                    && !(in_string && src[bp + 1] == b'"')
+                    && src.get(bp + len + 1) == Some(&b'>')
+                {
+                    bp += len;
+                } else if end - bp > 2
+                    && in_string
+                    && src.get(bp + 1) == Some(&b'\\')
+                    && src.get(bp + 2) == Some(&b'"')
+                    && src.get(bp + 3) == Some(&b'>')
+                {
+                    bp += 2;
+                }
+            }
+        }
+
+        if end.saturating_sub(bp) > 3
+            && src.get(bp) == Some(&b't')
+            && src.get(bp + 1) == Some(&b'_')
+        {
+            bp += 3;
+        } else if end.saturating_sub(bp) > 4
+            && src[bp..bp + 5].eq_ignore_ascii_case(b"char-")
+        {
+            let mut consumed = 0;
+            crate::charset::vim_str2nr(
+                &src[bp + 5..],
+                None,
+                Some(&mut consumed),
+                crate::charset::STR2NR_ALL,
+                None,
+                None,
+                0,
+                true,
+                None,
+            );
+            if consumed == 0 {
+                return None;
+            }
+            bp += usize::try_from(consumed).ok()? + 5;
+            break;
+        }
+        bp += 1;
+    }
+
+    if bp > end || src[bp] != b'>' {
+        return None;
+    }
+    let consumed = bp + 1;
+
+    let mut modifiers = 0;
+    let mut modp = effective_start + 1;
+    while modp < last_dash {
+        if src[modp] != b'-' {
+            let bit = name_to_mod_mask(i32::from(src[modp]));
+            if bit == 0 {
+                return None;
+            }
+            modifiers |= bit;
+        }
+        modp += 1;
+    }
+
+    let name_start = last_dash + 1;
+    let mut key = if src
+        .get(name_start..name_start + 5)
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"char-"))
+        && src.get(name_start + 5).is_some_and(u8::is_ascii_digit)
+    {
+        let mut len = 0;
+        let mut value = 0;
+        crate::charset::vim_str2nr(
+            &src[name_start + 5..],
+            None,
+            Some(&mut len),
+            crate::charset::STR2NR_ALL,
+            None,
+            Some(&mut value),
+            0,
+            true,
+            None,
+        );
+        if len == 0 {
+            return None;
+        }
+        value as i32
+    } else {
+        let (off, len) = if in_string
+            && src.get(name_start) == Some(&b'\\')
+            && src.get(name_start + 1) == Some(&b'"')
+        {
+            (1, 2)
+        } else {
+            (
+                0,
+                usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&src[name_start..]) })
+                    .unwrap_or(1)
+                    .max(1),
+            )
+        };
+        if modifiers != 0 && src.get(last_dash + len + 1) == Some(&b'>') {
+            crate::mbyte::utf_ptr2char(&src[name_start + off..])
+        } else {
+            let mut key = get_special_key_code(&src[name_start + off..bp]);
+            if flags & crate::keycodes_defs::fsk::KEEP_X_KEY == 0 {
+                key = handle_x_keys(key);
+            }
+            key
+        }
+    };
+
+    if key == 0 {
+        return None;
+    }
+    key = simplify_key(key, &mut modifiers);
+    if flags & crate::keycodes_defs::fsk::KEYCODE == 0 {
+        key = match key {
+            crate::keycodes_defs::K_BS => i32::from(crate::ascii_defs::BS),
+            crate::keycodes_defs::K_DEL | crate::keycodes_defs::K_KDEL => {
+                i32::from(crate::ascii_defs::DEL)
+            }
+            _ => key,
+        };
+    }
+
+    let mut did_simplify = false;
+    if !crate::keycodes_defs::is_special(key) {
+        key = extract_modifiers(
+            key,
+            &mut modifiers,
+            flags & crate::keycodes_defs::fsk::SIMPLIFY != 0,
+            Some(&mut did_simplify),
+        );
+    }
+    Some((key, modifiers, consumed, did_simplify))
+}
+
 macro_rules! mouse_entry {
     ($code:ident, $button:ident, $click:literal, $drag:literal) => {
         MouseTableEntry {
@@ -1047,6 +1213,78 @@ mod tests {
         // instead (and "t_a" itself isn't a real key name, so this
         // resolves to 0).
         assert_eq!(get_special_key_code(b"t_a"), 0);
+    }
+
+    // --- find_special_key ---
+
+    #[test]
+    fn find_special_key_parses_a_named_key_and_reports_consumed_bytes() {
+        assert_eq!(
+            find_special_key(b"<Up>tail", crate::keycodes_defs::fsk::KEYCODE),
+            Some((K_UP, 0, 4, false))
+        );
+    }
+
+    #[test]
+    fn find_special_key_parses_and_simplifies_modifiers() {
+        assert_eq!(
+            find_special_key(
+                b"<C-A>",
+                crate::keycodes_defs::fsk::KEYCODE | crate::keycodes_defs::fsk::SIMPLIFY,
+            ),
+            Some((i32::from(crate::ascii_defs::CTRL_A), 0, 5, true))
+        );
+        assert_eq!(
+            find_special_key(
+                b"<S-a>",
+                crate::keycodes_defs::fsk::KEYCODE | crate::keycodes_defs::fsk::SIMPLIFY,
+            ),
+            Some((i32::from(b'A'), 0, 5, false))
+        );
+    }
+
+    #[test]
+    fn find_special_key_keeps_alt_as_a_modifier() {
+        assert_eq!(
+            find_special_key(
+                b"<M-a>",
+                crate::keycodes_defs::fsk::KEYCODE | crate::keycodes_defs::fsk::SIMPLIFY,
+            ),
+            Some((
+                i32::from(b'a'),
+                i32::from(crate::keycodes_defs::MOD_MASK_ALT),
+                5,
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn find_special_key_parses_char_and_termcap_forms() {
+        assert_eq!(
+            find_special_key(b"<Char-0x41>", crate::keycodes_defs::fsk::KEYCODE),
+            Some((i32::from(b'A'), 0, 11, false))
+        );
+        assert_eq!(
+            find_special_key(b"<t_ab>", crate::keycodes_defs::fsk::KEYCODE),
+            Some((termcap2key(b'a', b'b'), 0, 6, false))
+        );
+    }
+
+    #[test]
+    fn find_special_key_maps_delete_to_a_byte_without_keycode_flag() {
+        assert_eq!(
+            find_special_key(b"<Del>", 0),
+            Some((i32::from(crate::ascii_defs::DEL), 0, 5, false))
+        );
+    }
+
+    #[test]
+    fn find_special_key_rejects_malformed_and_unknown_names() {
+        assert_eq!(find_special_key(b"Up", 0), None);
+        assert_eq!(find_special_key(b"<Up", 0), None);
+        assert_eq!(find_special_key(b"<NotARealKey>", 0), None);
+        assert_eq!(find_special_key(b"<Q-Up>", 0), None);
     }
 
     // --- extract_modifiers ---

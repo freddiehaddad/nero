@@ -292,6 +292,14 @@ pub const K_C_END: i32 = termcap2key(KS_EXTRA, KE_C_END);
 /// `<Cmd>` special key (`K_COMMAND`), used by `ops.rs`'s `is_ex_cmdchar`.
 pub const K_COMMAND: i32 = termcap2key(KS_EXTRA, KE_COMMAND);
 pub const K_ZERO: i32 = termcap2key(KS_ZERO, KE_FILLER);
+
+/// Flags for `find_special_key` (`FSK_*`).
+pub mod fsk {
+    pub const KEYCODE: i32 = 0x01;
+    pub const KEEP_X_KEY: i32 = 0x02;
+    pub const IN_STRING: i32 = 0x04;
+    pub const SIMPLIFY: i32 = 0x08;
+}
 pub const K_KUP: i32 = termcap2key(b'K', b'u');
 pub const K_KDOWN: i32 = termcap2key(b'K', b'd');
 pub const K_KLEFT: i32 = termcap2key(b'K', b'l');
