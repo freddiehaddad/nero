@@ -1999,6 +1999,27 @@ unsafe fn ll_get_or_alloc_list(wp: *mut WinT) -> *mut crate::types_defs::QfInfoT
     unsafe { (*wp).w_llist }
 }
 
+/// Free all quickfix or location-list contents (`qf_free_all`).
+///
+/// Passing a window releases both location-list references. Passing
+/// `None` clears every live list in the global quickfix stack while
+/// retaining its fixed allocation.
+///
+/// # Safety
+/// Window pointers and location-list stacks must satisfy
+/// `ll_free_all`'s requirements; the global stack must not be used
+/// concurrently.
+pub unsafe fn qf_free_all(wp: Option<*mut WinT>) {
+    if let Some(wp) = wp {
+        unsafe {
+            ll_free_all(std::ptr::addr_of_mut!((*wp).w_llist));
+            ll_free_all(std::ptr::addr_of_mut!((*wp).w_llist_ref));
+        }
+    } else if let Some(qi) = unsafe { QL_INFO.get_mut() }.as_mut() {
+        qf_free_list_stack_items(qi);
+    }
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -6147,6 +6168,41 @@ mod tests {
         assert_eq!(unsafe { (*(*winp).w_llist).qf_maxcount }, 6);
 
         unsafe { ll_free_all(std::ptr::addr_of_mut!((*winp).w_llist)) };
+    }
+
+    #[test]
+    fn qf_free_all_clears_global_lists_but_keeps_the_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = stack_with(2);
+        stack.qf_maxcount = 2;
+        stack.qf_lists[0].qf_title = Some(b"one".to_vec());
+        stack.qf_lists[1].qf_title = Some(b"two".to_vec());
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+
+        unsafe { qf_free_all(None) };
+        let qi = unsafe { QL_INFO.get_mut() }.as_ref().unwrap();
+        assert_eq!(qi.qf_lists.len(), 2);
+        assert_eq!(qi.qf_listcount, 2);
+        assert!(qi.qf_lists.iter().all(|list| list.qf_title.is_none()));
+    }
+
+    #[test]
+    fn qf_free_all_releases_both_window_location_list_references() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _busy = QuickfixBusyGuard::set(0);
+        let owned = Box::into_raw(Box::new(qf_alloc_stack(QfltypeT::Location, 2)));
+        let referenced = Box::into_raw(Box::new(qf_alloc_stack(QfltypeT::Location, 3)));
+        let mut win = WinT {
+            w_llist: owned,
+            w_llist_ref: referenced,
+            ..Default::default()
+        };
+        let winp = &mut win as *mut WinT;
+
+        unsafe { qf_free_all(Some(winp)) };
+        assert!(unsafe { (*winp).w_llist }.is_null());
+        assert!(unsafe { (*winp).w_llist_ref }.is_null());
     }
 
     #[test]
