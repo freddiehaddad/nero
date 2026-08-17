@@ -120,6 +120,17 @@ pub mod diff_flag {
 
 /// Combination of both inline-diff-caching flags (`ALL_INLINE_DIFF`).
 pub const ALL_INLINE_DIFF: i32 = diff_flag::INLINE_CHAR | diff_flag::INLINE_WORD;
+const ALL_INLINE: i32 = diff_flag::INLINE_NONE
+    | diff_flag::INLINE_SIMPLE
+    | diff_flag::INLINE_CHAR
+    | diff_flag::INLINE_WORD;
+
+pub mod xdf_flag {
+    pub const NEED_MINIMAL: i32 = 1 << 0;
+    pub const PATIENCE_DIFF: i32 = 1 << 14;
+    pub const HISTOGRAM_DIFF: i32 = 1 << 15;
+    pub const INDENT_HEURISTIC: i32 = 1 << 23;
+}
 
 /// `diff_flags` - the parsed bit-flag form of `'diffopt'`. A file-
 /// static in the original; translated as a `pub` `GlobalCell` since
@@ -132,6 +143,160 @@ pub static DIFF_FLAGS: crate::globals::GlobalCell<i32> = crate::globals::GlobalC
     diff_flag::INTERNAL | diff_flag::FILLER | diff_flag::CLOSE_OFF | diff_flag::LINEMATCH
         | diff_flag::INLINE_CHAR,
 );
+
+pub static DIFF_CONTEXT: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(6);
+pub static LINEMATCH_LINES: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(40);
+pub static DIFF_FOLDCOLUMN: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(2);
+pub static DIFF_ALGORITHM: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(xdf_flag::INDENT_HEURISTIC);
+
+/// Parse and apply one `'diffopt'` value (`diffopt_changed`).
+///
+/// Redrawing diff windows and recomputing scroll binding remain with
+/// those subsystems. Every parsed field and tabpage invalidation side
+/// effect is applied transactionally after full validation.
+///
+/// # Safety
+/// `GLOBALS.first_tabpage` and its `tp_next` chain must point to live
+/// tabpages whenever the parsed flags or algorithm change.
+#[must_use]
+pub unsafe fn diffopt_changed(value: &[u8]) -> bool {
+    let mut context = 6;
+    let mut linematch = 0;
+    let mut flags = 0;
+    let mut foldcolumn = 2;
+    let mut algorithm = 0;
+    let mut indent_heuristic = 0;
+    let mut pos = 0usize;
+
+    while pos < value.len() {
+        let rest = &value[pos..];
+        macro_rules! flag {
+            ($name:literal, $flag:expr) => {
+                if rest.starts_with($name) {
+                    pos += $name.len();
+                    flags |= $flag;
+                    true
+                } else {
+                    false
+                }
+            };
+        }
+
+        if flag!(b"filler", diff_flag::FILLER)
+            || flag!(b"anchor", diff_flag::ANCHOR)
+            || flag!(b"iblank", diff_flag::IBLANK)
+            || flag!(b"icase", diff_flag::ICASE)
+            || flag!(b"iwhiteall", diff_flag::IWHITEALL)
+            || flag!(b"iwhiteeol", diff_flag::IWHITEEOL)
+            || flag!(b"iwhite", diff_flag::IWHITE)
+            || flag!(b"horizontal", diff_flag::HORIZONTAL)
+            || flag!(b"vertical", diff_flag::VERTICAL)
+            || flag!(b"hiddenoff", diff_flag::HIDDEN_OFF)
+            || flag!(b"closeoff", diff_flag::CLOSE_OFF)
+            || flag!(b"followwrap", diff_flag::FOLLOWWRAP)
+            || flag!(b"internal", diff_flag::INTERNAL)
+        {
+            // Handled by the short-circuiting flag chain.
+        } else if rest.starts_with(b"context:")
+            && rest.get(8).is_some_and(u8::is_ascii_digit)
+        {
+            pos += 8;
+            let (parsed, consumed) =
+                crate::charset::getdigits_int(&value[pos..], false, context);
+            context = parsed;
+            pos += consumed;
+        } else if rest.starts_with(b"foldcolumn:")
+            && rest.get(11).is_some_and(u8::is_ascii_digit)
+        {
+            pos += 11;
+            let (parsed, consumed) =
+                crate::charset::getdigits_int(&value[pos..], false, foldcolumn);
+            foldcolumn = parsed;
+            pos += consumed;
+        } else if rest.starts_with(b"indent-heuristic") {
+            pos += 16;
+            indent_heuristic = xdf_flag::INDENT_HEURISTIC;
+        } else if rest.starts_with(b"algorithm:") {
+            pos += 10;
+            let algo = &value[pos..];
+            if algo.starts_with(b"myers") {
+                pos += 5;
+                algorithm = 0;
+            } else if algo.starts_with(b"minimal") {
+                pos += 7;
+                algorithm = xdf_flag::NEED_MINIMAL;
+            } else if algo.starts_with(b"patience") {
+                pos += 8;
+                algorithm = xdf_flag::PATIENCE_DIFF;
+            } else if algo.starts_with(b"histogram") {
+                pos += 9;
+                algorithm = xdf_flag::HISTOGRAM_DIFF;
+            } else {
+                return false;
+            }
+        } else if rest.starts_with(b"inline:") {
+            pos += 7;
+            flags &= !ALL_INLINE;
+            let inline = &value[pos..];
+            if inline.starts_with(b"none") {
+                pos += 4;
+                flags |= diff_flag::INLINE_NONE;
+            } else if inline.starts_with(b"simple") {
+                pos += 6;
+                flags |= diff_flag::INLINE_SIMPLE;
+            } else if inline.starts_with(b"char") {
+                pos += 4;
+                flags |= diff_flag::INLINE_CHAR;
+            } else if inline.starts_with(b"word") {
+                pos += 4;
+                flags |= diff_flag::INLINE_WORD;
+            } else {
+                return false;
+            }
+        } else if rest.starts_with(b"linematch:")
+            && rest.get(10).is_some_and(u8::is_ascii_digit)
+        {
+            pos += 10;
+            let (parsed, consumed) =
+                crate::charset::getdigits_int(&value[pos..], false, linematch);
+            linematch = parsed;
+            pos += consumed;
+            flags |= diff_flag::LINEMATCH | diff_flag::FILLER;
+        }
+
+        if value.get(pos).is_some_and(|&b| b != b',') {
+            return false;
+        }
+        pos += usize::from(value.get(pos) == Some(&b','));
+    }
+
+    algorithm |= indent_heuristic;
+    if flags & diff_flag::HORIZONTAL != 0 && flags & diff_flag::VERTICAL != 0 {
+        return false;
+    }
+
+    let changed =
+        unsafe { *DIFF_FLAGS.get_mut() } != flags
+            || unsafe { *DIFF_ALGORITHM.get_mut() } != algorithm;
+    if changed {
+        let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+        while !tp.is_null() {
+            unsafe { (*tp).tp_diff_invalid = 1 };
+            tp = unsafe { (*tp).tp_next };
+        }
+    }
+
+    *unsafe { DIFF_FLAGS.get_mut() } = flags;
+    *unsafe { DIFF_CONTEXT.get_mut() } = if context == 0 { 1 } else { context };
+    *unsafe { LINEMATCH_LINES.get_mut() } = linematch;
+    *unsafe { DIFF_FOLDCOLUMN.get_mut() } = foldcolumn;
+    *unsafe { DIFF_ALGORITHM.get_mut() } = algorithm;
+    true
+}
 
 /// Set when `diff_redraw()` still needs to be called
 /// (`need_diff_redraw`).
@@ -1159,6 +1324,135 @@ pub unsafe fn find_top_diff_block(
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    struct DiffoptGuard {
+        flags: i32,
+        context: i32,
+        linematch: i32,
+        foldcolumn: i32,
+        algorithm: i32,
+    }
+
+    impl DiffoptGuard {
+        fn new() -> Self {
+            Self {
+                flags: *unsafe { DIFF_FLAGS.get_mut() },
+                context: *unsafe { DIFF_CONTEXT.get_mut() },
+                linematch: *unsafe { LINEMATCH_LINES.get_mut() },
+                foldcolumn: *unsafe { DIFF_FOLDCOLUMN.get_mut() },
+                algorithm: *unsafe { DIFF_ALGORITHM.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for DiffoptGuard {
+        fn drop(&mut self) {
+            *unsafe { DIFF_FLAGS.get_mut() } = self.flags;
+            *unsafe { DIFF_CONTEXT.get_mut() } = self.context;
+            *unsafe { LINEMATCH_LINES.get_mut() } = self.linematch;
+            *unsafe { DIFF_FOLDCOLUMN.get_mut() } = self.foldcolumn;
+            *unsafe { DIFF_ALGORITHM.get_mut() } = self.algorithm;
+        }
+    }
+
+    #[test]
+    fn diffopt_changed_parses_the_real_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = DiffoptGuard::new();
+        assert!(unsafe {
+            diffopt_changed(
+                b"internal,filler,closeoff,indent-heuristic,inline:char,linematch:40",
+            )
+        });
+        assert_eq!(
+            *unsafe { DIFF_FLAGS.get_mut() },
+            diff_flag::INTERNAL
+                | diff_flag::FILLER
+                | diff_flag::CLOSE_OFF
+                | diff_flag::INLINE_CHAR
+                | diff_flag::LINEMATCH
+        );
+        assert_eq!(*unsafe { DIFF_CONTEXT.get_mut() }, 6);
+        assert_eq!(*unsafe { LINEMATCH_LINES.get_mut() }, 40);
+        assert_eq!(*unsafe { DIFF_FOLDCOLUMN.get_mut() }, 2);
+        assert_eq!(
+            *unsafe { DIFF_ALGORITHM.get_mut() },
+            xdf_flag::INDENT_HEURISTIC
+        );
+    }
+
+    #[test]
+    fn diffopt_changed_parses_numeric_algorithm_and_inline_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = DiffoptGuard::new();
+        assert!(unsafe {
+            diffopt_changed(
+                b"context:0,foldcolumn:4,algorithm:patience,inline:word,linematch:12,horizontal",
+            )
+        });
+        assert_eq!(*unsafe { DIFF_CONTEXT.get_mut() }, 1);
+        assert_eq!(*unsafe { DIFF_FOLDCOLUMN.get_mut() }, 4);
+        assert_eq!(*unsafe { LINEMATCH_LINES.get_mut() }, 12);
+        assert_eq!(
+            *unsafe { DIFF_ALGORITHM.get_mut() },
+            xdf_flag::PATIENCE_DIFF
+        );
+        assert_eq!(
+            *unsafe { DIFF_FLAGS.get_mut() },
+            diff_flag::INLINE_WORD
+                | diff_flag::LINEMATCH
+                | diff_flag::FILLER
+                | diff_flag::HORIZONTAL
+        );
+    }
+
+    #[test]
+    fn diffopt_changed_rejects_invalid_and_conflicting_values_transactionally() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = DiffoptGuard::new();
+        *unsafe { DIFF_FLAGS.get_mut() } = 0x1234;
+        *unsafe { DIFF_CONTEXT.get_mut() } = 77;
+
+        assert!(!unsafe { diffopt_changed(b"algorithm:bogus") });
+        assert!(!unsafe { diffopt_changed(b"horizontal,vertical") });
+        assert_eq!(*unsafe { DIFF_FLAGS.get_mut() }, 0x1234);
+        assert_eq!(*unsafe { DIFF_CONTEXT.get_mut() }, 77);
+    }
+
+    #[test]
+    fn diffopt_changed_last_inline_value_wins() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = DiffoptGuard::new();
+        assert!(unsafe { diffopt_changed(b"inline:none,inline:simple,inline:char") });
+        assert_eq!(
+            *unsafe { DIFF_FLAGS.get_mut() } & ALL_INLINE,
+            diff_flag::INLINE_CHAR
+        );
+    }
+
+    #[test]
+    fn diffopt_changed_invalidates_every_tab_when_flags_change() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = DiffoptGuard::new();
+        *unsafe { DIFF_FLAGS.get_mut() } = 0;
+        let mut second = crate::buffer_defs::TabpageT::default();
+        let secondp = &mut second as *mut crate::buffer_defs::TabpageT;
+        let mut first = crate::buffer_defs::TabpageT {
+            tp_next: secondp,
+            ..Default::default()
+        };
+        let firstp = &mut first as *mut crate::buffer_defs::TabpageT;
+        let _tabs = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                firstp,
+            )
+        };
+
+        assert!(unsafe { diffopt_changed(b"filler") });
+        assert_ne!(unsafe { (*firstp).tp_diff_invalid }, 0);
+        assert_ne!(unsafe { (*secondp).tp_diff_invalid }, 0);
+    }
 
     #[test]
     fn find_top_diff_block_returns_the_touching_chain_and_next_block() {
