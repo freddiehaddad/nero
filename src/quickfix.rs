@@ -130,6 +130,22 @@ unsafe fn incr_quickfix_busy() {
     unsafe { *QUICKFIX_BUSY.get_mut() += 1 };
 }
 
+/// Leave a quickfix critical section and process delayed location-list
+/// deletions (`decr_quickfix_busy`).
+///
+/// # Safety
+/// Must be paired with [`incr_quickfix_busy`] on the editor thread.
+#[allow(dead_code)]
+unsafe fn decr_quickfix_busy() {
+    unsafe { *QUICKFIX_BUSY.get_mut() -= 1 };
+    if unsafe { *QUICKFIX_BUSY.get_mut() } == 0 {
+        while let Some(mut qi) = unsafe { QF_DELETE_QUEUE.get_mut() }.pop() {
+            unsafe { ll_free_all(&mut qi) };
+        }
+    }
+    debug_assert!(unsafe { *QUICKFIX_BUSY.get_mut() } >= 0);
+}
+
 /// Set `w:quickfix_title` when the quickfix list has a title
 /// (`qf_set_title_var`).
 ///
@@ -2929,6 +2945,7 @@ mod tests {
     use super::*;
 
     struct QuickfixBusyGuard(i32);
+    struct QuickfixDeleteQueueGuard(Vec<*mut crate::types_defs::QfInfoT>);
 
     struct QuickfixWindowGuard {
         win: Box<crate::buffer_defs::WinT>,
@@ -2977,6 +2994,18 @@ mod tests {
         }
     }
 
+    impl QuickfixDeleteQueueGuard {
+        fn new() -> Self {
+            Self(std::mem::take(unsafe { QF_DELETE_QUEUE.get_mut() }))
+        }
+    }
+
+    impl Drop for QuickfixDeleteQueueGuard {
+        fn drop(&mut self) {
+            *unsafe { QF_DELETE_QUEUE.get_mut() } = std::mem::take(&mut self.0);
+        }
+    }
+
     #[test]
     fn incr_quickfix_busy_supports_nested_critical_sections() {
         let _lock = crate::globals::global_state_test_lock();
@@ -2986,6 +3015,30 @@ mod tests {
             incr_quickfix_busy();
         }
         assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 2);
+    }
+
+    #[test]
+    fn decr_quickfix_busy_processes_queued_deletes_at_the_outermost_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _busy = QuickfixBusyGuard::set(0);
+        let _queue = QuickfixDeleteQueueGuard::new();
+        let mut qi = Box::into_raw(Box::new(qf_alloc_stack(QfltypeT::Location, 2)));
+
+        unsafe {
+            incr_quickfix_busy();
+            incr_quickfix_busy();
+            ll_free_all(&mut qi);
+        }
+        assert!(qi.is_null());
+        assert_eq!(unsafe { QF_DELETE_QUEUE.get_mut() }.len(), 1);
+
+        unsafe { decr_quickfix_busy() };
+        assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 1);
+        assert_eq!(unsafe { QF_DELETE_QUEUE.get_mut() }.len(), 1);
+
+        unsafe { decr_quickfix_busy() };
+        assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 0);
+        assert!(unsafe { QF_DELETE_QUEUE.get_mut() }.is_empty());
     }
 
     #[test]
