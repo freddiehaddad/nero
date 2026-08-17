@@ -1160,6 +1160,68 @@ pub fn append_grapheme(
     }
 }
 
+#[must_use]
+pub fn begin_grapheme_recombine(
+    state: &mut VTermState,
+    first_codepoint: u32,
+) -> (crate::mbyte_defs::GraphemeState, usize, bool) {
+    if state.pos.row == state.combine_pos.row
+        && state.pos.col >= state.combine_pos.col
+        && state.pos.col <= state.combine_pos.col + state.combine_width
+        // SAFETY: both values are decoded Unicode codepoints and the
+        // stored grapheme state is exclusively borrowed.
+        && unsafe {
+            crate::mbyte::utf_iscomposing(
+                state.grapheme_last as i32,
+                first_codepoint as i32,
+                &mut state.grapheme_state,
+            )
+        }
+    {
+        state.pos.col = state.combine_pos.col;
+        state.at_phantom = false;
+        (state.grapheme_state, state.grapheme_len, true)
+    } else {
+        (crate::mbyte_defs::GRAPHEME_STATE_INIT, 0, false)
+    }
+}
+
+#[cfg(test)]
+mod grapheme_recombine_tests {
+    use super::*;
+
+    #[test]
+    fn recombine_rewinds_the_cursor_for_a_following_combining_mark() {
+        let mut state = VTermState::new(1, 8);
+        state.grapheme_buf[0] = b'A';
+        state.grapheme_len = 1;
+        state.grapheme_last = b'A' as u32;
+        state.combine_pos = crate::vterm_defs::VTermPos { row: 0, col: 2 };
+        state.combine_width = 1;
+        state.pos = crate::vterm_defs::VTermPos { row: 0, col: 3 };
+        state.at_phantom = true;
+
+        let (_, length, recombine) = begin_grapheme_recombine(&mut state, 0x0301);
+        assert!(recombine);
+        assert_eq!(length, 1);
+        assert_eq!(state.pos.col, 2);
+        assert!(!state.at_phantom);
+    }
+
+    #[test]
+    fn recombine_leaves_unrelated_text_at_the_current_cursor() {
+        let mut state = VTermState::new(1, 8);
+        state.grapheme_last = b'A' as u32;
+        state.combine_pos = crate::vterm_defs::VTermPos { row: 0, col: 2 };
+        state.combine_width = 1;
+        state.pos = crate::vterm_defs::VTermPos { row: 0, col: 3 };
+        let (_, length, recombine) = begin_grapheme_recombine(&mut state, b'B' as u32);
+        assert!(!recombine);
+        assert_eq!(length, 0);
+        assert_eq!(state.pos.col, 3);
+    }
+}
+
 #[cfg(test)]
 mod append_grapheme_tests {
     use super::*;
