@@ -2977,6 +2977,9 @@ pub unsafe fn qf_new_list(qi: &mut crate::types_defs::QfInfoT, qf_title: Option<
 /// derived from its length rather than tracked separately - so the
 /// whole loop is just clearing the vector.
 pub fn qf_free_items(qfl: &mut QfListT) {
+    for entry in &qfl.qf_entries {
+        unsafe { crate::eval::typval::tv_clear_simple(&entry.qf_user_data) };
+    }
     qfl.qf_entries.clear();
     qfl.qf_index = 0;
     qfl.qf_nonevalid = true;
@@ -8115,6 +8118,36 @@ mod tests {
         assert!(qfl.qf_ctx.is_some());
         assert_eq!(qfl.qf_id, 5);
         assert_eq!(qfl.qf_changedtick, 9);
+    }
+
+    #[test]
+    fn qf_free_items_releases_entry_user_data_references() {
+        let _lock = crate::globals::global_state_test_lock();
+        let user_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(user_list);
+            crate::eval::typval::tv_list_ref(user_list);
+        }
+        let mut qfl = QfListT {
+            qf_entries: vec![QflineT {
+                qf_user_data: crate::eval::typval_defs::TypvalT {
+                    value: crate::eval::typval_defs::TypvalValue::List(
+                        user_list,
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            qf_has_user_data: true,
+            ..Default::default()
+        };
+
+        qf_free_items(&mut qfl);
+
+        assert!(qfl.qf_entries.is_empty());
+        assert_eq!(unsafe { (*user_list).lv_refcount }, 1);
+        assert!(qfl.qf_has_user_data);
+        unsafe { crate::eval::typval::tv_list_unref(user_list) };
     }
 
     #[test]
