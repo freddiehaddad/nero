@@ -893,6 +893,21 @@ pub unsafe fn did_set_eventignore(
     }
 }
 
+/// The `'diffopt'` option is changed (`did_set_diffopt`).
+pub fn did_set_diffopt(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_dip
+        .clone()
+        .unwrap_or_default();
+    if unsafe { crate::diff::diffopt_changed(&value) } {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
 /// One of `'encoding'`, `'fileencoding'` or `'makeencoding'` changed
 /// (`did_set_encoding`).
 ///
@@ -4737,6 +4752,75 @@ mod tests {
         };
         assert_eq!(
             unsafe { did_set_eventignore(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    struct DiffoptCallbackGuard {
+        value: Option<Vec<u8>>,
+        flags: i32,
+        context: i32,
+        linematch: i32,
+        foldcolumn: i32,
+        algorithm: i32,
+    }
+
+    impl DiffoptCallbackGuard {
+        fn set(value: &[u8]) -> Self {
+            let old = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                .p_dip
+                .replace(value.to_vec());
+            Self {
+                value: old,
+                flags: *unsafe { crate::diff::DIFF_FLAGS.get_mut() },
+                context: *unsafe { crate::diff::DIFF_CONTEXT.get_mut() },
+                linematch: *unsafe { crate::diff::LINEMATCH_LINES.get_mut() },
+                foldcolumn: *unsafe { crate::diff::DIFF_FOLDCOLUMN.get_mut() },
+                algorithm: *unsafe { crate::diff::DIFF_ALGORITHM.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for DiffoptCallbackGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_dip = self.value.take();
+            *unsafe { crate::diff::DIFF_FLAGS.get_mut() } = self.flags;
+            *unsafe { crate::diff::DIFF_CONTEXT.get_mut() } = self.context;
+            *unsafe { crate::diff::LINEMATCH_LINES.get_mut() } = self.linematch;
+            *unsafe { crate::diff::DIFF_FOLDCOLUMN.get_mut() } = self.foldcolumn;
+            *unsafe { crate::diff::DIFF_ALGORITHM.get_mut() } = self.algorithm;
+        }
+    }
+
+    #[test]
+    fn did_set_diffopt_accepts_and_applies_a_valid_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tabs = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                std::ptr::null_mut(),
+            )
+        };
+        let _state = DiffoptCallbackGuard::set(
+            b"internal,filler,context:3,algorithm:minimal,inline:simple",
+        );
+        assert_eq!(
+            did_set_diffopt(&mut crate::option_defs::OptsetT::default()),
+            None
+        );
+        assert_eq!(*unsafe { crate::diff::DIFF_CONTEXT.get_mut() }, 3);
+        assert_eq!(
+            *unsafe { crate::diff::DIFF_ALGORITHM.get_mut() },
+            crate::diff::xdf_flag::NEED_MINIMAL
+        );
+    }
+
+    #[test]
+    fn did_set_diffopt_rejects_an_invalid_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = DiffoptCallbackGuard::set(b"horizontal,vertical");
+        assert_eq!(
+            did_set_diffopt(&mut crate::option_defs::OptsetT::default()),
             Some(crate::errors::e_invarg.as_bytes())
         );
     }
