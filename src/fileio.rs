@@ -1,4 +1,5 @@
 //! Translated from `src/nvim/fileio.c` (tractable core only).
+
 //!
 //! `fileio.c` (~3600 lines) is the real file-reading (`readfile()`)
 //! and encoding-detection (`check_for_bom`) engine. Almost everything
@@ -30,6 +31,44 @@
 //! Deferred: everything else in the file.
 
 use crate::mbyte::enc_canon_props;
+
+/// Shorten a buffer's displayed file name relative to `dirname`
+/// (`shorten_buf_fname`).
+///
+/// # Safety
+/// Must not run concurrently with option/global state read by the
+/// path-comparison helpers.
+pub unsafe fn shorten_buf_fname(
+    buf: &mut crate::buffer_defs::BufT,
+    dirname: &[u8],
+    force: bool,
+) {
+    let should_shorten = buf.b_fname.as_deref().is_some_and(|name| {
+        !crate::buffer::bt_nofilename(Some(buf))
+            && crate::path::path_with_url(name) == 0
+            && (force
+                || buf.b_sfname.is_none()
+                || buf
+                    .b_sfname
+                    .as_deref()
+                    .is_some_and(crate::path::path_is_absolute))
+    });
+    if !should_shorten {
+        return;
+    }
+
+    let shortened = buf.b_ffname.as_deref().and_then(|full| {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::path::path_shorten_fname(full, dirname) }.map(<[u8]>::to_vec)
+    });
+    if let Some(shortened) = shortened {
+        buf.b_sfname = Some(shortened.clone());
+        buf.b_fname = Some(shortened);
+    } else {
+        buf.b_sfname = None;
+        buf.b_fname.clone_from(&buf.b_ffname);
+    }
+}
 
 /// The path separator this platform's `PATHSEPSTR` appends.
 const PATHSEP: u8 = if cfg!(windows) { b'\\' } else { b'/' };
@@ -902,6 +941,29 @@ pub fn modname(fname: Option<&[u8]>, ext: &[u8], prepend_dot: bool) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shorten_buf_fname_uses_relative_name_or_restores_full_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_ffname: Some(b"/home/user/file.txt".to_vec()),
+            b_sfname: Some(b"/home/user/file.txt".to_vec()),
+            b_fname: Some(b"/home/user/file.txt".to_vec()),
+            ..Default::default()
+        };
+        unsafe { shorten_buf_fname(&mut buf, b"/home/user", false) };
+        assert_eq!(buf.b_sfname.as_deref(), Some(&b"file.txt"[..]));
+        assert_eq!(buf.b_fname.as_deref(), Some(&b"file.txt"[..]));
+
+        buf.b_sfname = Some(b"/home/user/file.txt".to_vec());
+        buf.b_fname = Some(b"/home/user/file.txt".to_vec());
+        unsafe { shorten_buf_fname(&mut buf, b"/other", false) };
+        assert!(buf.b_sfname.is_none());
+        assert_eq!(
+            buf.b_fname.as_deref(),
+            Some(&b"/home/user/file.txt"[..])
+        );
+    }
 
     #[test]
     fn msg_add_fileformat_appends_non_native_line_ending_markers() {
