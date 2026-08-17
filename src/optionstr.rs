@@ -876,6 +876,23 @@ pub unsafe fn did_set_display(
     None
 }
 
+/// The `'eventignore'` or `'eventignorewin'` option is changed
+/// (`did_set_eventignore`).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_eventignore(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let win = args.os_idx == crate::option_defs::OptIndex::Eventignorewin;
+    if crate::autocmd::check_ei(varp.as_deref().unwrap_or(&[]), win) {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
 /// The `'helplang'` option is changed (`did_set_helplang`).
 ///
 /// Validates a comma-separated list of exactly-2-letter language
@@ -4554,6 +4571,53 @@ mod tests {
         assert_eq!(unsafe { did_set_display(&mut args) }, None);
         let bit = 1u64 << (u32::from(b'a') & 0x3f);
         assert_ne!(unsafe { (*bufp).b_chartab[usize::from(b'a' >> 6)] } & bit, 0);
+    }
+
+    #[test]
+    fn did_set_eventignore_accepts_global_events_and_aliases() {
+        let mut value = Some(b"ColorScheme,FileEncoding".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Eventignore,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_eventignore(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_eventignorewin_accepts_only_window_local_events() {
+        let mut value = Some(b"BufEnter".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Eventignorewin,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_eventignore(&mut args) }, None);
+
+        let mut invalid = Some(b"ColorScheme".to_vec());
+        let mut invalid_args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Eventignorewin,
+            os_varp: &mut invalid as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_eventignore(&mut invalid_args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_eventignore_rejects_an_unknown_event() {
+        let mut value = Some(b"NotAnEvent".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Eventignore,
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_eventignore(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
     }
 
     // ---- did_set_backupext_or_patchmode ----
