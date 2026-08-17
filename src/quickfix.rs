@@ -2961,6 +2961,62 @@ pub fn qf_entry_on_or_before_pos(
     qfp.qf_lnum < pos.lnum || (qfp.qf_lnum == pos.lnum && qfp.qf_col <= pos.col)
 }
 
+/// Whether `entry` is definitively closer to a target position than
+/// `other_entry` (`entry_is_closer_to_target`).
+#[must_use]
+pub fn entry_is_closer_to_target(
+    entry: &QflineT,
+    other_entry: &QflineT,
+    target_fnum: i32,
+    target_lnum: i32,
+    target_col: i32,
+) -> bool {
+    if target_fnum == 0 {
+        return false;
+    }
+    let is_target_file = entry.qf_fnum != 0 && entry.qf_fnum == target_fnum;
+    let other_is_target_file =
+        other_entry.qf_fnum != 0 && other_entry.qf_fnum == target_fnum;
+    if !is_target_file && other_is_target_file {
+        return false;
+    }
+    if is_target_file && !other_is_target_file {
+        return true;
+    }
+
+    if target_lnum == 0 {
+        return false;
+    }
+    let line_distance = if entry.qf_lnum != 0 {
+        entry.qf_lnum.abs_diff(target_lnum)
+    } else {
+        u32::MAX
+    };
+    let other_line_distance = if other_entry.qf_lnum != 0 {
+        other_entry.qf_lnum.abs_diff(target_lnum)
+    } else {
+        u32::MAX
+    };
+    if line_distance != other_line_distance {
+        return line_distance < other_line_distance;
+    }
+
+    if target_col == 0 {
+        return false;
+    }
+    let column_distance = if entry.qf_col != 0 {
+        entry.qf_col.abs_diff(target_col)
+    } else {
+        u32::MAX
+    };
+    let other_column_distance = if other_entry.qf_col != 0 {
+        other_entry.qf_col.abs_diff(target_col)
+    } else {
+        u32::MAX
+    };
+    column_distance < other_column_distance
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4399,6 +4455,105 @@ mod tests {
         let above = entry_at(1, 99);
         assert!(qf_entry_before_pos(&above, &p, false));
         assert!(qf_entry_before_pos(&above, &p, true));
+    }
+
+    #[test]
+    fn entry_is_closer_to_target_prefers_file_then_line_then_column() {
+        let target_file = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 100,
+            qf_col: 20,
+            ..Default::default()
+        };
+        let other_file = QflineT {
+            qf_fnum: 8,
+            qf_lnum: 100,
+            qf_col: 20,
+            ..Default::default()
+        };
+        assert!(entry_is_closer_to_target(
+            &target_file,
+            &other_file,
+            7,
+            100,
+            20,
+        ));
+
+        let nearer_line = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 98,
+            qf_col: 1,
+            ..Default::default()
+        };
+        let farther_line = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 110,
+            qf_col: 20,
+            ..Default::default()
+        };
+        assert!(entry_is_closer_to_target(
+            &nearer_line,
+            &farther_line,
+            7,
+            100,
+            20,
+        ));
+
+        let nearer_col = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 100,
+            qf_col: 18,
+            ..Default::default()
+        };
+        let farther_col = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 100,
+            qf_col: 30,
+            ..Default::default()
+        };
+        assert!(entry_is_closer_to_target(
+            &nearer_col,
+            &farther_col,
+            7,
+            100,
+            20,
+        ));
+    }
+
+    #[test]
+    fn entry_is_closer_to_target_needs_each_target_component_and_breaks_ties_false() {
+        let entry = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 100,
+            qf_col: 20,
+            ..Default::default()
+        };
+        let same = entry.clone();
+        assert!(!entry_is_closer_to_target(&entry, &same, 0, 100, 20));
+        assert!(!entry_is_closer_to_target(&entry, &same, 7, 0, 20));
+        assert!(!entry_is_closer_to_target(&entry, &same, 7, 100, 0));
+        assert!(!entry_is_closer_to_target(&entry, &same, 7, 100, 20));
+    }
+
+    #[test]
+    fn entry_is_closer_to_target_treats_missing_positions_as_maximally_far() {
+        let positioned = QflineT {
+            qf_fnum: 7,
+            qf_lnum: 90,
+            qf_col: 5,
+            ..Default::default()
+        };
+        let missing = QflineT {
+            qf_fnum: 7,
+            ..Default::default()
+        };
+        assert!(entry_is_closer_to_target(
+            &positioned,
+            &missing,
+            7,
+            100,
+            10,
+        ));
     }
 
     // --- qf_find_win_with_normal_buf ---
