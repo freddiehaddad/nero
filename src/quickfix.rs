@@ -124,7 +124,6 @@ static QF_DELETE_QUEUE: std::sync::LazyLock<
 /// # Safety
 /// Must be paired with a future `decr_quickfix_busy` operation and run
 /// on the editor thread.
-#[allow(dead_code)]
 unsafe fn incr_quickfix_busy() {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *QUICKFIX_BUSY.get_mut() += 1 };
@@ -135,7 +134,6 @@ unsafe fn incr_quickfix_busy() {
 ///
 /// # Safety
 /// Must be paired with [`incr_quickfix_busy`] on the editor thread.
-#[allow(dead_code)]
 unsafe fn decr_quickfix_busy() {
     unsafe { *QUICKFIX_BUSY.get_mut() -= 1 };
     if unsafe { *QUICKFIX_BUSY.get_mut() } == 0 {
@@ -144,6 +142,21 @@ unsafe fn decr_quickfix_busy() {
         }
     }
     debug_assert!(unsafe { *QUICKFIX_BUSY.get_mut() } >= 0);
+}
+
+struct QuickfixBusyCallGuard;
+
+impl QuickfixBusyCallGuard {
+    unsafe fn enter() -> Self {
+        unsafe { incr_quickfix_busy() };
+        Self
+    }
+}
+
+impl Drop for QuickfixBusyCallGuard {
+    fn drop(&mut self) {
+        unsafe { decr_quickfix_busy() };
+    }
 }
 
 /// Set `w:quickfix_title` when the quickfix list has a title
@@ -2102,6 +2115,62 @@ unsafe fn qf_set_properties(
     }
     // qf_update_buffer(qi, NULL) for a new list remains display-only.
     retval
+}
+
+/// Populate or modify a quickfix/location-list stack (`set_errorlist`).
+///
+/// Direct item Lists and `{what}` property dictionaries are complete.
+/// Action `'f'` remains deferred pending `qf_free_stack`'s displayed-
+/// window reconstruction path.
+///
+/// # Safety
+/// `wp`, `list`, `what`, and every pointer reachable from their
+/// typvals must remain valid. Touches global quickfix/location stacks,
+/// busy/deletion state, buffer lookup, and typval reference counts.
+pub unsafe fn set_errorlist(
+    wp: Option<*mut WinT>,
+    list: *const crate::eval::typval_defs::ListT,
+    action: u8,
+    title: Option<&[u8]>,
+    what: Option<*mut crate::eval::typval_defs::DictT>,
+) -> i32 {
+    let qi = if let Some(wp) = wp {
+        unsafe { ll_get_or_alloc_list(wp) }
+    } else {
+        unsafe { QL_INFO.get_mut() }
+            .as_mut()
+            .map_or(std::ptr::null_mut(), std::ptr::from_mut)
+    };
+    assert!(!qi.is_null(), "set_errorlist: quickfix stack is not initialized");
+
+    if action == b'f' {
+        unimplemented!("set_errorlist: free action needs qf_free_stack");
+    }
+    if !list.is_null()
+        && unsafe { crate::eval::typval::tv_list_len(list) } != 0
+        && what.is_some()
+    {
+        return crate::vim_defs::FAIL;
+    }
+
+    let _busy = unsafe { QuickfixBusyCallGuard::enter() };
+    if let Some(what) = what {
+        unsafe { qf_set_properties(qi, what, action, title) }
+    } else {
+        let qf_idx = unsafe { (*qi).qf_curlist };
+        let retval = unsafe { qf_add_entries(qi, qf_idx, list, title, action) };
+        if retval == crate::vim_defs::OK
+            && qf_get_curlist(unsafe { &*qi }).is_some()
+        {
+            let idx = usize::try_from(unsafe { (*qi).qf_curlist })
+                .expect("current quickfix index must be nonnegative");
+            let qfl = unsafe {
+                std::ptr::addr_of_mut!((&mut (*qi).qf_lists)[idx])
+            };
+            qf_list_changed(unsafe { &mut *qfl });
+        }
+        retval
+    }
 }
 
 /// Add a quickfix list's `'quickfixtextfunc'` callback to a result
@@ -10312,6 +10381,159 @@ mod tests {
         );
         assert_eq!(qi.qf_lists[0].qf_changedtick, 0);
         unsafe { crate::eval::typval::tv_dict_free(what) };
+    }
+
+    #[test]
+    fn set_errorlist_populates_the_global_stack_from_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _ids = LastQfIdGuard::new();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 3));
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 4, 2, Some(true)),
+            )
+        };
+
+        assert_eq!(
+            unsafe {
+                set_errorlist(
+                    None,
+                    list,
+                    b' ',
+                    Some(b"title"),
+                    None,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        let qi = unsafe { QL_INFO.get_mut() }.as_mut().unwrap();
+        assert_eq!(qi.qf_listcount, 1);
+        assert_eq!(qi.qf_lists[0].qf_entries[0].qf_lnum, 4);
+        assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"title"[..]));
+        assert_eq!(qi.qf_lists[0].qf_changedtick, 1);
+        assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 0);
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn set_errorlist_applies_what_with_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                std::ptr::null_mut(),
+            )
+        };
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 3));
+        let empty = crate::eval::typval::tv_list_alloc(0);
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_str(
+            unsafe { &mut *what },
+            b"title",
+            Some(b"metadata"),
+        );
+
+        assert_eq!(
+            unsafe {
+                set_errorlist(
+                    None,
+                    empty,
+                    b' ',
+                    Some(b"default"),
+                    Some(what),
+                )
+            },
+            crate::vim_defs::OK
+        );
+        let qi = unsafe { QL_INFO.get_mut() }.as_mut().unwrap();
+        assert_eq!(
+            qi.qf_lists[0].qf_title.as_deref(),
+            Some(&b"metadata"[..])
+        );
+        assert_eq!(qi.qf_lists[0].qf_changedtick, 1);
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe {
+            crate::eval::typval::tv_dict_free(what);
+            crate::eval::typval::tv_list_unref(empty);
+        }
+    }
+
+    #[test]
+    fn set_errorlist_rejects_nonempty_list_plus_what_without_entering_busy_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 3));
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_append_number(list, 1) };
+        let what = crate::eval::typval::tv_dict_alloc();
+
+        assert_eq!(
+            unsafe {
+                set_errorlist(None, list, b'r', None, Some(what))
+            },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 0);
+        assert_eq!(
+            unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_listcount,
+            0
+        );
+
+        unsafe {
+            crate::eval::typval::tv_dict_free(what);
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn set_errorlist_allocates_and_populates_a_window_location_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_lhi = 3;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 6, 1, Some(true)),
+            )
+        };
+
+        assert_eq!(
+            unsafe {
+                set_errorlist(
+                    Some(win_ptr),
+                    list,
+                    b' ',
+                    Some(b"location"),
+                    None,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        let location = unsafe { (*win_ptr).w_llist };
+        assert!(!location.is_null());
+        assert_eq!(unsafe { (*location).qfl_type }, QfltypeT::Location);
+        assert_eq!(
+            unsafe { (&(*location).qf_lists)[0].qf_entries[0].qf_lnum },
+            6
+        );
+
+        unsafe {
+            qf_free_all(Some(win_ptr));
+            crate::eval::typval::tv_list_unref(list);
+        }
     }
 
     #[test]
