@@ -1662,7 +1662,7 @@ pub fn csi_repeat<C: VTermStateCallbacks>(
     state: &mut VTermState,
     callbacks: &mut C,
     count: i32,
-) {
+) -> bool {
     let width = state.combine_width.max(1);
     let end = (state.pos.col + count.max(1)).min(state.current_row_width());
     let schar = crate::grid::schar_from_buf(&state.grapheme_buf[..state.grapheme_len]);
@@ -1670,9 +1670,12 @@ pub fn csi_repeat<C: VTermStateCallbacks>(
         putglyph(state, callbacks, schar, width, state.pos, state.protected_cell);
         state.pos.col += width;
     }
-    if state.pos.col + width >= state.current_row_width() && state.mode.autowrap {
+    let preserve_phantom =
+        state.pos.col + width >= state.current_row_width() && state.mode.autowrap;
+    if preserve_phantom {
         state.at_phantom = true;
     }
+    preserve_phantom
 }
 
 pub fn csi_dec_sgr<C: VTermStateCallbacks>(
@@ -1688,6 +1691,392 @@ pub fn csi_dec_sgr<C: VTermStateCallbacks>(
             _ => continue,
         };
         state.setpen(callbacks, &[mapped]);
+    }
+}
+
+fn csi_raw_arg(
+    args: &[crate::vterm::parser::CsiArg],
+    index: usize,
+) -> crate::vterm::parser::CsiArg {
+    args.get(index)
+        .copied()
+        .unwrap_or(crate::vterm::parser::CSI_ARG_MISSING)
+}
+
+fn csi_arg_value(args: &[crate::vterm::parser::CsiArg], index: usize) -> i32 {
+    crate::vterm::parser::csi_arg(csi_raw_arg(args, index)) as i32
+}
+
+fn csi_arg_or(args: &[crate::vterm::parser::CsiArg], index: usize, default: i32) -> i32 {
+    crate::vterm::parser::csi_arg_or(csi_raw_arg(args, index), default as u32) as i32
+}
+
+fn csi_arg_count(args: &[crate::vterm::parser::CsiArg], index: usize) -> i32 {
+    crate::vterm::parser::csi_arg_count(csi_raw_arg(args, index)) as i32
+}
+
+pub fn on_csi<C: VTermStateCallbacks, F: VTermStateFallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    fallbacks: &mut F,
+    leader: Option<&[u8]>,
+    args: &[crate::vterm::parser::CsiArg],
+    intermed: Option<&[u8]>,
+    command: u8,
+) -> (i32, Vec<u8>) {
+    let leader_byte = match leader.unwrap_or_default() {
+        [] => 0,
+        [byte @ (b'?' | b'>' | b'<' | b'=')] => *byte,
+        _ => return (0, Vec::new()),
+    };
+    let intermed_byte = match intermed.unwrap_or_default() {
+        [] => 0,
+        [byte @ (b' ' | b'!' | b'"' | b'$' | b'\'')] => *byte,
+        _ => return (0, Vec::new()),
+    };
+    let old_position = state.pos;
+    let mut cancel_phantom = true;
+    let mut output = Vec::new();
+
+    match (leader_byte, intermed_byte, command) {
+        (0, 0, b'@') => csi_insert_chars(state, callbacks, csi_arg_count(args, 0)),
+        (0, 0, command @ (b'A'..=b'F' | b'a' | b'e' | b'j' | b'k')) => {
+            state.csi_move_cursor(command, csi_arg_count(args, 0));
+        }
+        (0, 0, command @ (b'G' | b'`')) => {
+            state.csi_position(command, 1, csi_arg_or(args, 0, 1));
+        }
+        (0, 0, command @ (b'H' | b'f')) => {
+            state.csi_position(
+                command,
+                csi_arg_or(args, 0, 1),
+                csi_arg_or(args, 1, 1),
+            );
+        }
+        (0, 0, b'I') => csi_tab(state, csi_arg_count(args, 0), true),
+        (leader @ (0 | b'?'), 0, b'J') => {
+            csi_erase_display(
+                state,
+                callbacks,
+                csi_arg_or(args, 0, 0),
+                leader == b'?',
+            );
+        }
+        (leader @ (0 | b'?'), 0, b'K') => {
+            if !csi_erase_line(
+                state,
+                callbacks,
+                csi_arg_or(args, 0, 0),
+                leader == b'?',
+            ) {
+                return (0, Vec::new());
+            }
+        }
+        (0, 0, b'L') => csi_insert_lines(state, callbacks, csi_arg_count(args, 0)),
+        (0, 0, b'M') => csi_delete_lines(state, callbacks, csi_arg_count(args, 0)),
+        (0, 0, b'P') => csi_delete_chars(state, callbacks, csi_arg_count(args, 0)),
+        (0, 0, b'S') => {
+            csi_scroll_region(state, callbacks, csi_arg_count(args, 0));
+        }
+        (0, 0, b'T') => {
+            csi_scroll_region(state, callbacks, -csi_arg_count(args, 0));
+        }
+        (0, 0, b'X') => csi_erase_chars(state, callbacks, csi_arg_count(args, 0)),
+        (0, 0, b'Z') => csi_tab(state, csi_arg_count(args, 0), false),
+        (0, 0, b'b') => {
+            cancel_phantom = !csi_repeat(state, callbacks, csi_arg_count(args, 0));
+        }
+        (0, 0, b'c') => {
+            if csi_arg_or(args, 0, 0) == 0 {
+                output = primary_device_attributes(state.ctrl8bit);
+            }
+        }
+        (b'>', 0, b'c') => output = secondary_device_attributes(state.ctrl8bit),
+        (0, 0, b'd') => {
+            state.csi_position(b'd', csi_arg_or(args, 0, 1), 1);
+        }
+        (0, 0, b'g') => {
+            if !csi_tab_clear(state, csi_arg_or(args, 0, 0)) {
+                return (0, Vec::new());
+            }
+        }
+        (leader @ (0 | b'?'), 0, b'h') => {
+            csi_set_modes(state, callbacks, args, leader == b'?', true);
+        }
+        (leader @ (0 | b'?'), 0, b'l') => {
+            csi_set_modes(state, callbacks, args, leader == b'?', false);
+        }
+        (0, 0, b'm') => state.setpen(callbacks, args),
+        (b'?', 0, b'm') => csi_dec_sgr(state, callbacks, args),
+        (leader @ (0 | b'?'), 0, b'n') => {
+            let value = csi_arg_or(args, 0, 0);
+            output = if value == 996 {
+                csi_theme_status(callbacks, state.ctrl8bit)
+            } else {
+                csi_device_status(state, value, leader == b'?', state.ctrl8bit)
+            };
+        }
+        (0, b'!', b'p') => csi_soft_reset(state, callbacks),
+        (b'?', b'$', b'p') => {
+            output = request_dec_mode(state, csi_arg_value(args, 0), state.ctrl8bit);
+        }
+        (b'>', 0, b'q') => output = request_version_string(state.ctrl8bit),
+        (0, b' ', b'q') => {
+            csi_set_cursor_style(state, callbacks, csi_arg_or(args, 0, 1));
+        }
+        (0, b'"', b'q') => {
+            csi_set_character_protection(state, csi_arg_or(args, 0, 0));
+        }
+        (0, 0, b'r') => {
+            let bottom = args
+                .get(1)
+                .copied()
+                .filter(|&arg| !crate::vterm::parser::csi_arg_is_missing(arg))
+                .map(|arg| crate::vterm::parser::csi_arg(arg) as i32);
+            state.set_vertical_margins(csi_arg_or(args, 0, 1), bottom);
+        }
+        (0, 0, b's') => {
+            let right = args
+                .get(1)
+                .copied()
+                .filter(|&arg| !crate::vterm::parser::csi_arg_is_missing(arg))
+                .map(|arg| crate::vterm::parser::csi_arg(arg) as i32);
+            state.set_horizontal_margins(csi_arg_or(args, 0, 1), right);
+        }
+        (leader @ (b'?' | b'>' | b'<' | b'='), 0, b'u') => {
+            output = csi_key_encoding(state, leader, args, state.ctrl8bit)
+                .expect("validated key-encoding leader");
+        }
+        (0, b'\'', b'}') => {
+            csi_insert_columns(state, callbacks, csi_arg_count(args, 0));
+        }
+        (0, b'\'', b'~') => {
+            csi_delete_columns(state, callbacks, csi_arg_count(args, 0));
+        }
+        _ => {
+            return (
+                i32::from(fallbacks.csi(leader, args, intermed, command)),
+                Vec::new(),
+            );
+        }
+    }
+
+    if state.mode.origin {
+        state.pos.row = state
+            .pos
+            .row
+            .clamp(state.scrollregion_top, state.scrollregion_bottom() - 1);
+        state.pos.col = state
+            .pos
+            .col
+            .clamp(state.scrollregion_left(), state.scrollregion_right() - 1);
+    } else {
+        state.pos.row = state.pos.row.clamp(0, state.rows - 1);
+        state.pos.col = state.pos.col.clamp(0, state.current_row_width() - 1);
+    }
+    updatecursor(state, callbacks, old_position, cancel_phantom);
+    (1, output)
+}
+
+#[cfg(test)]
+mod on_csi_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        moves: Vec<crate::vterm_defs::VTermPos>,
+        props: Vec<crate::vterm_defs::VTermProp>,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn move_cursor(
+            &mut self,
+            position: crate::vterm_defs::VTermPos,
+            _: crate::vterm_defs::VTermPos,
+            _: bool,
+        ) -> bool {
+            self.moves.push(position);
+            true
+        }
+
+        fn set_term_prop(
+            &mut self,
+            prop: crate::vterm_defs::VTermProp,
+            _: &crate::vterm_defs::VTermValue<'_>,
+        ) -> bool {
+            self.props.push(prop);
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct Fallback(usize);
+
+    impl VTermStateFallbacks for Fallback {
+        fn csi(
+            &mut self,
+            _: Option<&[u8]>,
+            _: &[crate::vterm::parser::CsiArg],
+            _: Option<&[u8]>,
+            _: u8,
+        ) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+
+    #[test]
+    fn csi_dispatch_moves_clamps_and_notifies_the_cursor() {
+        let mut state = VTermState::new(4, 5);
+        state.pos = crate::vterm_defs::VTermPos { row: 1, col: 2 };
+        let mut capture = Capture::default();
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                None,
+                &[20],
+                None,
+                b'C',
+            ),
+            (1, Vec::new())
+        );
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 4 });
+        assert_eq!(capture.moves, [state.pos]);
+    }
+
+    #[test]
+    fn csi_dispatch_handles_modes_pen_margins_and_presentation() {
+        let mut state = VTermState::new(6, 10);
+        state.initialize_pen_colors();
+        let mut capture = Capture::default();
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                Some(b"?"),
+                &[7, 25],
+                None,
+                b'h',
+            )
+            .0,
+            1
+        );
+        assert!(state.mode.autowrap);
+        assert!(state.mode.cursor_visible);
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                None,
+                &[1, 3],
+                None,
+                b'm',
+            )
+            .0,
+            1
+        );
+        assert!(state.pen.bold);
+        assert!(state.pen.italic);
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                None,
+                &[2, 5],
+                None,
+                b'r',
+            )
+            .0,
+            1
+        );
+        assert_eq!((state.scrollregion_top, state.scrollregion_bottom), (1, 5));
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                None,
+                &[6],
+                Some(b" "),
+                b'q',
+            )
+            .0,
+            1
+        );
+        assert_eq!(
+            state.mode.cursor_shape,
+            crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT as u8
+        );
+    }
+
+    #[test]
+    fn csi_dispatch_returns_device_and_version_responses() {
+        let mut state = VTermState::new(4, 5);
+        state.pos = crate::vterm_defs::VTermPos { row: 1, col: 2 };
+        let mut capture = Capture::default();
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                Some(b"?"),
+                &[6],
+                None,
+                b'n',
+            )
+            .1,
+            b"\x1b[?2;3R"
+        );
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut capture,
+                &mut (),
+                Some(b">"),
+                &[],
+                None,
+                b'q',
+            )
+            .1,
+            b"\x1bP>|libvterm(0.3)\x1b\\"
+        );
+    }
+
+    #[test]
+    fn csi_dispatch_routes_unknown_sequences_to_fallbacks() {
+        let mut state = VTermState::new(1, 1);
+        let mut fallback = Fallback::default();
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut (),
+                &mut fallback,
+                None,
+                &[],
+                None,
+                b'?',
+            ),
+            (1, Vec::new())
+        );
+        assert_eq!(fallback.0, 1);
+        assert_eq!(
+            on_csi(
+                &mut state,
+                &mut (),
+                &mut fallback,
+                Some(b"??"),
+                &[],
+                None,
+                b'?',
+            ),
+            (0, Vec::new())
+        );
+        assert_eq!(fallback.0, 1);
     }
 }
 
