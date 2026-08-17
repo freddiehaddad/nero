@@ -1151,6 +1151,19 @@ pub unsafe fn did_set_binary(
     None
 }
 
+/// Process an updated `'iminsert'` option (`did_set_iminsert`).
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin` and the current window list must be live
+/// and valid.
+pub unsafe fn did_set_iminsert(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // `showmode()` is immediate rendering only.
+    unsafe { crate::drawscreen::status_redraw_curbuf() };
+    None
+}
+
 /// Record the first vimrc path in an environment variable
 /// (`vimrc_found`).
 ///
@@ -1332,6 +1345,38 @@ mod binary_option_tests {
             (buf.b_p_tw, buf.b_p_wm, buf.b_p_ml, buf.b_p_et),
             (0, 0, 0, 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod iminsert_option_tests {
+    use super::*;
+
+    #[test]
+    fn did_set_iminsert_marks_current_buffer_statusline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_status_height: 1,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let win_ptr = std::ptr::from_mut(&mut win);
+        unsafe { (*win_ptr).w_buffer = buf_ptr };
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        assert_eq!(
+            unsafe { did_set_iminsert(&mut crate::option_defs::OptsetT::default()) },
+            None
+        );
+        assert!(unsafe { (*win_ptr).w_redr_status });
     }
 }
 
