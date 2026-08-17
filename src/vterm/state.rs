@@ -752,6 +752,15 @@ pub fn control_carriage_return(state: &mut VTermState) {
     state.pos.col = 0;
 }
 
+pub fn control_locking_shift(state: &mut VTermState, control: u8) -> bool {
+    match control {
+        0x0E => state.gl_set = 1,
+        0x0F => state.gl_set = 0,
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -786,6 +795,14 @@ mod control_backspace_tests {
         state.pos.col = 7;
         control_carriage_return(&mut state);
         assert_eq!(state.pos.col, 0);
+    }
+    #[test]
+    fn control_locking_shift_selects_g0_or_g1() {
+        let mut state = VTermState::new(1, 1);
+        assert!(control_locking_shift(&mut state, 0x0E));
+        assert_eq!(state.gl_set, 1);
+        assert!(control_locking_shift(&mut state, 0x0F));
+        assert_eq!(state.gl_set, 0);
     }
 }
 
