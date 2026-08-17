@@ -4077,6 +4077,52 @@ pub unsafe fn win_find_tabpage(win: *const WinT) -> *mut crate::buffer_defs::Tab
     std::ptr::null_mut()
 }
 
+/// Append `wp` after `after` in a tabpage's window list (`win_append`).
+///
+/// A null `after` inserts at the front. A null `tp` selects the current
+/// window list in `GLOBALS`.
+///
+/// # Safety
+/// All non-null pointers and their list links must be live and valid.
+pub unsafe fn win_append(
+    after: *mut crate::buffer_defs::WinT,
+    wp: *mut crate::buffer_defs::WinT,
+    tp: *mut crate::buffer_defs::TabpageT,
+) {
+    let globals = unsafe { &mut *crate::globals::GLOBALS.as_ptr() };
+    debug_assert!(tp.is_null() || tp != globals.curtab);
+    let first = if tp.is_null() {
+        &mut globals.firstwin
+    } else {
+        unsafe { &mut (*tp).tp_firstwin }
+    };
+    let last = if tp.is_null() {
+        &mut globals.lastwin
+    } else {
+        unsafe { &mut (*tp).tp_lastwin }
+    };
+    let before = if after.is_null() {
+        *first
+    } else {
+        unsafe { (*after).w_next }
+    };
+
+    unsafe {
+        (*wp).w_next = before;
+        (*wp).w_prev = after;
+    }
+    if after.is_null() {
+        *first = wp;
+    } else {
+        unsafe { (*after).w_next = wp };
+    }
+    if before.is_null() {
+        *last = wp;
+    } else {
+        unsafe { (*before).w_prev = wp };
+    }
+}
+
 /// Remove a window from a tabpage's doubly-linked window list
 /// (`win_remove`).
 ///
@@ -4115,6 +4161,33 @@ pub unsafe fn win_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win_append_inserts_between_existing_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut first = WinT::default();
+        let mut inserted = WinT::default();
+        let mut last = WinT::default();
+        let first_ptr = std::ptr::from_mut(&mut first);
+        let inserted_ptr = std::ptr::from_mut(&mut inserted);
+        let last_ptr = std::ptr::from_mut(&mut last);
+        unsafe {
+            (*first_ptr).w_next = last_ptr;
+            (*last_ptr).w_prev = first_ptr;
+        }
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, first_ptr)
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastwin, last_ptr)
+        };
+
+        unsafe { win_append(first_ptr, inserted_ptr, std::ptr::null_mut()) };
+        assert_eq!(unsafe { (*first_ptr).w_next }, inserted_ptr);
+        assert_eq!(unsafe { (*inserted_ptr).w_prev }, first_ptr);
+        assert_eq!(unsafe { (*inserted_ptr).w_next }, last_ptr);
+        assert_eq!(unsafe { (*last_ptr).w_prev }, inserted_ptr);
+    }
 
     #[test]
     fn win_remove_unlinks_current_tab_first_and_last_windows() {
