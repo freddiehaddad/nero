@@ -1337,6 +1337,148 @@ pub unsafe fn qf_add_entry_from_dict(
     status
 }
 
+/// Add a List of item dictionaries to a quickfix/location list
+/// (`qf_add_entries`).
+///
+/// Implements new, append, replace, and update actions, including
+/// first-entry and nearest-entry reselection. The final quickfix-buffer
+/// refresh remains deferred with `qf_update_buffer`.
+///
+/// # Safety
+/// `qi`, `list`, and every Dict/typval pointer reachable from `list`
+/// must remain valid. Touches global quickfix ids, buffer lookup,
+/// character classes, and typval reference counts.
+pub unsafe fn qf_add_entries(
+    qi: *mut crate::types_defs::QfInfoT,
+    mut qf_idx: i32,
+    list: *const crate::eval::typval_defs::ListT,
+    title: Option<&[u8]>,
+    action: u8,
+) -> i32 {
+    let Ok(initial_idx) = usize::try_from(qf_idx) else {
+        return qf_status::QF_FAIL;
+    };
+    if initial_idx >= unsafe { (*qi).qf_lists.len() } {
+        return qf_status::QF_FAIL;
+    }
+
+    let (prev_fnum, prev_lnum, prev_col) = {
+        let qfl = unsafe { &(&(*qi).qf_lists)[initial_idx] };
+        qfl.entry_at(qfl.qf_index).map_or((0, 0, 0), |entry| {
+            (entry.qf_fnum, entry.qf_lnum, entry.qf_col)
+        })
+    };
+    let mut select_first_entry = false;
+    let mut select_nearest_entry = false;
+
+    if action == b' ' || qf_idx == unsafe { (*qi).qf_listcount } {
+        select_first_entry = true;
+        unsafe { qf_new_list(&mut *qi, title) };
+        qf_idx = unsafe { (*qi).qf_curlist };
+    } else {
+        let qfl = unsafe {
+            std::ptr::addr_of_mut!(
+                (&mut (*qi).qf_lists)[initial_idx]
+            )
+        };
+        match action {
+            b'a' => {
+                if qf_list_empty(Some(unsafe { &*qfl })) {
+                    select_first_entry = true;
+                }
+            }
+            b'r' => {
+                select_first_entry = true;
+                qf_free_items(unsafe { &mut *qfl });
+                qf_store_title(unsafe { &mut *qfl }, title);
+            }
+            b'u' => {
+                select_nearest_entry = true;
+                qf_free_items(unsafe { &mut *qfl });
+                qf_store_title(unsafe { &mut *qfl }, title);
+            }
+            _ => {}
+        }
+    }
+
+    let Ok(idx) = usize::try_from(qf_idx) else {
+        return qf_status::QF_FAIL;
+    };
+    if idx >= unsafe { (*qi).qf_lists.len() } {
+        return qf_status::QF_FAIL;
+    }
+    let mut retval = qf_status::QF_OK;
+    let mut valid_entry = false;
+    let mut entry_to_select: Option<usize> = None;
+    let first = unsafe { crate::eval::typval::tv_list_first(list) };
+    let mut item = first;
+    while !item.is_null() {
+        let next = unsafe { (*item).li_next };
+        let crate::eval::typval_defs::TypvalValue::Dict(dict) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            item = next;
+            continue;
+        };
+        if dict.is_null() {
+            item = next;
+            continue;
+        }
+
+        let qfl = unsafe {
+            std::ptr::addr_of_mut!((&mut (*qi).qf_lists)[idx])
+        };
+        retval = unsafe {
+            qf_add_entry_from_dict(
+                &mut *qfl,
+                *dict,
+                std::ptr::eq(item, first),
+                &mut valid_entry,
+            )
+        };
+        if retval == qf_status::QF_FAIL {
+            break;
+        }
+
+        let new_idx = unsafe { (*qfl).qf_entries.len() - 1 };
+        let should_select = if select_first_entry {
+            entry_to_select.is_none()
+        } else if select_nearest_entry {
+            entry_to_select.is_none_or(|selected| {
+                let entries = unsafe { &(*qfl).qf_entries };
+                entry_is_closer_to_target(
+                    &entries[new_idx],
+                    &entries[selected],
+                    prev_fnum,
+                    prev_lnum,
+                    prev_col,
+                )
+            })
+        } else {
+            false
+        };
+        if should_select {
+            entry_to_select = Some(new_idx);
+        }
+        item = next;
+    }
+
+    let qfl = unsafe {
+        std::ptr::addr_of_mut!((&mut (*qi).qf_lists)[idx])
+    };
+    if valid_entry {
+        unsafe { (*qfl).qf_nonevalid = false };
+    } else if unsafe { (*qfl).qf_index } == 0 {
+        unsafe { (*qfl).qf_nonevalid = true };
+    }
+    if let Some(selected) = entry_to_select {
+        unsafe { (*qfl).qf_index = i32::try_from(selected + 1).unwrap_or(i32::MAX) };
+    }
+
+    // qf_update_buffer(qi, old_last) remains a display-only side effect.
+    retval
+}
+
 /// Whether an entry is still present in a quickfix list
 /// (`is_qf_entry_present`).
 #[allow(dead_code)]
@@ -10431,5 +10573,225 @@ mod tests {
                 &mut valid,
             )
         };
+    }
+
+    fn batch_item_dict(
+        bufnr: i32,
+        lnum: i32,
+        col: i32,
+        valid: Option<bool>,
+    ) -> *mut crate::eval::typval_defs::DictT {
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let dict_ref = unsafe { &mut *dict };
+        crate::eval::typval::tv_dict_add_nr(
+            dict_ref,
+            b"bufnr",
+            i64::from(bufnr),
+        );
+        crate::eval::typval::tv_dict_add_nr(
+            dict_ref,
+            b"lnum",
+            i64::from(lnum),
+        );
+        crate::eval::typval::tv_dict_add_nr(
+            dict_ref,
+            b"col",
+            i64::from(col),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            dict_ref,
+            b"text",
+            Some(b"item"),
+        );
+        if let Some(valid) = valid {
+            crate::eval::typval::tv_dict_add_nr(
+                dict_ref,
+                b"valid",
+                i64::from(valid),
+            );
+        }
+        dict
+    }
+
+    #[test]
+    fn qf_add_entries_creates_a_new_list_and_skips_non_dict_items() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut qi = qf_alloc_stack(QfltypeT::Quickfix, 3);
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 99);
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 1, 1, Some(true)),
+            );
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 2, 1, Some(true)),
+            );
+        }
+
+        assert_eq!(
+            unsafe {
+                qf_add_entries(
+                    qi_ptr,
+                    0,
+                    list,
+                    Some(b"new"),
+                    b' ',
+                )
+            },
+            qf_status::QF_OK
+        );
+        assert_eq!(qi.qf_listcount, 1);
+        assert_eq!(qi.qf_lists[0].qf_count(), 2);
+        assert_eq!(qi.qf_lists[0].qf_index, 1);
+        assert!(!qi.qf_lists[0].qf_nonevalid);
+        assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"new"[..]));
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn qf_add_entries_replace_selects_the_first_even_when_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT {
+                    qf_valid: true,
+                    ..Default::default()
+                }],
+                qf_index: 1,
+                qf_nonevalid: false,
+                qf_title: Some(b"old".to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 0, 0, None),
+            )
+        };
+
+        assert_eq!(
+            unsafe {
+                qf_add_entries(
+                    qi_ptr,
+                    0,
+                    list,
+                    Some(b"replaced"),
+                    b'r',
+                )
+            },
+            qf_status::QF_OK
+        );
+        assert_eq!(qi.qf_lists[0].qf_count(), 1);
+        assert_eq!(qi.qf_lists[0].qf_index, 1);
+        assert!(qi.qf_lists[0].qf_nonevalid);
+        assert_eq!(
+            qi.qf_lists[0].qf_title.as_deref(),
+            Some(&b"replaced"[..])
+        );
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn qf_add_entries_update_reselects_the_nearest_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            handle: 7,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                buf_ptr,
+            )
+        };
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT {
+                    qf_fnum: 7,
+                    qf_lnum: 100,
+                    qf_col: 20,
+                    qf_valid: true,
+                    ..Default::default()
+                }],
+                qf_index: 1,
+                qf_nonevalid: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(7, 90, 20, None),
+            );
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(7, 101, 20, None),
+            );
+        }
+
+        assert_eq!(
+            unsafe { qf_add_entries(qi_ptr, 0, list, None, b'u') },
+            qf_status::QF_OK
+        );
+        assert_eq!(qi.qf_lists[0].qf_index, 2);
+        assert_eq!(qi.qf_lists[0].qf_entries[1].qf_lnum, 101);
+        assert!(!qi.qf_lists[0].qf_nonevalid);
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn qf_add_entries_append_keeps_the_existing_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT {
+                    qf_valid: true,
+                    ..Default::default()
+                }],
+                qf_index: 1,
+                qf_nonevalid: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                list,
+                batch_item_dict(0, 2, 1, Some(true)),
+            )
+        };
+
+        assert_eq!(
+            unsafe { qf_add_entries(qi_ptr, 0, list, None, b'a') },
+            qf_status::QF_OK
+        );
+        assert_eq!(qi.qf_lists[0].qf_count(), 2);
+        assert_eq!(qi.qf_lists[0].qf_index, 1);
+
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 }
