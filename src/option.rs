@@ -982,6 +982,18 @@ pub fn get_option(opt_idx: OptIndex) -> &'static VimoptionT {
     unsafe { &*opt_ptr(opt_idx) }
 }
 
+/// Recover an option index from its entry pointer (`get_opt_idx`).
+///
+/// # Safety
+/// `opt` must point into the fixed `OPTIONS` array.
+#[must_use]
+pub unsafe fn get_opt_idx(opt: *const VimoptionT) -> OptIndex {
+    let base = OPTIONS.as_ptr().cast::<VimoptionT>();
+    let offset = unsafe { opt.offset_from(base) };
+    let index = usize::try_from(offset).expect("option pointer must not precede OPTIONS");
+    OptIndex::from_index(index).expect("option pointer must point inside OPTIONS")
+}
+
 /// Get a pointer to the flags used for the `kOptFlagInsecure`/
 /// `opt_flags::INSECURE` flag of `opt_idx`. For some local options a
 /// local flags field is used instead of the global `options[]` table's
@@ -5147,6 +5159,18 @@ mod varp_tests {
     fn get_option_returns_the_right_entry() {
         assert_eq!(get_option(OptIndex::Aleph).fullname, b"aleph");
         assert_eq!(get_option(OptIndex::Ambiwidth).fullname, b"ambiwidth");
+    }
+
+    #[test]
+    fn get_opt_idx_recovers_first_middle_and_last_indexes() {
+        for idx in [
+            OptIndex::Aleph,
+            OptIndex::Fileformat,
+            OptIndex::Writedelay,
+        ] {
+            let ptr = get_option(idx) as *const VimoptionT;
+            assert_eq!(unsafe { get_opt_idx(ptr) }, idx);
+        }
     }
 
     #[test]
