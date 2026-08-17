@@ -3192,6 +3192,61 @@ pub fn on_dcs_status(
     }
 }
 
+pub fn on_dcs<F: VTermStateFallbacks>(
+    state: &mut VTermState,
+    fallbacks: &mut F,
+    command: &[u8],
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+) -> (i32, Vec<u8>) {
+    if let Some(output) = on_dcs_status(state, command, fragment, state.ctrl8bit) {
+        (1, output)
+    } else {
+        (on_dcs_fallback(fallbacks, command, fragment), Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod on_dcs_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Fallback(usize);
+
+    impl VTermStateFallbacks for Fallback {
+        fn dcs(
+            &mut self,
+            _: &[u8],
+            _: crate::vterm_defs::VTermStringFragment<'_>,
+        ) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+
+    #[test]
+    fn dcs_dispatches_status_requests_and_fallbacks() {
+        let fragment = crate::vterm_defs::VTermStringFragment {
+            bytes: b"r",
+            initial: true,
+            final_fragment: true,
+            terminator: crate::vterm_defs::VTermTerminator::St,
+        };
+        let mut state = VTermState::new(4, 8);
+        state.reset_scrollregions();
+        let mut fallback = Fallback::default();
+        assert_eq!(
+            on_dcs(&mut state, &mut fallback, b"$q", fragment),
+            (1, b"\x1bP1$r1;4r\x1b\\".to_vec())
+        );
+        assert_eq!(fallback.0, 0);
+        assert_eq!(
+            on_dcs(&mut state, &mut fallback, b"x", fragment),
+            (1, Vec::new())
+        );
+        assert_eq!(fallback.0, 1);
+    }
+}
+
 #[cfg(test)]
 mod dcs_status_tests {
     use super::*;
