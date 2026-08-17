@@ -89,6 +89,8 @@
 //!
 //! Also [`cin_isinit`] - `"[typedef] [static|public|protected|
 //! private] enum"`, falling back to [`cin_is_compound_init`].
+//! Also [`parse_cino`] - the complete `'cinoptions'` parser and
+//! buffer-local indentation-cache initializer.
 //!
 //! Deferred: everything else - `cin_iswhileofdo_end`/
 //! `cin_is_cpp_baseclass`/`cin_isfuncdecl` (need `find_match_paren`
@@ -112,6 +114,142 @@ pub unsafe fn cindent_on() -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
     paste == 0 && (curbuf.b_p_cin != 0 || !curbuf.b_p_inde.as_deref().unwrap_or(&[]).is_empty())
+}
+
+/// Parse `'cinoptions'` into the buffer's cached indentation fields
+/// (`parse_cino`).
+pub fn parse_cino(buf: &mut crate::buffer_defs::BufT) {
+    let sw = crate::indent::get_sw_value(buf);
+    buf.b_ind_level = sw;
+    buf.b_ind_open_imag = 0;
+    buf.b_ind_no_brace = 0;
+    buf.b_ind_first_open = 0;
+    buf.b_ind_open_extra = 0;
+    buf.b_ind_close_extra = 0;
+    buf.b_ind_open_left_imag = 0;
+    buf.b_ind_jump_label = -1;
+    buf.b_ind_case = sw;
+    buf.b_ind_case_code = sw;
+    buf.b_ind_case_break = 0;
+    buf.b_ind_scopedecl = sw;
+    buf.b_ind_scopedecl_code = sw;
+    buf.b_ind_param = sw;
+    buf.b_ind_func_type = sw;
+    buf.b_ind_cpp_baseclass = sw;
+    buf.b_ind_continuation = sw;
+    buf.b_ind_unclosed = sw * 2;
+    buf.b_ind_unclosed2 = sw;
+    buf.b_ind_unclosed_noignore = 0;
+    buf.b_ind_unclosed_wrapped = 0;
+    buf.b_ind_unclosed_whiteok = 0;
+    buf.b_ind_matching_paren = 0;
+    buf.b_ind_paren_prev = 0;
+    buf.b_ind_comment = 0;
+    buf.b_ind_in_comment = 3;
+    buf.b_ind_in_comment2 = 0;
+    buf.b_ind_maxparen = 20;
+    buf.b_ind_maxcomment = 70;
+    buf.b_ind_java = 0;
+    buf.b_ind_js = 0;
+    buf.b_ind_keep_case_label = 0;
+    buf.b_ind_cpp_namespace = 0;
+    buf.b_ind_if_for_while = 0;
+    buf.b_ind_hash_comment = 0;
+    buf.b_ind_cpp_extern_c = 0;
+    buf.b_ind_pragma = 0;
+
+    let cino = buf.b_p_cino.clone().unwrap_or_default();
+    let mut pos = 0usize;
+    let mut fraction = 0i64;
+    while pos < cino.len() && cino[pos] != 0 {
+        let key = cino[pos];
+        pos += 1;
+        let negative = cino.get(pos) == Some(&b'-');
+        pos += usize::from(negative);
+        let digits_start = pos;
+        let (mut value, consumed) = crate::charset::getdigits(&cino[pos..], true, 0);
+        pos += consumed;
+        let mut divider = 0i64;
+
+        if cino.get(pos) == Some(&b'.') {
+            pos += 1;
+            fraction = 0;
+            while cino.get(pos).is_some_and(u8::is_ascii_digit) {
+                fraction = fraction
+                    .saturating_mul(10)
+                    .saturating_add(i64::from(cino[pos] - b'0'));
+                divider = if divider == 0 {
+                    10
+                } else {
+                    divider.saturating_mul(10)
+                };
+                pos += 1;
+            }
+        }
+
+        if cino.get(pos) == Some(&b's') {
+            if pos == digits_start {
+                value = i64::from(sw);
+            } else {
+                value = value.saturating_mul(i64::from(sw));
+                if divider != 0 {
+                    value = value.saturating_add(
+                        i64::from(sw)
+                            .saturating_mul(fraction)
+                            .saturating_add(divider / 2)
+                            / divider,
+                    );
+                }
+            }
+            pos += 1;
+        }
+        if negative {
+            value = value.saturating_neg();
+        }
+
+        let value = crate::math::trim_to_int(value);
+        match key {
+            b'>' => buf.b_ind_level = value,
+            b'e' => buf.b_ind_open_imag = value,
+            b'n' => buf.b_ind_no_brace = value,
+            b'f' => buf.b_ind_first_open = value,
+            b'{' => buf.b_ind_open_extra = value,
+            b'}' => buf.b_ind_close_extra = value,
+            b'^' => buf.b_ind_open_left_imag = value,
+            b'L' => buf.b_ind_jump_label = value,
+            b':' => buf.b_ind_case = value,
+            b'=' => buf.b_ind_case_code = value,
+            b'b' => buf.b_ind_case_break = value,
+            b'p' => buf.b_ind_param = value,
+            b't' => buf.b_ind_func_type = value,
+            b'/' => buf.b_ind_comment = value,
+            b'c' => buf.b_ind_in_comment = value,
+            b'C' => buf.b_ind_in_comment2 = value,
+            b'i' => buf.b_ind_cpp_baseclass = value,
+            b'+' => buf.b_ind_continuation = value,
+            b'(' => buf.b_ind_unclosed = value,
+            b'u' => buf.b_ind_unclosed2 = value,
+            b'U' => buf.b_ind_unclosed_noignore = value,
+            b'W' => buf.b_ind_unclosed_wrapped = value,
+            b'w' => buf.b_ind_unclosed_whiteok = value,
+            b'm' => buf.b_ind_matching_paren = value,
+            b'M' => buf.b_ind_paren_prev = value,
+            b')' => buf.b_ind_maxparen = value,
+            b'*' => buf.b_ind_maxcomment = value,
+            b'g' => buf.b_ind_scopedecl = value,
+            b'h' => buf.b_ind_scopedecl_code = value,
+            b'j' => buf.b_ind_java = value,
+            b'J' => buf.b_ind_js = value,
+            b'l' => buf.b_ind_keep_case_label = value,
+            b'#' => buf.b_ind_hash_comment = value,
+            b'N' => buf.b_ind_cpp_namespace = value,
+            b'k' => buf.b_ind_if_for_while = value,
+            b'E' => buf.b_ind_cpp_extern_c = value,
+            b'P' => buf.b_ind_pragma = value,
+            _ => {}
+        }
+        pos += usize::from(cino.get(pos) == Some(&b','));
+    }
 }
 
 /// Correct `'cinkeys'` maximum paren search distance for a start
@@ -1456,6 +1594,105 @@ mod tests {
         let result = unsafe { cindent_on() };
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste = old_paste;
         result
+    }
+
+    fn parsed_cino(value: &[u8]) -> BufT {
+        let mut buf = BufT {
+            b_p_sw: 4,
+            b_p_ts: 8,
+            b_p_cino: Some(value.to_vec()),
+            ..Default::default()
+        };
+        parse_cino(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn parse_cino_sets_all_default_values_from_shiftwidth() {
+        let buf = parsed_cino(b"");
+        assert_eq!(buf.b_ind_level, 4);
+        assert_eq!(buf.b_ind_case, 4);
+        assert_eq!(buf.b_ind_case_code, 4);
+        assert_eq!(buf.b_ind_scopedecl, 4);
+        assert_eq!(buf.b_ind_scopedecl_code, 4);
+        assert_eq!(buf.b_ind_param, 4);
+        assert_eq!(buf.b_ind_func_type, 4);
+        assert_eq!(buf.b_ind_cpp_baseclass, 4);
+        assert_eq!(buf.b_ind_continuation, 4);
+        assert_eq!(buf.b_ind_unclosed, 8);
+        assert_eq!(buf.b_ind_unclosed2, 4);
+        assert_eq!(buf.b_ind_jump_label, -1);
+        assert_eq!(buf.b_ind_in_comment, 3);
+        assert_eq!(buf.b_ind_maxparen, 20);
+        assert_eq!(buf.b_ind_maxcomment, 70);
+    }
+
+    #[test]
+    fn parse_cino_maps_every_option_letter_to_its_field() {
+        let buf = parsed_cino(
+            b">1,e2,n3,f4,{5,}6,^7,L8,:9,=10,b11,p12,t13,/14,c15,C16,i17,+18,(19,u20,U21,W22,w23,m24,M25,)26,*27,g28,h29,j30,J31,l32,#33,N34,k35,E36,P37",
+        );
+        assert_eq!(
+            [
+                buf.b_ind_level,
+                buf.b_ind_open_imag,
+                buf.b_ind_no_brace,
+                buf.b_ind_first_open,
+                buf.b_ind_open_extra,
+                buf.b_ind_close_extra,
+                buf.b_ind_open_left_imag,
+                buf.b_ind_jump_label,
+                buf.b_ind_case,
+                buf.b_ind_case_code,
+                buf.b_ind_case_break,
+                buf.b_ind_param,
+                buf.b_ind_func_type,
+                buf.b_ind_comment,
+                buf.b_ind_in_comment,
+                buf.b_ind_in_comment2,
+                buf.b_ind_cpp_baseclass,
+                buf.b_ind_continuation,
+                buf.b_ind_unclosed,
+                buf.b_ind_unclosed2,
+                buf.b_ind_unclosed_noignore,
+                buf.b_ind_unclosed_wrapped,
+                buf.b_ind_unclosed_whiteok,
+                buf.b_ind_matching_paren,
+                buf.b_ind_paren_prev,
+                buf.b_ind_maxparen,
+                buf.b_ind_maxcomment,
+                buf.b_ind_scopedecl,
+                buf.b_ind_scopedecl_code,
+                buf.b_ind_java,
+                buf.b_ind_js,
+                buf.b_ind_keep_case_label,
+                buf.b_ind_hash_comment,
+                buf.b_ind_cpp_namespace,
+                buf.b_ind_if_for_while,
+                buf.b_ind_cpp_extern_c,
+                buf.b_ind_pragma,
+            ],
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cino_applies_shiftwidth_multipliers_fractions_and_signs() {
+        let buf = parsed_cino(b">2s,e-s,n1.5s,f.5s");
+        assert_eq!(buf.b_ind_level, 8);
+        assert_eq!(buf.b_ind_open_imag, -4);
+        assert_eq!(buf.b_ind_no_brace, 6);
+        assert_eq!(buf.b_ind_first_open, 2);
+    }
+
+    #[test]
+    fn parse_cino_ignores_unknown_keys_and_accepts_missing_numbers_as_zero() {
+        let buf = parsed_cino(b"x99,e");
+        assert_eq!(buf.b_ind_level, 4);
+        assert_eq!(buf.b_ind_open_imag, 0);
     }
 
     #[test]
