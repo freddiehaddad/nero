@@ -7807,6 +7807,21 @@ pub fn append_item(s: &mut Vec<u8>, item: &[u8]) {
     s.extend_from_slice(item);
 }
 
+/// Prepend a comma-separated item to the beginning of `str`
+/// (`prepend_item`).
+///
+/// A comma is added after the item only when `str` is not already
+/// empty, so the result never ends with a stray separator.
+pub fn prepend_item(s: &mut Vec<u8>, item: &[u8]) {
+    let mut prefixed = Vec::with_capacity(item.len() + usize::from(!s.is_empty()) + s.len());
+    prefixed.extend_from_slice(item);
+    if !s.is_empty() {
+        prefixed.push(b',');
+    }
+    prefixed.extend_from_slice(s);
+    *s = prefixed;
+}
+
 /// Recognize the `:set` operator prefixing `arg`'s `=`
 /// (`get_op`).
 ///
@@ -9012,6 +9027,24 @@ mod did_set_title_tests {
         // Cross-verified: a second append then separates with a comma.
         append_item(&mut s, b"/y");
         assert_eq!(s, b"/x,/y");
+    }
+
+    #[test]
+    fn prepend_item_does_not_trail_with_a_separator() {
+        let mut s = Vec::new();
+        prepend_item(&mut s, b"/x");
+        assert_eq!(s, b"/x");
+
+        prepend_item(&mut s, b"/y");
+        assert_eq!(s, b"/y,/x");
+    }
+
+    #[test]
+    fn prepend_and_append_preserve_item_order() {
+        let mut s = b"middle".to_vec();
+        prepend_item(&mut s, b"first");
+        append_item(&mut s, b"last");
+        assert_eq!(s, b"first,middle,last");
     }
 
     #[test]
