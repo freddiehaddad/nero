@@ -40,6 +40,11 @@
 //! `other_sourcing_name`'s remaining body, which still needs
 //! `SOURCING_NAME`.
 //!
+//! Also [`messagesopt_changed`] - parsing and applying the
+//! `'messagesopt'` flags and numeric limits. Trimming an existing
+//! message history to the new maximum remains deferred with the
+//! history/display pipeline.
+//!
 //! `crate::grid::DEFAULT_GRID` is the original's own file-static
 //! `ScreenGrid default_grid` (declared in `grid.c`, `SCREEN_GRID_INIT`-
 //! initialized), needed by [`msg_use_grid`]. Since nothing in this
@@ -95,6 +100,106 @@ static LAST_SOURCING_LNUM: GlobalCell<crate::pos_defs::LinenrT> = GlobalCell::ne
 /// Pending external-message chunks (`msg_ext_chunks`).
 static MSG_EXT_CHUNKS: GlobalCell<Option<crate::api::private::defs::Array>> =
     GlobalCell::new(None);
+
+/// Parsed `'messagesopt'` flags (`msg_flags`).
+static MSG_FLAGS: GlobalCell<u32> = GlobalCell::new(
+    crate::option_vars::opt_mopt_flag::HIT_ENTER
+        | crate::option_vars::opt_mopt_flag::HISTORY
+        | crate::option_vars::opt_mopt_flag::PROGRESS,
+);
+
+/// Milliseconds to wait before showing a pending message (`msg_wait`).
+static MSG_WAIT: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Maximum number of retained message-history entries (`msg_hist_max`).
+static MSG_HIST_MAX: GlobalCell<i32> = GlobalCell::new(500);
+
+/// Send progress messages to the command-line target.
+const PROGRESS_TARGET_CMD: u32 = 0x01;
+
+/// Parsed progress-message targets (`progress_msg_target`).
+static PROGRESS_MSG_TARGET: GlobalCell<u32> = GlobalCell::new(PROGRESS_TARGET_CMD);
+
+/// Parse and apply a `'messagesopt'` value (`messagesopt_changed`).
+///
+/// The original reads `p_mopt` directly; accepting the value as a
+/// slice keeps this parser independently testable. Trimming an
+/// already-populated message history to the new maximum remains with
+/// the deferred message-history subsystem.
+#[must_use]
+pub fn messagesopt_changed(value: &[u8]) -> bool {
+    let mut flags = 0u32;
+    let mut wait = 0i32;
+    let mut history = 0i32;
+    let mut progress_target = 0u32;
+    let mut pos = 0usize;
+
+    while pos < value.len() {
+        if value[pos..].starts_with(b"hit-enter") {
+            pos += b"hit-enter".len();
+            flags |= crate::option_vars::opt_mopt_flag::HIT_ENTER;
+        } else if value[pos..].starts_with(b"wait:")
+            && value.get(pos + b"wait:".len()).is_some_and(u8::is_ascii_digit)
+        {
+            pos += b"wait:".len();
+            let start = pos;
+            while value.get(pos).is_some_and(u8::is_ascii_digit) {
+                pos += 1;
+            }
+            wait = std::str::from_utf8(&value[start..pos])
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(i32::MAX);
+            flags |= crate::option_vars::opt_mopt_flag::WAIT;
+        } else if value[pos..].starts_with(b"history:")
+            && value
+                .get(pos + b"history:".len())
+                .is_some_and(u8::is_ascii_digit)
+        {
+            pos += b"history:".len();
+            let start = pos;
+            while value.get(pos).is_some_and(u8::is_ascii_digit) {
+                pos += 1;
+            }
+            history = std::str::from_utf8(&value[start..pos])
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(i32::MAX);
+            flags |= crate::option_vars::opt_mopt_flag::HISTORY;
+        } else if value[pos..].starts_with(b"progress:") {
+            pos += b"progress:".len();
+            flags |= crate::option_vars::opt_mopt_flag::PROGRESS;
+            if value.get(pos) == Some(&b'c') {
+                progress_target |= PROGRESS_TARGET_CMD;
+                pos += 1;
+            }
+        }
+
+        if value.get(pos).is_some_and(|&b| b != b',') {
+            return false;
+        }
+        if value.get(pos) == Some(&b',') {
+            pos += 1;
+        }
+    }
+
+    if flags
+        & (crate::option_vars::opt_mopt_flag::HIT_ENTER
+            | crate::option_vars::opt_mopt_flag::WAIT)
+        == 0
+        || flags & crate::option_vars::opt_mopt_flag::HISTORY == 0
+        || history > 10_000
+        || wait > 10_000
+    {
+        return false;
+    }
+
+    *unsafe { MSG_FLAGS.get_mut() } = flags;
+    *unsafe { MSG_WAIT.get_mut() } = wait;
+    *unsafe { PROGRESS_MSG_TARGET.get_mut() } = progress_target;
+    *unsafe { MSG_HIST_MAX.get_mut() } = history;
+    true
+}
 
 /// Replace the external-message chunk array and return the old one
 /// (`msg_ext_init_chunks`).
@@ -822,6 +927,112 @@ pub unsafe fn sb_text_start_cmdline() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    struct MessagesOptGuard {
+        flags: u32,
+        wait: i32,
+        history: i32,
+        progress: u32,
+    }
+
+    impl MessagesOptGuard {
+        fn new() -> Self {
+            Self {
+                flags: *unsafe { MSG_FLAGS.get_mut() },
+                wait: *unsafe { MSG_WAIT.get_mut() },
+                history: *unsafe { MSG_HIST_MAX.get_mut() },
+                progress: *unsafe { PROGRESS_MSG_TARGET.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for MessagesOptGuard {
+        fn drop(&mut self) {
+            *unsafe { MSG_FLAGS.get_mut() } = self.flags;
+            *unsafe { MSG_WAIT.get_mut() } = self.wait;
+            *unsafe { MSG_HIST_MAX.get_mut() } = self.history;
+            *unsafe { PROGRESS_MSG_TARGET.get_mut() } = self.progress;
+        }
+    }
+
+    #[test]
+    fn messagesopt_changed_applies_hit_enter_history_and_progress() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = MessagesOptGuard::new();
+
+        assert!(messagesopt_changed(b"hit-enter,history:500,progress:c"));
+        assert_eq!(
+            *unsafe { MSG_FLAGS.get_mut() },
+            crate::option_vars::opt_mopt_flag::HIT_ENTER
+                | crate::option_vars::opt_mopt_flag::HISTORY
+                | crate::option_vars::opt_mopt_flag::PROGRESS
+        );
+        assert_eq!(*unsafe { MSG_WAIT.get_mut() }, 0);
+        assert_eq!(*unsafe { MSG_HIST_MAX.get_mut() }, 500);
+        assert_eq!(*unsafe { PROGRESS_MSG_TARGET.get_mut() }, PROGRESS_TARGET_CMD);
+    }
+
+    #[test]
+    fn messagesopt_changed_applies_wait_and_allows_no_progress_target() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = MessagesOptGuard::new();
+
+        assert!(messagesopt_changed(b"wait:123,history:42,progress:,"));
+        assert_eq!(
+            *unsafe { MSG_FLAGS.get_mut() },
+            crate::option_vars::opt_mopt_flag::WAIT
+                | crate::option_vars::opt_mopt_flag::HISTORY
+                | crate::option_vars::opt_mopt_flag::PROGRESS
+        );
+        assert_eq!(*unsafe { MSG_WAIT.get_mut() }, 123);
+        assert_eq!(*unsafe { MSG_HIST_MAX.get_mut() }, 42);
+        assert_eq!(*unsafe { PROGRESS_MSG_TARGET.get_mut() }, 0);
+    }
+
+    #[test]
+    fn messagesopt_changed_rejects_missing_required_parts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = MessagesOptGuard::new();
+
+        assert!(!messagesopt_changed(b"history:50"));
+        assert!(!messagesopt_changed(b"wait:10"));
+        assert!(!messagesopt_changed(b""));
+    }
+
+    #[test]
+    fn messagesopt_changed_rejects_unknown_or_malformed_parts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = MessagesOptGuard::new();
+
+        assert!(!messagesopt_changed(b"hit-enter,history:50,bogus"));
+        assert!(!messagesopt_changed(b"wait:,history:50"));
+        assert!(!messagesopt_changed(b"hit-enter history:50"));
+    }
+
+    #[test]
+    fn messagesopt_changed_rejects_limits_above_ten_thousand() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = MessagesOptGuard::new();
+
+        assert!(!messagesopt_changed(b"wait:10001,history:50"));
+        assert!(!messagesopt_changed(b"wait:10,history:10001"));
+    }
+
+    #[test]
+    fn messagesopt_changed_does_not_commit_an_invalid_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = MessagesOptGuard::new();
+        *unsafe { MSG_FLAGS.get_mut() } = 0xAA;
+        *unsafe { MSG_WAIT.get_mut() } = 77;
+        *unsafe { MSG_HIST_MAX.get_mut() } = 88;
+        *unsafe { PROGRESS_MSG_TARGET.get_mut() } = 0xBB;
+
+        assert!(!messagesopt_changed(b"bogus"));
+        assert_eq!(*unsafe { MSG_FLAGS.get_mut() }, 0xAA);
+        assert_eq!(*unsafe { MSG_WAIT.get_mut() }, 77);
+        assert_eq!(*unsafe { MSG_HIST_MAX.get_mut() }, 88);
+        assert_eq!(*unsafe { PROGRESS_MSG_TARGET.get_mut() }, 0xBB);
+    }
 
     struct MsgExtChunksGuard(
         Option<crate::api::private::defs::Array>,
