@@ -56,6 +56,32 @@
 
 use crate::menu_defs::{VimMenu, MNU_HIDDEN_CHAR};
 
+/// Split display text, mnemonic and accelerator text from one menu
+/// label (`menu_text`).
+#[allow(dead_code)]
+fn menu_text(label: &[u8]) -> (Vec<u8>, Option<u8>, Option<Vec<u8>>) {
+    let (mut text, accelerator) = if let Some(tab) = label.iter().position(|&byte| byte == b'\t') {
+        (label[..tab].to_vec(), Some(label[tab + 1..].to_vec()))
+    } else {
+        (label.to_vec(), None)
+    };
+
+    let mut mnemonic = None;
+    let mut pos = 0usize;
+    while let Some(relative) = text[pos..].iter().position(|&byte| byte == b'&') {
+        let ampersand = pos + relative;
+        if ampersand + 1 == text.len() {
+            break;
+        }
+        if text[ampersand + 1] != b'&' {
+            mnemonic = Some(text[ampersand + 1]);
+        }
+        text.remove(ampersand);
+        pos = ampersand + 1;
+    }
+    (text, mnemonic, accelerator)
+}
+
 /// Release one mode's menu command (`free_menu_string`).
 #[allow(dead_code)]
 fn free_menu_string(menu: &mut VimMenu, index: usize) {
@@ -471,6 +497,22 @@ pub fn menu_unescape_name(name: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_text_splits_accelerator_and_compacts_ampersands() {
+        assert_eq!(
+            menu_text(b"&File\tCtrl-F"),
+            (
+                b"File".to_vec(),
+                Some(b'F'),
+                Some(b"Ctrl-F".to_vec())
+            )
+        );
+        assert_eq!(
+            menu_text(b"Save && E&xit&"),
+            (b"Save & Exit&".to_vec(), Some(b'x'), None)
+        );
+    }
 
     #[test]
     fn free_menu_string_clears_only_the_selected_mode() {
