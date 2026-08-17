@@ -474,6 +474,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
         m.insert(&b"getcellwidths"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcellwidths });
+        m.insert(&b"setcellwidths"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_setcellwidths });
         m.insert(&b"getjumplist"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_getjumplist });
         m.insert(&b"getmarklist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getmarklist });
         m.insert(&b"getchangelist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getchangelist });
@@ -682,7 +683,6 @@ unsafe fn f_getcellwidths(_argvars: &[TypvalT], rettv: &mut TypvalT) {
 ///
 /// # Safety
 /// `list` must be null or point to a live, well-formed Vimscript list.
-#[allow(dead_code)]
 unsafe fn parse_cellwidths(
     list: *mut crate::eval::typval_defs::ListT,
 ) -> Option<Vec<crate::mbyte::CellWidthInterval>> {
@@ -730,6 +730,25 @@ unsafe fn parse_cellwidths(
         return None;
     }
     Some(intervals)
+}
+
+/// Set the character-width override table (`f_setcellwidths`).
+unsafe fn f_setcellwidths(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    let TypvalValue::List(list) = &argvars[0].value else {
+        return;
+    };
+    let Some(table) = (unsafe { parse_cellwidths(*list) }) else {
+        return;
+    };
+
+    let old = std::mem::replace(unsafe { crate::mbyte::CW_TABLE.get_mut() }, table);
+    if unsafe { crate::optionstr::check_chars_options() }.is_some() {
+        *unsafe { crate::mbyte::CW_TABLE.get_mut() } = old;
+        return;
+    }
+    drop(old);
+    unsafe { crate::r#move::changed_window_setting_all() };
+    // `redraw_all_later(UPD_NOT_VALID)` is redraw scheduling only.
 }
 
 /// `type({expr})` - a number identifying `{expr}`'s own type
@@ -8529,6 +8548,65 @@ mod tests {
     }
 
     #[test]
+    fn setcellwidths_installs_validated_intervals() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved_table = std::mem::take(unsafe { crate::mbyte::CW_TABLE.get_mut() });
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        unsafe {
+            (*win_ptr).w_buffer = buf_ptr;
+            (*tab_ptr).tp_firstwin = win_ptr;
+            (*tab_ptr).tp_lastwin = win_ptr;
+        }
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastwin, win_ptr)
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _firsttab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.first_tabpage, tab_ptr)
+        };
+
+        let outer = crate::eval::typval::tv_list_alloc(1);
+        let inner = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(inner, 0x100);
+            crate::eval::typval::tv_list_append_number(inner, 0x10F);
+            crate::eval::typval::tv_list_append_number(inner, 2);
+            crate::eval::typval::tv_list_append_list(outer, inner);
+        }
+        let args = [TypvalT {
+            value: TypvalValue::List(outer),
+            ..Default::default()
+        }];
+        unsafe { f_setcellwidths(&args, &mut TypvalT::default()) };
+        assert_eq!(
+            unsafe { crate::mbyte::CW_TABLE.get_mut() }.as_slice(),
+            &[crate::mbyte::CellWidthInterval {
+                first: 0x100,
+                last: 0x10F,
+                width: 2,
+            }]
+        );
+        *unsafe { crate::mbyte::CW_TABLE.get_mut() } = saved_table;
+        unsafe { crate::eval::typval::tv_list_unref(outer) };
+    }
+
+    #[test]
     fn getcellwidths_returns_configured_interval_lists() {
         let _lock = crate::globals::global_state_test_lock();
         let saved = std::mem::take(unsafe { crate::mbyte::CW_TABLE.get_mut() });
@@ -8565,6 +8643,7 @@ mod tests {
         for name in [
             "getcharmod",
             "getcellwidths",
+            "setcellwidths",
             "executable",
             "exepath",
             "and",
