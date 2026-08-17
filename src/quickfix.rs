@@ -2679,6 +2679,25 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
     }
 }
 
+/// Append a quickfix entry's line/column range text
+/// (`qf_range_text`).
+pub fn qf_range_text(gap: &mut GarrayT, entry: &QflineT) {
+    let mut text = entry.qf_lnum.to_string();
+    if entry.qf_end_lnum > 0 && entry.qf_lnum != entry.qf_end_lnum {
+        text.push('-');
+        text.push_str(&entry.qf_end_lnum.to_string());
+    }
+    if entry.qf_col > 0 {
+        text.push_str(" col ");
+        text.push_str(&entry.qf_col.to_string());
+        if entry.qf_end_col > 0 && entry.qf_col != entry.qf_end_col {
+            text.push('-');
+            text.push_str(&entry.qf_end_col.to_string());
+        }
+    }
+    gap.ga_concat_len(text.as_bytes());
+}
+
 /// Find the first window in the current tab page showing a normal
 /// buffer (`qf_find_win_with_normal_buf`).
 ///
@@ -7625,5 +7644,46 @@ mod tests {
         // byte, copied through unchanged (only whitespace immediately
         // AFTER a newline gets absorbed).
         assert_eq!(fmt(b"a\tb"), b"a\tb");
+    }
+
+    fn range_text(entry: &QflineT) -> Vec<u8> {
+        let mut gap = GarrayT::new(1, 16);
+        qf_range_text(&mut gap, entry);
+        gap.ga_data[..gap.ga_len as usize].to_vec()
+    }
+
+    #[test]
+    fn qf_range_text_formats_line_and_column_ranges() {
+        assert_eq!(
+            range_text(&QflineT {
+                qf_lnum: 10,
+                qf_end_lnum: 12,
+                qf_col: 3,
+                qf_end_col: 8,
+                ..Default::default()
+            }),
+            b"10-12 col 3-8"
+        );
+    }
+
+    #[test]
+    fn qf_range_text_omits_redundant_and_missing_endpoints() {
+        assert_eq!(
+            range_text(&QflineT {
+                qf_lnum: 10,
+                qf_end_lnum: 10,
+                qf_col: 3,
+                qf_end_col: 3,
+                ..Default::default()
+            }),
+            b"10 col 3"
+        );
+        assert_eq!(
+            range_text(&QflineT {
+                qf_lnum: 10,
+                ..Default::default()
+            }),
+            b"10"
+        );
     }
 }
