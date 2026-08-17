@@ -678,6 +678,60 @@ unsafe fn f_getcellwidths(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Validate and sort `setcellwidths()`'s interval list.
+///
+/// # Safety
+/// `list` must be null or point to a live, well-formed Vimscript list.
+#[allow(dead_code)]
+unsafe fn parse_cellwidths(
+    list: *mut crate::eval::typval_defs::ListT,
+) -> Option<Vec<crate::mbyte::CellWidthInterval>> {
+    if list.is_null() {
+        return None;
+    }
+    let mut intervals = Vec::with_capacity(unsafe { (*list).lv_len } as usize);
+    let mut outer_item = unsafe { (*list).lv_first };
+    while !outer_item.is_null() {
+        let inner = match unsafe { &(*outer_item).li_tv.value } {
+            TypvalValue::List(inner) if !inner.is_null() => *inner,
+            _ => return None,
+        };
+        let mut values = [0i64; 3];
+        let mut inner_item = unsafe { (*inner).lv_first };
+        for value in &mut values {
+            if inner_item.is_null() {
+                return None;
+            }
+            let TypvalValue::Number(number) = (unsafe { &(*inner_item).li_tv.value }) else {
+                return None;
+            };
+            *value = *number;
+            inner_item = unsafe { (*inner_item).li_next };
+        }
+        if !inner_item.is_null()
+            || values[0] < 0x80
+            || values[1] < values[0]
+            || !(1..=2).contains(&values[2])
+        {
+            return None;
+        }
+        intervals.push(crate::mbyte::CellWidthInterval {
+            first: values[0],
+            last: values[1],
+            width: values[2] as u8,
+        });
+        outer_item = unsafe { (*outer_item).li_next };
+    }
+    intervals.sort_by_key(|interval| interval.first);
+    if intervals
+        .windows(2)
+        .any(|pair| pair[1].first <= pair[0].last)
+    {
+        return None;
+    }
+    Some(intervals)
+}
+
 /// `type({expr})` - a number identifying `{expr}`'s own type
 /// (`f_type`). The returned numbers are fixed, documented,
 /// externally-observable values (`v:t_*` constants), not internal
@@ -8445,6 +8499,34 @@ mod tests {
     }
 
     // --- new-builtin table registration ---
+
+    #[test]
+    fn parse_cellwidths_validates_sorts_and_rejects_overlap() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe fn intervals(rows: &[[i64; 3]]) -> *mut crate::eval::typval_defs::ListT {
+            let outer = crate::eval::typval::tv_list_alloc(rows.len() as isize);
+            for row in rows {
+                let inner = crate::eval::typval::tv_list_alloc(3);
+                unsafe {
+                    crate::eval::typval::tv_list_append_number(inner, row[0]);
+                    crate::eval::typval::tv_list_append_number(inner, row[1]);
+                    crate::eval::typval::tv_list_append_number(inner, row[2]);
+                    crate::eval::typval::tv_list_append_list(outer, inner);
+                }
+            }
+            outer
+        }
+
+        let valid = unsafe { intervals(&[[0x200, 0x20F, 2], [0x100, 0x10F, 1]]) };
+        let parsed = unsafe { parse_cellwidths(valid) }.unwrap();
+        assert_eq!(parsed[0].first, 0x100);
+        assert_eq!(parsed[1].width, 2);
+        unsafe { crate::eval::typval::tv_list_unref(valid) };
+
+        let overlap = unsafe { intervals(&[[0x100, 0x110, 1], [0x108, 0x120, 2]]) };
+        assert!(unsafe { parse_cellwidths(overlap) }.is_none());
+        unsafe { crate::eval::typval::tv_list_unref(overlap) };
+    }
 
     #[test]
     fn getcellwidths_returns_configured_interval_lists() {
