@@ -1701,6 +1701,72 @@ pub fn csi_set_character_protection(state: &mut VTermState, value: i32) {
     state.set_character_protection(value);
 }
 
+pub fn csi_set_modes<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    args: &[crate::vterm::parser::CsiArg],
+    private: bool,
+    set: bool,
+) {
+    let value = i32::from(set);
+    if private {
+        for &arg in args {
+            if !crate::vterm::parser::csi_arg_is_missing(arg) {
+                set_dec_mode(
+                    state,
+                    callbacks,
+                    crate::vterm::parser::csi_arg(arg) as i32,
+                    value,
+                );
+            }
+        }
+    } else if let Some(&arg) = args.first()
+        && !crate::vterm::parser::csi_arg_is_missing(arg)
+    {
+        state.set_mode(crate::vterm::parser::csi_arg(arg) as i32, value);
+    }
+}
+
+#[cfg(test)]
+mod csi_mode_tests {
+    use super::*;
+
+    #[test]
+    fn standard_mode_commands_use_the_first_argument() {
+        let mut state = VTermState::new(1, 1);
+        csi_set_modes(&mut state, &mut (), &[4, 20], false, true);
+        assert!(state.mode.insert);
+        assert!(!state.mode.newline);
+        csi_set_modes(&mut state, &mut (), &[4], false, false);
+        assert!(!state.mode.insert);
+    }
+
+    #[test]
+    fn private_mode_commands_apply_every_argument() {
+        #[derive(Default)]
+        struct Accept;
+        impl VTermStateCallbacks for Accept {
+            fn set_term_prop(
+                &mut self,
+                _: crate::vterm_defs::VTermProp,
+                _: &crate::vterm_defs::VTermValue<'_>,
+            ) -> bool {
+                true
+            }
+        }
+
+        let mut state = VTermState::new(1, 1);
+        csi_set_modes(&mut state, &mut Accept, &[7, 25, 2004], true, true);
+        assert!(state.mode.autowrap);
+        assert!(state.mode.cursor_visible);
+        assert!(state.mode.bracketpaste);
+        csi_set_modes(&mut state, &mut Accept, &[7, 25, 2004], true, false);
+        assert!(!state.mode.autowrap);
+        assert!(!state.mode.cursor_visible);
+        assert!(!state.mode.bracketpaste);
+    }
+}
+
 #[cfg(test)]
 mod csi_presentation_tests {
     use super::*;
