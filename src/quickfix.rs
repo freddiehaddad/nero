@@ -152,7 +152,6 @@ unsafe fn decr_quickfix_busy() {
 /// # Safety
 /// `GLOBALS.curwin` must point to a live window with an initialized
 /// `w_vars` dictionary.
-#[allow(dead_code)]
 unsafe fn qf_set_title_var(list: &QfListT) {
     if let Some(title) = list.qf_title.as_deref() {
         // SAFETY: forwarded from this function's own safety doc.
@@ -163,6 +162,39 @@ unsafe fn qf_set_title_var(list: &QfListT) {
             )
         };
     }
+}
+
+/// Update `w:quickfix_title` in every window displaying `qi`
+/// (`qf_update_win_titlevar`).
+///
+/// # Safety
+/// `qi`, the global tab/window chains, and each matching window's
+/// `w_vars` dictionary must remain valid. Touches `GLOBALS.curwin`.
+#[allow(dead_code)]
+unsafe fn qf_update_win_titlevar(qi: *const crate::types_defs::QfInfoT) {
+    let qfl = qf_get_curlist(unsafe { &*qi })
+        .expect("qf_update_win_titlevar: current list must exist");
+    let saved_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        let mut win = if std::ptr::eq(
+            tp,
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab,
+        ) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            unsafe { (*tp).tp_firstwin }
+        };
+        while !win.is_null() {
+            if unsafe { is_qf_win(&*win, qi) } {
+                unsafe { crate::globals::GLOBALS.get_mut() }.curwin = win;
+                unsafe { qf_set_title_var(qfl) };
+            }
+            win = unsafe { (*win).w_next };
+        }
+        tp = unsafe { (*tp).tp_next };
+    }
+    unsafe { crate::globals::GLOBALS.get_mut() }.curwin = saved_curwin;
 }
 
 /// Autocommand name for `:make`/`:grep` commands
@@ -3839,6 +3871,132 @@ mod tests {
             )
         };
         assert_eq!(unchanged.value, value.value);
+    }
+
+    #[test]
+    fn qf_update_win_titlevar_updates_matching_windows_in_all_tabs_and_restores_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = Box::new(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_title: Some(b":make all".to_vec()),
+                ..Default::default()
+            }],
+            qfl_type: QfltypeT::Quickfix,
+            ..Default::default()
+        });
+        let qi_ptr = std::ptr::from_ref(&*qi);
+
+        let mut qf_buf1 = Box::new(crate::buffer_defs::BufT {
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        });
+        let qf_buf1_ptr = std::ptr::addr_of_mut!(*qf_buf1);
+        let mut qf_buf2 = Box::new(crate::buffer_defs::BufT {
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        });
+        let qf_buf2_ptr = std::ptr::addr_of_mut!(*qf_buf2);
+        let mut plain_buf = Box::new(crate::buffer_defs::BufT::default());
+        let plain_buf_ptr = std::ptr::addr_of_mut!(*plain_buf);
+        unsafe {
+            (*qf_buf1_ptr).b_next = qf_buf2_ptr;
+            (*qf_buf2_ptr).b_prev = qf_buf1_ptr;
+        }
+
+        let mut qf_win1 = Box::new(crate::buffer_defs::WinT::default());
+        let qf_win1_ptr = std::ptr::addr_of_mut!(*qf_win1);
+        let mut qf_win2 = Box::new(crate::buffer_defs::WinT::default());
+        let qf_win2_ptr = std::ptr::addr_of_mut!(*qf_win2);
+        let mut plain_win = Box::new(crate::buffer_defs::WinT::default());
+        let plain_win_ptr = std::ptr::addr_of_mut!(*plain_win);
+        unsafe {
+            (*qf_win1_ptr).w_buffer = qf_buf1_ptr;
+            (*qf_win1_ptr).w_next = plain_win_ptr;
+            (*qf_win1_ptr).w_vars = crate::eval::typval::tv_dict_alloc();
+            crate::eval::vars::init_var_dict(
+                &mut *(*qf_win1_ptr).w_vars,
+                &mut (*qf_win1_ptr).w_winvar,
+                crate::eval::typval_defs::ScopeType::Scope,
+            );
+
+            (*qf_win2_ptr).w_buffer = qf_buf2_ptr;
+            (*qf_win2_ptr).w_vars = crate::eval::typval::tv_dict_alloc();
+            crate::eval::vars::init_var_dict(
+                &mut *(*qf_win2_ptr).w_vars,
+                &mut (*qf_win2_ptr).w_winvar,
+                crate::eval::typval_defs::ScopeType::Scope,
+            );
+            (*plain_win_ptr).w_buffer = plain_buf_ptr;
+        }
+
+        let mut tp1 = Box::new(crate::buffer_defs::TabpageT::default());
+        let tp1_ptr = std::ptr::addr_of_mut!(*tp1);
+        let mut tp2 = Box::new(crate::buffer_defs::TabpageT::default());
+        let tp2_ptr = std::ptr::addr_of_mut!(*tp2);
+        unsafe {
+            (*tp1_ptr).tp_next = tp2_ptr;
+            (*tp2_ptr).tp_firstwin = qf_win2_ptr;
+        }
+
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                tp1_ptr,
+            )
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                tp1_ptr,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                qf_win1_ptr,
+            )
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                plain_win_ptr,
+            )
+        };
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                qf_buf2_ptr,
+            )
+        };
+
+        assert!(unsafe { is_qf_win(&*qf_win1_ptr, qi_ptr) });
+        assert!(unsafe { is_qf_win(&*qf_win2_ptr, qi_ptr) });
+        unsafe { qf_update_win_titlevar(qi_ptr) };
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+            plain_win_ptr
+        );
+        for (idx, win) in [qf_win1_ptr, qf_win2_ptr].into_iter().enumerate() {
+            let title = crate::eval::typval::tv_dict_find(
+                Some(unsafe { &mut *(*win).w_vars }),
+                b"quickfix_title",
+            );
+            assert!(title.is_some(), "quickfix title missing from window {idx}");
+            let title = title.unwrap();
+            assert!(matches!(
+                unsafe { &(*title).di_tv.value },
+                crate::eval::typval_defs::TypvalValue::String(Some(value))
+                    if value == b":make all"
+            ));
+        }
+
+        unsafe {
+            crate::eval::typval::tv_dict_free((*qf_win1_ptr).w_vars);
+            (*qf_win1_ptr).w_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_free((*qf_win2_ptr).w_vars);
+            (*qf_win2_ptr).w_vars = std::ptr::null_mut();
+        }
     }
 
     #[test]
