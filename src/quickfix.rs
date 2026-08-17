@@ -1561,6 +1561,54 @@ unsafe fn qf_setprop_context(
     crate::vim_defs::OK
 }
 
+/// Set the current entry index in a quickfix/location list
+/// (`qf_setprop_curidx`).
+///
+/// The original also moves a displayed quickfix window's cursor via
+/// `qf_win_pos_update`; that display-only side effect remains deferred.
+/// The selected entry and index state are updated in full.
+///
+/// # Safety
+/// `qi`, `qfl`, and `item` must remain valid and `qfl` must belong to
+/// `qi`.
+#[allow(dead_code)]
+unsafe fn qf_setprop_curidx(
+    _qi: *mut crate::types_defs::QfInfoT,
+    qfl: *mut QfListT,
+    item: *const crate::eval::typval_defs::DictitemT,
+) -> i32 {
+    let mut newidx = match unsafe { &(*item).di_tv.value } {
+        crate::eval::typval_defs::TypvalValue::String(Some(value))
+            if value.as_slice() == b"$" =>
+        {
+            unsafe { (*qfl).qf_count() }
+        }
+        _ => {
+            let mut error = false;
+            let value = crate::eval::typval::tv_get_number_chk(
+                unsafe { &(*item).di_tv },
+                Some(&mut error),
+            );
+            if error {
+                return crate::vim_defs::FAIL;
+            }
+            value as i32
+        }
+    };
+    if newidx < 1 {
+        return crate::vim_defs::FAIL;
+    }
+    newidx = newidx.min(unsafe { (*qfl).qf_count() });
+    let actual = get_nth_entry(unsafe { &*qfl }, newidx);
+    if unsafe { (*qfl).entry_at(actual) }.is_none() {
+        return crate::vim_defs::FAIL;
+    }
+    unsafe { (*qfl).qf_index = actual };
+
+    // qf_win_pos_update(qi, old_qfidx) is a display-only side effect.
+    crate::vim_defs::OK
+}
+
 /// Add a quickfix list's `'quickfixtextfunc'` callback to a result
 /// dictionary (`qf_getprop_qftf`).
 ///
@@ -1872,6 +1920,104 @@ mod qf_nth_valid_tests {
             crate::eval::typval::tv_list_unref(old_list);
             crate::eval::typval::tv_dict_unref(new_dict);
         }
+    }
+
+    #[test]
+    fn setprop_curidx_selects_the_last_entry_for_dollar() {
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT::default(),
+                    QflineT::default(),
+                    QflineT::default(),
+                ],
+                qf_index: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let qfl_ptr = unsafe {
+            std::ptr::addr_of_mut!((&mut (*qi_ptr).qf_lists)[0])
+        };
+        let item = crate::eval::typval::tv_dict_item_alloc(b"idx");
+        unsafe {
+            (*item).di_tv.value =
+                crate::eval::typval_defs::TypvalValue::String(Some(
+                    b"$".to_vec(),
+                ));
+        }
+        assert_eq!(
+            unsafe { qf_setprop_curidx(qi_ptr, qfl_ptr, item) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*qfl_ptr).qf_index }, 3);
+        unsafe { crate::eval::typval::tv_dict_item_free(item) };
+    }
+
+    #[test]
+    fn setprop_curidx_clamps_a_large_index_to_the_last_entry() {
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default(), QflineT::default()],
+                qf_index: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let qfl_ptr = unsafe {
+            std::ptr::addr_of_mut!((&mut (*qi_ptr).qf_lists)[0])
+        };
+        let item = crate::eval::typval::tv_dict_item_alloc(b"idx");
+        unsafe { (*item).di_tv.value = crate::eval::typval_defs::TypvalValue::Number(99) };
+        assert_eq!(
+            unsafe { qf_setprop_curidx(qi_ptr, qfl_ptr, item) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*qfl_ptr).qf_index }, 2);
+        unsafe { crate::eval::typval::tv_dict_item_free(item) };
+    }
+
+    #[test]
+    fn setprop_curidx_rejects_zero_invalid_types_and_empty_lists() {
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default()],
+                qf_index: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let qfl_ptr = unsafe {
+            std::ptr::addr_of_mut!((&mut (*qi_ptr).qf_lists)[0])
+        };
+        for value in [
+            crate::eval::typval_defs::TypvalValue::Number(0),
+            crate::eval::typval_defs::TypvalValue::Float(1.0),
+        ] {
+            let item = crate::eval::typval::tv_dict_item_alloc(b"idx");
+            unsafe { (*item).di_tv.value = value };
+            assert_eq!(
+                unsafe { qf_setprop_curidx(qi_ptr, qfl_ptr, item) },
+                crate::vim_defs::FAIL
+            );
+            assert_eq!(unsafe { (*qfl_ptr).qf_index }, 1);
+            unsafe { crate::eval::typval::tv_dict_item_free(item) };
+        }
+
+        unsafe { (*qfl_ptr).qf_entries.clear() };
+        let item = crate::eval::typval::tv_dict_item_alloc(b"idx");
+        unsafe { (*item).di_tv.value = crate::eval::typval_defs::TypvalValue::Number(1) };
+        assert_eq!(
+            unsafe { qf_setprop_curidx(qi_ptr, qfl_ptr, item) },
+            crate::vim_defs::FAIL
+        );
+        unsafe { crate::eval::typval::tv_dict_item_free(item) };
     }
 
     #[test]
