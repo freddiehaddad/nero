@@ -3920,6 +3920,19 @@ pub fn dispatch_status_request(state: &VTermState, ctrl8bit: bool) -> Vec<u8> {
     }
 }
 
+#[must_use]
+pub fn request_status_string(
+    state: &mut VTermState,
+    fragment: crate::vterm_defs::VTermStringFragment<'_>,
+    ctrl8bit: bool,
+) -> Vec<u8> {
+    if accumulate_decrqss(state, fragment) {
+        dispatch_status_request(state, ctrl8bit)
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn on_dcs_status(
     state: &mut VTermState,
     command: &[u8],
@@ -3929,11 +3942,7 @@ pub fn on_dcs_status(
     if command != b"$q" {
         return None;
     }
-    if accumulate_decrqss(state, fragment) {
-        Some(dispatch_status_request(state, ctrl8bit))
-    } else {
-        Some(Vec::new())
-    }
+    Some(request_status_string(state, fragment, ctrl8bit))
 }
 
 pub fn on_dcs<F: VTermStateFallbacks>(
@@ -4006,6 +4015,44 @@ mod dcs_status_tests {
         assert_eq!(
             on_dcs_status(&mut state, b"$q", fragment, false).unwrap(),
             b"\x1bP1$r1;2r\x1b\\"
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_status_string_tests {
+    use super::*;
+
+    #[test]
+    fn status_request_accumulates_fragments_before_replying() {
+        let mut state = VTermState::new(2, 80);
+        state.reset_scrollregions();
+        state.mode.cursor_shape =
+            crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK as u8;
+        state.mode.cursor_blink = true;
+        assert!(request_status_string(
+            &mut state,
+            crate::vterm_defs::VTermStringFragment {
+                bytes: b" ",
+                initial: true,
+                final_fragment: false,
+                terminator: crate::vterm_defs::VTermTerminator::St,
+            },
+            false,
+        )
+        .is_empty());
+        assert_eq!(
+            request_status_string(
+                &mut state,
+                crate::vterm_defs::VTermStringFragment {
+                    bytes: b"q",
+                    initial: false,
+                    final_fragment: true,
+                    terminator: crate::vterm_defs::VTermTerminator::St,
+                },
+                false,
+            ),
+            b"\x1bP1$r1 q\x1b\\"
         );
     }
 }
