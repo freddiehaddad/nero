@@ -2104,6 +2104,24 @@ unsafe fn bkc_store(buf_ptr: *mut crate::buffer_defs::BufT, use_local: bool, val
     }
 }
 
+/// The `'spellfile'` option is changed (`did_set_spellfile`).
+///
+/// The value is validated in full. Reloading active spell wordlists
+/// remains with the not-yet-translated `did_set_spell_option` path.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_spellfile(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    if crate::spell::valid_spellfile(varp.as_deref().unwrap_or(&[])) {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
 /// The `'spelloptions'` option is changed (`did_set_spelloptions`).
 ///
 /// Unlike this file's other local-or-global callbacks (which pick ONE
@@ -6385,7 +6403,30 @@ mod tests {
         });
     }
 
-    // ---- did_set_spelloptions ----
+    // ---- did_set_spellfile / did_set_spelloptions ----
+
+    #[test]
+    fn did_set_spellfile_accepts_add_wordlists() {
+        let mut value = Some(b"en.utf-8.add,de.add".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_spellfile(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_spellfile_rejects_a_non_add_file() {
+        let mut value = Some(b"spell.txt".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut value as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_spellfile(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
 
     /// Saves/restores the global `spo_flags` around a test body.
     fn with_spo_flags<R>(f: impl FnOnce() -> R) -> R {
