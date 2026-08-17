@@ -366,6 +366,14 @@ pub trait VTermStateCallbacks {
     ) -> bool {
         false
     }
+
+    fn theme(&mut self, _dark: &mut bool) -> bool {
+        false
+    }
+
+    fn sb_clear(&mut self) -> bool {
+        false
+    }
 }
 
 impl VTermStateCallbacks for () {}
@@ -1054,6 +1062,214 @@ pub fn csi_erase_chars<C: VTermStateCallbacks>(
         },
         false,
     );
+}
+
+pub fn csi_erase_display<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    value: i32,
+    selective: bool,
+) -> bool {
+    let reset_lineinfo = |state: &mut VTermState, callbacks: &mut C, row| {
+        state.set_lineinfo(row, FORCE, DWL_OFF, DHL_OFF, |row, new, old| {
+            callbacks.set_line_info(row, new, old)
+        });
+    };
+    match value {
+        0 => {
+            if state.cols > state.pos.col {
+                erase(
+                    state,
+                    callbacks,
+                    crate::vterm_defs::VTermRect {
+                        start_row: state.pos.row,
+                        end_row: state.pos.row + 1,
+                        start_col: state.pos.col,
+                        end_col: state.cols,
+                    },
+                    selective,
+                );
+            }
+            for row in state.pos.row + 1..state.rows {
+                reset_lineinfo(state, callbacks, row);
+            }
+            if state.rows > state.pos.row + 1 {
+                erase(
+                    state,
+                    callbacks,
+                    crate::vterm_defs::VTermRect {
+                        start_row: state.pos.row + 1,
+                        end_row: state.rows,
+                        start_col: 0,
+                        end_col: state.cols,
+                    },
+                    selective,
+                );
+            }
+        }
+        1 => {
+            for row in 0..state.pos.row {
+                reset_lineinfo(state, callbacks, row);
+            }
+            if state.pos.row > 0 {
+                erase(
+                    state,
+                    callbacks,
+                    crate::vterm_defs::VTermRect {
+                        start_row: 0,
+                        end_row: state.pos.row,
+                        start_col: 0,
+                        end_col: state.cols,
+                    },
+                    selective,
+                );
+            }
+            erase(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermRect {
+                    start_row: state.pos.row,
+                    end_row: state.pos.row + 1,
+                    start_col: 0,
+                    end_col: state.pos.col + 1,
+                },
+                selective,
+            );
+        }
+        2 => {
+            for row in 0..state.rows {
+                reset_lineinfo(state, callbacks, row);
+            }
+            erase(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermRect {
+                    start_row: 0,
+                    end_row: state.rows,
+                    start_col: 0,
+                    end_col: state.cols,
+                },
+                selective,
+            );
+        }
+        3 => {
+            let _ = callbacks.sb_clear();
+        }
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod csi_erase_display_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        erased: Vec<(crate::vterm_defs::VTermRect, bool)>,
+        scrollback_clears: usize,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn erase(&mut self, rect: crate::vterm_defs::VTermRect, selective: bool) -> bool {
+            self.erased.push((rect, selective));
+            true
+        }
+
+        fn sb_clear(&mut self) -> bool {
+            self.scrollback_clears += 1;
+            true
+        }
+    }
+
+    #[test]
+    fn erase_display_below_clears_cursor_tail_and_following_rows() {
+        let mut state = VTermState::new(4, 8);
+        state.pos = crate::vterm_defs::VTermPos { row: 1, col: 3 };
+        state.lineinfos[0][2].doublewidth = true;
+        let mut capture = Capture::default();
+        assert!(csi_erase_display(&mut state, &mut capture, 0, true));
+        assert_eq!(
+            capture.erased,
+            [
+                (
+                    crate::vterm_defs::VTermRect {
+                        start_row: 1,
+                        end_row: 2,
+                        start_col: 3,
+                        end_col: 8,
+                    },
+                    true,
+                ),
+                (
+                    crate::vterm_defs::VTermRect {
+                        start_row: 2,
+                        end_row: 4,
+                        start_col: 0,
+                        end_col: 8,
+                    },
+                    true,
+                ),
+            ]
+        );
+        assert!(!state.lineinfos[0][2].doublewidth);
+    }
+
+    #[test]
+    fn erase_display_above_clears_preceding_rows_and_cursor_head() {
+        let mut state = VTermState::new(4, 8);
+        state.pos = crate::vterm_defs::VTermPos { row: 2, col: 3 };
+        let mut capture = Capture::default();
+        assert!(csi_erase_display(&mut state, &mut capture, 1, false));
+        assert_eq!(
+            capture.erased,
+            [
+                (
+                    crate::vterm_defs::VTermRect {
+                        start_row: 0,
+                        end_row: 2,
+                        start_col: 0,
+                        end_col: 8,
+                    },
+                    false,
+                ),
+                (
+                    crate::vterm_defs::VTermRect {
+                        start_row: 2,
+                        end_row: 3,
+                        start_col: 0,
+                        end_col: 4,
+                    },
+                    false,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn erase_display_all_resets_every_line_and_cell() {
+        let mut state = VTermState::new(2, 3);
+        state.lineinfos[0][0].doublewidth = true;
+        state.lineinfos[0][1].doubleheight = 1;
+        let mut capture = Capture::default();
+        assert!(csi_erase_display(&mut state, &mut capture, 2, false));
+        assert_eq!(capture.erased[0].0, crate::vterm_defs::VTermRect {
+            start_row: 0,
+            end_row: 2,
+            start_col: 0,
+            end_col: 3,
+        });
+        assert_eq!(state.lineinfos[0], vec![Default::default(); 2]);
+    }
+
+    #[test]
+    fn erase_display_three_clears_scrollback_and_rejects_other_values() {
+        let mut state = VTermState::new(1, 1);
+        let mut capture = Capture::default();
+        assert!(csi_erase_display(&mut state, &mut capture, 3, false));
+        assert_eq!(capture.scrollback_clears, 1);
+        assert!(!csi_erase_display(&mut state, &mut capture, 4, false));
+    }
 }
 
 pub fn csi_tab_clear(state: &mut VTermState, value: i32) -> bool {
