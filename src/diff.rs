@@ -1109,10 +1109,94 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
     );
 }
 
+/// Find the first touching diff-block chain containing `topline`, and
+/// the first block after that chain (`find_top_diff_block`).
+///
+/// # Safety
+/// `GLOBALS.curtab` and its `tp_first_diff` chain must point to live
+/// values, and `fromidx` must be less than `DB_COUNT`.
+#[must_use]
+pub unsafe fn find_top_diff_block(
+    fromidx: usize,
+    topline: crate::pos_defs::LinenrT,
+) -> (*mut crate::buffer_defs::DiffT, *mut crate::buffer_defs::DiffT) {
+    let mut this_top: *mut crate::buffer_defs::DiffT = std::ptr::null_mut();
+    let mut local_top: *mut crate::buffer_defs::DiffT = std::ptr::null_mut();
+    let mut top_changed = false;
+    let mut block = unsafe { (*crate::globals::GLOBALS.get_mut().curtab).tp_first_diff };
+
+    while !block.is_null() {
+        if local_top.is_null() || top_changed {
+            local_top = block;
+            top_changed = false;
+        }
+
+        let current = unsafe { &*block };
+        if topline >= current.df_lnum[fromidx]
+            && topline <= current.df_lnum[fromidx] + current.df_count[fromidx]
+            && this_top.is_null()
+        {
+            this_top = local_top;
+        }
+
+        let next = current.df_next;
+        if next.is_null()
+            || unsafe { (*next).df_lnum[fromidx] }
+                != current.df_lnum[fromidx] + current.df_count[fromidx]
+        {
+            top_changed = true;
+            if !this_top.is_null() {
+                return (this_top, next);
+            }
+        }
+        block = next;
+    }
+
+    (this_top, std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    #[test]
+    fn find_top_diff_block_returns_the_touching_chain_and_next_block() {
+        let mut first = Box::new(crate::buffer_defs::DiffT::default());
+        let mut second = Box::new(crate::buffer_defs::DiffT::default());
+        let mut third = Box::new(crate::buffer_defs::DiffT::default());
+        let firstp = first.as_mut() as *mut crate::buffer_defs::DiffT;
+        let secondp = second.as_mut() as *mut crate::buffer_defs::DiffT;
+        let thirdp = third.as_mut() as *mut crate::buffer_defs::DiffT;
+        unsafe {
+            (*firstp).df_lnum[0] = 10;
+            (*firstp).df_count[0] = 2;
+            (*firstp).df_next = secondp;
+            (*secondp).df_lnum[0] = 12;
+            (*secondp).df_count[0] = 3;
+            (*secondp).df_next = thirdp;
+            (*thirdp).df_lnum[0] = 20;
+            (*thirdp).df_count[0] = 1;
+        }
+
+        let mut tab = crate::buffer_defs::TabpageT {
+            tp_first_diff: firstp,
+            ..Default::default()
+        };
+        let tabp = &mut tab as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurtabGuard::set(tabp);
+
+        assert_eq!(unsafe { find_top_diff_block(0, 11) }, (firstp, thirdp));
+        assert_eq!(unsafe { find_top_diff_block(0, 14) }, (firstp, thirdp));
+        assert_eq!(
+            unsafe { find_top_diff_block(0, 20) },
+            (thirdp, std::ptr::null_mut())
+        );
+        assert_eq!(
+            unsafe { find_top_diff_block(0, 5) },
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        );
+    }
 
     #[test]
     fn diffhunk_holds_both_original_and_new_ranges_independently() {
