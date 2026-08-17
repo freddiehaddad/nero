@@ -990,6 +990,24 @@ pub fn csi_erase_line<C: VTermStateCallbacks>(
     true
 }
 
+pub fn csi_tab(state: &mut VTermState, count: i32, forward: bool) {
+    state.tab(count.max(1), if forward { 1 } else { -1 });
+}
+
+#[cfg(test)]
+mod csi_tab_tests {
+    use super::*;
+    #[test]
+    fn csi_tab_moves_requested_stop_count() {
+        let mut state = VTermState::new(1, 20);
+        for col in [4, 8, 12] { state.set_col_tabstop(col); }
+        csi_tab(&mut state, 2, true);
+        assert_eq!(state.pos.col, 8);
+        csi_tab(&mut state, 1, false);
+        assert_eq!(state.pos.col, 4);
+    }
+}
+
 #[cfg(test)]
 mod csi_erase_line_tests {
     use super::*;
