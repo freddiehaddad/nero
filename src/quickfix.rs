@@ -2115,6 +2115,49 @@ pub unsafe fn qf_get_cur_idx(eap: &crate::ex_cmds_defs::ExargT) -> usize {
     })
 }
 
+/// Current valid-entry/file index for `:cdo`/`:cfdo`
+/// (`qf_get_cur_valid_idx`), with one as the empty/error fallback.
+///
+/// # Safety
+/// Forwarded from `qf_cmd_get_stack`.
+#[must_use]
+pub unsafe fn qf_get_cur_valid_idx(eap: &crate::ex_cmds_defs::ExargT) -> i32 {
+    let qi = unsafe { qf_cmd_get_stack(eap) };
+    if qi.is_null() {
+        return 1;
+    }
+    let Some(list) = qf_get_curlist(unsafe { &*qi }) else {
+        return 1;
+    };
+    if !qf_list_has_valid_entries(list) {
+        return 1;
+    }
+
+    let file_do = matches!(
+        eap.cmdidx,
+        crate::ex_cmds_defs::CmdIdxT::cfdo | crate::ex_cmds_defs::CmdIdxT::lfdo
+    );
+    let limit = usize::try_from(list.qf_index)
+        .unwrap_or(0)
+        .min(list.qf_entries.len());
+    let mut previous_fnum = 0;
+    let mut index = 0;
+    for entry in &list.qf_entries[..limit] {
+        if !entry.qf_valid {
+            continue;
+        }
+        if file_do {
+            if entry.qf_fnum > 0 && entry.qf_fnum != previous_fnum {
+                index += 1;
+                previous_fnum = entry.qf_fnum;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    index.max(1)
+}
+
 /// Build a new quickfix/location list stack holding up to `n` lists
 /// (`qf_alloc_stack`).
 ///
@@ -6599,6 +6642,64 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unsafe { qf_get_cur_idx(&eap) }, 0);
+    }
+
+    #[test]
+    fn qf_get_cur_valid_idx_counts_valid_entries_through_current_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_entries = vec![
+            QflineT { qf_valid: true, ..Default::default() },
+            QflineT { qf_valid: false, ..Default::default() },
+            QflineT { qf_valid: true, ..Default::default() },
+            QflineT { qf_valid: true, ..Default::default() },
+        ];
+        stack.qf_lists[0].qf_index = 3;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::cdo,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_cur_valid_idx(&eap) }, 2);
+    }
+
+    #[test]
+    fn qf_get_cur_valid_idx_counts_distinct_files_for_cfdo() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_entries = vec![
+            QflineT { qf_valid: true, qf_fnum: 1, ..Default::default() },
+            QflineT { qf_valid: true, qf_fnum: 1, ..Default::default() },
+            QflineT { qf_valid: true, qf_fnum: 2, ..Default::default() },
+            QflineT { qf_valid: true, qf_fnum: 2, ..Default::default() },
+        ];
+        stack.qf_lists[0].qf_index = 3;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::cfdo,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_cur_valid_idx(&eap) }, 2);
+    }
+
+    #[test]
+    fn qf_get_cur_valid_idx_returns_one_without_valid_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_entries = vec![QflineT::default()];
+        stack.qf_lists[0].qf_index = 1;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let eap = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::cdo,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_get_cur_valid_idx(&eap) }, 1);
     }
 
     #[test]
