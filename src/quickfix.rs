@@ -1982,7 +1982,6 @@ unsafe fn qf_setprop_curidx(
 /// # Safety
 /// `qi`, `item`, and every List/Dict/typval pointer reachable from
 /// `item` must remain valid. Forwarded from [`qf_add_entries`].
-#[allow(dead_code)]
 unsafe fn qf_setprop_items(
     qi: *mut crate::types_defs::QfInfoT,
     qf_idx: i32,
@@ -2014,11 +2013,11 @@ unsafe fn qf_setprop_items(
 
 /// Set quickfix/location-list properties (`qf_set_properties`).
 ///
-/// Title, context, current index, callback, target-list selection,
-/// new-list creation, and changed ticks are translated. `"items"` and
-/// `"lines"` remain explicit gaps pending `qf_add_entries` and the
-/// full `'errorformat'` parser. Creating a new list also defers the
-/// display-only `qf_update_buffer` refresh.
+/// Title, items, context, current index, callback, target-list
+/// selection, new-list creation, and changed ticks are translated.
+/// `"lines"` remains an explicit gap pending the full `'errorformat'`
+/// parser. Creating a new list also defers the display-only
+/// `qf_update_buffer` refresh.
 ///
 /// # Safety
 /// `qi`, `what`, and every pointer reachable from their typvals must
@@ -2061,8 +2060,10 @@ unsafe fn qf_set_properties(
     {
         retval = unsafe { qf_setprop_title(qi, qf_idx, what, item) };
     }
-    if crate::eval::typval::tv_dict_find(Some(unsafe { &mut *what }), b"items").is_some() {
-        unimplemented!("qf_set_properties: items need qf_add_entries");
+    if let Some(item) =
+        crate::eval::typval::tv_dict_find(Some(unsafe { &mut *what }), b"items")
+    {
+        retval = unsafe { qf_setprop_items(qi, qf_idx, item, action) };
     }
     if crate::eval::typval::tv_dict_find(Some(unsafe { &mut *what }), b"lines").is_some() {
         unimplemented!("qf_set_properties: lines need qf_init_ext/errorformat");
@@ -10238,6 +10239,53 @@ mod tests {
             Some(&b"requested"[..])
         );
         assert_eq!(qi.qf_lists[0].qf_changedtick, 1);
+        qf_free(&mut qi.qf_lists[0]);
+        unsafe { crate::eval::typval::tv_dict_free(what) };
+    }
+
+    #[test]
+    fn qf_set_properties_replaces_items_through_batch_insertion() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT {
+                    qf_valid: true,
+                    ..Default::default()
+                }],
+                qf_index: 1,
+                qf_title: Some(b"kept".to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let qi_ptr = std::ptr::from_mut(&mut qi);
+        let items = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(
+                items,
+                batch_item_dict(0, 5, 2, Some(true)),
+            )
+        };
+        let what = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(
+                &mut *what,
+                b"items",
+                items,
+            )
+        };
+
+        assert_eq!(
+            unsafe { qf_set_properties(qi_ptr, what, b'r', None) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(qi.qf_lists[0].qf_count(), 1);
+        assert_eq!(qi.qf_lists[0].qf_entries[0].qf_lnum, 5);
+        assert_eq!(qi.qf_lists[0].qf_entries[0].qf_col, 2);
+        assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"kept"[..]));
+        assert_eq!(qi.qf_lists[0].qf_changedtick, 1);
+
         qf_free(&mut qi.qf_lists[0]);
         unsafe { crate::eval::typval::tv_dict_free(what) };
     }
