@@ -2811,6 +2811,71 @@ pub fn qf_range_text(gap: &mut GarrayT, entry: &QflineT) {
     gap.ga_concat_len(text.as_bytes());
 }
 
+/// Convert one quickfix entry to a dictionary and append it to `list`
+/// (`get_qfline_items`).
+///
+/// # Safety
+/// Touches the global buffer list and List/Dict GC registries.
+pub unsafe fn get_qfline_items(
+    entry: &QflineT,
+    list: *mut crate::eval::typval_defs::ListT,
+) -> i32 {
+    let mut bufnr = entry.qf_fnum;
+    if bufnr != 0 && unsafe { crate::buffer::buflist_findnr(bufnr) }.is_null() {
+        bufnr = 0;
+    }
+
+    let dict = crate::eval::typval::tv_dict_alloc();
+    unsafe { crate::eval::typval::tv_list_append_dict(list, dict) };
+    let dict = unsafe { &mut *dict };
+    let type_text = if entry.qf_type == 0 {
+        &[][..]
+    } else {
+        std::slice::from_ref(&entry.qf_type)
+    };
+    for (key, value) in [
+        (&b"bufnr"[..], i64::from(bufnr)),
+        (&b"lnum"[..], i64::from(entry.qf_lnum)),
+        (&b"end_lnum"[..], i64::from(entry.qf_end_lnum)),
+        (&b"col"[..], i64::from(entry.qf_col)),
+        (&b"end_col"[..], i64::from(entry.qf_end_col)),
+        (&b"vcol"[..], i64::from(entry.qf_viscol)),
+        (&b"nr"[..], i64::from(entry.qf_nr)),
+    ] {
+        let status = crate::eval::typval::tv_dict_add_nr(dict, key, value);
+        assert_eq!(status, crate::vim_defs::OK);
+    }
+    for (key, value) in [
+        (&b"module"[..], entry.qf_module.as_deref().unwrap_or(&[])),
+        (&b"pattern"[..], entry.qf_pattern.as_deref().unwrap_or(&[])),
+        (&b"text"[..], entry.qf_text.as_deref().unwrap_or(&[])),
+        (&b"type"[..], type_text),
+    ] {
+        let status = crate::eval::typval::tv_dict_add_str(dict, key, Some(value));
+        assert_eq!(status, crate::vim_defs::OK);
+    }
+    if !matches!(
+        entry.qf_user_data.value,
+        crate::eval::typval_defs::TypvalValue::Unknown
+    ) {
+        let status = unsafe {
+            crate::eval::typval::tv_dict_add_tv(
+                dict,
+                b"user_data",
+                &entry.qf_user_data,
+            )
+        };
+        assert_eq!(status, crate::vim_defs::OK);
+    }
+    let status = crate::eval::typval::tv_dict_add_nr(
+        dict,
+        b"valid",
+        i64::from(entry.qf_valid),
+    );
+    assert_eq!(status, crate::vim_defs::OK);
+    crate::vim_defs::OK
+}
+
 /// Find the first window in the current tab page showing a normal
 /// buffer (`qf_find_win_with_normal_buf`).
 ///
@@ -7838,5 +7903,84 @@ mod tests {
             }),
             b"10"
         );
+    }
+
+    #[test]
+    fn get_qfline_items_appends_the_complete_entry_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let entry = QflineT {
+            qf_lnum: 10,
+            qf_end_lnum: 12,
+            qf_col: 3,
+            qf_end_col: 8,
+            qf_nr: 42,
+            qf_module: Some(b"compiler".to_vec()),
+            qf_pattern: Some(b"needle".to_vec()),
+            qf_text: Some(b"message".to_vec()),
+            qf_viscol: true,
+            qf_type: b'E',
+            qf_user_data: crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(9),
+                ..Default::default()
+            },
+            qf_valid: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { get_qfline_items(&entry, list) },
+            crate::vim_defs::OK
+        );
+        let item = unsafe { crate::eval::typval::tv_list_first(list) };
+        let crate::eval::typval_defs::TypvalValue::Dict(dict) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            panic!("entry must be a dict");
+        };
+        let dict = unsafe { &mut **dict };
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(dict), b"lnum") },
+            10
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_string(Some(dict), b"module") },
+            Some(b"compiler".to_vec())
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_string(Some(dict), b"type") },
+            Some(b"E".to_vec())
+        );
+        assert!(crate::eval::typval::tv_dict_find(Some(dict), b"user_data").is_some());
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_qfline_items_zeroes_a_missing_buffer_and_omits_unknown_user_data() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let entry = QflineT {
+            qf_fnum: 99,
+            ..Default::default()
+        };
+        unsafe { get_qfline_items(&entry, list) };
+        let item = unsafe { crate::eval::typval::tv_list_first(list) };
+        let crate::eval::typval_defs::TypvalValue::Dict(dict) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            panic!("entry must be a dict");
+        };
+        let dict = unsafe { &mut **dict };
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(dict), b"bufnr") },
+            0
+        );
+        assert!(crate::eval::typval::tv_dict_find(Some(dict), b"user_data").is_none());
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 }
