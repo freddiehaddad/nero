@@ -2236,6 +2236,27 @@ impl VTermState {
         true
     }
 
+    pub fn csi_position(&mut self, command: u8, row: i32, col: i32) -> bool {
+        match command {
+            b'G' | b'`' => self.pos.col = col.max(1) - 1,
+            b'd' => {
+                self.pos.row = row.max(1) - 1;
+                if self.mode.origin { self.pos.row += self.scrollregion_top; }
+            }
+            b'H' | b'f' => {
+                self.pos.row = row.max(1) - 1;
+                self.pos.col = col.max(1) - 1;
+                if self.mode.origin {
+                    self.pos.row += self.scrollregion_top;
+                    self.pos.col += self.scrollregion_left();
+                }
+            }
+            _ => return false,
+        }
+        self.at_phantom = false;
+        true
+    }
+
     #[must_use]
     pub fn dec_mode_value(&self, number: i32) -> Option<bool> {
         Some(match number {
@@ -2743,6 +2764,18 @@ mod termprop_state_tests {
         assert!(state.csi_move_cursor(b'E', 1));
         assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 4, col: 0 });
         assert!(!state.csi_move_cursor(b'Z', 1));
+    }
+    #[test]
+    fn csi_position_handles_absolute_and_origin_relative_coordinates() {
+        let mut state = VTermState::new(10, 10);
+        assert!(state.csi_position(b'H', 3, 4));
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 2, col: 3 });
+        state.mode.origin = true;
+        state.scrollregion_top = 2;
+        state.mode.leftrightmargin = true;
+        state.scrollregion_left = 1;
+        state.csi_position(b'f', 1, 1);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 2, col: 1 });
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
