@@ -561,6 +561,28 @@ fn append_pen_color(
     }
 }
 
+pub fn vterm_state_getpen_color(
+    color: &crate::vterm_defs::VTermColor,
+    args: &mut Vec<crate::vterm::parser::CsiArg>,
+    foreground: bool,
+) -> usize {
+    append_pen_color(color, foreground, args);
+    args.len()
+}
+
+#[cfg(test)]
+mod getpen_color_tests {
+    use super::*;
+    #[test]
+    fn getpen_color_appends_after_existing_arguments() {
+        let mut color = crate::vterm_defs::VTermColor::default();
+        crate::vterm_defs::vterm_color_indexed(&mut color, 3);
+        let mut args = vec![1];
+        assert_eq!(vterm_state_getpen_color(&color, &mut args, true), 2);
+        assert_eq!(args, [1, 33]);
+    }
+}
+
 /// Serializes the active pen as SGR arguments (`vterm_state_getpen`).
 #[must_use]
 pub fn vterm_state_getpen(state: &VTermPenState) -> Vec<crate::vterm::parser::CsiArg> {
