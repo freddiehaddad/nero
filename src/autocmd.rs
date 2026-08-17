@@ -86,6 +86,10 @@
 //! right now, becoming fully correct end-to-end the moment a future
 //! session adds real `FileType` autocmd registration.
 //!
+//! Also [`event_name2nr`]/[`check_ei`] - event-name parsing and
+//! validation for `'eventignore'`/`'eventignorewin'`, directly over
+//! the already-translated authoritative event-name table.
+//!
 //! Deferred: everything else - `apply_autocmds_group`'s real
 //! autocmd-matching-and-execution body (needs pattern matching,
 //! `exec_autocmds`, script/function invocation via the not-yet-started
@@ -597,6 +601,62 @@ pub fn arg_augroup_get(arg: &[u8]) -> (i32, usize) {
         // Match: skip over the group name and any following blanks.
         (group, p + crate::charset::skipwhite(&arg[p..]))
     }
+}
+
+/// Resolve one event name and return its event plus bytes consumed
+/// (`event_name2nr`).
+///
+/// The event name ends at NUL, whitespace, comma or `|`. A comma is
+/// consumed; the other terminators are not. Event names are matched
+/// case-insensitively, including aliases in `EVENT_NAMES`.
+#[must_use]
+pub fn event_name2nr(start: &[u8]) -> (Option<EventT>, usize) {
+    let mut end = 0;
+    while end < start.len()
+        && start[end] != 0
+        && !crate::ascii_defs::ascii_iswhite(i32::from(start[end]))
+        && !matches!(start[end], b',' | b'|')
+    {
+        end += 1;
+    }
+
+    let event = crate::autocmd_defs::EVENT_NAMES
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(&start[..end]))
+        .map(|entry| entry.event);
+    let consumed = end + usize::from(start.get(end) == Some(&b','));
+    (event, consumed)
+}
+
+/// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
+///
+/// `win` selects the window-local option, which accepts only entries
+/// marked `win_local` in the event-name table. The special `all`
+/// token is accepted in either option.
+#[must_use]
+pub fn check_ei(ei: &[u8], win: bool) -> bool {
+    let mut pos = 0;
+    while pos < ei.len() && ei[pos] != 0 {
+        let rest = &ei[pos..];
+        if rest.len() >= 3
+            && rest[..3].eq_ignore_ascii_case(b"all")
+            && matches!(rest.get(3), None | Some(0 | b','))
+        {
+            pos += 3 + usize::from(rest.get(3) == Some(&b','));
+            continue;
+        }
+
+        pos += usize::from(ei[pos] == b'-');
+        let (event, consumed) = event_name2nr(&ei[pos..]);
+        let Some(event) = event else {
+            return false;
+        };
+        pos += consumed;
+        if win && !crate::autocmd_defs::EVENT_NAMES[event as usize].win_local {
+            return false;
+        }
+    }
+    true
 }
 
 /// Event names for `ExpandGeneric`, excluding group names
@@ -1348,7 +1408,65 @@ mod tests {
         reset_augroup_map();
     }
 
-    // --- get_event_name_no_group ---
+    // --- event_name2nr / check_ei / get_event_name_no_group ---
+
+    #[test]
+    fn event_name2nr_resolves_case_insensitively_and_consumes_a_comma() {
+        let (event, consumed) = event_name2nr(b"bufenter,ColorScheme");
+        assert_eq!(event, Some(EventT::BufEnter));
+        assert_eq!(consumed, b"bufenter,".len());
+    }
+
+    #[test]
+    fn event_name2nr_stops_before_whitespace_and_bar() {
+        let (event, consumed) = event_name2nr(b"BufEnter rest");
+        assert_eq!(event, Some(EventT::BufEnter));
+        assert_eq!(consumed, b"BufEnter".len());
+
+        let (event, consumed) = event_name2nr(b"ColorScheme|echo");
+        assert_eq!(event, Some(EventT::ColorScheme));
+        assert_eq!(consumed, b"ColorScheme".len());
+    }
+
+    #[test]
+    fn event_name2nr_resolves_an_alias_to_its_canonical_event() {
+        let (event, consumed) = event_name2nr(b"FileEncoding");
+        assert_eq!(event, Some(EventT::EncodingChanged));
+        assert_eq!(consumed, b"FileEncoding".len());
+    }
+
+    #[test]
+    fn event_name2nr_reports_unknown_names_and_their_consumed_length() {
+        let (event, consumed) = event_name2nr(b"NotAnEvent,next");
+        assert_eq!(event, None);
+        assert_eq!(consumed, b"NotAnEvent,".len());
+    }
+
+    #[test]
+    fn check_ei_accepts_empty_all_and_comma_separated_events() {
+        assert!(check_ei(b"", false));
+        assert!(check_ei(b"all", false));
+        assert!(check_ei(b"BufEnter,ColorScheme", false));
+    }
+
+    #[test]
+    fn check_ei_accepts_subtraction_and_case_insensitive_names() {
+        assert!(check_ei(b"-bufenter,COLORSCHEME", false));
+    }
+
+    #[test]
+    fn check_ei_rejects_unknown_empty_and_whitespace_separated_entries() {
+        assert!(!check_ei(b"NotAnEvent", false));
+        assert!(!check_ei(b",BufEnter", false));
+        assert!(!check_ei(b"BufEnter ColorScheme", false));
+    }
+
+    #[test]
+    fn check_ei_window_form_accepts_only_window_local_events() {
+        assert!(check_ei(b"BufEnter", true));
+        assert!(check_ei(b"all", true));
+        assert!(!check_ei(b"ColorScheme", true));
+    }
 
     #[test]
     fn get_event_name_no_group_indexes_the_table_directly() {
