@@ -1368,6 +1368,29 @@ fn qf_setprop_get_qfidx(
     index
 }
 
+/// Set a quickfix list's `'quickfixtextfunc'` callback
+/// (`qf_setprop_qftf`).
+///
+/// # Safety
+/// `item` must point to a live dictionary item. Global callback and
+/// secure-mode state must not be mutated concurrently.
+#[allow(dead_code)]
+unsafe fn qf_setprop_qftf(
+    qfl: &mut QfListT,
+    item: *mut crate::eval::typval_defs::DictitemT,
+) -> i32 {
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return crate::vim_defs::FAIL;
+    }
+    crate::eval::typval::callback_free(&mut qfl.qf_qftf_cb);
+    if let Some(callback) =
+        unsafe { crate::eval::typval::callback_from_typval(&(*item).di_tv) }
+    {
+        qfl.qf_qftf_cb = callback;
+    }
+    crate::vim_defs::OK
+}
+
 #[cfg(test)]
 mod qf_nth_valid_tests {
     use super::*;
@@ -1481,6 +1504,27 @@ mod qf_nth_valid_tests {
         );
         assert!(!newlist);
         unsafe { crate::eval::typval::tv_dict_free(id) };
+    }
+
+    #[test]
+    fn setprop_qftf_installs_a_string_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"quickfixtextfunc");
+        unsafe {
+            (*item).di_tv.value =
+                crate::eval::typval_defs::TypvalValue::String(Some(b"MyFunc".to_vec()));
+        }
+        let mut qfl = QfListT::default();
+        assert_eq!(
+            unsafe { qf_setprop_qftf(&mut qfl, item) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            qfl.qf_qftf_cb.kind(),
+            crate::eval::typval_defs::CallbackType::Funcref
+        );
+        crate::eval::typval::callback_free(&mut qfl.qf_qftf_cb);
+        unsafe { crate::eval::typval::tv_dict_item_free(item) };
     }
 }
 
