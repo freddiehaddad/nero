@@ -2538,6 +2538,33 @@ pub unsafe fn set_option_varp(opt_idx: OptIndex, varp: *mut c_void, value: OptVa
     }
 }
 
+/// Restore editor context after an option get/set operation
+/// (`restore_option_context`).
+///
+/// # Safety
+/// `ctx` must point to a live `CtxSwitch` for window/buffer scope, or
+/// a saved live `TabpageT` pointer for tab scope. The current tabpage
+/// and its window list must also be live for tab restoration.
+pub unsafe fn restore_option_context(
+    ctx: *mut std::ffi::c_void,
+    scope: crate::option_defs::OptScope,
+) {
+    match scope {
+        crate::option_defs::OptScope::Global => {}
+        crate::option_defs::OptScope::Win | crate::option_defs::OptScope::Buf => {
+            crate::context::ctx_restore(unsafe { &*(ctx as *const crate::context_defs::CtxSwitch) });
+        }
+        crate::option_defs::OptScope::Tab => {
+            let saved = unsafe { *(ctx as *const *mut crate::buffer_defs::TabpageT) };
+            let current = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+            unsafe {
+                crate::window::unuse_tabpage(current);
+                crate::window::use_tabpage(saved);
+            }
+        }
+    }
+}
+
 /// Get the value of an option (`get_option_value`).
 ///
 /// # Safety
@@ -5606,6 +5633,87 @@ mod optval_tests {
 
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         globals.curbuf = prev_buf;
+    }
+
+    #[test]
+    fn restore_option_context_global_and_noop_ctxswitch_are_noops() {
+        unsafe {
+            restore_option_context(std::ptr::null_mut(), crate::option_defs::OptScope::Global)
+        };
+
+        let switch = crate::context_defs::CtxSwitch::default();
+        unsafe {
+            restore_option_context(
+                (&switch as *const crate::context_defs::CtxSwitch)
+                    .cast_mut()
+                    .cast(),
+                crate::option_defs::OptScope::Buf,
+            )
+        };
+    }
+
+    #[test]
+    fn restore_option_context_tab_reactivates_the_saved_tabpage() {
+        struct ChGuard(crate::types_defs::OptInt);
+        impl Drop for ChGuard {
+            fn drop(&mut self) {
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = self.0;
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let mut current = crate::buffer_defs::TabpageT::default();
+        let mut saved = crate::buffer_defs::TabpageT {
+            tp_ch_used: 7,
+            ..Default::default()
+        };
+        let currentp = &mut current as *mut crate::buffer_defs::TabpageT;
+        let savedp = &mut saved as *mut crate::buffer_defs::TabpageT;
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                currentp,
+            )
+        };
+        let _topframe = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.topframe,
+                std::ptr::null_mut(),
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let old_ch = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch;
+        let _ch = ChGuard(old_ch);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = 3;
+        let mut ctx = savedp;
+
+        unsafe {
+            restore_option_context(
+                (&mut ctx as *mut *mut crate::buffer_defs::TabpageT).cast(),
+                crate::option_defs::OptScope::Tab,
+            )
+        };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curtab, savedp);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch, 7);
+        assert_eq!(unsafe { (*currentp).tp_ch_used }, 3);
     }
 
     #[test]
