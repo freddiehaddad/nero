@@ -1012,6 +1012,25 @@ pub fn request_dec_mode(state: &VTermState, number: i32, ctrl8bit: bool) -> Vec<
     [prefix, format!("?{number};{reply}$y").as_bytes()].concat()
 }
 
+#[must_use]
+pub fn primary_device_attributes(ctrl8bit: bool) -> Vec<u8> {
+    let prefix: &[u8] = if ctrl8bit {
+        &[crate::vterm_defs::C1_CSI]
+    } else {
+        b"\x1b["
+    };
+    [prefix, b"?", VTERM_PRIMARY_DEVICE_ATTR, b"c"].concat()
+}
+
+#[cfg(test)]
+mod primary_device_response_tests {
+    use super::*;
+    #[test]
+    fn primary_device_response_uses_configurable_attribute_string() {
+        assert_eq!(primary_device_attributes(false), b"\x1b[?61;22;52c");
+    }
+}
+
 #[cfg(test)]
 mod dec_mode_request_tests {
     use super::*;
