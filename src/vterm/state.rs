@@ -3843,7 +3843,7 @@ impl VTermState {
     pub fn csi_move_cursor(&mut self, command: u8, count: i32) -> bool {
         let count = count.max(1);
         match command {
-            b'A' => self.pos.row -= count,
+            b'A' | b'k' => self.pos.row -= count,
             b'B' | b'e' => self.pos.row += count,
             b'C' | b'a' => self.pos.col += count,
             b'D' | b'j' => self.pos.col -= count,
@@ -4472,8 +4472,10 @@ mod termprop_state_tests {
         state.pos = crate::vterm_defs::VTermPos { row: 5, col: 5 };
         assert!(state.csi_move_cursor(b'A', 2));
         assert_eq!(state.pos.row, 3);
+        assert!(state.csi_move_cursor(b'k', 1));
+        assert_eq!(state.pos.row, 2);
         assert!(state.csi_move_cursor(b'E', 1));
-        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 4, col: 0 });
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 3, col: 0 });
         assert!(!state.csi_move_cursor(b'Z', 1));
     }
     #[test]
