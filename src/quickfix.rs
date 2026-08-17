@@ -2974,6 +2974,143 @@ pub unsafe fn qf_getprop_items(
     crate::vim_defs::OK
 }
 
+/// Return requested quickfix/location-list properties
+/// (`qf_get_properties`).
+///
+/// The `"lines"` request form remains deferred because it needs
+/// `qf_init_ext` and the full `'errorformat'` parser. Every ordinary
+/// property handled by `getqflist()`/`getloclist()` is translated.
+///
+/// # Safety
+/// `wp`, `what`, `retdict`, and every quickfix/window/buffer pointer
+/// reachable from them must remain valid. Touches global quickfix,
+/// window, buffer, callback, and List/Dict GC state.
+pub unsafe fn qf_get_properties(
+    wp: Option<&crate::buffer_defs::WinT>,
+    what: *mut crate::eval::typval_defs::DictT,
+    retdict: *mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    let global = unsafe { &*QL_INFO.as_ptr() };
+    let mut qi = global
+        .as_ref()
+        .map_or(std::ptr::null(), std::ptr::from_ref);
+    assert!(!qi.is_null(), "qf_get_properties: quickfix stack is not initialized");
+
+    if crate::eval::typval::tv_dict_find(Some(unsafe { &mut *what }), b"lines").is_some() {
+        unimplemented!("qf_get_properties: parsing lines needs qf_init_ext/errorformat");
+    }
+
+    if let Some(wp) = wp {
+        qi = if is_ll_window(wp) {
+            wp.w_llist_ref
+        } else {
+            wp.w_llist
+        };
+    }
+
+    let flags = qf_getprop_keys2flags(unsafe { &mut *what }, wp.is_some());
+    let qi_ref = unsafe { qi.as_ref() };
+    let mut qf_idx = INVALID_QFIDX;
+    if !qf_stack_empty(qi_ref) {
+        qf_idx = qf_getprop_qfidx(
+            qi_ref.expect("nonempty stack must exist"),
+            unsafe { &mut *what },
+        );
+    }
+    if qf_stack_empty(qi_ref) || qf_idx == INVALID_QFIDX {
+        return unsafe {
+            qf_getprop_defaults(
+                qi_ref,
+                flags,
+                wp.is_some(),
+                &mut *retdict,
+            )
+        };
+    }
+
+    let qi_ref = qi_ref.expect("selected stack must exist");
+    let qfl = qf_get_list(qi_ref, qf_idx).expect("selected list must exist");
+    let mut eidx = 0;
+    if let Some(item) =
+        crate::eval::typval::tv_dict_find(Some(unsafe { &mut *what }), b"idx")
+    {
+        let crate::eval::typval_defs::TypvalValue::Number(index) =
+            (unsafe { &(*item).di_tv.value })
+        else {
+            return crate::vim_defs::FAIL;
+        };
+        eidx = *index as i32;
+    }
+
+    use qf_getlist_flag as flag;
+    let mut status = crate::vim_defs::OK;
+    if flags & flag::TITLE != 0 {
+        status = qf_getprop_title(qfl, unsafe { &mut *retdict });
+    }
+    if status == crate::vim_defs::OK && flags & flag::NR != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"nr",
+            i64::from(qf_idx + 1),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::WINID != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"winid",
+            i64::from(unsafe { qf_winid(qi) }),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::ITEMS != 0 {
+        status = unsafe { qf_getprop_items(qi_ref, qf_idx, eidx, retdict) };
+    }
+    if status == crate::vim_defs::OK && flags & flag::CONTEXT != 0 {
+        status = unsafe { qf_getprop_ctx(qfl, &mut *retdict) };
+    }
+    if status == crate::vim_defs::OK && flags & flag::ID != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"id",
+            i64::from(qfl.qf_id),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::IDX != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"idx",
+            i64::from(qf_getprop_idx(qfl, eidx)),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::SIZE != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"size",
+            i64::from(qfl.qf_count()),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::TICK != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"changedtick",
+            i64::from(qfl.qf_changedtick),
+        );
+    }
+    if status == crate::vim_defs::OK && wp.is_some() && flags & flag::FILEWINID != 0 {
+        status = unsafe { qf_getprop_filewinid(wp, qi, &mut *retdict) };
+    }
+    if status == crate::vim_defs::OK && flags & flag::QFBUFNR != 0 {
+        status = crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *retdict },
+            b"qfbufnr",
+            i64::from(unsafe { qf_getprop_qfbufnr(Some(qi_ref)) }),
+        );
+    }
+    if status == crate::vim_defs::OK && flags & flag::QFTF != 0 {
+        status = unsafe { qf_getprop_qftf(qfl, &mut *retdict) };
+    }
+    status
+}
+
 /// Find the first window in the current tab page showing a normal
 /// buffer (`qf_find_win_with_normal_buf`).
 ///
@@ -8219,6 +8356,7 @@ mod tests {
 
         *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
             qf_listcount: 1,
+            qf_bufnr: 99,
             qf_lists: vec![QfListT {
                 qf_entries: vec![QflineT { qf_lnum: 15, ..Default::default() }],
                 ..Default::default()
@@ -8318,5 +8456,202 @@ mod tests {
                 if unsafe { crate::eval::typval::tv_list_len(*list) } == 0
         ));
         unsafe { crate::eval::typval::tv_dict_free(dict) };
+    }
+
+    #[test]
+    fn qf_get_properties_returns_every_requested_quickfix_property() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_bufnr: 99,
+            qf_lists: vec![QfListT {
+                qf_id: 77,
+                qf_entries: vec![
+                    QflineT { qf_lnum: 2, ..Default::default() },
+                    QflineT { qf_lnum: 4, ..Default::default() },
+                ],
+                qf_index: 2,
+                qf_title: Some(b"title".to_vec()),
+                qf_changedtick: 9,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"all", 1);
+        let result = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_get_properties(None, what, result) },
+            crate::vim_defs::OK
+        );
+        let result_ref = unsafe { &mut *result };
+        assert_eq!(result_ref.dv_index.len(), 11);
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_string(Some(result_ref), b"title") },
+            Some(b"title".to_vec())
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(result_ref), b"nr") },
+            1
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(result_ref), b"id") },
+            77
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(result_ref), b"idx") },
+            2
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(result_ref), b"size") },
+            2
+        );
+        let items = crate::eval::typval::tv_dict_find(Some(result_ref), b"items").unwrap();
+        assert!(matches!(
+            unsafe { &(*items).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::List(list)
+                if unsafe { crate::eval::typval::tv_list_len(*list) } == 2
+        ));
+        assert!(crate::eval::typval::tv_dict_find(Some(result_ref), b"filewinid").is_none());
+        unsafe {
+            crate::eval::typval::tv_dict_free(result);
+            crate::eval::typval::tv_dict_free(what);
+        }
+    }
+
+    #[test]
+    fn qf_get_properties_respects_a_requested_entry_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![
+                    QflineT { qf_lnum: 2, ..Default::default() },
+                    QflineT { qf_lnum: 4, ..Default::default() },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let what = crate::eval::typval::tv_dict_alloc();
+        let what_ref = unsafe { &mut *what };
+        crate::eval::typval::tv_dict_add_nr(what_ref, b"items", 1);
+        crate::eval::typval::tv_dict_add_nr(what_ref, b"idx", 2);
+        let result = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_get_properties(None, what, result) },
+            crate::vim_defs::OK
+        );
+        let result_ref = unsafe { &mut *result };
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(result_ref), b"idx") },
+            2
+        );
+        let items = crate::eval::typval::tv_dict_find(Some(result_ref), b"items").unwrap();
+        let crate::eval::typval_defs::TypvalValue::List(items) =
+            (unsafe { &(*items).di_tv.value })
+        else {
+            panic!("items must be a list");
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(*items) }, 1);
+        unsafe {
+            crate::eval::typval::tv_dict_free(result);
+            crate::eval::typval::tv_dict_free(what);
+        }
+    }
+
+    #[test]
+    fn qf_get_properties_returns_defaults_for_an_empty_stack_and_rejects_bad_idx() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_bufnr: 99,
+            ..Default::default()
+        });
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"all", 1);
+        let result = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_get_properties(None, what, result) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_get_number(Some(&mut *result), b"nr") },
+            0
+        );
+        unsafe {
+            crate::eval::typval::tv_dict_free(result);
+            crate::eval::typval::tv_dict_free(what);
+        }
+
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_str(unsafe { &mut *what }, b"idx", Some(b"bad"));
+        let result = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_get_properties(None, what, result) },
+            crate::vim_defs::FAIL
+        );
+        unsafe {
+            crate::eval::typval::tv_dict_free(result);
+            crate::eval::typval::tv_dict_free(what);
+        }
+    }
+
+    #[test]
+    fn qf_get_properties_includes_filewinid_for_location_requests() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT::default());
+        let mut location = Box::new(crate::types_defs::QfInfoT {
+            qf_listcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT::default()],
+                ..Default::default()
+            }],
+            qfl_type: QfltypeT::Location,
+            qf_bufnr: 99,
+            ..Default::default()
+        });
+        let location_ptr = std::ptr::addr_of_mut!(*location);
+        let win = crate::buffer_defs::WinT {
+            w_llist: location_ptr,
+            ..Default::default()
+        };
+        let what = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *what }, b"all", 1);
+        let result = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { qf_get_properties(Some(&win), what, result) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    Some(&mut *result),
+                    b"filewinid",
+                )
+            },
+            0
+        );
+        unsafe {
+            crate::eval::typval::tv_dict_free(result);
+            crate::eval::typval::tv_dict_free(what);
+        }
     }
 }
