@@ -1382,6 +1382,89 @@ pub unsafe fn qf_find_win(
     std::ptr::null_mut()
 }
 
+/// Find the buffer displaying quickfix/location stack `qi`
+/// (`qf_find_buf`).
+///
+/// # Safety
+/// The global buffer and tab/window lists must contain valid, live,
+/// acyclic pointers.
+#[must_use]
+pub unsafe fn qf_find_buf(
+    qi: &mut crate::types_defs::QfInfoT,
+) -> *mut crate::buffer_defs::BufT {
+    if qi.qf_bufnr != INVALID_QFBUFNR {
+        let qfbuf = unsafe { crate::buffer::buflist_findnr(qi.qf_bufnr) };
+        if !qfbuf.is_null() {
+            return qfbuf;
+        }
+        qi.qf_bufnr = INVALID_QFBUFNR;
+    }
+
+    let globals = unsafe { &*crate::globals::GLOBALS.as_ptr() };
+    let mut tp = globals.first_tabpage;
+    while !tp.is_null() {
+        let mut win = if tp == globals.curtab {
+            globals.firstwin
+        } else {
+            unsafe { (*tp).tp_firstwin }
+        };
+        while !win.is_null() {
+            if unsafe { is_qf_win(&*win, qi) } {
+                return unsafe { (*win).w_buffer };
+            }
+            win = unsafe { (*win).w_next };
+        }
+        tp = unsafe { (*tp).tp_next };
+    }
+    std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod qf_find_buf_tests {
+    use super::*;
+
+    #[test]
+    fn find_buf_uses_number_then_falls_back_to_open_quickfix_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            handle: 7,
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        unsafe {
+            (*win_ptr).w_buffer = buf_ptr;
+            (*tab_ptr).tp_firstwin = win_ptr;
+        }
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _firsttab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.first_tabpage, tab_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+
+        let mut qi = crate::types_defs::QfInfoT {
+            qf_bufnr: 7,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { qf_find_buf(&mut qi) }, buf_ptr);
+
+        qi.qf_bufnr = 99;
+        assert_eq!(unsafe { qf_find_buf(&mut qi) }, buf_ptr);
+        assert_eq!(qi.qf_bufnr, INVALID_QFBUFNR);
+    }
+}
+
 /// Returns the current tabpage's window id for quickfix/location stack
 /// `qi` (`qf_winid`), or zero when no such window is open.
 ///
