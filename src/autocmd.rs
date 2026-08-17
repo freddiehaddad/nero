@@ -262,16 +262,42 @@ pub fn block_autocmds() {
     unsafe { *AUTOCMD_BLOCKED.get_mut() += 1 };
 }
 
+/// Trigger `TermResponse` autocommands and remember the response
+/// channel (`do_termresponse_autocmd`).
+pub fn do_termresponse_autocmd(sequence: &[u8], channel_id: u64) {
+    let mut data = crate::api::private::defs::Object::Dict(vec![
+        crate::api::private::defs::KeyValuePair {
+            key: b"sequence".to_vec(),
+            value: crate::api::private::defs::Object::String(sequence.to_vec()),
+        },
+        crate::api::private::defs::KeyValuePair {
+            key: b"chan".to_vec(),
+            value: crate::api::private::defs::Object::Integer(channel_id as i64),
+        },
+    ]);
+    let _ = apply_autocmds_group(
+        EventT::TermResponse,
+        None,
+        None,
+        true,
+        augroup::ALL,
+        None,
+        std::ptr::null_mut(),
+        std::ptr::from_mut(&mut data),
+        false,
+    );
+    unsafe { *TERMRESPONSE_CHANGED.get_mut() = true };
+    unsafe { *TERMRESPONSE_CHAN_ID.get_mut() = channel_id };
+}
+
 /// Undo the effect of [`block_autocmds`] (`unblock_autocmds`).
 ///
 /// The original's "trigger the deferred termresponse autocmd now"
 /// branch (reached only when `v:termresponse` was set while blocked)
-/// is `unimplemented!()` here: nothing currently translated can ever
-/// set `TERMRESPONSE_CHANGED` true (needs real terminal I/O
-/// detecting a termcap response, `tui/*.c`, not yet translated) - this
-/// branch is therefore provably unreachable today, matching the
-/// established "narrow, provably-unreachable branch" precedent (e.g.
-/// `func_clear_items`'s `FC_LUAREF` arm).
+/// is `unimplemented!()` here: [`do_termresponse_autocmd`] can now set
+/// `TERMRESPONSE_CHANGED`, but no translated code can register a real
+/// `TermResponse` autocmd, so the final [`has_event`] operand remains
+/// false and this branch is still unreachable.
 pub fn unblock_autocmds() {
     unsafe { *AUTOCMD_BLOCKED.get_mut() -= 1 };
 
@@ -708,6 +734,23 @@ pub unsafe fn do_filetype_autocmd(buf: *mut BufT, force: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn termresponse_autocmd_records_changed_state_and_channel() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = (
+            unsafe { *TERMRESPONSE_CHANGED.get_mut() },
+            unsafe { *TERMRESPONSE_CHAN_ID.get_mut() },
+        );
+        do_termresponse_autocmd(b"\x1b[?1;2c", 42);
+        let got = (
+            unsafe { *TERMRESPONSE_CHANGED.get_mut() },
+            unsafe { *TERMRESPONSE_CHAN_ID.get_mut() },
+        );
+        unsafe { *TERMRESPONSE_CHANGED.get_mut() = saved.0 };
+        unsafe { *TERMRESPONSE_CHAN_ID.get_mut() = saved.1 };
+        assert_eq!(got, (true, 42));
+    }
 
     #[test]
     fn has_event_is_false_for_every_event_when_autocmds_are_always_empty() {
