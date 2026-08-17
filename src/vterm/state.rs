@@ -1186,6 +1186,211 @@ pub fn begin_grapheme_recombine(
     }
 }
 
+pub fn on_text<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+    bytes: &[u8],
+    utf8: bool,
+) -> usize {
+    let old_position = state.pos;
+    let (codepoints, consumed) = decode_text_codepoints(state, bytes, utf8);
+    let Some(&first_codepoint) = codepoints.first() else {
+        return consumed;
+    };
+    let (mut grapheme_state, mut grapheme_len, mut recombine) =
+        begin_grapheme_recombine(state, first_codepoint);
+    let mut index = 0;
+
+    while index < codepoints.len() {
+        (index, grapheme_len) = append_grapheme(
+            &codepoints,
+            index,
+            &mut state.grapheme_buf,
+            grapheme_len,
+            &mut grapheme_state,
+        );
+        // SAFETY: grapheme_buf[..grapheme_len] contains complete UTF-8
+        // characters produced by utf_char2bytes.
+        let width = unsafe {
+            crate::mbyte::utf_ptr2cells_len(
+                &state.grapheme_buf[..grapheme_len],
+                grapheme_len as i32,
+            )
+        };
+        if state.at_phantom || state.pos.col + width > state.current_row_width() {
+            linefeed(state, callbacks);
+            state.pos.col = 0;
+            state.at_phantom = false;
+            state.lineinfos[state.active_lineinfo][state.pos.row as usize].continuation = true;
+        }
+
+        if state.mode.insert && !recombine {
+            scroll(
+                state,
+                callbacks,
+                crate::vterm_defs::VTermRect {
+                    start_row: state.pos.row,
+                    end_row: state.pos.row + 1,
+                    start_col: state.pos.col,
+                    end_col: state.current_row_width(),
+                },
+                0,
+                -1,
+            );
+        }
+
+        let schar = crate::grid::schar_from_buf(&state.grapheme_buf[..grapheme_len]);
+        putglyph(
+            state,
+            callbacks,
+            schar,
+            width,
+            state.pos,
+            state.protected_cell,
+        );
+
+        if index == codepoints.len() {
+            state.grapheme_len = grapheme_len;
+            state.grapheme_last = codepoints[index - 1];
+            state.grapheme_state = grapheme_state;
+            state.combine_width = width;
+            state.combine_pos = state.pos;
+        } else {
+            grapheme_len = 0;
+            recombine = false;
+        }
+
+        if state.pos.col + width >= state.current_row_width() {
+            if state.mode.autowrap {
+                state.at_phantom = true;
+            }
+        } else {
+            state.pos.col += width;
+        }
+    }
+
+    updatecursor(state, callbacks, old_position, false);
+    consumed
+}
+
+#[cfg(test)]
+mod on_text_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        glyphs: Vec<(Vec<u8>, crate::vterm_defs::VTermPos)>,
+        scrolls: Vec<(crate::vterm_defs::VTermRect, i32)>,
+        moves: Vec<crate::vterm_defs::VTermPos>,
+    }
+
+    impl VTermStateCallbacks for Capture {
+        fn put_glyph(
+            &mut self,
+            info: &crate::vterm_defs::VTermGlyphInfo,
+            position: crate::vterm_defs::VTermPos,
+        ) -> bool {
+            self.glyphs.push((crate::grid::schar_get(info.schar), position));
+            true
+        }
+
+        fn scroll_rect(
+            &mut self,
+            rect: crate::vterm_defs::VTermRect,
+            _: i32,
+            rightward: i32,
+        ) -> bool {
+            self.scrolls.push((rect, rightward));
+            true
+        }
+
+        fn move_cursor(
+            &mut self,
+            position: crate::vterm_defs::VTermPos,
+            _: crate::vterm_defs::VTermPos,
+            _: bool,
+        ) -> bool {
+            self.moves.push(position);
+            true
+        }
+    }
+
+    fn reset_state(rows: i32, cols: i32) -> VTermState {
+        let mut state = VTermState::new(rows, cols);
+        state.reset(false);
+        state
+    }
+
+    #[test]
+    fn text_emits_ascii_glyphs_and_advances_the_cursor() {
+        let mut state = reset_state(2, 8);
+        let mut capture = Capture::default();
+        assert_eq!(on_text(&mut state, &mut capture, b"ABC", false), 3);
+        assert_eq!(
+            capture.glyphs,
+            [
+                (b"A".to_vec(), crate::vterm_defs::VTermPos { row: 0, col: 0 }),
+                (b"B".to_vec(), crate::vterm_defs::VTermPos { row: 0, col: 1 }),
+                (b"C".to_vec(), crate::vterm_defs::VTermPos { row: 0, col: 2 }),
+            ]
+        );
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 0, col: 3 });
+        assert_eq!(capture.moves, [state.pos]);
+        assert_eq!(&state.grapheme_buf[..state.grapheme_len], b"C");
+    }
+
+    #[test]
+    fn text_wraps_from_phantom_column_and_marks_continuation() {
+        let mut state = reset_state(2, 2);
+        let mut capture = Capture::default();
+        assert_eq!(on_text(&mut state, &mut capture, b"ABC", false), 3);
+        assert_eq!(
+            capture.glyphs[2].1,
+            crate::vterm_defs::VTermPos { row: 1, col: 0 }
+        );
+        assert!(state.lineinfos[0][1].continuation);
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 1 });
+    }
+
+    #[test]
+    fn text_insert_mode_scrolls_before_each_new_glyph() {
+        let mut state = reset_state(1, 5);
+        state.mode.insert = true;
+        state.pos.col = 2;
+        let mut capture = Capture::default();
+        assert_eq!(on_text(&mut state, &mut capture, b"X", false), 1);
+        assert_eq!(
+            capture.scrolls,
+            [(
+                crate::vterm_defs::VTermRect {
+                    start_row: 0,
+                    end_row: 1,
+                    start_col: 2,
+                    end_col: 5,
+                },
+                -1,
+            )]
+        );
+    }
+
+    #[test]
+    fn text_recombines_a_mark_received_in_the_next_fragment() {
+        let mut state = reset_state(1, 8);
+        let mut capture = Capture::default();
+        assert_eq!(on_text(&mut state, &mut capture, b"A", true), 1);
+        assert_eq!(
+            on_text(&mut state, &mut capture, "\u{301}".as_bytes(), true),
+            2
+        );
+        assert_eq!(capture.glyphs[1].0, "A\u{301}".as_bytes());
+        assert_eq!(
+            capture.glyphs[1].1,
+            crate::vterm_defs::VTermPos { row: 0, col: 0 }
+        );
+        assert_eq!(state.pos.col, 1);
+    }
+}
+
 #[cfg(test)]
 mod grapheme_recombine_tests {
     use super::*;
