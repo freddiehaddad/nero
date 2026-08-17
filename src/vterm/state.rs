@@ -738,6 +738,16 @@ pub fn control_horizontal_tab(state: &mut VTermState) {
     state.tab(1, 1);
 }
 
+pub fn control_linefeed<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+) {
+    linefeed(state, callbacks);
+    if state.mode.newline {
+        state.pos.col = 0;
+    }
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -757,6 +767,14 @@ mod control_backspace_tests {
         state.set_col_tabstop(4);
         control_horizontal_tab(&mut state);
         assert_eq!(state.pos.col, 4);
+    }
+    #[test]
+    fn control_linefeed_honors_newline_mode() {
+        let mut state = VTermState::new(2, 10);
+        state.pos.col = 4;
+        state.mode.newline = true;
+        control_linefeed(&mut state, &mut ());
+        assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 0 });
     }
 }
 
