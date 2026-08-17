@@ -1193,6 +1193,55 @@ pub fn get_nth_entry(qfl: &QfListT, errornr: i32) -> i32 {
     idx
 }
 
+/// Return the one-based index of the `n`th valid error or distinct
+/// file entry (`qf_get_nth_valid_entry`).
+#[allow(dead_code)]
+#[must_use]
+fn qf_get_nth_valid_entry(qfl: &QfListT, n: usize, fdo: bool) -> usize {
+    if !qf_list_has_valid_entries(qfl) || n == 0 {
+        return 1;
+    }
+    let mut previous_file = 0;
+    let mut valid_count = 0usize;
+    for (index, entry) in qfl.qf_entries.iter().enumerate() {
+        if entry.qf_valid {
+            if fdo {
+                if entry.qf_fnum > 0 && entry.qf_fnum != previous_file {
+                    valid_count += 1;
+                    previous_file = entry.qf_fnum;
+                }
+            } else {
+                valid_count += 1;
+            }
+        }
+        if valid_count == n {
+            return index + 1;
+        }
+    }
+    1
+}
+
+#[cfg(test)]
+mod qf_nth_valid_tests {
+    use super::*;
+
+    #[test]
+    fn nth_valid_entry_counts_errors_or_distinct_files() {
+        let qfl = QfListT {
+            qf_entries: vec![
+                QflineT { qf_valid: false, qf_fnum: 1, ..Default::default() },
+                QflineT { qf_valid: true, qf_fnum: 2, ..Default::default() },
+                QflineT { qf_valid: true, qf_fnum: 2, ..Default::default() },
+                QflineT { qf_valid: true, qf_fnum: 3, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(qf_get_nth_valid_entry(&qfl, 2, false), 3);
+        assert_eq!(qf_get_nth_valid_entry(&qfl, 2, true), 4);
+        assert_eq!(qf_get_nth_valid_entry(&qfl, 99, false), 1);
+    }
+}
+
 /// Returns whether the specified quickfix/location stack is empty
 /// (`qf_stack_empty`).
 ///
