@@ -2186,6 +2186,29 @@ impl VTermState {
         crate::vterm::pen::vterm_state_convert_color_to_rgb(&state, color);
     }
 
+    pub fn set_penattr<C: VTermStateCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        attr: crate::vterm_defs::VTermAttr,
+        value_type: crate::vterm_defs::VTermValueType,
+        value: &crate::vterm_defs::VTermValue<'_>,
+    ) -> i32 {
+        let mut pen_state = crate::vterm::pen::VTermPenState {
+            pen: self.pen,
+            ..Default::default()
+        };
+        let mut adapter = StatePenCallback(callbacks);
+        let result = crate::vterm::pen::vterm_state_set_penattr(
+            &mut pen_state,
+            attr,
+            value_type,
+            Some(value),
+            &mut adapter,
+        );
+        self.pen = pen_state.pen;
+        result
+    }
+
     pub fn reset_pen<C: VTermStateCallbacks>(&mut self, callbacks: &mut C) {
         let mut pen_state = crate::vterm::pen::VTermPenState {
             pen: self.pen,
@@ -2563,6 +2586,21 @@ mod termprop_state_tests {
         crate::vterm_defs::vterm_color_indexed(&mut color, 2);
         state.convert_color_to_rgb(&mut color);
         assert_eq!((color.red, color.green, color.blue), (0, 224, 0));
+    }
+    #[test]
+    fn state_penattr_wrapper_updates_current_pen() {
+        let mut state = VTermState::new(1, 1);
+        let mut callbacks = ();
+        assert_eq!(
+            state.set_penattr(
+                &mut callbacks,
+                crate::vterm_defs::VTermAttr::Bold,
+                crate::vterm_defs::VTermValueType::Bool,
+                &crate::vterm_defs::VTermValue::Boolean(1),
+            ),
+            1
+        );
+        assert!(state.pen.bold);
     }
     #[test]
     fn reset_pen_restores_state_default_colors() {
