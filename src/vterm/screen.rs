@@ -110,6 +110,34 @@ pub trait VTermScreenCallbacks {
 
 impl VTermScreenCallbacks for () {}
 
+pub struct VTermScreenHost<C> {
+    pub screen: VTermScreen,
+    pub callbacks: Option<C>,
+}
+
+pub fn vterm_screen_set_callbacks<C>(
+    host: &mut VTermScreenHost<C>,
+    callbacks: Option<C>,
+) {
+    host.callbacks = callbacks;
+}
+
+#[cfg(test)]
+mod screen_callback_setter_tests {
+    use super::*;
+    #[test]
+    fn screen_callback_setter_installs_and_removes_callbacks() {
+        let mut host = VTermScreenHost {
+            screen: screen_new(1, 1),
+            callbacks: None::<u8>,
+        };
+        vterm_screen_set_callbacks(&mut host, Some(7));
+        assert_eq!(host.callbacks, Some(7));
+        vterm_screen_set_callbacks(&mut host, None);
+        assert_eq!(host.callbacks, None);
+    }
+}
+
 /// Creates a screen with its primary buffer (`screen_new`).
 #[must_use]
 pub fn screen_new(rows: i32, cols: i32) -> VTermScreen {
