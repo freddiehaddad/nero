@@ -770,6 +770,23 @@ pub fn control_single_shift(state: &mut VTermState, control: u8) -> bool {
     true
 }
 
+pub fn control_reverse_index<C: VTermStateCallbacks>(
+    state: &mut VTermState,
+    callbacks: &mut C,
+) {
+    if state.pos.row == state.scrollregion_top {
+        let rect = crate::vterm_defs::VTermRect {
+            start_row: state.scrollregion_top,
+            end_row: state.scrollregion_bottom(),
+            start_col: state.scrollregion_left(),
+            end_col: state.scrollregion_right(),
+        };
+        scroll(state, callbacks, rect, -1, 0);
+    } else if state.pos.row > 0 {
+        state.pos.row -= 1;
+    }
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -820,6 +837,17 @@ mod control_backspace_tests {
         assert_eq!(state.gsingle_set, 2);
         assert!(control_single_shift(&mut state, 0x8F));
         assert_eq!(state.gsingle_set, 3);
+    }
+    #[test]
+    fn reverse_index_moves_up_or_scrolls_region() {
+        let mut state = VTermState::new(3, 3);
+        state.reset_scrollregions();
+        state.pos.row = 2;
+        control_reverse_index(&mut state, &mut ());
+        assert_eq!(state.pos.row, 1);
+        state.pos.row = 0;
+        control_reverse_index(&mut state, &mut ());
+        assert_eq!(state.pos.row, 0);
     }
 }
 
