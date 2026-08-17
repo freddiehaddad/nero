@@ -1128,6 +1128,59 @@ mod decode_text_tests {
     }
 }
 
+pub fn append_grapheme(
+    codepoints: &[u32],
+    mut index: usize,
+    buffer: &mut [u8],
+    mut length: usize,
+    grapheme_state: &mut crate::mbyte_defs::GraphemeState,
+) -> (usize, usize) {
+    loop {
+        if length < buffer.len().saturating_sub(4) {
+            length += usize::try_from(crate::mbyte::utf_char2bytes(
+                codepoints[index] as i32,
+                &mut buffer[length..],
+            ))
+            .unwrap_or(0);
+        }
+        index += 1;
+        if index >= codepoints.len()
+            // SAFETY: codepoints are valid decoded Unicode scalar values
+            // and grapheme_state is exclusively borrowed for this scan.
+            || !unsafe {
+                crate::mbyte::utf_iscomposing(
+                    codepoints[index - 1] as i32,
+                    codepoints[index] as i32,
+                    grapheme_state,
+                )
+            }
+        {
+            return (index, length);
+        }
+    }
+}
+
+#[cfg(test)]
+mod append_grapheme_tests {
+    use super::*;
+
+    #[test]
+    fn grapheme_builder_appends_a_base_and_combining_mark() {
+        let codepoints = [b'A' as u32, 0x0301, b'B' as u32];
+        let mut buffer = [0; crate::types_defs::MAX_SCHAR_SIZE];
+        let mut grapheme_state = crate::mbyte_defs::GRAPHEME_STATE_INIT;
+        let (index, length) =
+            append_grapheme(&codepoints, 0, &mut buffer, 0, &mut grapheme_state);
+        assert_eq!(index, 2);
+        assert_eq!(&buffer[..length], "A\u{301}".as_bytes());
+
+        let (index, length) =
+            append_grapheme(&codepoints, index, &mut buffer, 0, &mut grapheme_state);
+        assert_eq!(index, 3);
+        assert_eq!(&buffer[..length], b"B");
+    }
+}
+
 pub fn control_reverse_index<C: VTermStateCallbacks>(
     state: &mut VTermState,
     callbacks: &mut C,
