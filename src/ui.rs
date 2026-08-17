@@ -186,6 +186,30 @@ static PENDING_MODE_INFO_UPDATE: crate::globals::GlobalCell<bool> =
 static CURSOR_GRID_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
     crate::globals::GlobalCell::new(crate::grid::DEFAULT_GRID_HANDLE);
 
+#[cfg(test)]
+pub(crate) unsafe fn ui_test_cursor_state() -> (crate::types_defs::HandleT, i32, i32, bool) {
+    unsafe {
+        (
+            *CURSOR_GRID_HANDLE.get_mut(),
+            *CURSOR_ROW.get_mut(),
+            *CURSOR_COL.get_mut(),
+            *PENDING_CURSOR_UPDATE.get_mut(),
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn ui_test_restore_cursor_state(
+    state: (crate::types_defs::HandleT, i32, i32, bool),
+) {
+    unsafe {
+        *CURSOR_GRID_HANDLE.get_mut() = state.0;
+        *CURSOR_ROW.get_mut() = state.1;
+        *CURSOR_COL.get_mut() = state.2;
+        *PENDING_CURSOR_UPDATE.get_mut() = state.3;
+    }
+}
+
 /// The cursor-shape mode index last sent to the UIs (`ui_mode_idx`).
 ///
 /// Starts at `-1`, which matches no real mode, so the first check

@@ -120,6 +120,10 @@ const PROGRESS_TARGET_CMD: u32 = 0x01;
 /// Parsed progress-message targets (`progress_msg_target`).
 static PROGRESS_MSG_TARGET: GlobalCell<u32> = GlobalCell::new(PROGRESS_TARGET_CMD);
 
+/// View used to position the message grid (`msg_grid_adj`).
+static MSG_GRID_ADJ: LazyLock<GlobalCell<crate::grid_defs::GridView>> =
+    LazyLock::new(|| GlobalCell::new(crate::grid_defs::GridView::default()));
+
 /// Parse and apply a `'messagesopt'` value (`messagesopt_changed`).
 ///
 /// The original reads `p_mopt` directly; accepting the value as a
@@ -199,6 +203,22 @@ pub fn messagesopt_changed(value: &[u8]) -> bool {
     *unsafe { PROGRESS_MSG_TARGET.get_mut() } = progress_target;
     *unsafe { MSG_HIST_MAX.get_mut() } = history;
     true
+}
+
+/// Move the UI cursor on the adjusted message grid
+/// (`msg_cursor_goto`).
+///
+/// # Safety
+/// `MSG_GRID_ADJ.target` must point to a live `ScreenGrid`.
+pub unsafe fn msg_cursor_goto(row: i32, mut col: i32) {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if globals.cmdmsg_rl {
+        col = globals.Columns - 1 - col;
+    }
+    let view = unsafe { &*MSG_GRID_ADJ.as_ptr() };
+    let (grid, row, col) = crate::grid::grid_adjust(view, row, col);
+    debug_assert!(!grid.is_null());
+    unsafe { crate::ui::ui_grid_cursor_goto((*grid).handle, row, col) };
 }
 
 /// Replace the external-message chunk array and return the old one
@@ -953,6 +973,100 @@ pub(crate) mod tests {
             *unsafe { MSG_HIST_MAX.get_mut() } = self.history;
             *unsafe { PROGRESS_MSG_TARGET.get_mut() } = self.progress;
         }
+    }
+
+    struct MsgGridGuard(crate::grid_defs::GridView);
+
+    impl MsgGridGuard {
+        fn install(value: crate::grid_defs::GridView) -> Self {
+            Self(std::mem::replace(
+                unsafe { MSG_GRID_ADJ.get_mut() },
+                value,
+            ))
+        }
+    }
+
+    impl Drop for MsgGridGuard {
+        fn drop(&mut self) {
+            let old = std::mem::take(&mut self.0);
+            *unsafe { MSG_GRID_ADJ.get_mut() } = old;
+        }
+    }
+
+    struct UiCursorGuard((crate::types_defs::HandleT, i32, i32, bool));
+
+    impl UiCursorGuard {
+        fn new() -> Self {
+            Self(unsafe { crate::ui::ui_test_cursor_state() })
+        }
+    }
+
+    impl Drop for UiCursorGuard {
+        fn drop(&mut self) {
+            unsafe { crate::ui::ui_test_restore_cursor_state(self.0) };
+        }
+    }
+
+    #[test]
+    fn msg_cursor_goto_applies_message_grid_offsets() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.Columns,
+                80,
+            )
+        };
+        let _rightleft = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmdmsg_rl,
+                false,
+            )
+        };
+        let _cursor = UiCursorGuard::new();
+        let mut grid = crate::grid_defs::ScreenGrid {
+            handle: 77,
+            ..Default::default()
+        };
+        let gridp = &mut grid as *mut crate::grid_defs::ScreenGrid;
+        let _view = MsgGridGuard::install(crate::grid_defs::GridView {
+            target: gridp,
+            row_offset: 2,
+            col_offset: 3,
+        });
+
+        unsafe { msg_cursor_goto(5, 7) };
+        assert_eq!(unsafe { crate::ui::ui_test_cursor_state() }, (77, 7, 10, true));
+    }
+
+    #[test]
+    fn msg_cursor_goto_mirrors_the_column_for_rightleft_messages() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.Columns,
+                80,
+            )
+        };
+        let _rightleft = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmdmsg_rl,
+                true,
+            )
+        };
+        let _cursor = UiCursorGuard::new();
+        let mut grid = crate::grid_defs::ScreenGrid {
+            handle: 88,
+            ..Default::default()
+        };
+        let gridp = &mut grid as *mut crate::grid_defs::ScreenGrid;
+        let _view = MsgGridGuard::install(crate::grid_defs::GridView {
+            target: gridp,
+            row_offset: 0,
+            col_offset: 0,
+        });
+
+        unsafe { msg_cursor_goto(4, 7) };
+        assert_eq!(unsafe { crate::ui::ui_test_cursor_state() }, (88, 4, 72, true));
     }
 
     #[test]
