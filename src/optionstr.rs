@@ -860,6 +860,23 @@ pub unsafe fn did_set_helpfile() -> Option<&'static [u8]> {
     None
 }
 
+/// Process an updated `'display'` option (`did_set_display`).
+///
+/// # Safety
+/// Forwarded from [`did_set_str_generic`] and
+/// [`crate::charset::init_chartab`].
+pub unsafe fn did_set_display(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let error = unsafe { did_set_str_generic(args) };
+    if error.is_some() {
+        return error;
+    }
+    let _ = unsafe { crate::charset::init_chartab() };
+    // `msg_grid_validate()` belongs to the message-grid redraw path.
+    None
+}
+
 /// The `'helplang'` option is changed (`did_set_helplang`).
 ///
 /// Validates a comma-separated list of exactly-2-letter language
@@ -4430,6 +4447,53 @@ mod tests {
         assert_eq!(unsafe { did_set_str_generic(&mut args) }, None);
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ff = prev;
+    }
+
+    #[test]
+    fn did_set_display_rejects_an_invalid_value_before_rebuilding_chartab() {
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Display,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { did_set_display(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_display_rebuilds_the_current_buffers_chartab() {
+        struct CurbufRestore(*mut crate::buffer_defs::BufT);
+
+        impl Drop for CurbufRestore {
+            fn drop(&mut self) {
+                unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.0;
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_isk: Some(b"a".to_vec()),
+            ..Default::default()
+        };
+        let bufp = &mut buf as *mut crate::buffer_defs::BufT;
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let _restore = CurbufRestore(old_curbuf);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = bufp;
+
+        let mut val: Option<Vec<u8>> = Some(b"lastline".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Display,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_display(&mut args) }, None);
+        let bit = 1u64 << (u32::from(b'a') & 0x3f);
+        assert_ne!(unsafe { (*bufp).b_chartab[usize::from(b'a' >> 6)] } & bit, 0);
     }
 
     // ---- did_set_backupext_or_patchmode ----
