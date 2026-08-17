@@ -2297,6 +2297,32 @@ impl VTermState {
         };
     }
 
+    pub fn set_cursor_style(&mut self, value: i32) {
+        match value {
+            0 | 1 => {
+                self.mode.cursor_blink = true;
+                self.mode.cursor_shape =
+                    crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK as u8;
+            }
+            2 => {
+                self.mode.cursor_blink = false;
+                self.mode.cursor_shape =
+                    crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK as u8;
+            }
+            3 | 4 => {
+                self.mode.cursor_blink = value == 3;
+                self.mode.cursor_shape =
+                    crate::vterm_defs::VTERM_PROP_CURSORSHAPE_UNDERLINE as u8;
+            }
+            5 | 6 => {
+                self.mode.cursor_blink = value == 5;
+                self.mode.cursor_shape =
+                    crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT as u8;
+            }
+            _ => {}
+        }
+    }
+
     #[must_use]
     pub fn dec_mode_value(&self, number: i32) -> Option<bool> {
         Some(match number {
@@ -2834,6 +2860,22 @@ mod termprop_state_tests {
         assert_eq!((state.scrollregion_left, state.scrollregion_right), (4, 70));
         state.set_horizontal_margins(70, Some(5));
         assert_eq!((state.scrollregion_left, state.scrollregion_right), (0, -1));
+    }
+    #[test]
+    fn cursor_style_maps_blinking_and_steady_shapes() {
+        let mut state = VTermState::new(1, 1);
+        state.set_cursor_style(3);
+        assert!(state.mode.cursor_blink);
+        assert_eq!(
+            state.mode.cursor_shape,
+            crate::vterm_defs::VTERM_PROP_CURSORSHAPE_UNDERLINE as u8
+        );
+        state.set_cursor_style(6);
+        assert!(!state.mode.cursor_blink);
+        assert_eq!(
+            state.mode.cursor_shape,
+            crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BAR_LEFT as u8
+        );
     }
     #[test]
     fn initialize_pen_colors_sets_defaults_and_ansi_palette() {
