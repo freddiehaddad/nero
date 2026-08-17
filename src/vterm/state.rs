@@ -3303,17 +3303,20 @@ pub fn vterm_state_reset<C: VTermStateCallbacks>(
     let _ = callbacks.init_pen();
     state.reset_pen(callbacks);
     let _ = settermprop_bool(
-        callbacks,
+        state,
+        Some(callbacks),
         crate::vterm_defs::VTermProp::CursorVisible,
         1,
     );
     let _ = settermprop_bool(
-        callbacks,
+        state,
+        Some(callbacks),
         crate::vterm_defs::VTermProp::CursorBlink,
         1,
     );
     let _ = settermprop_int(
-        callbacks,
+        state,
+        Some(callbacks),
         crate::vterm_defs::VTermProp::CursorShape,
         crate::vterm_defs::VTERM_PROP_CURSORSHAPE_BLOCK,
     );
@@ -3485,38 +3488,47 @@ mod escape_dispatch_tests {
 
 /// Emits a boolean terminal property (`settermprop_bool`).
 pub fn settermprop_bool<C: VTermStateCallbacks>(
-    callbacks: &mut C,
+    state: &mut VTermState,
+    callbacks: Option<&mut C>,
     prop: crate::vterm_defs::VTermProp,
     value: i32,
 ) -> i32 {
-    i32::from(callbacks.set_term_prop(
+    vterm_state_set_termprop(
+        state,
+        callbacks,
         prop,
         &crate::vterm_defs::VTermValue::Boolean(value),
-    ))
+    )
 }
 
 /// Emits an integer terminal property (`settermprop_int`).
 pub fn settermprop_int<C: VTermStateCallbacks>(
-    callbacks: &mut C,
+    state: &mut VTermState,
+    callbacks: Option<&mut C>,
     prop: crate::vterm_defs::VTermProp,
     value: i32,
 ) -> i32 {
-    i32::from(callbacks.set_term_prop(
+    vterm_state_set_termprop(
+        state,
+        callbacks,
         prop,
         &crate::vterm_defs::VTermValue::Number(value),
-    ))
+    )
 }
 
 /// Emits a string terminal property (`settermprop_string`).
 pub fn settermprop_string<C: VTermStateCallbacks>(
-    callbacks: &mut C,
+    state: &mut VTermState,
+    callbacks: Option<&mut C>,
     prop: crate::vterm_defs::VTermProp,
     fragment: crate::vterm_defs::VTermStringFragment<'_>,
 ) -> i32 {
-    i32::from(callbacks.set_term_prop(
+    vterm_state_set_termprop(
+        state,
+        callbacks,
         prop,
         &crate::vterm_defs::VTermValue::String(fragment),
-    ))
+    )
 }
 
 /// Saves or restores cursor, pen, and cursor presentation
@@ -4458,10 +4470,12 @@ mod termprop_string_tests {
                 true
             }
         }
+        let mut state = VTermState::new(1, 1);
         let mut capture = Capture(Vec::new());
         assert_eq!(
             settermprop_string(
-                &mut capture,
+                &mut state,
+                Some(&mut capture),
                 crate::vterm_defs::VTermProp::Title,
                 crate::vterm_defs::VTermStringFragment {
                     bytes: b"title",
@@ -5917,16 +5931,19 @@ mod tests {
                 true
             }
         }
+        let mut state = VTermState::new(1, 1);
         let mut capture = Capture(None);
         assert_eq!(
             settermprop_bool(
-                &mut capture,
+                &mut state,
+                Some(&mut capture),
                 crate::vterm_defs::VTermProp::CursorVisible,
                 2,
             ),
             1
         );
         assert_eq!(capture.0, Some(2));
+        assert!(state.mode.cursor_visible);
     }
 
     #[test]
@@ -5945,16 +5962,19 @@ mod tests {
                 true
             }
         }
+        let mut state = VTermState::new(1, 1);
         let mut capture = Capture(None);
         assert_eq!(
             settermprop_int(
-                &mut capture,
+                &mut state,
+                Some(&mut capture),
                 crate::vterm_defs::VTermProp::CursorShape,
                 3,
             ),
             1
         );
         assert_eq!(capture.0, Some(3));
+        assert_eq!(state.mode.cursor_shape, 3);
     }
 
     #[test]
