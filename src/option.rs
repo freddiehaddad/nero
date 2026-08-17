@@ -7903,6 +7903,46 @@ pub fn remove_comma_item(s: &mut Vec<u8>, item: usize, item_len: usize) {
     }
 }
 
+/// Find a comma-separated item matching `key[..key_len]`
+/// (`find_key_item`), returning its offset and full item length.
+#[must_use]
+pub fn find_key_item(src: &[u8], key: &[u8], key_len: usize) -> Option<(usize, usize)> {
+    let key = key.get(..key_len)?;
+    let mut start = 0usize;
+    while start < src.len() {
+        let end = src[start..]
+            .iter()
+            .position(|&b| b == b',')
+            .map_or(src.len(), |off| start + off);
+        if src[start..end].starts_with(key) {
+            return Some((start, end - start));
+        }
+        start = end.saturating_add(1);
+    }
+    None
+}
+
+/// Remove every comma-separated item matching a key, except an
+/// optional item at `skip` (`remove_key_item`).
+pub fn remove_key_item(
+    s: &mut Vec<u8>,
+    key: &[u8],
+    key_len: usize,
+    skip: Option<usize>,
+) {
+    while let Some((mut found, mut item_len)) = find_key_item(s, key, key_len) {
+        if Some(found) == skip {
+            let next = found + item_len + usize::from(s.get(found + item_len) == Some(&b','));
+            let Some((offset, len)) = find_key_item(&s[next..], key, key_len) else {
+                break;
+            };
+            found = next + offset;
+            item_len = len;
+        }
+        remove_comma_item(s, found, item_len);
+    }
+}
+
 /// Append a comma-separated item to the end of `str`
 /// (`append_item`).
 ///
@@ -9123,6 +9163,41 @@ mod did_set_title_tests {
         let mut s = b"/a,/b,/c".to_vec();
         remove_comma_item(&mut s, 0, 2);
         assert_eq!(s, b"/b,/c");
+    }
+
+    #[test]
+    fn find_key_item_returns_the_matching_item_and_full_length() {
+        assert_eq!(
+            find_key_item(b"a:1,b:22,a:333", b"a:", 2),
+            Some((0, 3))
+        );
+        assert_eq!(
+            find_key_item(b"a:1,b:22,a:333", b"b:", 2),
+            Some((4, 4))
+        );
+        assert_eq!(find_key_item(b"a:1,b:22", b"c:", 2), None);
+    }
+
+    #[test]
+    fn find_key_item_matches_only_at_item_boundaries() {
+        assert_eq!(
+            find_key_item(b"prefixa:1,a:2", b"a:", 2),
+            Some((10, 3))
+        );
+    }
+
+    #[test]
+    fn remove_key_item_removes_every_matching_key() {
+        let mut value = b"a:1,b:2,a:3,c:4".to_vec();
+        remove_key_item(&mut value, b"a:", 2, None);
+        assert_eq!(value, b"b:2,c:4");
+    }
+
+    #[test]
+    fn remove_key_item_keeps_the_requested_match_only() {
+        let mut value = b"a:1,b:2,a:3,a:4".to_vec();
+        remove_key_item(&mut value, b"a:", 2, Some(0));
+        assert_eq!(value, b"a:1,b:2");
     }
 
     #[test]
