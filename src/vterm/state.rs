@@ -1047,6 +1047,86 @@ pub fn csi_dec_sgr<C: VTermStateCallbacks>(
     }
 }
 
+#[must_use]
+pub fn csi_key_encoding(
+    state: &mut VTermState,
+    leader: u8,
+    args: &[crate::vterm::parser::CsiArg],
+    ctrl8bit: bool,
+) -> Option<Vec<u8>> {
+    let first = args
+        .first()
+        .copied()
+        .unwrap_or(crate::vterm::parser::CSI_ARG_MISSING);
+    match leader {
+        b'?' => Some(request_key_encoding_flags(state, ctrl8bit)),
+        b'>' => {
+            push_key_encoding_flags(
+                state,
+                crate::vterm::parser::csi_arg_or(first, 0) as i32,
+            );
+            Some(Vec::new())
+        }
+        b'<' => {
+            pop_key_encoding_flags(
+                state,
+                crate::vterm::parser::csi_arg_or(first, 1) as i32,
+            );
+            Some(Vec::new())
+        }
+        b'=' => {
+            let mode = args
+                .get(1)
+                .copied()
+                .filter(|&arg| !crate::vterm::parser::csi_arg_is_missing(arg))
+                .map_or(1, |arg| crate::vterm::parser::csi_arg(arg) as i32);
+            set_key_encoding_flags(
+                state,
+                crate::vterm::parser::csi_arg_or(first, 0) as i32,
+                mode,
+            );
+            Some(Vec::new())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod csi_key_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn key_encoding_query_reports_current_flags() {
+        let mut state = VTermState::new(1, 1);
+        set_key_encoding_flags(&mut state, 3, 1);
+        assert_eq!(
+            csi_key_encoding(&mut state, b'?', &[], false),
+            Some(b"\x1b[?3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_encoding_push_pop_and_set_update_current_stack_entry() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(csi_key_encoding(&mut state, b'>', &[3], false), Some(Vec::new()));
+        assert_eq!(state.key_encoding_stacks[0].size, 2);
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 3);
+
+        assert_eq!(csi_key_encoding(&mut state, b'=', &[4, 1], false), Some(Vec::new()));
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 4);
+
+        assert_eq!(csi_key_encoding(&mut state, b'<', &[1], false), Some(Vec::new()));
+        assert_eq!(state.key_encoding_stacks[0].size, 1);
+        assert_eq!(state.key_encoding_stacks[0].current().bits(), 0);
+    }
+
+    #[test]
+    fn key_encoding_rejects_unknown_leader() {
+        let mut state = VTermState::new(1, 1);
+        assert_eq!(csi_key_encoding(&mut state, b'!', &[], false), None);
+    }
+}
+
 #[cfg(test)]
 mod csi_dec_sgr_tests {
     use super::*;
