@@ -3073,6 +3073,24 @@ impl VTermState {
         result
     }
 
+    pub fn setpen<C: VTermStateCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+        args: &[crate::vterm::parser::CsiArg],
+    ) {
+        let mut pen_state = crate::vterm::pen::VTermPenState {
+            pen: self.pen,
+            default_fg: self.default_fg,
+            default_bg: self.default_bg,
+            palette: crate::vterm::pen::VTermPalette { colors: self.colors },
+            bold_is_highbright: self.bold_is_highbright,
+            ..Default::default()
+        };
+        let mut adapter = StatePenCallback(callbacks);
+        crate::vterm::pen::vterm_state_setpen(&mut pen_state, args, &mut adapter);
+        self.pen = pen_state.pen;
+    }
+
     pub fn reset_pen<C: VTermStateCallbacks>(&mut self, callbacks: &mut C) {
         let mut pen_state = crate::vterm::pen::VTermPenState {
             pen: self.pen,
@@ -3582,6 +3600,15 @@ mod termprop_state_tests {
             1
         );
         assert!(state.pen.bold);
+    }
+    #[test]
+    fn state_setpen_applies_sgr_arguments() {
+        let mut state = VTermState::new(1, 1);
+        state.initialize_pen_colors();
+        state.setpen(&mut (), &[1, 3, 4]);
+        assert!(state.pen.bold);
+        assert!(state.pen.italic);
+        assert_eq!(state.pen.underline, crate::vterm_defs::VTERM_UNDERLINE_SINGLE);
     }
     #[test]
     fn reset_pen_restores_state_default_colors() {
