@@ -20,7 +20,8 @@
 //! modifier-encoded key codes to libvterm's modifier mask;
 //! `terminal_check_cursor` follows the terminal cursor and viewport;
 //! `get_rgb` converts a libvterm color to Neovim's packed RGB value;
-//! [`terminal_set_streamed_paste`] transitions bracketed paste state.
+//! [`terminal_set_streamed_paste`] transitions bracketed paste state;
+//! `terminal_focus` emits libvterm focus reports.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -100,6 +101,19 @@ fn get_rgb(
         u32::from(color.green),
         u32::from(color.blue),
     ) as i32
+}
+
+#[allow(dead_code)]
+#[must_use]
+fn terminal_focus(
+    state: &crate::vterm::state::VTermState,
+    focus: bool,
+) -> Vec<u8> {
+    if focus {
+        crate::vterm::state::vterm_state_focus_in(state, state.ctrl8bit)
+    } else {
+        crate::vterm::state::vterm_state_focus_out(state, state.ctrl8bit)
+    }
 }
 
 /// Whether `term` is the terminal currently focused in Terminal mode
@@ -344,6 +358,20 @@ mod tests {
             b"\x1b[201~"
         );
         assert!(!term.streamed_paste);
+    }
+
+    #[test]
+    fn terminal_focus_emits_reports_when_enabled() {
+        let mut state = crate::vterm::state::VTermState::new(1, 1);
+        assert!(terminal_focus(&state, true).is_empty());
+        state.mode.report_focus = true;
+        assert_eq!(terminal_focus(&state, true), b"\x1b[I");
+        assert_eq!(terminal_focus(&state, false), b"\x1b[O");
+        state.ctrl8bit = true;
+        assert_eq!(
+            terminal_focus(&state, true),
+            [crate::vterm_defs::C1_CSI, b'I']
+        );
     }
 
     struct ModMaskGuard {
