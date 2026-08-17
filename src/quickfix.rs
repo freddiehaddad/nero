@@ -2775,8 +2775,10 @@ pub fn qf_free_items(qfl: &mut QfListT) {
 pub fn qf_free(qfl: &mut QfListT) {
     qf_free_items(qfl);
     qfl.qf_title = None;
-    qfl.qf_ctx = None;
-    qfl.qf_qftf_cb = crate::eval::typval_defs::Callback::default();
+    if let Some(context) = qfl.qf_ctx.take() {
+        unsafe { crate::eval::typval::tv_clear_simple(&context) };
+    }
+    crate::eval::typval::callback_free(&mut qfl.qf_qftf_cb);
     qfl.qf_id = 0;
     qfl.qf_changedtick = 0;
 }
@@ -7914,6 +7916,49 @@ mod tests {
         assert!(qfl.qf_ctx.is_none());
         assert_eq!(qfl.qf_id, 0);
         assert_eq!(qfl.qf_changedtick, 0);
+    }
+
+    #[test]
+    fn qf_free_releases_context_and_callback_references() {
+        let _lock = crate::globals::global_state_test_lock();
+        let context_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(context_list);
+            crate::eval::typval::tv_list_ref(context_list);
+        }
+        let callback_partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let mut qfl = QfListT {
+            qf_ctx: Some(Box::new(crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(
+                    context_list,
+                ),
+                ..Default::default()
+            })),
+            qf_qftf_cb: crate::eval::typval_defs::Callback::Partial(
+                callback_partial,
+            ),
+            ..Default::default()
+        };
+
+        qf_free(&mut qfl);
+
+        assert_eq!(unsafe { (*context_list).lv_refcount }, 1);
+        assert_eq!(unsafe { (*callback_partial).pt_refcount }, 1);
+        assert!(qfl.qf_ctx.is_none());
+        assert_eq!(
+            qfl.qf_qftf_cb.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        unsafe {
+            crate::eval::typval::tv_list_unref(context_list);
+            crate::eval::typval::partial_unref(callback_partial);
+        }
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 
     #[test]
