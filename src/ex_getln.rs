@@ -54,6 +54,47 @@
 //! before translating. `optionstr.rs`'s `did_set_wildmode` is its
 //! real caller.
 
+/// Trigger one command-line autocmd (`trigger_cmd_autocmd`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must be null or point to a live buffer, and global
+/// editor state must not be mutated concurrently.
+#[allow(dead_code)]
+unsafe fn trigger_cmd_autocmd(typechar: i32, event: crate::autocmd_defs::EventT) {
+    let typestr = [typechar as u8];
+    let curbuf = unsafe { (*crate::globals::GLOBALS.as_ptr()).curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { curbuf.as_ref() };
+    let _ = crate::autocmd::apply_autocmds(
+        event,
+        Some(&typestr),
+        Some(&typestr),
+        false,
+        buf,
+    );
+}
+
+#[cfg(test)]
+mod trigger_cmd_autocmd_tests {
+    use super::*;
+
+    #[test]
+    fn command_autocmd_trigger_is_inert_without_registered_events() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        unsafe {
+            trigger_cmd_autocmd(
+                i32::from(b':'),
+                crate::autocmd_defs::EventT::CmdlineChanged,
+            );
+        }
+    }
+}
+
 /// What [`vim_strsave_fnameescape`] is escaping for (`VSE_NONE`/
 /// `VSE_SHELL`/`VSE_BUFFER`, `ex_getln.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
