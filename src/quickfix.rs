@@ -2109,6 +2109,38 @@ pub fn qf_pop_stack(qi: &mut crate::types_defs::QfInfoT, adjust: bool) {
     }
 }
 
+/// Resize a quickfix/location-list stack (`qf_resize_stack_base`).
+///
+/// Updating an already-open quickfix buffer after resizing remains
+/// with the deferred quickfix display-buffer synchronization path.
+fn qf_resize_stack_base(qi: &mut crate::types_defs::QfInfoT, n: i32) {
+    if n == qi.qf_maxcount {
+        return;
+    }
+
+    if n < qi.qf_maxcount && n < qi.qf_listcount {
+        let amount = qi.qf_listcount - n;
+        for _ in 0..amount {
+            qf_pop_stack(qi, true);
+        }
+    }
+
+    let n = usize::try_from(n).expect("quickfix stack size must be nonnegative");
+    qi.qf_lists.resize_with(n, QfListT::default);
+    qi.qf_maxcount = i32::try_from(n).expect("quickfix stack size fits i32");
+}
+
+/// Resize the global quickfix stack (`qf_resize_stack`).
+///
+/// # Safety
+/// Touches the global `QL_INFO` stack.
+pub unsafe fn qf_resize_stack(n: i32) {
+    let qi = unsafe { QL_INFO.get_mut() }
+        .as_mut()
+        .expect("qf_resize_stack: the global quickfix stack is not initialized");
+    qf_resize_stack_base(qi, n);
+}
+
 /// Prepare a new, empty list at the top of the stack (`qf_new_list`).
 ///
 /// Any lists above the current one are freed first, so that browsing
@@ -5987,6 +6019,55 @@ mod tests {
 
         assert_eq!(qi.qf_listcount, 2);
         assert_eq!(qi.qf_curlist, 1);
+    }
+
+    #[test]
+    fn qf_resize_stack_base_grows_with_default_slots() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = stack_with(2);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+
+        qf_resize_stack_base(&mut qi, 4);
+
+        assert_eq!(qi.qf_maxcount, 4);
+        assert_eq!(qi.qf_lists.len(), 4);
+        assert_eq!(qi.qf_lists[0].qf_id, 11);
+        assert_eq!(qi.qf_lists[1].qf_id, 22);
+        assert_eq!(qi.qf_lists[2].qf_id, 0);
+        assert_eq!(qi.qf_lists[3].qf_id, 0);
+    }
+
+    #[test]
+    fn qf_resize_stack_base_drops_oldest_live_lists_when_shrinking() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = stack_with(4);
+        for (i, qfl) in qi.qf_lists.iter_mut().enumerate() {
+            qfl.qf_id = u32::try_from(i + 1).unwrap();
+        }
+        qi.qf_maxcount = 4;
+        qi.qf_curlist = 3;
+
+        qf_resize_stack_base(&mut qi, 2);
+
+        assert_eq!(qi.qf_maxcount, 2);
+        assert_eq!(qi.qf_listcount, 2);
+        assert_eq!(qi.qf_curlist, 1);
+        assert_eq!(qi.qf_lists.len(), 2);
+        assert_eq!(qi.qf_lists[0].qf_id, 3);
+        assert_eq!(qi.qf_lists[1].qf_id, 4);
+    }
+
+    #[test]
+    fn qf_resize_stack_resizes_the_global_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = Some(stack_with(3));
+
+        unsafe { qf_resize_stack(5) };
+        let qi = unsafe { QL_INFO.get_mut() }.as_ref().unwrap();
+        assert_eq!(qi.qf_maxcount, 5);
+        assert_eq!(qi.qf_lists.len(), 5);
     }
 
     #[test]
