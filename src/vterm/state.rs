@@ -748,6 +748,10 @@ pub fn control_linefeed<C: VTermStateCallbacks>(
     }
 }
 
+pub fn control_carriage_return(state: &mut VTermState) {
+    state.pos.col = 0;
+}
+
 #[cfg(test)]
 mod control_backspace_tests {
     use super::*;
@@ -775,6 +779,13 @@ mod control_backspace_tests {
         state.mode.newline = true;
         control_linefeed(&mut state, &mut ());
         assert_eq!(state.pos, crate::vterm_defs::VTermPos { row: 1, col: 0 });
+    }
+    #[test]
+    fn carriage_return_moves_to_column_zero() {
+        let mut state = VTermState::new(1, 10);
+        state.pos.col = 7;
+        control_carriage_return(&mut state);
+        assert_eq!(state.pos.col, 0);
     }
 }
 
