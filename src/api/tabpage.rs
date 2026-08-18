@@ -4,7 +4,8 @@
 //! machinery, none of which are wired into this API layer yet).
 //!
 //! Translated: [`nvim_tabpage_list_wins`], [`nvim_tabpage_get_win`],
-//! [`nvim_tabpage_get_number`], [`nvim_tabpage_is_valid`].
+//! [`nvim_tabpage_get_number`], [`nvim_tabpage_get_var`],
+//! [`nvim_tabpage_is_valid`].
 //!
 //! Deferred (each needs a real, not-yet-translated subsystem beyond
 //! `find_tab_by_handle` itself): `nvim_tabpage_get/set/del_var`
@@ -13,7 +14,9 @@
 //! real window-switching machinery for the "switching to the current
 //! tabpage" branch).
 
-use crate::api::private::defs::{Array, Boolean, Error, Integer, Object, Tabpage, Window};
+use crate::api::private::defs::{
+    Array, Boolean, Error, Integer, NvimString, Object, Tabpage, Window,
+};
 use crate::api::private::helpers::find_tab_by_handle;
 
 /// List every window in `tabpage` (`nvim_tabpage_list_wins`).
@@ -113,10 +116,49 @@ pub unsafe fn nvim_tabpage_is_valid(tabpage: Tabpage) -> Boolean {
     !unsafe { find_tab_by_handle(tabpage, &mut stub) }.is_null()
 }
 
+/// Get a tabpage-scoped variable (`nvim_tabpage_get_var`).
+///
+/// # Safety
+/// Forwarded from [`find_tab_by_handle`] and the scope-dictionary
+/// converter.
+pub unsafe fn nvim_tabpage_get_var(
+    tabpage: Tabpage,
+    name: &NvimString,
+    err: &mut Error,
+) -> Object {
+    let tabpage = unsafe { find_tab_by_handle(tabpage, err) };
+    if tabpage.is_null() {
+        return Object::Nil;
+    }
+    unsafe {
+        crate::api::private::helpers::dict_get_value((*tabpage).tp_vars, name, err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::{TabpageT, WinT};
+
+    #[test]
+    fn nvim_tabpage_get_var_returns_a_real_tabpage_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TabFixture::new(31);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"answer", 42) },
+            crate::vim_defs::OK
+        );
+        fx.tab_mut().tp_vars = dict;
+        let mut err = Error::default();
+        let value = unsafe {
+            nvim_tabpage_get_var(fx.handle(), &b"answer".to_vec(), &mut err)
+        };
+        assert!(matches!(value, Object::Integer(42)));
+        assert!(!err.is_set());
+        fx.tab_mut().tp_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
 
     /// `Box::into_raw`/`Box::from_raw` (never a live `Box` field
     /// alongside a separately-derived raw pointer) - see
