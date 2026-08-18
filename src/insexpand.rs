@@ -2215,6 +2215,23 @@ pub unsafe fn did_set_thesaurusfunc(
     }
 }
 
+/// Release completion-owned global state on exit
+/// (`free_insexpand_stuff`).
+///
+/// `compl_orig_extmarks` has no Rust representation yet; all currently
+/// translated state is released here.
+///
+/// # Safety
+/// Every callback referent must remain valid and global completion
+/// state must not be accessed concurrently.
+pub unsafe fn free_insexpand_stuff() {
+    *unsafe { COMPL_ORIG_TEXT.get_mut() } = None;
+    crate::eval::typval::callback_free(unsafe { CFU_CB.get_mut() });
+    crate::eval::typval::callback_free(unsafe { OFU_CB.get_mut() });
+    crate::eval::typval::callback_free(unsafe { TSRFU_CB.get_mut() });
+    clear_cpt_callbacks(unsafe { CPT_CB.get_mut() });
+}
+
 /// Free an array of `'complete'` callbacks (`clear_cpt_callbacks`).
 fn clear_cpt_callbacks(callbacks: &mut Vec<crate::eval::typval_defs::Callback>) {
     for callback in callbacks.iter_mut() {
@@ -5347,5 +5364,70 @@ mod tests {
             unsafe { set_cpt_callbacks(&crate::option_defs::OptsetT::default()) },
             crate::vim_defs::FAIL
         );
+    }
+
+    #[test]
+    fn free_insexpand_stuff_releases_text_and_all_global_callbacks() {
+        let _lock = global_state_test_lock();
+        let _text = ComplTextGuard::new();
+        let _cfu = CfuGuard::install(None);
+        let _ofu = OfuGuard::install(None);
+        let _tsrfu = TsrfuGuard::install(None);
+
+        let cfu = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let ofu = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let tsrfu = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let cpt = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 2,
+                ..Default::default()
+            },
+        ));
+        let _cpt = CptGuard::install(vec![
+            crate::eval::typval_defs::Callback::Partial(cpt),
+        ]);
+        *unsafe { CFU_CB.get_mut() } =
+            crate::eval::typval_defs::Callback::Partial(cfu);
+        *unsafe { OFU_CB.get_mut() } =
+            crate::eval::typval_defs::Callback::Partial(ofu);
+        *unsafe { TSRFU_CB.get_mut() } =
+            crate::eval::typval_defs::Callback::Partial(tsrfu);
+        *unsafe { COMPL_ORIG_TEXT.get_mut() } = Some(b"original".to_vec());
+
+        unsafe { free_insexpand_stuff() };
+
+        assert!(unsafe { COMPL_ORIG_TEXT.get_mut() }.is_none());
+        assert_eq!(
+            unsafe { CFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert_eq!(
+            unsafe { OFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert_eq!(
+            unsafe { TSRFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(unsafe { CPT_CB.get_mut() }.is_empty());
+        for partial in [cfu, ofu, tsrfu, cpt] {
+            assert_eq!(unsafe { (*partial).pt_refcount }, 1);
+            unsafe { crate::eval::typval::partial_unref(partial) };
+        }
     }
 }
