@@ -990,6 +990,43 @@ pub fn expand_set_str_generic(
     )
 }
 
+/// Expand an option whose value is a list of one-byte flags
+/// (`expand_set_opt_listflag`).
+fn expand_set_opt_listflag(
+    args: &crate::option_defs::OptexpandT,
+    flags: &[u8],
+) -> Option<Vec<Vec<u8>>> {
+    let option_val = args.oe_opt_value.as_deref().unwrap_or(&[]);
+    let cmdline_val = args.oe_set_arg.as_deref().unwrap_or(&[]);
+    let include_orig_val = args.oe_include_orig_val && !option_val.is_empty();
+    let mut matches = Vec::with_capacity(flags.len() + usize::from(include_orig_val));
+
+    if include_orig_val {
+        matches.push(option_val.to_vec());
+    }
+
+    for &flag in flags {
+        if args.oe_append && option_val.contains(&flag) {
+            continue;
+        }
+        if !cmdline_val.contains(&flag) {
+            if include_orig_val && option_val.len() == 1 && flag == option_val[0] {
+                continue;
+            }
+            matches.push(vec![flag]);
+        }
+    }
+
+    (!matches.is_empty()).then_some(matches)
+}
+
+/// Expand `'concealcursor'` flag values (`expand_set_concealcursor`).
+pub fn expand_set_concealcursor(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    expand_set_opt_listflag(args, crate::option_vars::COCU_ALL.as_bytes())
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5128,6 +5165,61 @@ mod tests {
             ..Default::default()
         };
         let _ = expand_set_str_generic(&mut args);
+    }
+
+    #[test]
+    fn expand_set_opt_listflag_filters_used_and_typed_flags() {
+        let args = crate::option_defs::OptexpandT {
+            oe_opt_value: Some(b"ni".to_vec()),
+            oe_append: true,
+            oe_set_arg: Some(b"v".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_set_opt_listflag(&args, b"nvic"),
+            Some(vec![b"c".to_vec()])
+        );
+    }
+
+    #[test]
+    fn expand_set_opt_listflag_includes_original_without_duplicating_a_single_flag() {
+        let args = crate::option_defs::OptexpandT {
+            oe_opt_value: Some(b"n".to_vec()),
+            oe_include_orig_val: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_set_opt_listflag(&args, b"nvic"),
+            Some(vec![
+                b"n".to_vec(),
+                b"v".to_vec(),
+                b"i".to_vec(),
+                b"c".to_vec(),
+            ])
+        );
+    }
+
+    #[test]
+    fn expand_set_opt_listflag_fails_when_every_flag_is_already_present() {
+        let args = crate::option_defs::OptexpandT {
+            oe_set_arg: Some(b"nvic".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(expand_set_opt_listflag(&args, b"nvic"), None);
+    }
+
+    #[test]
+    fn expand_set_concealcursor_returns_each_valid_flag() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        assert_eq!(
+            expand_set_concealcursor(&mut args),
+            Some(vec![
+                b"n".to_vec(),
+                b"v".to_vec(),
+                b"i".to_vec(),
+                b"c".to_vec(),
+            ])
+        );
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);
