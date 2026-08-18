@@ -91,6 +91,24 @@ pub unsafe fn nvim_get_option(name: &NvimString, err: &mut Error) -> Object {
     unsafe { get_option_from(std::ptr::null_mut(), OptScope::Global, name, err) }
 }
 
+/// Get a buffer option value (`nvim_buf_get_option`).
+///
+/// # Safety
+/// Forwarded from buffer-handle lookup and
+/// [`crate::option::get_option_value_for`].
+pub unsafe fn nvim_buf_get_option(
+    buffer: Buffer,
+    name: &NvimString,
+    err: &mut Error,
+) -> Object {
+    let buffer =
+        unsafe { crate::api::private::helpers::find_buffer_by_handle(buffer, err) };
+    if buffer.is_null() {
+        return Object::Nil;
+    }
+    unsafe { get_option_from(buffer.cast(), OptScope::Buf, name, err) }
+}
+
 unsafe fn set_option_to(
     to: *mut std::ffi::c_void,
     scope: OptScope,
@@ -505,6 +523,36 @@ mod tests {
             Object::Nil
         ));
         assert_eq!(empty.msg.as_deref(), Some("Invalid option name: '<empty>'"));
+    }
+
+    #[test]
+    fn nvim_buf_get_option_reads_the_buffer_local_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf = Box::into_raw(Box::new(crate::buffer_defs::BufT {
+            b_p_ts: 7,
+            ..Default::default()
+        }));
+        let syn = Box::into_raw(Box::new(crate::buffer_defs::SynblockT::default()));
+        let win = Box::into_raw(Box::new(crate::buffer_defs::WinT {
+            w_buffer: buf,
+            w_s: syn,
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf) };
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win) };
+        let mut err = Error::default();
+        let value = unsafe { nvim_buf_get_option(0, &b"tabstop".to_vec(), &mut err) };
+        assert!(matches!(value, Object::Integer(7)));
+        assert!(!err.is_set());
+        drop(_curwin);
+        drop(_curbuf);
+        unsafe {
+            drop(Box::from_raw(win));
+            drop(Box::from_raw(syn));
+            drop(Box::from_raw(buf));
+        }
     }
 
     #[test]
