@@ -7728,6 +7728,74 @@ pub unsafe fn did_set_cmdheight(
     None
 }
 
+/// Process updated `'lines'` or `'columns'` values
+/// (`did_set_lines_or_columns`).
+///
+/// Startup/non-fullscreen resizing, dimension clamping, command-row
+/// correction, `'window'` adjustment and `'scrolljump'` adjustment are
+/// translated. Resizing an already-live fullscreen grid still needs
+/// `screen_resize`.
+///
+/// # Safety
+/// `args.os_varp` must point at the changed numeric option; forwarded
+/// from [`crate::drawscreen::check_screensize`].
+pub unsafe fn did_set_lines_or_columns(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let options = crate::option_vars::OPTION_VARS.as_ptr();
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: both pointers address process-lifetime stores.
+    let (lines, columns, rows, screen_columns, full_screen) = unsafe {
+        (
+            (*options).p_lines,
+            (*options).p_columns,
+            (*globals).Rows,
+            (*globals).Columns,
+            (*globals).full_screen,
+        )
+    };
+
+    if lines != i64::from(rows) || columns != i64::from(screen_columns) {
+        if unsafe { *crate::drawscreen::UPDATING_SCREEN.get_mut() } {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_option_varp(args.os_idx, args.os_varp, args.os_oldval.clone()) };
+        } else if full_screen {
+            unimplemented!(
+                "did_set_lines_or_columns: resizing a live grid needs screen_resize"
+            );
+        } else {
+            unsafe {
+                (*globals).Rows = i32::try_from(lines).expect("validated lines fits i32");
+                (*globals).Columns =
+                    i32::try_from(columns).expect("validated columns fits i32");
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::drawscreen::check_screensize() };
+            let command_height = unsafe { (*options).p_ch }.max(1);
+            let new_row = unsafe { (*globals).Rows }
+                - i32::try_from(command_height).expect("validated cmdheight fits i32");
+            if unsafe { (*globals).cmdline_row } > new_row
+                && i64::from(unsafe { (*globals).Rows }) > unsafe { (*options).p_ch }
+            {
+                unsafe { (*globals).cmdline_row = new_row };
+            }
+        }
+
+        let rows = unsafe { (*globals).Rows };
+        if unsafe { (*options).p_window } >= i64::from(rows)
+            || !option_was_set(OptIndex::Window)
+        {
+            unsafe { (*options).p_window = i64::from(rows - 1) };
+        }
+    }
+
+    let rows = unsafe { (*globals).Rows };
+    if unsafe { (*options).p_sj } >= i64::from(rows) && full_screen {
+        unsafe { (*options).p_sj = i64::from(rows / 2) };
+    }
+    None
+}
+
 /// Process a new `'helpheight'` value (`did_set_helpheight`).
 ///
 /// A single-window layout needs no action. Enlarging a help window in
@@ -9167,6 +9235,59 @@ mod did_set_title_tests {
         }
     }
 
+    struct ScreenSizeOptionsGuard {
+        lines: crate::types_defs::OptInt,
+        columns: crate::types_defs::OptInt,
+        window: crate::types_defs::OptInt,
+        scrolljump: crate::types_defs::OptInt,
+        cmdheight: crate::types_defs::OptInt,
+        updating: bool,
+    }
+
+    impl ScreenSizeOptionsGuard {
+        fn set(
+            lines: crate::types_defs::OptInt,
+            columns: crate::types_defs::OptInt,
+            window: crate::types_defs::OptInt,
+            scrolljump: crate::types_defs::OptInt,
+            cmdheight: crate::types_defs::OptInt,
+            updating: bool,
+        ) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = ScreenSizeOptionsGuard {
+                lines: unsafe { (*options).p_lines },
+                columns: unsafe { (*options).p_columns },
+                window: unsafe { (*options).p_window },
+                scrolljump: unsafe { (*options).p_sj },
+                cmdheight: unsafe { (*options).p_ch },
+                updating: unsafe { *crate::drawscreen::UPDATING_SCREEN.get_mut() },
+            };
+            unsafe {
+                (*options).p_lines = lines;
+                (*options).p_columns = columns;
+                (*options).p_window = window;
+                (*options).p_sj = scrolljump;
+                (*options).p_ch = cmdheight;
+                *crate::drawscreen::UPDATING_SCREEN.get_mut() = updating;
+            }
+            previous
+        }
+    }
+
+    impl Drop for ScreenSizeOptionsGuard {
+        fn drop(&mut self) {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            unsafe {
+                (*options).p_lines = self.lines;
+                (*options).p_columns = self.columns;
+                (*options).p_window = self.window;
+                (*options).p_sj = self.scrolljump;
+                (*options).p_ch = self.cmdheight;
+                *crate::drawscreen::UPDATING_SCREEN.get_mut() = self.updating;
+            }
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9482,6 +9603,115 @@ mod did_set_title_tests {
         };
 
         unsafe { did_set_cmdheight(&mut args) };
+    }
+
+    #[test]
+    fn did_set_lines_or_columns_applies_and_clamps_startup_dimensions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = ScreenSizeOptionsGuard::set(1, 5, 999, 0, 1, false);
+        let _rows = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 24)
+        };
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Columns, 80)
+        };
+        let _cmdline_row = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.cmdline_row, 99)
+        };
+        let _full_screen = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.full_screen, false)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Lines,
+            os_varp: unsafe { std::ptr::addr_of_mut!((*options).p_lines) }.cast(),
+            os_oldval: crate::option_defs::OptVal::Number(24),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_lines_or_columns(&mut args) }, None);
+        let globals = crate::globals::GLOBALS.as_ptr();
+        assert_eq!(unsafe { (*globals).Rows }, crate::window::MIN_LINES);
+        assert_eq!(unsafe { (*globals).Columns }, crate::window::MIN_COLUMNS);
+        assert_eq!(unsafe { (*globals).cmdline_row }, crate::window::MIN_LINES - 1);
+        assert_eq!(
+            unsafe { (*options).p_window },
+            i64::from(crate::window::MIN_LINES - 1)
+        );
+    }
+
+    #[test]
+    fn did_set_lines_or_columns_restores_the_old_value_during_screen_update() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = ScreenSizeOptionsGuard::set(30, 80, 10, 0, 1, true);
+        let _rows = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 24)
+        };
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Columns, 80)
+        };
+        let _full_screen = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.full_screen, false)
+        };
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Lines,
+            os_varp: unsafe { std::ptr::addr_of_mut!((*options).p_lines) }.cast(),
+            os_oldval: crate::option_defs::OptVal::Number(24),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_lines_or_columns(&mut args) }, None);
+        assert_eq!(unsafe { (*options).p_lines }, 24);
+        assert_eq!(unsafe { (*crate::globals::GLOBALS.as_ptr()).Rows }, 24);
+    }
+
+    #[test]
+    #[should_panic(expected = "screen_resize")]
+    fn did_set_lines_or_columns_live_grid_needs_screen_resize() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = ScreenSizeOptionsGuard::set(30, 80, 10, 0, 1, false);
+        let _rows = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 24)
+        };
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Columns, 80)
+        };
+        let _full_screen = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.full_screen, true)
+        };
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Lines,
+            os_varp: unsafe { std::ptr::addr_of_mut!((*options).p_lines) }.cast(),
+            os_oldval: crate::option_defs::OptVal::Number(24),
+            ..Default::default()
+        };
+        unsafe { did_set_lines_or_columns(&mut args) };
+    }
+
+    #[test]
+    fn did_set_lines_or_columns_adjusts_scrolljump_without_a_resize() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = ScreenSizeOptionsGuard::set(24, 80, 10, 30, 1, false);
+        let _rows = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 24)
+        };
+        let _columns = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Columns, 80)
+        };
+        let _full_screen = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.full_screen, true)
+        };
+        let mut args = crate::option_defs::OptsetT::default();
+        assert_eq!(unsafe { did_set_lines_or_columns(&mut args) }, None);
+        assert_eq!(unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_sj }, 12);
     }
 
     #[test]

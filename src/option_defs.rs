@@ -8103,6 +8103,10 @@ fn wire_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::option::did_set_langnoremap);
     options[OptIndex::Langremap as usize].opt_did_set_cb =
         Some(crate::option::did_set_langremap);
+    options[OptIndex::Lines as usize].opt_did_set_cb =
+        Some(crate::option::did_set_lines_or_columns);
+    options[OptIndex::Columns as usize].opt_did_set_cb =
+        Some(crate::option::did_set_lines_or_columns);
     options[OptIndex::Lhistory as usize].opt_did_set_cb =
         Some(crate::option::did_set_xhistory);
     options[OptIndex::Lisp as usize].opt_did_set_cb =
@@ -8629,6 +8633,8 @@ mod options_table_tests {
             b"keymodel",
             b"langnoremap",
             b"langremap",
+            b"lines",
+            b"columns",
             b"lhistory",
             b"lisp",
             b"lispoptions",

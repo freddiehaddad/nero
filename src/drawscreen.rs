@@ -17,6 +17,10 @@
 //! established "small, simple, mechanically correct piece ahead of
 //! its real caller" precedent.
 //!
+//! Also translated: [`check_screensize`] and [`UPDATING_SCREEN`],
+//! the dimension validation and redraw-in-progress state used by the
+//! `'lines'`/`'columns'` option callback.
+//!
 //! Also translated: the whole redraw-scheduling family -
 //! [`redraw_later`], [`set_must_redraw`], [`redraw_all_later`],
 //! [`redraw_buf_later`], [`redraw_curbuf_later`],
@@ -610,6 +614,10 @@ pub unsafe fn status_redraw_curbuf() {
 /// While computing a statusline and the like we do not want any
 /// `w_redr_type` or `must_redraw` to be set (`redraw_not_allowed`).
 pub static REDRAW_NOT_ALLOWED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether the screen grid is currently being updated
+/// (`updating_screen`).
+pub static UPDATING_SCREEN: GlobalCell<bool> = GlobalCell::new(false);
 
 /// The line the `'hlsearch'` highlight currently reports the cursor
 /// on (`search_hl_has_cursor_lnum`).
@@ -2522,4 +2530,3 @@ mod tests {
         reset_comp_col_globals();
     }
 }
-
