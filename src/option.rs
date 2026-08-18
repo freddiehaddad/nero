@@ -7946,6 +7946,25 @@ pub fn did_set_pumblend(
     None
 }
 
+/// Process an updated `'spell'` value (`did_set_spell`).
+///
+/// Disabling spell checking needs no further work. Enabling it still
+/// needs `parse_spelllang`, which loads and validates the active spell
+/// languages.
+///
+/// # Safety
+/// `args.os_win` must point to a live `WinT`.
+pub unsafe fn did_set_spell(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*win).w_onebuf_opt.wo_spell == 0 } {
+        return None;
+    }
+    unimplemented!("did_set_spell: enabling spell checking needs parse_spelllang");
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///
@@ -9449,6 +9468,31 @@ mod did_set_title_tests {
         let mut args = fold_args(crate::option_defs::OptIndex::Smoothscroll, &mut win);
         assert_eq!(unsafe { did_set_smoothscroll(&mut args) }, None);
         assert_eq!(win.w_skipcol, 12, "w_skipcol must survive turning it ON");
+    }
+
+    #[test]
+    fn did_set_spell_disabling_needs_no_spell_language_loading() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 0;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_spell(&mut args) }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "parse_spelllang")]
+    fn did_set_spell_enabling_needs_spell_language_loading() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 1;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+        unsafe { did_set_spell(&mut args) };
     }
 
     #[test]
