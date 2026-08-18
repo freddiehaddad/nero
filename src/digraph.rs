@@ -8,10 +8,14 @@
 //! Translated: [`check_digraph_chars_valid`] - a small, pure validation
 //! function with no dependency on the digraph tables themselves.
 //!
+//! Also [`keymap_init`]'s empty-option path, which unloads the active
+//! keymap name and clears the initialization flag. Loading a nonempty
+//! keymap remains deferred with runtime-file sourcing.
+//!
 //! Deferred: everything else - `getdigraph`/`digraph_get`/`putdigraph`/
 //! `listdigraphs`/`ex_digraphs`/`f_digraph_get(list)`/`ex_loadkeymap`
-//! and the keymap-loading machinery, all needing the digraph/keymap
-//! table storage.
+//! and nonempty keymap loading, all needing the remaining
+//! digraph/keymap or runtime-source machinery.
 
 use crate::ascii_defs::ESC;
 use crate::garray_defs::TypedGarrayT;
@@ -71,6 +75,39 @@ pub struct KmapT {
 /// so collapsing them changes no observable behaviour.
 pub fn keymap_ga_clear(kmap_ga: &mut TypedGarrayT<KmapT>) {
     kmap_ga.ga_clear();
+}
+
+/// Set up the key mapping table for a buffer's `'keymap'`
+/// (`keymap_init`).
+///
+/// The empty-option unload path is complete. A nonempty option needs
+/// runtime-file sourcing and `:loadkeymap`, and stops exactly there.
+///
+/// # Safety
+/// `buf.b_vars`, when non-null, must point to a live dictionary. A
+/// genuinely loaded keymap still needs the mapping-table subsystem.
+pub unsafe fn keymap_init(
+    buf: &mut crate::buffer_defs::BufT,
+) -> Option<&'static [u8]> {
+    buf.b_kmap_state &= !crate::buffer_defs::KEYMAP_INIT;
+    if buf.b_p_keymap.as_deref().unwrap_or(&[]).is_empty() {
+        if buf.b_kmap_state & crate::buffer_defs::KEYMAP_LOADED != 0 {
+            unimplemented!("keymap_init: unloading active :lmap entries needs do_map");
+        }
+        if !buf.b_vars.is_null()
+            && let Some(item) = crate::eval::typval::tv_dict_find(
+                Some(unsafe { &mut *buf.b_vars }),
+                b"keymap_name",
+            )
+        {
+            unsafe {
+                crate::eval::typval::tv_dict_item_remove(&mut *buf.b_vars, item);
+            }
+        }
+        None
+    } else {
+        unimplemented!("keymap_init: loading keymap runtime files needs source_runtime");
+    }
 }
 
 /// Add a digraph to the user table, or update the one already there
@@ -174,6 +211,60 @@ mod tests {
 
         assert_eq!(ga.ga_len(), 1);
         assert_eq!(ga.items[0], kmap(b"cd", b"y"));
+    }
+
+    #[test]
+    fn keymap_init_empty_value_clears_init_and_removes_keymap_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert!(!dict.is_null());
+        assert_eq!(
+            crate::eval::typval::tv_dict_add_str(
+                unsafe { &mut *dict },
+                b"keymap_name",
+                Some(b"old"),
+            ),
+            crate::vim_defs::OK
+        );
+        let mut buf = crate::buffer_defs::BufT {
+            b_vars: dict,
+            b_p_keymap: Some(Vec::new()),
+            b_kmap_state: crate::buffer_defs::KEYMAP_INIT,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { keymap_init(&mut buf) }, None);
+        assert_eq!(buf.b_kmap_state & crate::buffer_defs::KEYMAP_INIT, 0);
+        assert!(crate::eval::typval::tv_dict_find(
+            Some(unsafe { &mut *dict }),
+            b"keymap_name",
+        )
+        .is_none());
+
+        buf.b_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    #[should_panic(expected = "source_runtime")]
+    fn keymap_init_nonempty_value_needs_runtime_file_sourcing() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_keymap: Some(b"russian-jcukenwin".to_vec()),
+            b_kmap_state: crate::buffer_defs::KEYMAP_INIT,
+            ..Default::default()
+        };
+        let _ = unsafe { keymap_init(&mut buf) };
+    }
+
+    #[test]
+    #[should_panic(expected = "do_map")]
+    fn keymap_init_loaded_empty_value_needs_mapping_removal() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_keymap: Some(Vec::new()),
+            b_kmap_state: crate::buffer_defs::KEYMAP_LOADED,
+            ..Default::default()
+        };
+        let _ = unsafe { keymap_init(&mut buf) };
     }
 
     // ---- registerdigraph ----
