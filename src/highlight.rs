@@ -64,6 +64,266 @@ pub unsafe fn object_to_color(
     }
 }
 
+/// Nested `cterm` flags accepted by [`dict2hlattrs`].
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct HighlightCtermDict {
+        pub reverse: bool,
+        pub bold: bool,
+        pub italic: bool,
+        pub underline: bool,
+        pub undercurl: bool,
+        pub underdouble: bool,
+        pub underdotted: bool,
+        pub underdashed: bool,
+        pub standout: bool,
+        pub strikethrough: bool,
+        pub altfont: bool,
+        pub dim: bool,
+        pub blink: bool,
+        pub conceal: bool,
+        pub overline: bool,
+        pub nocombine: bool,
+    }
+
+    /// Typed API highlight dictionary (`Dict(highlight)`).
+    #[derive(Debug, Clone, Default)]
+    pub struct HighlightDict {
+        pub reverse: Option<bool>,
+        pub bold: Option<bool>,
+        pub italic: Option<bool>,
+        pub underline: Option<bool>,
+        pub undercurl: Option<bool>,
+        pub underdouble: Option<bool>,
+        pub underdotted: Option<bool>,
+        pub underdashed: Option<bool>,
+        pub standout: Option<bool>,
+        pub strikethrough: Option<bool>,
+        pub altfont: Option<bool>,
+        pub dim: Option<bool>,
+        pub blink: Option<bool>,
+        pub conceal: Option<bool>,
+        pub overline: Option<bool>,
+        pub fg_indexed: Option<bool>,
+        pub bg_indexed: Option<bool>,
+        pub nocombine: Option<bool>,
+        pub default_: Option<bool>,
+        pub fg: Option<crate::api::private::defs::Object>,
+        pub foreground: Option<crate::api::private::defs::Object>,
+        pub bg: Option<crate::api::private::defs::Object>,
+        pub background: Option<crate::api::private::defs::Object>,
+        pub sp: Option<crate::api::private::defs::Object>,
+        pub special: Option<crate::api::private::defs::Object>,
+        pub blend: Option<i64>,
+        pub link: Option<i64>,
+        pub link_global: Option<i64>,
+        pub cterm: Option<HighlightCtermDict>,
+        pub ctermfg: Option<crate::api::private::defs::Object>,
+        pub ctermbg: Option<crate::api::private::defs::Object>,
+        pub font: Option<Vec<u8>>,
+    }
+
+    fn apply_highlight_flag(mask: &mut i32, value: Option<bool>, flag: u32) {
+        let Some(value) = value else {
+            return;
+        };
+        let flag = flag as i32;
+        let clear_mask = if flag & crate::highlight_defs::HL_UNDERLINE_MASK as i32 != 0 {
+            crate::highlight_defs::HL_UNDERLINE_MASK as i32
+        } else {
+            flag
+        };
+        if value {
+            *mask = (*mask & !clear_mask) | flag;
+        } else if *mask & clear_mask == flag {
+            *mask &= !clear_mask;
+        }
+    }
+
+    fn add_cterm_flag(mask: &mut i32, value: bool, flag: u32) {
+        if !value {
+            return;
+        }
+        let flag = flag as i32;
+        if flag & crate::highlight_defs::HL_UNDERLINE_MASK as i32 != 0 {
+            *mask &= !(crate::highlight_defs::HL_UNDERLINE_MASK as i32);
+        }
+        *mask |= flag;
+    }
+
+    /// Convert a typed API highlight dictionary to highlight attributes
+    /// (`dict2hlattrs`).
+    ///
+    /// # Safety
+    /// Forwarded from [`object_to_color`] and [`hl_add_font_idx`].
+    pub unsafe fn dict2hlattrs(
+        dict: &HighlightDict,
+        use_rgb: bool,
+        link_id: Option<&mut i32>,
+        base: Option<&crate::highlight_defs::HlAttrs>,
+        err: &mut crate::api::private::defs::Error,
+    ) -> crate::highlight_defs::HlAttrs {
+        use crate::highlight_defs::*;
+        let default = HlAttrs::default();
+        let mut fg = base.map_or(-1, |attrs| attrs.rgb_fg_color);
+        let mut bg = base.map_or(-1, |attrs| attrs.rgb_bg_color);
+        let mut ctermfg = base.map_or(-1, |attrs| {
+            if attrs.cterm_fg_color == 0 {
+                -1
+            } else {
+                i32::from(attrs.cterm_fg_color) - 1
+            }
+        });
+        let mut ctermbg = base.map_or(-1, |attrs| {
+            if attrs.cterm_bg_color == 0 {
+                -1
+            } else {
+                i32::from(attrs.cterm_bg_color) - 1
+            }
+        });
+        let mut sp = base.map_or(-1, |attrs| attrs.rgb_sp_color);
+        let mut blend = base.map_or(-1, |attrs| attrs.hl_blend);
+        let mut mask = base.map_or(0, |attrs| attrs.rgb_ae_attr);
+        let mut cterm_mask = base.map_or(0, |attrs| attrs.cterm_ae_attr);
+        let mut font = base.map_or(-1, |attrs| attrs.font);
+
+        apply_highlight_flag(&mut mask, dict.reverse, HL_INVERSE);
+        apply_highlight_flag(&mut mask, dict.bold, HL_BOLD);
+        apply_highlight_flag(&mut mask, dict.italic, HL_ITALIC);
+        apply_highlight_flag(&mut mask, dict.underline, HL_UNDERLINE);
+        apply_highlight_flag(&mut mask, dict.undercurl, HL_UNDERCURL);
+        apply_highlight_flag(&mut mask, dict.underdouble, HL_UNDERDOUBLE);
+        apply_highlight_flag(&mut mask, dict.underdotted, HL_UNDERDOTTED);
+        apply_highlight_flag(&mut mask, dict.underdashed, HL_UNDERDASHED);
+        apply_highlight_flag(&mut mask, dict.standout, HL_STANDOUT);
+        apply_highlight_flag(&mut mask, dict.strikethrough, HL_STRIKETHROUGH);
+        apply_highlight_flag(&mut mask, dict.altfont, HL_ALTFONT);
+        apply_highlight_flag(&mut mask, dict.dim, HL_DIM);
+        apply_highlight_flag(&mut mask, dict.blink, HL_BLINK);
+        apply_highlight_flag(&mut mask, dict.conceal, HL_CONCEALED);
+        apply_highlight_flag(&mut mask, dict.overline, HL_OVERLINE);
+        if use_rgb {
+            apply_highlight_flag(&mut mask, dict.fg_indexed, HL_FG_INDEXED);
+            apply_highlight_flag(&mut mask, dict.bg_indexed, HL_BG_INDEXED);
+        }
+        apply_highlight_flag(&mut mask, dict.nocombine, HL_NOCOMBINE);
+        apply_highlight_flag(&mut mask, dict.default_, HL_DEFAULT);
+
+        if let Some(value) = &dict.fg {
+            fg = unsafe { object_to_color(value, "fg", use_rgb, err) };
+        } else if let Some(value) = &dict.foreground {
+            fg = unsafe { object_to_color(value, "foreground", use_rgb, err) };
+        }
+        if err.is_set() {
+            return default;
+        }
+        if let Some(value) = &dict.bg {
+            bg = unsafe { object_to_color(value, "bg", use_rgb, err) };
+        } else if let Some(value) = &dict.background {
+            bg = unsafe { object_to_color(value, "background", use_rgb, err) };
+        }
+        if err.is_set() {
+            return default;
+        }
+        if let Some(value) = &dict.sp {
+            sp = unsafe { object_to_color(value, "sp", true, err) };
+        } else if let Some(value) = &dict.special {
+            sp = unsafe { object_to_color(value, "special", true, err) };
+        }
+        if err.is_set() {
+            return default;
+        }
+        if let Some(value) = dict.blend {
+            if !(0..=100).contains(&value) {
+                err.r#type = crate::api::private::defs::ErrorType::Validation;
+                err.msg = Some("Invalid 'blend': out of range".to_string());
+                return default;
+            }
+            blend = value as i32;
+        }
+
+        if dict.link.is_some() || dict.link_global.is_some() {
+            let Some(link_id) = link_id else {
+                err.r#type = crate::api::private::defs::ErrorType::Validation;
+                err.msg = Some(format!(
+                    "Invalid Key: '{}'",
+                    if dict.link_global.is_some() {
+                        "link_global"
+                    } else {
+                        "link"
+                    }
+                ));
+                return default;
+            };
+            if let Some(link_global) = dict.link_global {
+                *link_id = link_global as i32;
+                mask |= HL_GLOBAL as i32;
+            } else if let Some(link) = dict.link {
+                *link_id = link as i32;
+            }
+        }
+
+        let cterm_provided = dict.cterm.is_some();
+        if let Some(cterm) = &dict.cterm {
+            cterm_mask = 0;
+            add_cterm_flag(&mut cterm_mask, cterm.reverse, HL_INVERSE);
+            add_cterm_flag(&mut cterm_mask, cterm.bold, HL_BOLD);
+            add_cterm_flag(&mut cterm_mask, cterm.italic, HL_ITALIC);
+            add_cterm_flag(&mut cterm_mask, cterm.underline, HL_UNDERLINE);
+            add_cterm_flag(&mut cterm_mask, cterm.undercurl, HL_UNDERCURL);
+            add_cterm_flag(&mut cterm_mask, cterm.underdouble, HL_UNDERDOUBLE);
+            add_cterm_flag(&mut cterm_mask, cterm.underdotted, HL_UNDERDOTTED);
+            add_cterm_flag(&mut cterm_mask, cterm.underdashed, HL_UNDERDASHED);
+            add_cterm_flag(&mut cterm_mask, cterm.standout, HL_STANDOUT);
+            add_cterm_flag(&mut cterm_mask, cterm.strikethrough, HL_STRIKETHROUGH);
+            add_cterm_flag(&mut cterm_mask, cterm.altfont, HL_ALTFONT);
+            add_cterm_flag(&mut cterm_mask, cterm.dim, HL_DIM);
+            add_cterm_flag(&mut cterm_mask, cterm.blink, HL_BLINK);
+            add_cterm_flag(&mut cterm_mask, cterm.conceal, HL_CONCEALED);
+            add_cterm_flag(&mut cterm_mask, cterm.overline, HL_OVERLINE);
+            add_cterm_flag(&mut cterm_mask, cterm.nocombine, HL_NOCOMBINE);
+        }
+        if let Some(value) = &dict.ctermfg {
+            ctermfg = unsafe { object_to_color(value, "ctermfg", false, err) };
+            if err.is_set() {
+                return default;
+            }
+        }
+        if let Some(value) = &dict.ctermbg {
+            ctermbg = unsafe { object_to_color(value, "ctermbg", false, err) };
+            if err.is_set() {
+                return default;
+            }
+        }
+
+        let mut attrs = HlAttrs::default();
+        if use_rgb {
+            if !cterm_provided {
+                cterm_mask = mask;
+            }
+            attrs.rgb_ae_attr = mask;
+            attrs.rgb_fg_color = fg;
+            attrs.rgb_bg_color = bg;
+            attrs.rgb_sp_color = sp;
+            attrs.hl_blend = blend;
+            attrs.cterm_fg_color = if ctermfg == -1 { 0 } else { (ctermfg + 1) as i16 };
+            attrs.cterm_bg_color = if ctermbg == -1 { 0 } else { (ctermbg + 1) as i16 };
+            attrs.cterm_ae_attr = cterm_mask;
+        } else {
+            attrs.cterm_fg_color = if fg == -1 { 0 } else { (fg + 1) as i16 };
+            attrs.cterm_bg_color = if bg == -1 { 0 } else { (bg + 1) as i16 };
+            attrs.cterm_ae_attr = mask;
+        }
+        if let Some(name) = &dict.font {
+            font = if !name.is_empty() && !name.eq_ignore_ascii_case(b"NONE") {
+                unsafe { hl_add_font_idx(name) }
+            } else {
+                -1
+            };
+        }
+        attrs.font = font;
+        attrs
+    }
+
 /// Interned font names, indexed by the value `hl_add_font_idx`
 /// returns (`fonts`).
 ///
@@ -1792,6 +2052,154 @@ mod tests {
         assert_eq!(
             type_err.msg.as_deref(),
             Some("Invalid 'fg': expected String or Integer")
+        );
+    }
+
+    #[test]
+    fn dict2hlattrs_parses_rgb_colors_flags_blend_and_cterm_defaults() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_t_colors = unsafe { crate::globals::GLOBALS.get_mut() }.t_colors;
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = 0;
+        let dict = HighlightDict {
+            bold: Some(true),
+            underline: Some(true),
+            undercurl: Some(true),
+            fg: Some(crate::api::private::defs::Object::String(
+                b"RebeccaPurple".to_vec(),
+            )),
+            bg: Some(crate::api::private::defs::Object::Integer(0x112233)),
+            sp: Some(crate::api::private::defs::Object::String(b"#445566".to_vec())),
+            blend: Some(35),
+            ctermfg: Some(crate::api::private::defs::Object::String(b"DarkBlue".to_vec())),
+            ..Default::default()
+        };
+        let mut err = crate::api::private::defs::Error::default();
+        let attrs = unsafe { dict2hlattrs(&dict, true, None, None, &mut err) };
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = old_t_colors;
+
+        assert!(!err.is_set());
+        assert_eq!(attrs.rgb_fg_color, 0x663399);
+        assert_eq!(attrs.rgb_bg_color, 0x112233);
+        assert_eq!(attrs.rgb_sp_color, 0x445566);
+        assert_eq!(attrs.hl_blend, 35);
+        assert_eq!(
+            attrs.rgb_ae_attr,
+            (crate::highlight_defs::HL_BOLD | crate::highlight_defs::HL_UNDERCURL) as i32
+        );
+        assert_eq!(attrs.cterm_ae_attr, attrs.rgb_ae_attr);
+        assert_eq!(attrs.cterm_fg_color, 2);
+    }
+
+    #[test]
+    fn dict2hlattrs_applies_cterm_links_fonts_and_base_merging() {
+        let _lock = crate::globals::global_state_test_lock();
+        let base = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_BOLD as i32,
+            rgb_fg_color: 0x010203,
+            ..Default::default()
+        };
+        let dict = HighlightDict {
+            bold: Some(false),
+            link_global: Some(17),
+            cterm: Some(HighlightCtermDict {
+                italic: true,
+                ..Default::default()
+            }),
+            font: Some(b"NeroApiFont".to_vec()),
+            ..Default::default()
+        };
+        let mut link = 0;
+        let mut err = crate::api::private::defs::Error::default();
+        let attrs =
+            unsafe { dict2hlattrs(&dict, true, Some(&mut link), Some(&base), &mut err) };
+
+        assert!(!err.is_set());
+        assert_eq!(link, 17);
+        assert_eq!(
+            attrs.rgb_ae_attr,
+            crate::highlight_defs::HL_GLOBAL as i32
+        );
+        assert_eq!(
+            attrs.cterm_ae_attr,
+            crate::highlight_defs::HL_ITALIC as i32
+        );
+        assert_eq!(attrs.rgb_fg_color, 0x010203);
+        assert!(attrs.font >= 0);
+    }
+
+    #[test]
+    fn dict2hlattrs_reports_invalid_blend_link_and_color_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut blend_err = crate::api::private::defs::Error::default();
+        let attrs = unsafe {
+            dict2hlattrs(
+                &HighlightDict {
+                    blend: Some(101),
+                    ..Default::default()
+                },
+                true,
+                None,
+                None,
+                &mut blend_err,
+            )
+        };
+        assert_eq!(attrs, crate::highlight_defs::HlAttrs::default());
+        assert_eq!(
+            blend_err.msg.as_deref(),
+            Some("Invalid 'blend': out of range")
+        );
+
+        let mut link_err = crate::api::private::defs::Error::default();
+        let _ = unsafe {
+            dict2hlattrs(
+                &HighlightDict {
+                    link: Some(3),
+                    ..Default::default()
+                },
+                true,
+                None,
+                None,
+                &mut link_err,
+            )
+        };
+        assert_eq!(link_err.msg.as_deref(), Some("Invalid Key: 'link'"));
+
+        let mut color_err = crate::api::private::defs::Error::default();
+        let _ = unsafe {
+            dict2hlattrs(
+                &HighlightDict {
+                    fg: Some(crate::api::private::defs::Object::String(
+                        b"missing".to_vec(),
+                    )),
+                    ..Default::default()
+                },
+                true,
+                None,
+                None,
+                &mut color_err,
+            )
+        };
+        assert_eq!(
+            color_err.msg.as_deref(),
+            Some("Invalid highlight color: 'missing'")
+        );
+
+        let mut alias_err = crate::api::private::defs::Error::default();
+        let _ = unsafe {
+            dict2hlattrs(
+                &HighlightDict {
+                    background: Some(crate::api::private::defs::Object::Boolean(true)),
+                    ..Default::default()
+                },
+                true,
+                None,
+                None,
+                &mut alias_err,
+            )
+        };
+        assert_eq!(
+            alias_err.msg.as_deref(),
+            Some("Invalid 'background': expected String or Integer")
         );
     }
 
