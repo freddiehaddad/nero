@@ -3854,6 +3854,71 @@ pub unsafe fn set_option_value_for(
     unsafe { set_option_value_handle_tty(name, opt_idx, value, opt_flags) }
 }
 
+/// Get an option value for an explicit scope target
+/// (`get_option_value_for`).
+///
+/// Global/current-context reads and non-current tabpage reads are
+/// complete. Switching to a different buffer/window still needs
+/// `ctx_switch`.
+///
+/// # Safety
+/// `from` must point to a live value matching `scope`; tabpage state
+/// must satisfy [`crate::window::unuse_tabpage`]/
+/// [`crate::window::use_tabpage`]. Forwarded from
+/// [`get_option_value`].
+pub unsafe fn get_option_value_for(
+    opt_idx: OptIndex,
+    opt_flags: u32,
+    scope: OptScope,
+    from: *mut c_void,
+) -> OptVal {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (curbuf, curwin, curtab) =
+        unsafe { ((*globals).curbuf, (*globals).curwin, (*globals).curtab) };
+
+    match scope {
+        OptScope::Global => {
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe { get_option_value(opt_idx, opt_flags) };
+        }
+        OptScope::Win if from.cast::<WinT>() == curwin => {
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe { get_option_value(opt_idx, opt_flags) };
+        }
+        OptScope::Buf if from.cast::<BufT>() == curbuf => {
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe { get_option_value(opt_idx, opt_flags) };
+        }
+        OptScope::Win | OptScope::Buf => {
+            unimplemented!(
+                "get_option_value_for: cross-window/buffer reads need switch_option_context"
+            )
+        }
+        OptScope::Tab => {}
+    }
+
+    let target = from.cast::<crate::buffer_defs::TabpageT>();
+    if target == curtab {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { get_option_value(opt_idx, opt_flags) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::window::unuse_tabpage(curtab);
+        crate::window::use_tabpage(target);
+    }
+    // SAFETY: target tabpage state is installed.
+    let value = unsafe { get_option_value(opt_idx, opt_flags) };
+    // SAFETY: save the target and restore the original tabpage.
+    unsafe {
+        crate::window::unuse_tabpage(target);
+        crate::window::use_tabpage(curtab);
+    }
+    value
+}
+
 /// Set an option directly without validation or side effects
 /// (`set_option_direct`).
 ///
@@ -7264,6 +7329,23 @@ mod did_set_option_tests {
         }
     }
 
+    struct CommandHeightGuard(crate::types_defs::OptInt);
+
+    impl CommandHeightGuard {
+        fn set(value: crate::types_defs::OptInt) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_ch };
+            unsafe { (*options).p_ch = value };
+            CommandHeightGuard(previous)
+        }
+    }
+
+    impl Drop for CommandHeightGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ch = self.0 };
+        }
+    }
+
     /// Resets every piece of shared global state a `did_set_option`
     /// test could observe leaking from a sibling test: `GLOBALS.secure`/
     /// `sandbox`, `OPTION_VARS.p_mouse`/`p_flp`/`p_wbr`, and (for the
@@ -8074,6 +8156,78 @@ mod did_set_option_tests {
                 target_ptr.cast(),
             );
         };
+    }
+
+    #[test]
+    fn get_option_value_for_reads_and_restores_a_noncurrent_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cmdheight = CommandHeightGuard::set(3);
+        let mut current = crate::buffer_defs::TabpageT::default();
+        let current_ptr = std::ptr::from_mut(&mut current);
+        let mut target = crate::buffer_defs::TabpageT {
+            tp_ch_used: 7,
+            ..Default::default()
+        };
+        let target_ptr = std::ptr::from_mut(&mut target);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, current_ptr)
+        };
+        let _topframe = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.topframe,
+                std::ptr::null_mut(),
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.lastwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curwin,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(
+            unsafe {
+                get_option_value_for(
+                    OptIndex::Cmdheight,
+                    crate::option_defs::opt_set_flags::OPT_GLOBAL,
+                    OptScope::Tab,
+                    target_ptr.cast(),
+                )
+            },
+            OptVal::Number(7)
+        );
+        assert_eq!(unsafe { (*crate::globals::GLOBALS.as_ptr()).curtab }, current_ptr);
+        assert_eq!(unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ch }, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "switch_option_context")]
+    fn get_option_value_for_cross_window_needs_context_switching() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        let mut target = WinT::default();
+        let target_ptr = std::ptr::from_mut(&mut target);
+        unsafe {
+            let _ = get_option_value_for(
+                OptIndex::Scrolloff,
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                OptScope::Win,
+                target_ptr.cast(),
+            );
+        }
     }
 
     #[test]
