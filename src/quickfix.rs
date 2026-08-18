@@ -2168,9 +2168,8 @@ unsafe fn qf_set_properties(
 
 /// Populate or modify a quickfix/location-list stack (`set_errorlist`).
 ///
-/// Direct item Lists and `{what}` property dictionaries are complete.
-/// Action `'f'` remains deferred pending `qf_free_stack`'s displayed-
-/// window reconstruction path.
+/// Direct item Lists, `{what}` property dictionaries, and action `'f'`
+/// stack freeing are complete.
 ///
 /// # Safety
 /// `wp`, `list`, `what`, and every pointer reachable from their
@@ -2193,7 +2192,8 @@ pub unsafe fn set_errorlist(
     assert!(!qi.is_null(), "set_errorlist: quickfix stack is not initialized");
 
     if action == b'f' {
-        unimplemented!("set_errorlist: free action needs qf_free_stack");
+        unsafe { qf_free_stack(wp, qi) };
+        return crate::vim_defs::OK;
     }
     if !list.is_null()
         && unsafe { crate::eval::typval::tv_list_len(list) } != 0
@@ -10758,6 +10758,48 @@ mod tests {
     }
 
     #[test]
+    fn setqflist_builtin_free_action_clears_the_global_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 2);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_entries.push(QflineT::default());
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(list),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(
+                    Some(b"f".to_vec()),
+                ),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        unsafe { f_setqflist(&args, &mut rettv) };
+
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::Number(0)
+        );
+        assert_eq!(
+            unsafe { QL_INFO.get_mut() }.as_ref().unwrap().qf_listcount,
+            0
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
     fn setloclist_builtin_populates_the_current_windows_location_stack() {
         let _lock = crate::globals::global_state_test_lock();
         let _ids = LastQfIdGuard::new();
@@ -10818,6 +10860,39 @@ mod tests {
             qf_free_all(Some(win_ptr));
             crate::eval::typval::tv_list_unref(list);
         }
+    }
+
+    #[test]
+    fn set_errorlist_free_action_clears_the_global_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut stack = qf_alloc_stack(QfltypeT::Quickfix, 2);
+        stack.qf_listcount = 1;
+        stack.qf_lists[0].qf_entries.push(QflineT::default());
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+
+        assert_eq!(
+            unsafe {
+                set_errorlist(
+                    None,
+                    std::ptr::null(),
+                    b'f',
+                    None,
+                    None,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        let stack = unsafe { QL_INFO.get_mut() }.as_ref().unwrap();
+        assert_eq!(stack.qf_listcount, 0);
+        assert_eq!(stack.qf_curlist, 0);
+        assert_eq!(stack.qf_lists[0].qf_count(), 0);
     }
 
     #[test]
