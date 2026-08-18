@@ -924,6 +924,61 @@ pub unsafe fn highlight_attr_set_all() {
     }
 }
 
+/// Configure command-line completion for `:highlight`
+/// (`set_context_in_highlight_cmd`).
+///
+/// The `:highlight Ni` animated listing is display-only and remains
+/// with the message/UI pipeline; completion parsing and include flags
+/// are complete.
+///
+/// # Safety
+/// Mutates `GLOBALS.include_default`/`include_link`.
+pub unsafe fn set_context_in_highlight_cmd(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    argument: &[u8],
+) {
+    xp.xp_context = crate::cmdexpand_defs::ExpandContext::Highlight;
+    xp.xp_pattern = Some(argument.to_vec());
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    globals.include_link = 2;
+    globals.include_default = 1;
+
+    if argument.is_empty() {
+        return;
+    }
+    let mut start = 0;
+    let mut end = crate::charset::skiptowhite(&argument[start..]) + start;
+    if end == argument.len() {
+        return;
+    }
+
+    unsafe { crate::globals::GLOBALS.get_mut() }.include_default = 0;
+    if b"default".starts_with(&argument[start..end]) {
+        start = end + crate::charset::skipwhite(&argument[end..]);
+        xp.xp_pattern = Some(argument[start..].to_vec());
+        end = start + crate::charset::skiptowhite(&argument[start..]);
+    }
+    if end == argument.len() {
+        return;
+    }
+
+    unsafe { crate::globals::GLOBALS.get_mut() }.include_link = 0;
+    let token = &argument[start..end];
+    if b"link".starts_with(token) || b"clear".starts_with(token) {
+        start = end + crate::charset::skipwhite(&argument[end..]);
+        xp.xp_pattern = Some(argument[start..].to_vec());
+        end = start + crate::charset::skiptowhite(&argument[start..]);
+        if end != argument.len() {
+            start = end + crate::charset::skipwhite(&argument[end..]);
+            xp.xp_pattern = Some(argument[start..].to_vec());
+            end = start + crate::charset::skiptowhite(&argument[start..]);
+        }
+    }
+    if end != argument.len() {
+        xp.xp_context = crate::cmdexpand_defs::ExpandContext::Nothing;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,6 +1121,29 @@ mod tests {
             let old = globals.t_colors;
             globals.t_colors = value;
             Self(old)
+        }
+    }
+
+    struct HighlightCompletionGuard {
+        default_: i32,
+        link: i32,
+    }
+
+    impl HighlightCompletionGuard {
+        fn capture() -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            Self {
+                default_: globals.include_default,
+                link: globals.include_link,
+            }
+        }
+    }
+
+    impl Drop for HighlightCompletionGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.include_default = self.default_;
+            globals.include_link = self.link;
         }
     }
 
@@ -1316,6 +1394,48 @@ mod tests {
         bold = crate::types_defs::TriState::None;
         assert_eq!(lookup_color(1, true, &mut bold), 4);
         assert_eq!(bold, crate::types_defs::TriState::False);
+    }
+
+    #[test]
+    fn set_context_in_highlight_cmd_completes_groups_and_subcommands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = HighlightCompletionGuard::capture();
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+
+        unsafe { set_context_in_highlight_cmd(&mut xp, b"") };
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Highlight);
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"".as_slice()));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.include_default, 1);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.include_link, 2);
+
+        unsafe { set_context_in_highlight_cmd(&mut xp, b"Err") };
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"Err".as_slice()));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.include_default, 1);
+
+        unsafe { set_context_in_highlight_cmd(&mut xp, b"default Err") };
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"Err".as_slice()));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.include_default, 0);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.include_link, 2);
+    }
+
+    #[test]
+    fn set_context_in_highlight_cmd_advances_link_and_clear_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = HighlightCompletionGuard::capture();
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+
+        unsafe { set_context_in_highlight_cmd(&mut xp, b"link Source Tar") };
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Highlight);
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"Tar".as_slice()));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.include_link, 0);
+
+        unsafe { set_context_in_highlight_cmd(&mut xp, b"clear Group extra") };
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Highlight);
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"extra".as_slice()));
+
+        unsafe { set_context_in_highlight_cmd(&mut xp, b"clear Group extra more") };
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Nothing);
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"extra more".as_slice()));
     }
 
     /// IDs are 1-based, so the first group is id 1 and id 0 is "no
