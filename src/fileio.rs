@@ -13,6 +13,8 @@
 //! `/dev/fd/10` stays valid. `write_lnum_adjust` leaves the `0`
 //! "nothing is missing an EOL" sentinel alone rather than shifting it
 //! into a real line number.
+//! Also translated: [`shorten_fnames`] over the real global buffer
+//! list, built on [`shorten_buf_fname`].
 //!
 //! Translated: `get_fio_flags` (resolve the `FIO_*` conversion flags
 //! for a given encoding name, via `mbyte.c`'s already-real
@@ -67,6 +69,34 @@ pub unsafe fn shorten_buf_fname(
     } else {
         buf.b_sfname = None;
         buf.b_fname.clone_from(&buf.b_ffname);
+    }
+}
+
+/// Shorten displayed names for every buffer after changing cwd
+/// (`shorten_fnames`).
+///
+/// Swap-file names are first made absolute through
+/// [`crate::memfile::mf_fullname`]. Redraw scheduling is omitted.
+///
+/// # Safety
+/// `GLOBALS.firstbuf`'s `b_next` chain and every non-null `ml_mfp`
+/// pointer must consist of live values. Forwarded from
+/// [`shorten_buf_fname`].
+pub unsafe fn shorten_fnames(force: bool) {
+    let dirname = crate::os::fs::os_dirname().unwrap_or_default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut buf = unsafe { (*crate::globals::GLOBALS.as_ptr()).firstbuf };
+    while !buf.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { shorten_buf_fname(&mut *buf, &dirname, force) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let memfile = unsafe { (*buf).b_ml.ml_mfp };
+        if !memfile.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            crate::memfile::mf_fullname(unsafe { &mut *memfile });
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        buf = unsafe { (*buf).b_next };
     }
 }
 
@@ -963,6 +993,47 @@ mod tests {
             buf.b_fname.as_deref(),
             Some(&b"/home/user/file.txt"[..])
         );
+    }
+
+    #[test]
+    fn shorten_fnames_walks_all_buffers_and_absolutizes_swap_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let cwd = crate::os::fs::os_dirname().expect("current directory");
+        let first_name = crate::path::concat_fnames(&cwd, b"first.txt", true);
+        let second_name = crate::path::concat_fnames(&cwd, b"second.txt", true);
+
+        let mut memfile = crate::memfile::mf_open(None, 0).expect("memfile");
+        memfile.mf_fname = Some(b"relative.swp".to_vec());
+        memfile.mf_ffname = Some(b"/absolute/first.swp".to_vec());
+        let memfile_ptr = std::ptr::from_mut(&mut memfile);
+
+        let mut second = crate::buffer_defs::BufT {
+            b_ffname: Some(second_name.clone()),
+            b_sfname: Some(second_name.clone()),
+            b_fname: Some(second_name),
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::from_mut(&mut second);
+        let mut first = crate::buffer_defs::BufT {
+            b_next: second_ptr,
+            b_ffname: Some(first_name.clone()),
+            b_sfname: Some(first_name.clone()),
+            b_fname: Some(first_name),
+            ..Default::default()
+        };
+        first.b_ml.ml_mfp = memfile_ptr;
+        let first_ptr = std::ptr::from_mut(&mut first);
+        let _firstbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstbuf, first_ptr)
+        };
+
+        unsafe { shorten_fnames(true) };
+
+        assert_eq!(unsafe { (*first_ptr).b_fname.as_deref() }, Some(b"first.txt".as_slice()));
+        assert_eq!(unsafe { (*second_ptr).b_fname.as_deref() }, Some(b"second.txt".as_slice()));
+        assert_eq!(unsafe { (*memfile_ptr).mf_fname.as_deref() }, Some(b"/absolute/first.swp".as_slice()));
+        assert!(unsafe { (*memfile_ptr).mf_ffname.is_none() });
     }
 
     #[test]
