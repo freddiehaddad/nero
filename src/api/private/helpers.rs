@@ -381,6 +381,30 @@ pub unsafe fn get_default_stl_hl(
     }
 }
 
+/// Set script context for an API call and return the previous context
+/// (`api_set_sctx`).
+///
+/// # Safety
+/// Mutates `GLOBALS.current_sctx` and may read the shared script-item
+/// registry when preserving an existing Lua script context.
+#[must_use]
+pub unsafe fn api_set_sctx(channel_id: u64) -> crate::eval::typval_defs::SctxT {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let previous = globals.current_sctx;
+    if channel_id != crate::api::private::defs::VIML_INTERNAL_CALL {
+        globals.current_sctx.sc_lnum = 0;
+        if channel_id == crate::api::private::defs::LUA_INTERNAL_CALL {
+            if !crate::runtime::script_is_lua(globals.current_sctx.sc_sid) {
+                globals.current_sctx.sc_sid = crate::globals::SID_LUA;
+            }
+        } else {
+            globals.current_sctx.sc_sid = crate::globals::SID_API_CLIENT;
+            globals.current_sctx.sc_chan = channel_id;
+        }
+    }
+    previous
+}
+
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
 ///
 /// String names create the group when it does not exist, matching
@@ -639,6 +663,33 @@ mod tests {
             unsafe { get_default_stl_hl(other_ptr, true, 0) },
             b"WinBarNC"
         );
+    }
+
+    #[test]
+    fn api_set_sctx_preserves_vimscript_and_stamps_external_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx =
+            crate::eval::typval_defs::SctxT {
+                sc_sid: 7,
+                sc_seq: 3,
+                sc_lnum: 11,
+                sc_chan: 2,
+            };
+        let vim_old = unsafe {
+            api_set_sctx(crate::api::private::defs::VIML_INTERNAL_CALL)
+        };
+        let vim_current = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        let external_old = unsafe { api_set_sctx(99) };
+        let external_current = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = previous;
+
+        assert_eq!(vim_old.sc_sid, 7);
+        assert_eq!(vim_current.sc_lnum, 11);
+        assert_eq!(external_old.sc_sid, 7);
+        assert_eq!(external_current.sc_sid, crate::globals::SID_API_CLIENT);
+        assert_eq!(external_current.sc_chan, 99);
+        assert_eq!(external_current.sc_lnum, 0);
     }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
