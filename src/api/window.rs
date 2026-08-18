@@ -170,6 +170,28 @@ pub unsafe fn nvim_win_set_var(
     };
 }
 
+/// Delete a window-scoped variable (`nvim_win_del_var`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`] and the checked
+/// scope-dictionary writer.
+pub unsafe fn nvim_win_del_var(win: Window, name: &NvimString, err: &mut Error) {
+    let win = unsafe { find_window_by_handle(win, err) };
+    if win.is_null() {
+        return;
+    }
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*win).w_vars,
+            name,
+            &Object::Nil,
+            true,
+            false,
+            err,
+        )
+    };
+}
+
 /// Optional range controls for [`nvim_win_text_height`].
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct WinTextHeightOpts {
@@ -658,6 +680,26 @@ mod tests {
             .expect("window variable");
         unsafe {
             crate::eval::typval::tv_dict_item_remove(&mut *dict, item);
+            (*fx.win).w_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn nvim_win_del_var_removes_a_window_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(23);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"value", 3) },
+            crate::vim_defs::OK
+        );
+        unsafe { (*fx.win).w_vars = dict };
+        let mut err = Error::default();
+        unsafe { nvim_win_del_var((*fx.win).handle, &b"value".to_vec(), &mut err) };
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }.is_none());
+        assert!(!err.is_set());
+        unsafe {
             (*fx.win).w_vars = std::ptr::null_mut();
             crate::eval::typval::tv_dict_unref(dict);
         }
