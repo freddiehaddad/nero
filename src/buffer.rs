@@ -268,6 +268,35 @@ pub unsafe fn buflist_findnr(nr: i32) -> *mut BufT {
     std::ptr::null_mut()
 }
 
+/// Return an owned display name for buffer number `number`
+/// (`buflist_nr2name`).
+///
+/// # Safety
+/// Forwarded from [`buflist_findnr`] and
+/// [`crate::os::env::home_replace_save`].
+#[must_use]
+pub unsafe fn buflist_nr2name(
+    number: i32,
+    fullname: bool,
+    helptail: bool,
+) -> Option<Vec<u8>> {
+    let buf = unsafe { buflist_findnr(number) };
+    if buf.is_null() {
+        return None;
+    }
+    let name = if fullname {
+        unsafe { &(*buf).b_ffname }
+    } else {
+        unsafe { &(*buf).b_fname }
+    };
+    Some(unsafe {
+        crate::os::env::home_replace_save(
+            if helptail { Some(&*buf) } else { None },
+            name.as_deref(),
+        )
+    })
+}
+
 /// Find buffer `handle` in the global buffer list, or a null pointer
 /// if not found (`handle_get_buffer`, `api/private/helpers.h`). A
 /// plain `pmap_get(int)(&buffer_handles, (h))` in the original - this
@@ -1857,6 +1886,24 @@ mod tests {
         let _guard = LastbufGuard::set(&mut buf as *mut BufT);
 
         assert!(unsafe { handle_get_buffer(99) }.is_null());
+    }
+
+    #[test]
+    fn buflist_nr2name_returns_help_tail_and_none_for_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            handle: 44,
+            b_help: true,
+            b_ffname: Some(b"/runtime/doc/help.txt".to_vec()),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _guard = LastbufGuard::set(buf_ptr);
+        assert_eq!(
+            unsafe { buflist_nr2name(44, true, true) },
+            Some(b"help.txt".to_vec())
+        );
+        assert_eq!(unsafe { buflist_nr2name(99, true, true) }, None);
     }
 
     /// Unlike `buflist_findnr(0)` (which resolves `0` to
