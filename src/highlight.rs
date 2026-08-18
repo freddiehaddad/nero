@@ -377,6 +377,38 @@ pub unsafe fn hl_blend_attrs(
     id
 }
 
+/// Add `url` to an existing highlight attribute (`hl_add_url`).
+///
+/// URLs are interned by value, and an existing URL on `attr` remains
+/// higher priority through [`hl_combine_attr`], matching the original.
+///
+/// # Safety
+/// Mutates the shared URL, attribute, and combination tables.
+#[must_use]
+pub unsafe fn hl_add_url(attr: i32, url: &[u8]) -> i32 {
+    let url = &url[..url.iter().position(|&c| c == 0).unwrap_or(url.len())];
+    let urls = unsafe { URLS.get_mut() };
+    let index = if let Some(index) = urls.iter().position(|stored| stored == url) {
+        index
+    } else {
+        urls.push(url.to_vec());
+        urls.len() - 1
+    };
+
+    let url_attrs = crate::highlight_defs::HlAttrs {
+        url: index as i32,
+        ..Default::default()
+    };
+    let new_attr = get_attr_entry(crate::highlight_defs::HlEntry {
+        attr: url_attrs,
+        kind: crate::highlight_defs::HlKind::Ui,
+        id1: 0,
+        id2: 0,
+        winid: 0,
+    });
+    unsafe { hl_combine_attr(attr, new_attr) }
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -1144,6 +1176,63 @@ mod tests {
         assert!(through);
         assert_eq!(unsafe { hl_blend_attrs(3, -1, &mut through) }, -1);
         assert!(through);
+    }
+
+    #[test]
+    fn hl_add_url_interns_and_combines_a_url() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _attrs = AttributeEntriesGuard::empty();
+        let _urls = UrlsGuard::install(Vec::new());
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+
+        let attr = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_fg_color: 0x12_34_56,
+                ..Default::default()
+            })
+        };
+        let with_url = unsafe { hl_add_url(attr, b"https://example.test") };
+        let attrs = unsafe { syn_attr2entry(with_url) };
+
+        assert_eq!(attrs.rgb_fg_color, 0x12_34_56);
+        assert_eq!(attrs.url, 0);
+        assert_eq!(
+            unsafe { hl_get_url(attrs.url as u32) }.as_deref(),
+            Some(b"https://example.test".as_slice())
+        );
+    }
+
+    #[test]
+    fn hl_add_url_reuses_an_interned_url_and_stops_at_nul() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _attrs = AttributeEntriesGuard::empty();
+        let _urls = UrlsGuard::install(Vec::new());
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+
+        let first = unsafe { hl_add_url(0, b"https://example.test\0ignored") };
+        let second = unsafe { hl_add_url(0, b"https://example.test") };
+
+        assert_eq!(first, second);
+        assert_eq!(unsafe { URLS.get_mut() }.len(), 1);
+    }
+
+    #[test]
+    fn hl_add_url_keeps_an_existing_url_on_the_base_attribute() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _attrs = AttributeEntriesGuard::empty();
+        let _urls = UrlsGuard::install(vec![b"https://base.test".to_vec()]);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+
+        let base = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                url: 0,
+                ..Default::default()
+            })
+        };
+        let combined = unsafe { hl_add_url(base, b"https://new.test") };
+
+        assert_eq!(unsafe { syn_attr2entry(combined) }.url, 0);
+        assert_eq!(unsafe { URLS.get_mut() }.len(), 2);
     }
 
     struct NamespaceHighlightsGuard {
