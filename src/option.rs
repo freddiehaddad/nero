@@ -221,9 +221,9 @@
 //!   [`option_was_set`]'s own doc comment for why).
 //!
 //! Deferred:
-//! - [`parse_winhl_opt`]'s nonempty local-window application path
-//!   needs `get_decor_provider`/`ns_hl_def`. Global validation and the
-//!   empty-local reset path are real.
+//! - [`parse_winhl_opt`]'s empty-target local mapping form needs
+//!   `hl_get_syn_attr`; ordinary highlight links, global validation,
+//!   and the empty-local reset path are real.
 //! - Cross-window/buffer paths in `get_option_value_for`/
 //!   `set_option_value_for` need the real `ctx_switch`.
 //! - Ten remaining did-set/expand callbacks still need their own
@@ -247,9 +247,9 @@ use std::ffi::c_void;
 
 /// Parse a `'winhighlight'` value (`parse_winhl_opt`).
 ///
-/// Global validation (`win == None`) and clearing a local value are
-/// complete. Applying a nonempty value to a window stops at the
-/// namespace highlight-definition machinery, which is not translated.
+/// Global validation, clearing a local value, and applying local
+/// highlight links are complete. A local mapping with an empty target
+/// stops in `ns_hl_def` at direct-attribute interning.
 ///
 /// # Safety
 /// Touches the highlight-group registry, and `win`, when present, must
@@ -281,9 +281,29 @@ pub unsafe fn parse_winhl_opt(
         return true;
     }
 
-    if !win.is_null() {
-        unimplemented!("parse_winhl_opt: local highlight definitions need ns_hl_def");
-    }
+    let namespace = if win.is_null() {
+        0
+    } else {
+        if unsafe { (*win).w_ns_hl_winhl } == 0 {
+            unsafe {
+                (*win).w_ns_hl_winhl =
+                    crate::api::extmark::nvim_create_namespace(&Vec::new()) as i32;
+            }
+        } else {
+            let provider = unsafe {
+                crate::decoration_provider::get_decor_provider(
+                    (*win).w_ns_hl_winhl,
+                    true,
+                )
+            };
+            unsafe { (*provider).hl_valid += 1 };
+        }
+        let namespace = unsafe { (*win).w_ns_hl_winhl };
+        if unsafe { (*win).w_ns_hl } <= 0 {
+            unsafe { (*win).w_ns_hl = namespace };
+        }
+        namespace
+    };
 
     for part in value.split(|byte| *byte == b',') {
         let Some(colon) = part.iter().position(|byte| *byte == b':') else {
@@ -307,6 +327,23 @@ pub unsafe fn parse_winhl_opt(
         if source_id == 0 {
             return false;
         }
+        if namespace != 0 {
+            let attrs = crate::highlight_defs::HlAttrs {
+                rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
+                ..Default::default()
+            };
+            unsafe {
+                crate::highlight::ns_hl_def(
+                    namespace,
+                    source_id,
+                    attrs,
+                    target_id,
+                );
+            }
+        }
+    }
+    if !win.is_null() {
+        unsafe { (*win).w_hl_needs_update = 1 };
     }
     true
 }
@@ -5303,6 +5340,12 @@ mod tests {
     struct WinhlGroupGuard {
         items: Vec<crate::highlight_group::HlGroup>,
         names: crate::map::Map<Vec<u8>, i32>,
+        definitions: crate::map::Map<
+            crate::highlight_defs::ColorKey,
+            crate::highlight_defs::ColorItem,
+        >,
+        providers: Vec<crate::decoration_defs::DecorProvider>,
+        next_namespace: i32,
     }
 
     impl WinhlGroupGuard {
@@ -5313,7 +5356,20 @@ mod tests {
                 unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() },
                 crate::map::Map::new(),
             );
-            Self { items, names }
+            let definitions = std::mem::replace(
+                unsafe { crate::highlight::NS_HLS.get_mut() },
+                crate::map::Map::new(),
+            );
+            let providers =
+                std::mem::take(unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() });
+            let next_namespace = *unsafe { crate::api::extmark::NEXT_NAMESPACE_ID.get_mut() };
+            Self {
+                items,
+                names,
+                definitions,
+                providers,
+                next_namespace,
+            }
         }
     }
 
@@ -5323,6 +5379,12 @@ mod tests {
                 std::mem::take(&mut self.items);
             *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } =
                 std::mem::replace(&mut self.names, crate::map::Map::new());
+            *unsafe { crate::highlight::NS_HLS.get_mut() } =
+                std::mem::replace(&mut self.definitions, crate::map::Map::new());
+            *unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() } =
+                std::mem::take(&mut self.providers);
+            *unsafe { crate::api::extmark::NEXT_NAMESPACE_ID.get_mut() } =
+                self.next_namespace;
         }
     }
 
@@ -5367,10 +5429,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ns_hl_def")]
-    fn parse_winhl_opt_nonempty_local_value_needs_namespace_definitions() {
+    fn parse_winhl_opt_applies_nonempty_local_links() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = WinhlGroupGuard::empty();
         let mut win = WinT::default();
-        let _ = unsafe { parse_winhl_opt(Some(b"Normal:MyNormal"), Some(&mut win)) };
+
+        assert!(unsafe {
+            parse_winhl_opt(Some(b"Normal:MyNormal"), Some(&mut win))
+        });
+        assert!(win.w_ns_hl_winhl > 0);
+        assert_eq!(win.w_ns_hl, win.w_ns_hl_winhl);
+        assert_eq!(win.w_hl_needs_update, 1);
+        let source = unsafe { crate::highlight_group::syn_name2id_len(b"Normal") };
+        let target = unsafe { crate::highlight_group::syn_name2id_len(b"MyNormal") };
+        let item = unsafe { crate::highlight::NS_HLS.get_mut() }
+            .get(&crate::highlight_defs::ColorKey::new(
+                win.w_ns_hl_winhl,
+                source,
+            ))
+            .expect("window highlight mapping");
+        assert_eq!(item.link_id, target);
+        assert!(item.link_global);
+    }
+
+    #[test]
+    #[should_panic(expected = "hl_get_syn_attr")]
+    fn parse_winhl_opt_empty_local_target_needs_direct_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = WinhlGroupGuard::empty();
+        let mut win = WinT::default();
+        let _ = unsafe { parse_winhl_opt(Some(b"EndOfBuffer:"), Some(&mut win)) };
     }
 
     fn buf_with_ff(ff: &str, bin: bool) -> BufT {
