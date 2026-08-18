@@ -8317,6 +8317,8 @@ fn wire_optionstr_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::did_set_winbar);
     options[OptIndex::Winborder as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_winborder);
+    options[OptIndex::Winhighlight as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_winhighlight);
 }
 
 fn wire_callback_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
@@ -8746,6 +8748,7 @@ mod options_table_tests {
             b"wildcharm",
             b"wildmode",
             b"winbar",
+            b"winhighlight",
             b"winblend",
             b"winborder",
             b"window",

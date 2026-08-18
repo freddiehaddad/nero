@@ -3455,6 +3455,30 @@ pub unsafe fn did_set_pumborder(
     None
 }
 
+/// The `'winhighlight'` option changed (`did_set_winhighlight`).
+///
+/// # Safety
+/// `args.os_win` must point to a live window and `args.os_varp` to a
+/// live `Option<Vec<u8>>`.
+pub unsafe fn did_set_winhighlight(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win as *mut crate::buffer_defs::WinT;
+    let local_varp = unsafe {
+        std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_winhl).cast::<c_void>()
+    };
+    let local = args.os_varp == local_varp;
+    let value = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) }
+        .clone()
+        .unwrap_or_default();
+    let target = local.then(|| unsafe { &mut *win });
+    if unsafe { crate::option::parse_winhl_opt(Some(&value), target) } {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
 /// The `'tabline'` option is changed (`did_set_tabline`).
 ///
 /// # Safety
@@ -8952,6 +8976,50 @@ mod tests {
                 Some(crate::errors::e_invarg.as_bytes())
             );
         });
+    }
+
+    #[test]
+    fn did_set_winhighlight_rejects_an_invalid_global_value() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let mut value = Some(b"Normal".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Winhighlight,
+            os_win: win_ptr.cast(),
+            os_varp: std::ptr::from_mut(&mut value).cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { did_set_winhighlight(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_winhighlight_empty_local_value_detaches_its_namespace() {
+        let mut win = crate::buffer_defs::WinT {
+            w_ns_hl: 12,
+            w_ns_hl_winhl: 12,
+            w_hl_needs_update: 0,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let varp = unsafe {
+            std::ptr::addr_of_mut!((*win_ptr).w_onebuf_opt.wo_winhl)
+        };
+        unsafe { *varp = Some(Vec::new()) };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Winhighlight,
+            os_win: win_ptr.cast(),
+            os_varp: varp.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_winhighlight(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_ns_hl }, 0);
+        assert_eq!(unsafe { (*win_ptr).w_ns_hl_winhl }, 12);
+        assert_eq!(unsafe { (*win_ptr).w_hl_needs_update }, 1);
     }
 
     // ---- did_set_verbosefile ----
