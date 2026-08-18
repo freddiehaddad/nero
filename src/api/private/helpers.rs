@@ -11,6 +11,9 @@
 //! exactly, since `Error` is a real, returned value future API
 //! callers will read, not a skippable display side effect like
 //! `emsg()`).
+//! Also [`object_to_hl_id`] - String names resolve through the real
+//! highlight-group registry, while Integer IDs are range-checked
+//! against the current group count.
 //!
 //! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
 //! generic, variadic/printf-style message formatters; this crate uses
@@ -20,7 +23,7 @@
 //! not a general `vim_snprintf`" precedent - if/when a second real
 //! caller needs this, revisit whether a shared helper is worthwhile).
 
-use crate::api::private::defs::{Buffer, Error, ErrorType, Tabpage, Window};
+use crate::api::private::defs::{Buffer, Error, ErrorType, Object, Tabpage, Window};
 use crate::buffer_defs::{BufT, TabpageT, WinT};
 
 /// Find window `window` (a real window handle, or `0` for the current
@@ -92,6 +95,40 @@ pub unsafe fn find_tab_by_handle(tabpage: Tabpage, err: &mut Error) -> *mut Tabp
     rv
 }
 
+/// Convert an API object to a highlight-group ID (`object_to_hl_id`).
+///
+/// String names create the group when it does not exist, matching
+/// `syn_check_group`; Integer IDs are accepted only when they identify
+/// an existing, 1-based group. Other object types set a validation
+/// error and return `0`.
+///
+/// # Safety
+/// Forwarded from the highlight-group registry functions.
+pub unsafe fn object_to_hl_id(obj: &Object, what: &str, err: &mut Error) -> i32 {
+    match obj {
+        Object::String(name) => {
+            if name.is_empty() {
+                0
+            } else {
+                unsafe { crate::highlight_group::syn_check_group(name) }
+            }
+        }
+        Object::Integer(id) => {
+            let id = *id as i32;
+            if (1..=unsafe { crate::highlight_group::highlight_num_groups() }).contains(&id) {
+                id
+            } else {
+                0
+            }
+        }
+        _ => {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some(format!("Invalid 'hl_group': expected {what}"));
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +142,81 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    struct HighlightTableGuard {
+        items: Vec<crate::highlight_group::HlGroup>,
+        names: crate::map::Map<Vec<u8>, i32>,
+    }
+
+    impl HighlightTableGuard {
+        fn empty() -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            let items = std::mem::take(&mut table.items);
+            let names = std::mem::replace(
+                unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() },
+                crate::map::Map::new(),
+            );
+            Self { items, names }
+        }
+    }
+
+    impl Drop for HighlightTableGuard {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.items);
+            *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } =
+                std::mem::replace(&mut self.names, crate::map::Map::new());
+        }
+    }
+
+    #[test]
+    fn object_to_hl_id_creates_a_named_group_and_accepts_its_integer_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = HighlightTableGuard::empty();
+        let mut err = Error::default();
+
+        assert_eq!(
+            unsafe { object_to_hl_id(&Object::String(b"Border".to_vec()), "highlight", &mut err) },
+            1
+        );
+        assert!(!err.is_set());
+        assert_eq!(
+            unsafe { object_to_hl_id(&Object::Integer(1), "highlight", &mut err) },
+            1
+        );
+        assert_eq!(
+            unsafe { object_to_hl_id(&Object::Integer(2), "highlight", &mut err) },
+            0
+        );
+    }
+
+    #[test]
+    fn object_to_hl_id_accepts_an_empty_name_as_no_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = HighlightTableGuard::empty();
+        let mut err = Error::default();
+
+        assert_eq!(
+            unsafe { object_to_hl_id(&Object::String(Vec::new()), "highlight", &mut err) },
+            0
+        );
+        assert!(!err.is_set());
+        assert_eq!(unsafe { crate::highlight_group::highlight_num_groups() }, 0);
+    }
+
+    #[test]
+    fn object_to_hl_id_rejects_an_unexpected_object_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = HighlightTableGuard::empty();
+        let mut err = Error::default();
+
+        assert_eq!(
+            unsafe { object_to_hl_id(&Object::Boolean(true), "border highlight", &mut err) },
+            0
+        );
+        assert!(err.is_set());
+        assert_eq!(err.r#type, ErrorType::Validation);
     }
 
     /// A `window == 0` request always resolves to `GLOBALS.curwin`,
