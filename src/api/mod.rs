@@ -2,6 +2,7 @@
 //! `api/` submodule tree in Rust.
 
 pub mod buffer;
+pub mod deprecated;
 pub mod extmark;
 pub mod private;
 pub mod tabpage;
