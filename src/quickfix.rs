@@ -331,6 +331,53 @@ fn cbuffer_get_auname(
     }
 }
 
+/// Resolve and validate `:cbuffer`/`:lbuffer` command arguments
+/// (`cbuffer_process_args`).
+///
+/// # Safety
+/// The global current-buffer/current-window and buffer-list pointers
+/// must be valid.
+pub unsafe fn cbuffer_process_args(
+    eap: &mut crate::ex_cmds_defs::ExargT,
+    bufp: &mut *mut BufT,
+    line1: &mut crate::pos_defs::LinenrT,
+    line2: &mut crate::pos_defs::LinenrT,
+) -> i32 {
+    let arg = eap.arg.as_deref().unwrap_or(&[]);
+    let mut buf = std::ptr::null_mut();
+    if arg.is_empty() {
+        buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    } else {
+        let digits = crate::charset::skipdigits(arg);
+        let after = digits + crate::charset::skipwhite(&arg[digits..]);
+        if after == arg.len() {
+            let (number, _) = crate::charset::getdigits_int(arg, false, 0);
+            buf = unsafe { crate::buffer::buflist_findnr(number) };
+        }
+    }
+    if buf.is_null() || unsafe { (*buf).b_ml.ml_mfp }.is_null() {
+        return crate::vim_defs::FAIL;
+    }
+
+    if eap.addr_count == 0 {
+        eap.line1 = 1;
+        eap.line2 = unsafe { (*buf).b_ml.ml_line_count };
+    }
+    let count = unsafe { (*buf).b_ml.ml_line_count };
+    if eap.line1 < 1
+        || eap.line1 > count
+        || eap.line2 < 1
+        || eap.line2 > count
+    {
+        return crate::vim_defs::FAIL;
+    }
+
+    *line1 = eap.line1;
+    *line2 = eap.line2;
+    *bufp = buf;
+    crate::vim_defs::OK
+}
+
 /// Autocommand name for `:cexpr`/`:lexpr` commands
 /// (`cexpr_get_auname`).
 #[allow(dead_code)]
@@ -5578,6 +5625,179 @@ mod tests {
             Some(b"laddbuffer".as_slice())
         );
         assert_eq!(cbuffer_get_auname(CmdIdxT::cfile), None);
+    }
+
+    fn cbuffer_test_memfile() -> crate::memfile_defs::MemfileT {
+        crate::memfile_defs::MemfileT {
+            mf_fname: None,
+            mf_ffname: None,
+            mf_fd: None,
+            mf_flags: 0,
+            mf_reopen: false,
+            mf_free_first: std::ptr::null_mut(),
+            mf_hash: crate::map::Map::default(),
+            mf_trans: crate::map::Map::default(),
+            mf_blocknr_max: 0,
+            mf_blocknr_min: -1,
+            mf_neg_count: 0,
+            mf_infile_count: 0,
+            mf_page_size: 4096,
+            mf_dirty: crate::memfile_defs::MfdirtyT::No,
+        }
+    }
+
+    #[test]
+    fn cbuffer_process_args_defaults_to_current_buffer_full_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut memfile = Box::new(cbuffer_test_memfile());
+        let memfile_ptr = std::ptr::addr_of_mut!(*memfile);
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        unsafe {
+            (*buf_ptr).b_ml.ml_mfp = memfile_ptr;
+            (*buf_ptr).b_ml.ml_line_count = 5;
+        }
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        let mut selected = std::ptr::null_mut();
+        let mut line1 = 0;
+        let mut line2 = 0;
+
+        assert_eq!(
+            unsafe {
+                cbuffer_process_args(
+                    &mut eap,
+                    &mut selected,
+                    &mut line1,
+                    &mut line2,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(selected, buf_ptr);
+        assert_eq!((line1, line2), (1, 5));
+        assert_eq!((eap.line1, eap.line2), (1, 5));
+    }
+
+    #[test]
+    fn cbuffer_process_args_resolves_numeric_buffer_and_explicit_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut memfile = Box::new(cbuffer_test_memfile());
+        let memfile_ptr = std::ptr::addr_of_mut!(*memfile);
+        let mut buf = Box::new(BufT {
+            handle: 12,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        unsafe {
+            (*buf_ptr).b_ml.ml_mfp = memfile_ptr;
+            (*buf_ptr).b_ml.ml_line_count = 8;
+        }
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                buf_ptr,
+            )
+        };
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"12   ".to_vec()),
+            addr_count: 1,
+            line1: 2,
+            line2: 6,
+            ..Default::default()
+        };
+        let mut selected = std::ptr::null_mut();
+        let mut line1 = 0;
+        let mut line2 = 0;
+
+        assert_eq!(
+            unsafe {
+                cbuffer_process_args(
+                    &mut eap,
+                    &mut selected,
+                    &mut line1,
+                    &mut line2,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(selected, buf_ptr);
+        assert_eq!((line1, line2), (2, 6));
+    }
+
+    #[test]
+    fn cbuffer_process_args_rejects_bad_argument_unloaded_buffer_and_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut selected = std::ptr::null_mut();
+        let mut line1 = -1;
+        let mut line2 = -1;
+        let mut bad_arg = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"12x".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                cbuffer_process_args(
+                    &mut bad_arg,
+                    &mut selected,
+                    &mut line1,
+                    &mut line2,
+                )
+            },
+            crate::vim_defs::FAIL
+        );
+
+        let mut unloaded = Box::new(BufT::default());
+        let unloaded_ptr = std::ptr::addr_of_mut!(*unloaded);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                unloaded_ptr,
+            )
+        };
+        let mut unloaded_arg = crate::ex_cmds_defs::ExargT::default();
+        assert_eq!(
+            unsafe {
+                cbuffer_process_args(
+                    &mut unloaded_arg,
+                    &mut selected,
+                    &mut line1,
+                    &mut line2,
+                )
+            },
+            crate::vim_defs::FAIL
+        );
+
+        let mut memfile = Box::new(cbuffer_test_memfile());
+        let memfile_ptr = std::ptr::addr_of_mut!(*memfile);
+        unsafe {
+            (*unloaded_ptr).b_ml.ml_mfp = memfile_ptr;
+            (*unloaded_ptr).b_ml.ml_line_count = 3;
+        }
+        let mut bad_range = crate::ex_cmds_defs::ExargT {
+            addr_count: 1,
+            line1: 2,
+            line2: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                cbuffer_process_args(
+                    &mut bad_range,
+                    &mut selected,
+                    &mut line1,
+                    &mut line2,
+                )
+            },
+            crate::vim_defs::FAIL
+        );
+        assert!(selected.is_null());
+        assert_eq!((line1, line2), (-1, -1));
     }
 
     #[test]
