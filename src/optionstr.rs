@@ -1153,6 +1153,57 @@ pub fn expand_set_chars_option(
     (!matches.is_empty()).then_some(matches)
 }
 
+/// Whether completion is currently inside the named colon suboption
+/// (`completing_value_for_subopt`).
+fn completing_value_for_subopt(
+    args: &crate::option_defs::OptexpandT,
+    name_suffix: &[u8],
+) -> bool {
+    // SAFETY: the option-expansion callback contract requires
+    // `oe_xp`, when non-null, to point to a live expansion context.
+    let Some(xp) = (unsafe { args.oe_xp.as_ref() }) else {
+        return false;
+    };
+    let pattern = xp.xp_pattern.as_deref().unwrap_or(&[]);
+    args.oe_set_arg
+        .as_deref()
+        .and_then(|set_arg| set_arg.strip_suffix(pattern))
+        .and_then(|prefix| prefix.strip_suffix(b":"))
+        .is_some_and(|prefix| prefix.ends_with(name_suffix))
+}
+
+/// Expand `'diffopt'`, including values of its `algorithm:` and
+/// `inline:` suboptions (`expand_set_diffopt`).
+pub fn expand_set_diffopt(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    // SAFETY: the option-expansion callback contract requires
+    // `oe_xp`, when non-null, to point to a live expansion context.
+    let pattern = unsafe { args.oe_xp.as_ref() }
+        .and_then(|xp| xp.xp_pattern.as_deref())
+        .unwrap_or(&[]);
+    let completing_suboption = args
+        .oe_set_arg
+        .as_deref()
+        .and_then(|set_arg| set_arg.strip_suffix(pattern))
+        .is_some_and(|prefix| prefix.ends_with(b":"));
+
+    if completing_suboption {
+        if completing_value_for_subopt(args, b"algorithm") {
+            return expand_set_opt_string(
+                args,
+                crate::option_vars::OPT_DIP_ALGORITHM_VALUES,
+            );
+        }
+        if completing_value_for_subopt(args, b"inline") {
+            return expand_set_opt_string(args, crate::option_vars::OPT_DIP_INLINE_VALUES);
+        }
+        return None;
+    }
+
+    expand_set_opt_string(args, crate::option_vars::OPT_DIP_VALUES)
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5560,6 +5611,77 @@ mod tests {
             ..Default::default()
         };
         let _ = expand_set_chars_option(&mut args);
+    }
+
+    fn diffopt_expand_args(
+        set_arg: &[u8],
+        pattern: &[u8],
+    ) -> (
+        crate::cmdexpand_defs::ExpandT,
+        crate::option_defs::OptexpandT,
+    ) {
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_pattern: Some(pattern.to_vec()),
+            ..Default::default()
+        };
+        let args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Diffopt,
+            oe_set_arg: Some(set_arg.to_vec()),
+            ..Default::default()
+        };
+        (xp, args)
+    }
+
+    #[test]
+    fn expand_set_diffopt_returns_top_level_values() {
+        let (mut xp, mut args) = diffopt_expand_args(b"internal,ic", b"ic");
+        args.oe_xp = std::ptr::from_mut(&mut xp);
+        assert_eq!(
+            expand_set_diffopt(&mut args),
+            Some(
+                crate::option_vars::OPT_DIP_VALUES
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn expand_set_diffopt_returns_algorithm_suboption_values() {
+        let (mut xp, mut args) = diffopt_expand_args(b"internal,algorithm:m", b"m");
+        args.oe_xp = std::ptr::from_mut(&mut xp);
+        assert_eq!(
+            expand_set_diffopt(&mut args),
+            Some(
+                crate::option_vars::OPT_DIP_ALGORITHM_VALUES
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn expand_set_diffopt_returns_inline_suboption_values() {
+        let (mut xp, mut args) = diffopt_expand_args(b"inline:", b"");
+        args.oe_xp = std::ptr::from_mut(&mut xp);
+        assert_eq!(
+            expand_set_diffopt(&mut args),
+            Some(
+                crate::option_vars::OPT_DIP_INLINE_VALUES
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn expand_set_diffopt_rejects_an_unknown_suboption_value_list() {
+        let (mut xp, mut args) = diffopt_expand_args(b"context:", b"");
+        args.oe_xp = std::ptr::from_mut(&mut xp);
+        assert_eq!(expand_set_diffopt(&mut args), None);
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);
