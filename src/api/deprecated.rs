@@ -90,6 +90,61 @@ pub unsafe fn nvim_get_option(name: &NvimString, err: &mut Error) -> Object {
     unsafe { get_option_from(std::ptr::null_mut(), OptScope::Global, name, err) }
 }
 
+unsafe fn set_option_to(
+    to: *mut std::ffi::c_void,
+    scope: OptScope,
+    name: &NvimString,
+    value: Object,
+    err: &mut Error,
+) {
+    if name.is_empty() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Invalid option name: '<empty>'".to_string());
+        return;
+    }
+    let opt_idx = crate::option::find_option(name);
+    if opt_idx == crate::option_defs::OptIndex::Invalid {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid option name: '{}'",
+            String::from_utf8_lossy(name)
+        ));
+        return;
+    }
+    let actual_type = value.object_type();
+    let (value, invalid_type) = crate::option::object_as_optval(value);
+    if invalid_type {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid 'value': expected valid option type, got {actual_type:?}"
+        ));
+        return;
+    }
+    let opt_flags = if scope == OptScope::Win
+        && !crate::option::option_has_scope(opt_idx, OptScope::Global)
+    {
+        0
+    } else if scope == OptScope::Global {
+        crate::option_defs::opt_set_flags::OPT_GLOBAL
+    } else {
+        crate::option_defs::opt_set_flags::OPT_LOCAL
+    };
+    if let Some(message) =
+        unsafe { crate::option::set_option_value_for(name, opt_idx, value, opt_flags, scope, to) }
+    {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(message.to_string());
+    }
+}
+
+/// Set the global value of an option (`nvim_set_option`).
+///
+/// # Safety
+/// Forwarded from [`crate::option::set_option_value_for`].
+pub unsafe fn nvim_set_option(name: &NvimString, value: Object, err: &mut Error) {
+    unsafe { set_option_to(std::ptr::null_mut(), OptScope::Global, name, value, err) };
+}
+
 /// Get one buffer line through the deprecated API (`buffer_get_line`).
 ///
 /// # Safety
@@ -243,6 +298,59 @@ mod tests {
             Object::Nil
         ));
         assert_eq!(empty.msg.as_deref(), Some("Invalid option name: '<empty>'"));
+    }
+
+    #[test]
+    fn nvim_set_option_writes_a_real_global_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic;
+        let buf_ptr = Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+        let synblock_ptr = Box::into_raw(Box::new(crate::buffer_defs::SynblockT::default()));
+        let win_ptr = Box::into_raw(Box::new(crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_s: synblock_ptr,
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr) };
+        let mut err = Error::default();
+        unsafe {
+            nvim_set_option(
+                &b"ignorecase".to_vec(),
+                Object::Boolean(true),
+                &mut err,
+            )
+        };
+        let written = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = previous;
+        assert_eq!(written, 1);
+        assert!(!err.is_set());
+        drop(_curwin);
+        drop(_curbuf);
+        unsafe {
+            drop(Box::from_raw(win_ptr));
+            drop(Box::from_raw(synblock_ptr));
+            drop(Box::from_raw(buf_ptr));
+        }
+    }
+
+    #[test]
+    fn nvim_set_option_rejects_invalid_value_types() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut err = Error::default();
+        unsafe {
+            nvim_set_option(
+                &b"ignorecase".to_vec(),
+                Object::Float(1.0),
+                &mut err,
+            )
+        };
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("Invalid 'value': expected valid option type, got Float")
+        );
     }
 
     #[test]
