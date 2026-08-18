@@ -4211,6 +4211,38 @@ pub unsafe fn did_set_ambiwidth(
     unsafe { check_chars_options() }
 }
 
+/// The `'background'` option is changed (`did_set_background`).
+///
+/// Validation and unchanged-value detection are complete. A real
+/// light/dark transition still needs highlight initialization and
+/// colorscheme-variable handling.
+///
+/// # Safety
+/// Forwarded from [`did_set_str_generic`].
+pub unsafe fn did_set_background(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(error) = unsafe { did_set_str_generic(args) } {
+        return Some(error);
+    }
+
+    let old = match &args.os_oldval {
+        crate::option_defs::OptVal::String(value) => value.first().copied().unwrap_or(0),
+        _ => 0,
+    };
+    let current = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_bg.as_deref() }
+        .and_then(|value| value.first().copied())
+        .unwrap_or(0);
+    if old == current {
+        return None;
+    }
+
+    unimplemented!(
+        "did_set_background: a light/dark transition needs highlight initialization"
+    );
+}
+
 /// The `'emoji'` option is changed (`did_set_emoji`).
 ///
 /// Note this validates `'ambiwidth'`, not `'emoji'` itself - both
@@ -4232,6 +4264,60 @@ pub unsafe fn did_set_emoji(_args: &mut crate::option_defs::OptsetT) -> Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BackgroundGuard(Option<Vec<u8>>);
+
+    impl BackgroundGuard {
+        fn set(value: &[u8]) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_bg.replace(value.to_vec()) };
+            BackgroundGuard(previous)
+        }
+    }
+
+    impl Drop for BackgroundGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_bg = self.0.take() };
+        }
+    }
+
+    fn background_args(old: &[u8]) -> crate::option_defs::OptsetT {
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Background,
+            os_varp: unsafe { std::ptr::addr_of_mut!((*options).p_bg) }.cast(),
+            os_oldval: crate::option_defs::OptVal::String(old.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_background_unchanged_value_needs_no_highlight_reinitialization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _background = BackgroundGuard::set(b"dark");
+        let mut args = background_args(b"dark");
+        assert_eq!(unsafe { did_set_background(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_background_rejects_an_invalid_value_before_highlight_work() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _background = BackgroundGuard::set(b"bogus");
+        let mut args = background_args(b"dark");
+        assert_eq!(
+            unsafe { did_set_background(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "highlight initialization")]
+    fn did_set_background_changed_value_needs_highlight_reinitialization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _background = BackgroundGuard::set(b"light");
+        let mut args = background_args(b"dark");
+        unsafe { did_set_background(&mut args) };
+    }
 
     fn set_secure(value: i32) -> i32 {
         // SAFETY: caller holds `global_state_test_lock()` for the

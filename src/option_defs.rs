@@ -8335,6 +8335,8 @@ fn wire_callback_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
 fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
     options[OptIndex::Backupext as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_backupext_or_patchmode);
+    options[OptIndex::Background as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_background);
     options[OptIndex::Breakat as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_breakat);
     options[OptIndex::Cedit as usize].opt_did_set_cb =
@@ -8686,6 +8688,7 @@ mod options_table_tests {
             b"window",
             b"wrap",
             b"backupext",
+            b"background",
             b"breakat",
             b"cedit",
             b"cmdheight",
