@@ -7,8 +7,9 @@
 //! subsystems.
 
 use crate::api::private::defs::{
-    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, StringArray,
+    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, StringArray,
 };
+use crate::option_defs::OptScope;
 
 fn convert_index(index: Integer) -> Integer {
     if index < 0 {
@@ -31,6 +32,62 @@ pub unsafe fn nvim_buf_get_number(buffer: Buffer, err: &mut Error) -> Integer {
     } else {
         i64::from(unsafe { (*buf).handle })
     }
+}
+
+unsafe fn get_option_from(
+    from: *mut std::ffi::c_void,
+    scope: OptScope,
+    name: &NvimString,
+    err: &mut Error,
+) -> Object {
+    if name.is_empty() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Invalid option name: '<empty>'".to_string());
+        return Object::Nil;
+    }
+    let opt_idx = crate::option::find_option(name);
+    if opt_idx == crate::option_defs::OptIndex::Invalid {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid option name: '{}'",
+            String::from_utf8_lossy(name)
+        ));
+        return Object::Nil;
+    }
+    let value = if crate::option::option_has_scope(opt_idx, scope) {
+        unsafe {
+            crate::option::get_option_value_for(
+                opt_idx,
+                if scope == OptScope::Global {
+                    crate::option_defs::opt_set_flags::OPT_GLOBAL
+                } else {
+                    crate::option_defs::opt_set_flags::OPT_LOCAL
+                },
+                scope,
+                from,
+            )
+        }
+    } else {
+        crate::option_defs::OptVal::Nil
+    };
+    if value == crate::option_defs::OptVal::Nil {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid option name: '{}'",
+            String::from_utf8_lossy(name)
+        ));
+        Object::Nil
+    } else {
+        crate::option::optval_as_object(value)
+    }
+}
+
+/// Get the global value of an option (`nvim_get_option`).
+///
+/// # Safety
+/// Forwarded from [`crate::option::get_option_value_for`].
+pub unsafe fn nvim_get_option(name: &NvimString, err: &mut Error) -> Object {
+    unsafe { get_option_from(std::ptr::null_mut(), OptScope::Global, name, err) }
 }
 
 /// Get one buffer line through the deprecated API (`buffer_get_line`).
@@ -154,6 +211,38 @@ mod tests {
         let mut err = Error::default();
         assert_eq!(unsafe { nvim_buf_get_number(99, &mut err) }, 0);
         assert_eq!(err.msg.as_deref(), Some("Invalid buffer id: 99"));
+    }
+
+    #[test]
+    fn nvim_get_option_returns_a_real_global_option_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = 1;
+        let mut err = Error::default();
+        let value = unsafe { nvim_get_option(&b"ignorecase".to_vec(), &mut err) };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = previous;
+        assert!(matches!(value, Object::Boolean(true)));
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_get_option_rejects_unknown_and_empty_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut unknown = Error::default();
+        assert!(matches!(
+            unsafe { nvim_get_option(&b"nero_unknown_option".to_vec(), &mut unknown) },
+            Object::Nil
+        ));
+        assert_eq!(
+            unknown.msg.as_deref(),
+            Some("Invalid option name: 'nero_unknown_option'")
+        );
+        let mut empty = Error::default();
+        assert!(matches!(
+            unsafe { nvim_get_option(&Vec::new(), &mut empty) },
+            Object::Nil
+        ));
+        assert_eq!(empty.msg.as_deref(), Some("Invalid option name: '<empty>'"));
     }
 
     #[test]
