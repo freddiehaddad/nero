@@ -8385,6 +8385,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::option::did_set_winheight);
     options[OptIndex::Winminwidth as usize].opt_did_set_cb =
         Some(crate::window::did_set_winminwidth);
+    options[OptIndex::Winwidth as usize].opt_did_set_cb =
+        Some(crate::option::did_set_winwidth);
 }
 
 #[cfg(test)]
@@ -8705,6 +8707,7 @@ mod options_table_tests {
             b"winminheight",
             b"winheight",
             b"winminwidth",
+            b"winwidth",
         ];
         if cfg!(windows) {
             expected.push(b"completeslash");
