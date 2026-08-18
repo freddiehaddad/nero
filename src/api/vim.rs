@@ -5,7 +5,8 @@
 //!
 //! Translated: [`nvim_list_bufs`], [`nvim_list_wins`], [`nvim_list_tabpages`],
 //! [`nvim_get_current_win`]/
-//! [`nvim_get_current_buf`]/[`nvim_get_current_tabpage`] (harvested ahead of the rest of this
+//! [`nvim_get_current_buf`]/[`nvim_get_current_tabpage`], [`nvim_get_current_line`]
+//! (harvested ahead of the rest of this
 //! file, matching the established "one tractable function ahead of a
 //! huge file" precedent used elsewhere in this crate, e.g.
 //! `ex_docmd.rs`; `nvim_get_current_win` is also `api/tabpage.c`'s own
@@ -108,6 +109,21 @@ pub unsafe fn nvim_get_current_buf() -> Buffer {
 pub unsafe fn nvim_get_current_tabpage() -> Tabpage {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { &*crate::globals::GLOBALS.get_mut().curtab }.handle
+}
+
+/// Get the current cursor line (`nvim_get_current_line`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` and `GLOBALS.curwin` must point to live objects.
+pub unsafe fn nvim_get_current_line(err: &mut Error) -> NvimString {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    unsafe {
+        crate::api::deprecated::buffer_get_line(
+            (*globals.curbuf).handle,
+            i64::from((*globals.curwin).w_cursor.lnum) - 1,
+            err,
+        )
+    }
 }
 
 /// Whether byte length `len` passes `nvim_strwidth`'s own length
@@ -341,6 +357,49 @@ mod tests {
             )
         };
         assert!(unsafe { nvim_list_tabpages() }.is_empty());
+    }
+
+    #[test]
+    fn nvim_get_current_line_returns_the_cursor_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf_ptr = Box::into_raw(Box::new(BufT::default()));
+        assert_eq!(unsafe { crate::memline::ml_open(&mut *buf_ptr) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut *buf_ptr, 1, b"first\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut *buf_ptr, 1, b"second\0", 7, false) },
+            crate::vim_defs::OK
+        );
+        let win_ptr = Box::into_raw(Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT {
+                lnum: 2,
+                col: 0,
+                coladd: 0,
+            },
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr) };
+        let _lastbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr) };
+        let mut err = Error::default();
+
+        let line = unsafe { nvim_get_current_line(&mut err) };
+
+        assert_eq!(line, b"second");
+        assert!(!err.is_set());
+        unsafe {
+            let mfp = (*buf_ptr).b_ml.ml_mfp;
+            (*buf_ptr).b_ml.ml_mfp = std::ptr::null_mut();
+            crate::memfile::mf_close(*Box::from_raw(mfp), false);
+            drop(Box::from_raw(win_ptr));
+            drop(Box::from_raw(buf_ptr));
+        }
     }
 
     struct HighlightNamespaceGuard {
