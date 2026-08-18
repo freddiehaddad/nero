@@ -3805,6 +3805,55 @@ pub unsafe fn set_option_value_handle_tty(
     unsafe { set_option_value(opt_idx, value, opt_flags) }
 }
 
+/// Set an option value for an explicit scope target
+/// (`set_option_value_for`).
+///
+/// Global/current-context writes and the original's special
+/// non-current-tab `'cmdheight'` path are complete. Switching to a
+/// different buffer/window still needs `switch_option_context`.
+///
+/// # Safety
+/// `from` must point to a live value matching `scope`; forwarded from
+/// [`set_option_value_handle_tty`].
+#[must_use]
+pub unsafe fn set_option_value_for(
+    name: &[u8],
+    opt_idx: OptIndex,
+    value: OptVal,
+    opt_flags: u32,
+    scope: OptScope,
+    from: *mut c_void,
+) -> Option<&'static str> {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (curbuf, curwin, curtab) =
+        unsafe { ((*globals).curbuf, (*globals).curwin, (*globals).curtab) };
+
+    if scope == OptScope::Tab && from.cast::<crate::buffer_defs::TabpageT>() != curtab {
+        debug_assert!(opt_idx == OptIndex::Cmdheight);
+        let OptVal::Number(number) = value else {
+            return Some(crate::errors::e_invarg);
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*from.cast::<crate::buffer_defs::TabpageT>()).tp_ch_used = number };
+        return None;
+    }
+
+    match scope {
+        OptScope::Global | OptScope::Tab => {}
+        OptScope::Win if from.cast::<WinT>() == curwin => {}
+        OptScope::Buf if from.cast::<BufT>() == curbuf => {}
+        OptScope::Win | OptScope::Buf => {
+            unimplemented!(
+                "set_option_value_for: cross-window/buffer writes need switch_option_context"
+            )
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_option_value_handle_tty(name, opt_idx, value, opt_flags) }
+}
+
 /// Set an option directly without validation or side effects
 /// (`set_option_direct`).
 ///
@@ -7228,7 +7277,15 @@ mod did_set_option_tests {
         ov.p_mouse = None;
         ov.p_flp = None;
         ov.p_wbr = None;
-        for &idx in &[OptIndex::Aleph, OptIndex::Cdhome, OptIndex::Backupext, OptIndex::Allowrevins, OptIndex::Arabic]
+        for &idx in &[
+            OptIndex::Aleph,
+            OptIndex::Cdhome,
+            OptIndex::Backupext,
+            OptIndex::Allowrevins,
+            OptIndex::Arabic,
+            OptIndex::Scrolloff,
+            OptIndex::Tabstop,
+        ]
         {
             reset_option_was_set(idx);
             let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
@@ -7936,6 +7993,90 @@ mod did_set_option_tests {
     }
 
     #[test]
+    fn set_option_value_for_handles_noncurrent_tab_cmdheight_directly() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut current = crate::buffer_defs::TabpageT::default();
+        let current_ptr = std::ptr::from_mut(&mut current);
+        let mut target = crate::buffer_defs::TabpageT::default();
+        let target_ptr = std::ptr::from_mut(&mut target);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, current_ptr)
+        };
+
+        assert_eq!(
+            unsafe {
+                set_option_value_for(
+                    b"cmdheight",
+                    OptIndex::Cmdheight,
+                    OptVal::Number(7),
+                    0,
+                    OptScope::Tab,
+                    target_ptr.cast(),
+                )
+            },
+            None
+        );
+        assert_eq!(unsafe { (*target_ptr).tp_ch_used }, 7);
+
+        assert_eq!(
+            unsafe {
+                set_option_value_for(
+                    b"cmdheight",
+                    OptIndex::Cmdheight,
+                    OptVal::String(b"seven".to_vec()),
+                    0,
+                    OptScope::Tab,
+                    target_ptr.cast(),
+                )
+            },
+            Some(crate::errors::e_invarg)
+        );
+    }
+
+    #[test]
+    fn set_option_value_for_uses_the_already_current_buffer_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+        unsafe { (*buf).b_p_ts = 8 };
+        assert_eq!(
+            unsafe {
+                set_option_value_for(
+                    b"tabstop",
+                    OptIndex::Tabstop,
+                    OptVal::Number(3),
+                    crate::option_defs::opt_set_flags::OPT_LOCAL,
+                    OptScope::Buf,
+                    buf.cast(),
+                )
+            },
+            None
+        );
+        assert_eq!(unsafe { (*buf).b_p_ts }, 3);
+        reset_shared_state();
+    }
+
+    #[test]
+    #[should_panic(expected = "switch_option_context")]
+    fn set_option_value_for_cross_window_needs_context_switching() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        let mut target = WinT::default();
+        let target_ptr = std::ptr::from_mut(&mut target);
+        unsafe {
+            let _ = set_option_value_for(
+                b"scrolloff",
+                OptIndex::Scrolloff,
+                OptVal::Number(2),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                OptScope::Win,
+                target_ptr.cast(),
+            );
+        };
+    }
+
+    #[test]
     fn set_option_direct_skips_hidden_options_and_accepts_invalid_numeric_values() {
         let _lock = crate::globals::global_state_test_lock();
         reset_shared_state();
@@ -7973,6 +8114,7 @@ mod did_set_option_tests {
             None
         );
         assert_eq!(unsafe { (*win).w_onebuf_opt.wo_so }, -1);
+        reset_shared_state();
     }
 
     #[test]
