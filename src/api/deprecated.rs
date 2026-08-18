@@ -6,7 +6,9 @@
 //! source file remain with their respective not-yet-translated API
 //! subsystems.
 
-use crate::api::private::defs::{Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString};
+use crate::api::private::defs::{
+    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, StringArray,
+};
 
 fn convert_index(index: Integer) -> Integer {
     if index < 0 {
@@ -30,6 +32,35 @@ pub unsafe fn buffer_get_line(buffer: Buffer, index: Integer, err: &mut Error) -
     } else {
         lines.into_iter().next().unwrap_or_default()
     }
+}
+
+fn convert_slice_range(
+    start: Integer,
+    end: Integer,
+    include_start: Boolean,
+    include_end: Boolean,
+) -> (Integer, Integer) {
+    (
+        convert_index(start) + i64::from(!include_start),
+        convert_index(end) + i64::from(include_end),
+    )
+}
+
+/// Get a buffer-line range through the deprecated API
+/// (`buffer_get_line_slice`).
+///
+/// # Safety
+/// Forwarded from [`crate::api::buffer::nvim_buf_get_lines`].
+pub unsafe fn buffer_get_line_slice(
+    buffer: Buffer,
+    start: Integer,
+    end: Integer,
+    include_start: Boolean,
+    include_end: Boolean,
+    err: &mut Error,
+) -> StringArray {
+    let (start, end) = convert_slice_range(start, end, include_start, include_end);
+    unsafe { crate::api::buffer::nvim_buf_get_lines(0, buffer, start, end, false, err) }
 }
 
 /// Get a highlight definition by group ID (`nvim_get_hl_by_id`).
@@ -92,6 +123,29 @@ mod tests {
         let mut err = Error::default();
         let line = unsafe { buffer_get_line(999, 0, &mut err) };
         assert!(line.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid buffer id: 999"));
+    }
+
+    #[test]
+    fn convert_slice_range_matches_the_legacy_index_rules() {
+        assert_eq!(convert_slice_range(0, 3, true, false), (0, 3));
+        assert_eq!(convert_slice_range(0, 3, false, true), (1, 4));
+        assert_eq!(convert_slice_range(-3, -1, true, true), (-4, -1));
+        assert_eq!(convert_slice_range(-3, -1, false, false), (-3, -2));
+    }
+
+    #[test]
+    fn buffer_get_line_slice_returns_empty_and_an_error_for_an_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut err = Error::default();
+        let lines = unsafe { buffer_get_line_slice(999, 0, -1, true, false, &mut err) };
+        assert!(lines.is_empty());
         assert_eq!(err.msg.as_deref(), Some("Invalid buffer id: 999"));
     }
 
