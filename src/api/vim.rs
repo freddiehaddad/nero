@@ -265,6 +265,43 @@ pub unsafe fn nvim_get_mark(name: &NvimString, err: &mut Error) -> Array {
     ]
 }
 
+/// Delete an uppercase/file mark (`nvim_del_mark`).
+///
+/// # Safety
+/// Forwarded from [`crate::api::private::helpers::set_mark`].
+pub unsafe fn nvim_del_mark(name: &NvimString, err: &mut Error) -> Boolean {
+    if name.len() != 1 {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(if name.is_empty() {
+            "Invalid mark name (must be a single char)".to_string()
+        } else {
+            format!(
+                "Invalid mark name (must be a single char): '{}'",
+                String::from_utf8_lossy(name)
+            )
+        });
+        return false;
+    }
+    let mark = name[0];
+    if !mark.is_ascii_uppercase() && !mark.is_ascii_digit() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid mark name (must be file/uppercase): '{}'",
+            String::from_utf8_lossy(name)
+        ));
+        return false;
+    }
+    unsafe {
+        crate::api::private::helpers::set_mark(
+            std::ptr::null_mut(),
+            mark,
+            0,
+            0,
+            err,
+        )
+    }
+}
+
 /// Return the complete named RGB color map (`nvim_get_color_map`).
 #[must_use]
 pub fn nvim_get_color_map() -> Dict {
@@ -1142,6 +1179,36 @@ mod tests {
             err.msg.as_deref(),
             Some("Invalid mark name (must be file/uppercase): 'a'")
         );
+    }
+
+    #[test]
+    fn nvim_del_mark_removes_an_uppercase_mark() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved_marks = unsafe { crate::mark::NAMEDFM.get_mut() }.clone();
+        let index = crate::mark::mark_global_index(b'R') as usize;
+        let marks = unsafe { crate::mark::NAMEDFM.get_mut() };
+        marks[index].fmark.mark.lnum = 9;
+        let buf = Box::into_raw(Box::new(BufT {
+            handle: 1,
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf) };
+        let _lastbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf) };
+        let mut err = Error::default();
+        let deleted = unsafe { nvim_del_mark(&b"R".to_vec(), &mut err) };
+        let cleared = unsafe { crate::mark::NAMEDFM.get_mut() }[index]
+            .fmark
+            .mark
+            .lnum;
+        *unsafe { crate::mark::NAMEDFM.get_mut() } = saved_marks;
+        assert!(deleted);
+        assert_eq!(cleared, 0);
+        assert!(!err.is_set());
+        drop(_lastbuf);
+        drop(_curbuf);
+        unsafe { drop(Box::from_raw(buf)) };
     }
 
     struct HighlightNamespaceGuard {
