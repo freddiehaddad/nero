@@ -3,8 +3,8 @@
 //! machinery, the msgpack-rpc dispatch layer, command execution, and
 //! the Lua host, none of which are wired into this API layer yet).
 //!
-//! Translated: [`nvim_get_current_win`]/[`nvim_get_current_buf`]/
-//! [`nvim_get_current_tabpage`] (harvested ahead of the rest of this
+//! Translated: [`nvim_list_bufs`], [`nvim_get_current_win`]/
+//! [`nvim_get_current_buf`]/[`nvim_get_current_tabpage`] (harvested ahead of the rest of this
 //! file, matching the established "one tractable function ahead of a
 //! huge file" precedent used elsewhere in this crate, e.g.
 //! `ex_docmd.rs`; `nvim_get_current_win` is also `api/tabpage.c`'s own
@@ -13,8 +13,25 @@
 //! the already-existing `mbyte.rs::mb_string2cells`).
 
 use crate::api::private::defs::{
-    Buffer, Error, ErrorType, Integer, NvimString, Tabpage, Window,
+    Array, Buffer, Error, ErrorType, Integer, NvimString, Object, Tabpage, Window,
 };
+
+/// List every current buffer, including unlisted and unloaded buffers
+/// (`nvim_list_bufs`).
+///
+/// # Safety
+/// `GLOBALS.firstbuf` and each `b_next` link must form a live buffer
+/// list.
+#[must_use]
+pub unsafe fn nvim_list_bufs() -> Array {
+    let mut result = Vec::new();
+    let mut buf = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+    while !buf.is_null() {
+        result.push(Object::Buffer(unsafe { (*buf).handle }));
+        buf = unsafe { (*buf).b_next };
+    }
+    result
+}
 
 /// Get the current window's handle (`nvim_get_current_win`).
 ///
@@ -138,6 +155,44 @@ pub unsafe fn nvim_set_hl_ns_fast(ns_id: Integer) {
 mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, TabpageT, WinT};
+
+    #[test]
+    fn nvim_list_bufs_returns_every_linked_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = BufT {
+            handle: 72,
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = BufT {
+            handle: 71,
+            b_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let _firstbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstbuf, first_ptr)
+        };
+
+        let buffers = unsafe { nvim_list_bufs() };
+
+        assert!(matches!(
+            buffers.as_slice(),
+            [Object::Buffer(71), Object::Buffer(72)]
+        ));
+    }
+
+    #[test]
+    fn nvim_list_bufs_returns_empty_for_an_empty_buffer_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _firstbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(unsafe { nvim_list_bufs() }.is_empty());
+    }
 
     struct HighlightNamespaceGuard {
         global: i32,
