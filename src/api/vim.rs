@@ -76,6 +76,18 @@ pub unsafe fn nvim_get_color_by_name(name: &NvimString) -> Integer {
     i64::from(unsafe { crate::highlight_group::name_to_color(name) }.0)
 }
 
+/// Return the complete named RGB color map (`nvim_get_color_map`).
+#[must_use]
+pub fn nvim_get_color_map() -> Dict {
+    crate::highlight_group::COLOR_NAME_TABLE
+        .iter()
+        .map(|(name, value)| crate::api::private::defs::KeyValuePair {
+            key: name.to_vec(),
+            value: Object::Integer(i64::from(*value)),
+        })
+        .collect()
+}
+
 /// List every current buffer, including unlisted and unloaded buffers
 /// (`nvim_list_bufs`).
 ///
@@ -557,6 +569,20 @@ mod tests {
             unsafe { nvim_get_color_by_name(&b"not-a-color".to_vec()) },
             -1
         );
+    }
+
+    #[test]
+    fn nvim_get_color_map_returns_every_named_color() {
+        let colors = nvim_get_color_map();
+        assert_eq!(colors.len(), 707);
+        assert!(colors.iter().any(|pair| {
+            pair.key == b"RebeccaPurple"
+                && matches!(pair.value, Object::Integer(0x663399))
+        }));
+        assert!(colors.iter().any(|pair| {
+            pair.key == b"YellowGreen"
+                && matches!(pair.value, Object::Integer(0x9acd32))
+        }));
     }
 
     struct HighlightNamespaceGuard {
