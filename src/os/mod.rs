@@ -6,6 +6,7 @@
 pub mod env;
 pub mod fs;
 pub mod fs_defs;
+pub mod input;
 pub mod lang;
 // The original `src/nvim/os/os.h` really does live inside the `os/`
 // directory, so this module naturally mirrors it as `os::os` - kept
