@@ -30,6 +30,22 @@ use crate::api::private::defs::{
 };
 use crate::api::private::helpers::find_buffer_by_handle;
 
+/// Resolve a buffer and ensure its memline is loaded
+/// (`api_buf_ensure_loaded`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`].
+pub unsafe fn api_buf_ensure_loaded(buf: Buffer, err: &mut Error) -> *mut crate::buffer_defs::BufT {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return std::ptr::null_mut();
+    }
+    if unsafe { (*buf).b_ml.ml_mfp }.is_null() {
+        unimplemented!("api_buf_ensure_loaded: loading an unloaded buffer needs buf_ensure_loaded");
+    }
+    buf
+}
+
 /// Return buffer lines from the 0-based, end-exclusive range
 /// `[start, end)` (`nvim_buf_get_lines`).
 ///
@@ -321,6 +337,37 @@ pub unsafe fn nvim_buf_del_var(buf: Buffer, name: &NvimString, err: &mut Error) 
             err,
         )
     };
+}
+
+/// Set or delete a named mark in a buffer (`nvim_buf_set_mark`).
+///
+/// # Safety
+/// Forwarded from [`api_buf_ensure_loaded`] and
+/// [`crate::api::private::helpers::set_mark`].
+pub unsafe fn nvim_buf_set_mark(
+    buf: Buffer,
+    name: &NvimString,
+    line: Integer,
+    col: Integer,
+    err: &mut Error,
+) -> Boolean {
+    let buf = unsafe { api_buf_ensure_loaded(buf, err) };
+    if buf.is_null() {
+        return false;
+    }
+    if name.len() != 1 {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(if name.is_empty() {
+            "Invalid mark name (must be a single char)".to_string()
+        } else {
+            format!(
+                "Invalid mark name (must be a single char): '{}'",
+                String::from_utf8_lossy(name)
+            )
+        });
+        return false;
+    }
+    unsafe { crate::api::private::helpers::set_mark(buf, name[0], line, col, err) }
 }
 
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
@@ -757,6 +804,33 @@ mod tests {
         assert!(!err.is_set());
         fx.buf_mut().b_vars = std::ptr::null_mut();
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn nvim_buf_set_mark_sets_and_deletes_a_local_mark() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(53);
+        fx.buf_mut().b_ml.ml_line_count = 10;
+        let mut mfp = Box::new(test_memfile());
+        fx.buf_mut().b_ml.ml_mfp = std::ptr::addr_of_mut!(*mfp);
+        let mut err = Error::default();
+        assert!(unsafe {
+            nvim_buf_set_mark(fx.handle(), &b"a".to_vec(), 4, 2, &mut err)
+        });
+        assert_eq!(
+            fx.buf_mut().b_namedm[0].mark,
+            crate::pos_defs::PosT {
+                lnum: 4,
+                col: 2,
+                coladd: 0
+            }
+        );
+        assert!(unsafe {
+            nvim_buf_set_mark(fx.handle(), &b"a".to_vec(), 0, 99, &mut err)
+        });
+        assert_eq!(fx.buf_mut().b_namedm[0].mark.lnum, 0);
+        assert!(!err.is_set());
+        fx.buf_mut().b_ml.ml_mfp = std::ptr::null_mut();
     }
 
     #[test]
