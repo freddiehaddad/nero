@@ -88,6 +88,9 @@ pub unsafe fn object_to_color(
     /// Typed API highlight dictionary (`Dict(highlight)`).
     #[derive(Debug, Clone, Default)]
     pub struct HighlightDict {
+        pub force: Option<bool>,
+        pub update: Option<bool>,
+        pub url: Option<Vec<u8>>,
         pub reverse: Option<bool>,
         pub bold: Option<bool>,
         pub italic: Option<bool>,

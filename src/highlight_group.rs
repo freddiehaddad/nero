@@ -1662,6 +1662,7 @@ pub unsafe fn highlight_attr_set_all() {
             } else if group.sg_rgb_bg_idx == COLOR_IDX_BG {
                 group.sg_rgb_bg = normal_bg;
             }
+
             if group.sg_rgb_fg_idx == COLOR_IDX_FG {
                 group.sg_rgb_fg = normal_fg;
             } else if group.sg_rgb_fg_idx == COLOR_IDX_BG {
@@ -1674,6 +1675,162 @@ pub unsafe fn highlight_attr_set_all() {
             }
         }
         unsafe { set_hl_attr(idx) };
+    }
+}
+
+/// Set the global definition of one highlight group (`set_hl_group`).
+///
+/// Remote-UI default-color and mode-info notifications are deferred
+/// with the UI transport; all group, attribute, Normal-color, redraw,
+/// and script-context state is updated.
+///
+/// # Safety
+/// `id` must identify a live highlight group. Mutates shared
+/// highlight/group/global state.
+pub unsafe fn set_hl_group(
+    id: i32,
+    attrs: crate::highlight_defs::HlAttrs,
+    dict: &crate::highlight::HighlightDict,
+    link_id: i32,
+) {
+    use crate::highlight_defs::HL_DEFAULT;
+    let idx = id - 1;
+    let is_default = attrs.rgb_ae_attr & HL_DEFAULT as i32 != 0;
+    if is_default
+        && unsafe { hl_has_settings(idx, true) }
+        && !dict.force.unwrap_or(false)
+    {
+        return;
+    }
+
+    let (old_link, linked_indices) = {
+        let table = unsafe { HL_TABLE.get_mut() };
+        let old_link = table.items[idx as usize].sg_link;
+        let linked_indices = if old_link > 0 {
+            let linked = &table.items[(old_link - 1) as usize];
+            Some((
+                linked.sg_rgb_fg_idx,
+                linked.sg_rgb_bg_idx,
+                linked.sg_rgb_sp_idx,
+            ))
+        } else {
+            None
+        };
+        (old_link, linked_indices)
+    };
+    let current_sctx = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+    let mut script_ctx = current_sctx;
+    script_ctx.sc_lnum += crate::runtime::sourcing_lnum();
+    let update = dict.update.unwrap_or(false);
+
+    let color_index = |value: Option<&crate::api::private::defs::Object>,
+                       color: i32,
+                       inherited: Option<i32>| {
+        use crate::api::private::defs::Object;
+        if let Some(value) = value {
+            if color < 0 {
+                COLOR_IDX_NONE
+            } else if let Object::String(name) = value {
+                if name.is_empty() {
+                    COLOR_IDX_HEX
+                } else {
+                    unsafe { name_to_color(name) }.1
+                }
+            } else {
+                COLOR_IDX_HEX
+            }
+        } else if !update {
+            COLOR_IDX_NONE
+        } else if old_link > 0 && color >= 0 {
+            inherited.filter(|index| *index != COLOR_IDX_NONE).unwrap_or(COLOR_IDX_HEX)
+        } else {
+            COLOR_IDX_NONE
+        }
+    };
+    let fg_obj = dict.fg.as_ref().or(dict.foreground.as_ref());
+    let bg_obj = dict.bg.as_ref().or(dict.background.as_ref());
+    let sp_obj = dict.sp.as_ref().or(dict.special.as_ref());
+    let fg_idx = color_index(fg_obj, attrs.rgb_fg_color, linked_indices.map(|v| v.0));
+    let bg_idx = color_index(bg_obj, attrs.rgb_bg_color, linked_indices.map(|v| v.1));
+    let sp_idx = color_index(sp_obj, attrs.rgb_sp_color, linked_indices.map(|v| v.2));
+    let font = if attrs.font >= 0 {
+        unsafe { crate::highlight::hl_get_font(attrs.font) }
+    } else {
+        None
+    };
+
+    {
+        let group = &mut unsafe { HL_TABLE.get_mut() }.items[idx as usize];
+        group.sg_cleared = false;
+        if link_id > 0 {
+            group.sg_link = link_id;
+            group.sg_script_ctx = script_ctx;
+            group.sg_set |= sg_set::LINK;
+            if is_default {
+                group.sg_deflink = link_id;
+                group.sg_deflink_sctx = script_ctx;
+            }
+        } else {
+            group.sg_link = 0;
+        }
+        group.sg_gui = attrs.rgb_ae_attr & !(HL_DEFAULT as i32);
+        group.sg_rgb_fg = attrs.rgb_fg_color;
+        group.sg_rgb_bg = attrs.rgb_bg_color;
+        group.sg_rgb_sp = attrs.rgb_sp_color;
+        group.sg_rgb_fg_idx = fg_idx;
+        group.sg_rgb_bg_idx = bg_idx;
+        group.sg_rgb_sp_idx = sp_idx;
+        group.sg_cterm = attrs.cterm_ae_attr & !(HL_DEFAULT as i32);
+        group.sg_cterm_bg = i32::from(attrs.cterm_bg_color);
+        group.sg_cterm_fg = i32::from(attrs.cterm_fg_color);
+        group.sg_cterm_bold = group.sg_cterm & crate::highlight_defs::HL_BOLD as i32 != 0;
+        if attrs.hl_blend != -1 {
+            group.sg_blend = attrs.hl_blend;
+        } else if !update {
+            group.sg_blend = -1;
+        }
+        if attrs.font >= 0 {
+            group.sg_font = font;
+        } else if dict.font.is_some() || !update {
+            group.sg_font = None;
+        }
+        group.sg_script_ctx = script_ctx;
+    }
+
+    let attr = unsafe { crate::highlight::hl_get_syn_attr(0, id, attrs) };
+    unsafe { HL_TABLE.get_mut() }.items[idx as usize].sg_attr = attr;
+    let is_normal = unsafe { HL_TABLE.get_mut() }.items[idx as usize]
+        .sg_name_u
+        .eq(b"NORMAL");
+    if is_normal {
+        let (old_fg, old_bg, old_sp) = unsafe {
+            (
+                *crate::highlight::NORMAL_FG.get_mut(),
+                *crate::highlight::NORMAL_BG.get_mut(),
+                *crate::highlight::NORMAL_SP.get_mut(),
+            )
+        };
+        unsafe {
+            *crate::highlight::CTERM_NORMAL_FG_COLOR.get_mut() =
+                i32::from(attrs.cterm_fg_color);
+            *crate::highlight::CTERM_NORMAL_BG_COLOR.get_mut() =
+                i32::from(attrs.cterm_bg_color);
+            *crate::highlight::NORMAL_FG.get_mut() = attrs.rgb_fg_color;
+            *crate::highlight::NORMAL_BG.get_mut() = attrs.rgb_bg_color;
+            *crate::highlight::NORMAL_SP.get_mut() = attrs.rgb_sp_color;
+        }
+        if old_fg != attrs.rgb_fg_color
+            || old_bg != attrs.rgb_bg_color
+            || old_sp != attrs.rgb_sp_color
+        {
+            unsafe { highlight_attr_set_all() };
+        }
+    } else if crate::cursor_shape::cursor_mode_uses_syn_id(id) {
+        unsafe { crate::ui::ui_mode_info_set() };
+    }
+    unsafe {
+        crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_NOT_VALID);
+        crate::globals::GLOBALS.get_mut().need_highlight_changed = true;
     }
 }
 
@@ -1777,6 +1934,50 @@ mod tests {
         assert_eq!(named.0, 0x663399);
         assert!(named.1 >= 0);
         assert_eq!(invalid, (-1, COLOR_IDX_NONE));
+    }
+
+    #[test]
+    fn set_hl_group_updates_global_group_state_and_attribute_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = HlTableGuard::with_names(&[b"Example", b"Target"]);
+        let _attrs = AttributeTableGuard::empty();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let old_changed = unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed;
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_BOLD as i32,
+            cterm_ae_attr: crate::highlight_defs::HL_ITALIC as i32,
+            rgb_fg_color: 0x663399,
+            cterm_fg_color: 2,
+            hl_blend: 25,
+            font: unsafe { crate::highlight::hl_add_font_idx(b"NeroGroupFont") },
+            ..Default::default()
+        };
+        let dict = crate::highlight::HighlightDict {
+            fg: Some(crate::api::private::defs::Object::String(
+                b"RebeccaPurple".to_vec(),
+            )),
+            font: Some(b"NeroGroupFont".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { set_hl_group(1, attrs, &dict, 2) };
+
+        let group = unsafe { HL_TABLE.get_mut() }.items[0].clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed = old_changed;
+        assert_eq!(group.sg_link, 2);
+        assert_eq!(group.sg_gui, crate::highlight_defs::HL_BOLD as i32);
+        assert_eq!(group.sg_cterm, crate::highlight_defs::HL_ITALIC as i32);
+        assert_eq!(group.sg_rgb_fg, 0x663399);
+        assert!(group.sg_rgb_fg_idx >= 0);
+        assert_eq!(group.sg_cterm_fg, 2);
+        assert_eq!(group.sg_blend, 25);
+        assert_eq!(group.sg_font.as_deref(), Some(b"NeroGroupFont".as_slice()));
+        assert!(group.sg_attr > 0);
     }
 
     /// Installs a table of groups AND the matching uppercase name
