@@ -1590,22 +1590,15 @@ pub unsafe fn do_syntax_autocmd(buf: *mut BufT, value_changed: bool) {
 
 /// Handle side-effects of setting an option (`did_set_option`).
 ///
-/// The `opt.opt_did_set_cb.is_some()` branch `unimplemented!()`s at
-/// the exact point a real per-option callback would be invoked -
-/// currently unreachable for EVERY option in this crate's own
-/// [`OPTIONS`] table (all 377 entries have `opt_did_set_cb: None`
-/// today, matching `option_defs.rs`'s own module doc: none of the
-/// ~150 real `did_set_*`/`expand_*` callback FUNCTIONS have been
-/// translated yet, so there is nothing for any entry's own
-/// `opt_did_set_cb` to reference - this is a stronger statement than
-/// the original's own "188/377 options have one, 189 don't" split,
-/// which describes upstream neovim's real callback population, not
-/// this crate's own not-yet-populated one). Kept as a real branch
-/// (not omitted) so a future session translating even a single real
-/// callback and wiring it into that option's own [`OPTIONS`] entry
-/// makes this genuinely reachable, with no restructuring needed here.
+/// Dispatches every translated per-option callback wired into
+/// [`OPTIONS`], carrying the real old/new values and the current
+/// buffer/window pointers through [`crate::option_defs::OptsetT`].
+/// Callback outputs
+/// (`os_value_changed`/`os_value_checked`/`os_restore_chartab`) feed
+/// the same later side effects and rollback handling as in the
+/// original.
 ///
-/// Also `unimplemented!()`s for 2 further real-but-substantial
+/// `unimplemented!()`s for 2 further real-but-substantial
 /// branches: `curwin.w_s.b_p_spl` (`'spelllang'`, needs
 /// `do_spelllang_source`'s own `source_runtime_vim_lua` - real file
 /// I/O/script sourcing) and `p_wbr`/`curwin.w_onebuf_opt.wo_wbr`
@@ -1614,23 +1607,10 @@ pub unsafe fn do_syntax_autocmd(buf: *mut BufT, value_changed: bool) {
 /// substantially more than a redraw hint unlike every other omitted
 /// call in this function's own tail).
 ///
-/// Since nothing in this scope ever runs a real per-option callback,
-/// `value_changed`/`value_checked`/`restore_chartab` (the callback's
-/// own `os_value_changed`/`os_value_checked`/`os_restore_chartab`
-/// outputs) can only ever be `false` here - kept as real, named
-/// bindings (not inlined `false` literals at each use) so a future
-/// session wiring up even one real callback can just start assigning
-/// them, with no restructuring needed here. The original's own
-/// `buf_init_chartab(curbuf, true)` call (reached only when
-/// `restore_chartab` is true) is therefore unreachable in this scope
-/// and not translated.
-///
 /// Drops `errbuf`/`errbuflen` from the original's own signature
-/// entirely: both are used ONLY to populate `optset_T`'s own fields
-/// for the (here, `unimplemented!()`'d) per-option callback dispatch;
-/// this function's own 3 real error messages are all static
-/// `&'static str` constants, never written through a caller-supplied
-/// buffer.
+/// entirely. Callbacks that need a formatted diagnostic keep their
+/// own `OptsetT.os_errbuf`; no translated caller supplies a separate
+/// scratch buffer yet.
 ///
 /// Returns `None` on success, `Some(message)` on error - collapsing
 /// the original's own `NULL`/non-`NULL` `const char *` return into an
@@ -1657,8 +1637,15 @@ pub unsafe fn did_set_option(
 ) -> Option<&'static str> {
     let opt = get_option(opt_idx);
     let mut errmsg: Option<&'static str> = None;
-    let value_changed = false;
-    let value_checked = false;
+    let mut value_changed = false;
+    let mut value_checked = false;
+    let mut restore_chartab = false;
+
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { (*globals).curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { (*globals).curwin };
 
     // Disallow changing some options from secure mode.
     // SAFETY: momentary read.
@@ -1680,13 +1667,28 @@ pub unsafe fn did_set_option(
         && unsafe { check_illegal_path_names(s, opt.flags) }
     {
         errmsg = Some(crate::errors::e_invarg);
-    } else if opt.opt_did_set_cb.is_some() {
+    } else if let Some(callback) = opt.opt_did_set_cb {
         // Invoke the option specific callback function to validate and
         // apply the new value.
-        unimplemented!(
-            "did_set_option: {opt_idx:?} has a real opt_did_set_cb - only the 189/377 \
-             options without one are translated so far"
-        );
+        let mut callback_args = crate::option_defs::OptsetT {
+            os_varp: varp,
+            os_idx: opt_idx,
+            os_flags: opt_flags as i32,
+            os_oldval: old_value.clone(),
+            os_newval: new_value.clone(),
+            os_buf: curbuf.cast(),
+            os_win: curwin.cast(),
+            ..Default::default()
+        };
+        // SAFETY: the callback receives the same live pointers covered
+        // by this function's own safety contract.
+        errmsg = unsafe { callback(&mut callback_args) }.map(|message| {
+            std::str::from_utf8(message)
+                .expect("translated option callback errors must be valid UTF-8")
+        });
+        value_changed = callback_args.os_value_changed;
+        value_checked = callback_args.os_value_checked;
+        restore_chartab = callback_args.os_restore_chartab;
     }
 
     // If option is hidden or if an error is detected, restore the
@@ -1694,6 +1696,10 @@ pub unsafe fn did_set_option(
     if let Some(e) = errmsg {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { set_option_varp(opt_idx, varp, old_value) };
+        if restore_chartab {
+            // SAFETY: forwarded from this function's own safety doc.
+            let _ = unsafe { crate::charset::buf_init_chartab(&mut *curbuf, true) };
+        }
         return Some(e);
     }
 
@@ -1748,11 +1754,6 @@ pub unsafe fn did_set_option(
     if direct {
         return errmsg;
     }
-
-    // SAFETY: forwarded from this function's own safety doc.
-    let g = unsafe { crate::globals::GLOBALS.get_mut() };
-    let curbuf = g.curbuf;
-    let curwin = g.curwin;
 
     // SAFETY: forwarded from this function's own safety doc.
     let b_p_syn_ptr = unsafe { std::ptr::addr_of_mut!((*curbuf).b_p_syn) as *mut c_void };

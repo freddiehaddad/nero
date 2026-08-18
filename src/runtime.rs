@@ -80,8 +80,11 @@ fn copy_runtime_search_path(source: &RuntimeSearchPath) -> RuntimeSearchPath {
 
 /// Invalidates the cached runtime search path after `'runtimepath'`
 /// changes (`did_set_runtimepackpath`).
-pub fn did_set_runtimepackpath() {
+pub fn did_set_runtimepackpath(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     unsafe { *RUNTIME_SEARCH_PATH_VALID.get_mut() = false };
+    None
 }
 
 /// `script_items` - the growable registry of all sourced scripts,
@@ -599,7 +602,10 @@ mod tests {
     fn did_set_runtimepackpath_invalidates_the_cached_search_path() {
         let _lock = global_state_test_lock();
         unsafe { *RUNTIME_SEARCH_PATH_VALID.get_mut() = true };
-        did_set_runtimepackpath();
+        assert_eq!(
+            did_set_runtimepackpath(&mut crate::option_defs::OptsetT::default()),
+            None
+        );
         assert!(!unsafe { *RUNTIME_SEARCH_PATH_VALID.get_mut() });
     }
     use crate::globals::global_state_test_lock;

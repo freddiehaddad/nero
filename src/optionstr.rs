@@ -179,14 +179,9 @@
 //! (a 256-entry "is this byte a line-break character" lookup table)
 //! from `'breakat'`, with no validation at all. Reads the GLOBAL
 //! `p_breakat` directly rather than `args.os_varp`, exactly as the
-//! original does. Note this does NOT yet change
-//! `charset::vim_isbreak`, which still uses its own fixed
-//! DEFAULT-`'breakat'` table: nothing calls `did_set_breakat` at
-//! startup in this crate yet (its real caller is the
-//! `opt_did_set_cb` dispatch during `option.c`'s own option
-//! initialization, and no `OPTIONS` entry has a populated
-//! `opt_did_set_cb` yet), so the table would still be all-zero at
-//! every real read - wiring that up is a separate, later change.
+//! original does. Its `OPTIONS` entry and `did_set_option` dispatch
+//! are real now, but `charset::vim_isbreak` still uses its own fixed
+//! DEFAULT-`'breakat'` table rather than reading `breakat_flags`.
 //!
 //! Also [`did_set_cursorlineopt`] (rejects an empty value outright,
 //! then delegates to `option.rs`'s already-real `fill_culopt_flags`;
@@ -794,7 +789,9 @@ pub unsafe fn did_set_str_generic(args: &mut crate::option_defs::OptsetT) -> Opt
 /// both would resolve to the same effective suffix (stripping one
 /// shared leading `.`, if present on each), which would make
 /// neovim's own backup-vs-patch-file disambiguation logic ambiguous.
-pub fn did_set_backupext_or_patchmode() -> Option<&'static [u8]> {
+pub fn did_set_backupext_or_patchmode(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: a plain, momentary read of two independent option
     // values - no aliasing hazard.
     let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
@@ -844,7 +841,9 @@ pub unsafe fn did_set_backspace(args: &mut crate::option_defs::OptsetT) -> Optio
 /// # Safety
 /// Forwards `crate::os::env::vim_unsetenv_ext`'s own safety
 /// requirements (touches `crate::globals::GLOBALS`).
-pub unsafe fn did_set_helpfile() -> Option<&'static [u8]> {
+pub unsafe fn did_set_helpfile(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     let globals = unsafe { crate::globals::GLOBALS.get_mut() };
     let didset_vim = globals.didset_vim;
     let didset_vimruntime = globals.didset_vimruntime;
@@ -993,7 +992,9 @@ pub unsafe fn did_set_cinoptions(
 /// - `"ab,"` (trailing comma, nothing after) -> invalid (`s[3]` would
 ///   be the terminator right after the comma).
 /// - `"abc"` (3rd byte isn't a comma or the terminator) -> invalid.
-pub fn did_set_helplang() -> Option<&'static [u8]> {
+pub fn did_set_helplang(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: a plain, momentary read - no aliasing hazard.
     let p_hlg = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg.clone();
     let s: &[u8] = p_hlg.as_deref().unwrap_or(&[]);
@@ -1335,7 +1336,9 @@ pub unsafe fn did_set_splitkeep(args: &mut crate::option_defs::OptsetT) -> Optio
 ///
 /// # Safety
 /// Touches `OPTION_VARS`, matching `spell_check_sps`'s own safety doc.
-pub unsafe fn did_set_spellsuggest() -> Option<&'static [u8]> {
+pub unsafe fn did_set_spellsuggest(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { crate::spellsuggest::spell_check_sps() } == crate::vim_defs::OK {
         None
@@ -1348,7 +1351,9 @@ pub unsafe fn did_set_spellsuggest() -> Option<&'static [u8]> {
 ///
 /// # Safety
 /// Touches `OPTION_VARS`, matching `spell_check_msm`'s own safety doc.
-pub unsafe fn did_set_mkspellmem() -> Option<&'static [u8]> {
+pub unsafe fn did_set_mkspellmem(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { crate::spellfile::spell_check_msm() } == crate::vim_defs::OK {
         None
@@ -1416,7 +1421,9 @@ pub unsafe fn did_set_whichwrap(args: &mut crate::option_defs::OptsetT) -> Optio
 ///
 /// # Safety
 /// Touches `OPTION_VARS`.
-pub unsafe fn did_set_mousescroll() -> Option<&'static [u8]> {
+pub unsafe fn did_set_mousescroll(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     use crate::option_vars::{MOUSESCROLL_HOR_DFLT, MOUSESCROLL_VERT_DFLT};
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -1514,7 +1521,9 @@ pub unsafe fn did_set_showbreak(args: &mut crate::option_defs::OptsetT) -> Optio
 /// # Safety
 /// Touches `OPTION_VARS`/`GLOBALS`, matching `check_opt_wim`'s own
 /// safety doc.
-pub unsafe fn did_set_wildmode() -> Option<&'static [u8]> {
+pub unsafe fn did_set_wildmode(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { crate::ex_getln::check_opt_wim() } == crate::vim_defs::OK {
         None
@@ -2798,7 +2807,9 @@ pub unsafe fn did_set_fileformat(args: &mut crate::option_defs::OptsetT) -> Opti
 /// Reads the GLOBAL `OPTION_VARS.p_cia` directly rather than
 /// `args.os_varp`, exactly as the original does (see
 /// [`did_set_breakat`]'s own note about this recurring pattern).
-pub fn did_set_completeitemalign() -> Option<&'static [u8]> {
+pub fn did_set_completeitemalign(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: a plain field read on `OPTION_VARS`, no aliasing hazard.
     let p_cia = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cia.clone().unwrap_or_default();
 
@@ -3278,14 +3289,12 @@ pub unsafe fn did_set_comments(args: &mut crate::option_defs::OptsetT) -> Option
 /// silently read stale global state - so this function's own tests
 /// set `OPTION_VARS.p_breakat` itself.
 ///
-/// Note this does NOT yet change [`crate::charset::vim_isbreak`],
-/// which still uses its own fixed DEFAULT-`'breakat'` table: nothing
-/// calls `did_set_breakat` at startup in this crate yet (the real
-/// caller is the `opt_did_set_cb` dispatch in `option.c`'s option
-/// initialization, and no `OPTIONS` entry has a populated
-/// `opt_did_set_cb` yet), so `breakat_flags` would still be all-zero
-/// at every real read. Wiring that up is a separate, later change.
-pub fn did_set_breakat() -> Option<&'static [u8]> {
+/// Its `OPTIONS` entry and `did_set_option` dispatch are real now.
+/// [`crate::charset::vim_isbreak`] still uses its own fixed
+/// DEFAULT-`'breakat'` table rather than reading `breakat_flags`.
+pub fn did_set_breakat(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
     // SAFETY: a plain field read/write on `OPTION_VARS`, no aliasing
     // hazard (no other reference into it is held across this call).
     let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
@@ -5018,7 +5027,10 @@ mod tests {
     fn did_set_backupext_or_patchmode_different_suffixes_is_ok() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_bex_pm(Some(b"~"), Some(b".orig"));
-        assert_eq!(did_set_backupext_or_patchmode(), None);
+        assert_eq!(
+            did_set_backupext_or_patchmode(&mut Default::default()),
+            None
+        );
         restore_bex_pm(prev);
     }
 
@@ -5026,7 +5038,7 @@ mod tests {
     fn did_set_backupext_or_patchmode_identical_suffixes_fails() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_bex_pm(Some(b".bak"), Some(b".bak"));
-        assert!(did_set_backupext_or_patchmode().is_some());
+        assert!(did_set_backupext_or_patchmode(&mut Default::default()).is_some());
         restore_bex_pm(prev);
     }
 
@@ -5037,7 +5049,7 @@ mod tests {
         // reduce to the same "bak" suffix once the shared leading '.'
         // is stripped from whichever side has one.
         let prev = set_bex_pm(Some(b"bak"), Some(b".bak"));
-        assert!(did_set_backupext_or_patchmode().is_some());
+        assert!(did_set_backupext_or_patchmode(&mut Default::default()).is_some());
         restore_bex_pm(prev);
     }
 
@@ -5113,7 +5125,7 @@ mod tests {
         globals.didset_vim = true;
         globals.didset_vimruntime = true;
 
-        assert_eq!(unsafe { did_set_helpfile() }, None);
+        assert_eq!(unsafe { did_set_helpfile(&mut Default::default()) }, None);
 
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         assert!(!globals.didset_vim);
@@ -5131,7 +5143,7 @@ mod tests {
         globals.didset_vim = false;
         globals.didset_vimruntime = false;
 
-        assert_eq!(unsafe { did_set_helpfile() }, None);
+        assert_eq!(unsafe { did_set_helpfile(&mut Default::default()) }, None);
 
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         assert!(!globals.didset_vim);
@@ -5153,7 +5165,7 @@ mod tests {
     fn did_set_helplang_empty_is_valid() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_hlg(Some(b""));
-        assert_eq!(did_set_helplang(), None);
+        assert_eq!(did_set_helplang(&mut Default::default()), None);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5161,7 +5173,7 @@ mod tests {
     fn did_set_helplang_single_two_letter_code_is_valid() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_hlg(Some(b"ab"));
-        assert_eq!(did_set_helplang(), None);
+        assert_eq!(did_set_helplang(&mut Default::default()), None);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5169,7 +5181,7 @@ mod tests {
     fn did_set_helplang_comma_separated_codes_are_valid() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_hlg(Some(b"ab,cd,ef"));
-        assert_eq!(did_set_helplang(), None);
+        assert_eq!(did_set_helplang(&mut Default::default()), None);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5177,7 +5189,10 @@ mod tests {
     fn did_set_helplang_single_leftover_byte_is_invalid() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_hlg(Some(b"a"));
-        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            did_set_helplang(&mut Default::default()),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5185,7 +5200,10 @@ mod tests {
     fn did_set_helplang_trailing_comma_with_nothing_after_is_invalid() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_hlg(Some(b"ab,"));
-        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            did_set_helplang(&mut Default::default()),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5193,7 +5211,10 @@ mod tests {
     fn did_set_helplang_third_byte_not_a_comma_is_invalid() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_hlg(Some(b"abc"));
-        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            did_set_helplang(&mut Default::default()),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5202,7 +5223,10 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         // "ab,c" - the 2nd code's own 2nd letter is the terminator.
         let prev = set_p_hlg(Some(b"ab,c"));
-        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            did_set_helplang(&mut Default::default()),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 
@@ -5752,7 +5776,7 @@ mod tests {
     fn did_set_spellsuggest_valid_value_is_ok() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_sps(Some(b"best,10"));
-        assert_eq!(unsafe { did_set_spellsuggest() }, None);
+        assert_eq!(unsafe { did_set_spellsuggest(&mut Default::default()) }, None);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sps = prev;
     }
 
@@ -5760,7 +5784,10 @@ mod tests {
     fn did_set_spellsuggest_invalid_value_fails() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_sps(Some(b"bogus"));
-        assert_eq!(unsafe { did_set_spellsuggest() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_spellsuggest(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sps = prev;
     }
 
@@ -5777,7 +5804,7 @@ mod tests {
     fn did_set_mkspellmem_valid_value_is_ok() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_msm(Some(b"460000,2000,500"));
-        assert_eq!(unsafe { did_set_mkspellmem() }, None);
+        assert_eq!(unsafe { did_set_mkspellmem(&mut Default::default()) }, None);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_msm = prev;
     }
 
@@ -5785,7 +5812,10 @@ mod tests {
     fn did_set_mkspellmem_invalid_value_fails() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_msm(Some(b"bogus"));
-        assert_eq!(unsafe { did_set_mkspellmem() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_mkspellmem(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_msm = prev;
     }
 
@@ -6553,7 +6583,7 @@ mod tests {
         let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         let prev = set_p_breakat(Some(b" \t!@*-+;:,./?"));
 
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
 
         let flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         for b in *b" \t!@*-+;:,./?" {
@@ -6570,13 +6600,13 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         let prev = set_p_breakat(Some(b"abc"));
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
         assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags[b'a' as usize], 1);
 
         // Setting a disjoint value must clear every previous flag -
         // the original rebuilds the whole table from scratch.
         set_p_breakat(Some(b"xyz"));
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
         let flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         assert_eq!(flags[b'a' as usize], 0);
         assert_eq!(flags[b'x' as usize], 1);
@@ -6589,10 +6619,10 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         let prev = set_p_breakat(Some(b"abc"));
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
 
         set_p_breakat(Some(b""));
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
         assert!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags.iter().all(|&f| f == 0));
 
         restore_breakat(prev, prev_flags);
@@ -6605,10 +6635,10 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         let prev = set_p_breakat(Some(b"abc"));
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
 
         set_p_breakat(None);
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
         assert!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags.iter().all(|&f| f == 0));
 
         restore_breakat(prev, prev_flags);
@@ -6621,7 +6651,7 @@ mod tests {
         let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         let prev = set_p_breakat(Some(&[0x00, 0x7F, 0x80, 0xFF]));
 
-        assert_eq!(did_set_breakat(), None);
+        assert_eq!(did_set_breakat(&mut Default::default()), None);
 
         let flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
         for b in [0x00u8, 0x7F, 0x80, 0xFF] {
@@ -9018,7 +9048,7 @@ mod tests {
     #[test]
     fn did_set_completeitemalign_accepts_the_real_default_order() {
         with_cia(Some(b"abbr,kind,menu"), || {
-            assert_eq!(did_set_completeitemalign(), None);
+            assert_eq!(did_set_completeitemalign(&mut Default::default()), None);
             // CPT_ABBR=0, CPT_KIND=1, CPT_MENU=2 packed base-10:
             // ((0*10+1)*10+2) == 12.
             assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags, 12);
@@ -9028,7 +9058,7 @@ mod tests {
     #[test]
     fn did_set_completeitemalign_accepts_a_reordered_list() {
         with_cia(Some(b"menu,kind,abbr"), || {
-            assert_eq!(did_set_completeitemalign(), None);
+            assert_eq!(did_set_completeitemalign(&mut Default::default()), None);
             // ((2*10+1)*10+0) == 210.
             assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags, 210);
         });
@@ -9037,7 +9067,10 @@ mod tests {
     #[test]
     fn did_set_completeitemalign_rejects_a_duplicate_item() {
         with_cia(Some(b"abbr,abbr,menu"), || {
-            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+            assert_eq!(
+                did_set_completeitemalign(&mut Default::default()),
+                Some(crate::errors::e_invarg.as_bytes())
+            );
             // Rejected before any store, so the flags stay untouched.
             assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags, 0);
         });
@@ -9046,7 +9079,10 @@ mod tests {
     #[test]
     fn did_set_completeitemalign_rejects_too_few_items() {
         with_cia(Some(b"abbr,kind"), || {
-            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+            assert_eq!(
+                did_set_completeitemalign(&mut Default::default()),
+                Some(crate::errors::e_invarg.as_bytes())
+            );
         });
     }
 
@@ -9054,21 +9090,30 @@ mod tests {
     fn did_set_completeitemalign_rejects_an_empty_value() {
         // Zero items means new_cia_flags == 0 AND count != 3.
         with_cia(Some(b""), || {
-            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+            assert_eq!(
+                did_set_completeitemalign(&mut Default::default()),
+                Some(crate::errors::e_invarg.as_bytes())
+            );
         });
     }
 
     #[test]
     fn did_set_completeitemalign_rejects_an_unknown_item() {
         with_cia(Some(b"abbr,kind,bogus"), || {
-            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+            assert_eq!(
+                did_set_completeitemalign(&mut Default::default()),
+                Some(crate::errors::e_invarg.as_bytes())
+            );
         });
     }
 
     #[test]
     fn did_set_completeitemalign_rejects_more_than_three_items() {
         with_cia(Some(b"abbr,kind,menu,abbr"), || {
-            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+            assert_eq!(
+                did_set_completeitemalign(&mut Default::default()),
+                Some(crate::errors::e_invarg.as_bytes())
+            );
         });
     }
 
@@ -9158,7 +9203,7 @@ mod tests {
     fn did_set_mousescroll_the_real_default_value_sets_both_directions() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"ver:3,hor:6"));
-        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        assert_eq!(unsafe { did_set_mousescroll(&mut Default::default()) }, None);
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         assert_eq!(opts.p_mousescroll_vert, 3);
         assert_eq!(opts.p_mousescroll_hor, 6);
@@ -9169,7 +9214,7 @@ mod tests {
     fn did_set_mousescroll_only_vertical_falls_back_to_the_horizontal_default() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"ver:5"));
-        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        assert_eq!(unsafe { did_set_mousescroll(&mut Default::default()) }, None);
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         assert_eq!(opts.p_mousescroll_vert, 5);
         assert_eq!(opts.p_mousescroll_hor, crate::option_vars::MOUSESCROLL_HOR_DFLT);
@@ -9180,7 +9225,7 @@ mod tests {
     fn did_set_mousescroll_only_horizontal_falls_back_to_the_vertical_default() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"hor:10"));
-        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        assert_eq!(unsafe { did_set_mousescroll(&mut Default::default()) }, None);
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         assert_eq!(opts.p_mousescroll_vert, crate::option_vars::MOUSESCROLL_VERT_DFLT);
         assert_eq!(opts.p_mousescroll_hor, 10);
@@ -9191,7 +9236,10 @@ mod tests {
     fn did_set_mousescroll_duplicate_direction_fails() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"ver:1,ver:2"));
-        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_mousescroll(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
     }
 
@@ -9199,7 +9247,10 @@ mod tests {
     fn did_set_mousescroll_unknown_direction_fails() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"foo:1"));
-        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_mousescroll(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
     }
 
@@ -9209,7 +9260,10 @@ mod tests {
         // length == 4 ("ver:"), no digit at all - length <= 4 fails
         // before the direction/digit checks even run.
         let prev = set_p_mousescroll(Some(b"ver:"));
-        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_mousescroll(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
     }
 
@@ -9218,7 +9272,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"ver:x"));
         assert_eq!(
-            unsafe { did_set_mousescroll() },
+            unsafe { did_set_mousescroll(&mut Default::default()) },
             Some(crate::gettext_defs::gettext_noop("E5080: Digit expected").as_bytes())
         );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
@@ -9231,7 +9285,10 @@ mod tests {
         // `length` (== strlen("") == 0) satisfy `length <= 4`,
         // rejecting it immediately - not a translation bug.
         let prev = set_p_mousescroll(Some(b""));
-        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_mousescroll(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
     }
 
@@ -9239,7 +9296,7 @@ mod tests {
     fn did_set_mousescroll_allows_zero_to_disable_scrolling() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_mousescroll(Some(b"ver:0,hor:0"));
-        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        assert_eq!(unsafe { did_set_mousescroll(&mut Default::default()) }, None);
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         assert_eq!(opts.p_mousescroll_vert, 0);
         assert_eq!(opts.p_mousescroll_hor, 0);
@@ -9318,7 +9375,7 @@ mod tests {
     fn did_set_wildmode_valid_value_is_ok() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_wim(Some(b"full"));
-        assert_eq!(unsafe { did_set_wildmode() }, None);
+        assert_eq!(unsafe { did_set_wildmode(&mut Default::default()) }, None);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wim = prev;
     }
 
@@ -9326,7 +9383,10 @@ mod tests {
     fn did_set_wildmode_invalid_value_fails() {
         let _lock = crate::globals::global_state_test_lock();
         let prev = set_p_wim(Some(b"bogus"));
-        assert_eq!(unsafe { did_set_wildmode() }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(
+            unsafe { did_set_wildmode(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wim = prev;
     }
 

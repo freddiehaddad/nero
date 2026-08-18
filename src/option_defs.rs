@@ -25,11 +25,11 @@
 //! of value an option accepts, with no value attached - `OptVal` itself
 //! doesn't fit that use case).
 //!
-//! Deferred: most `opt_did_set_cb`/`opt_expand_cb` real callback
-//! implementations (`option.c`'s `did_set_*`/`optionstr.c`'s
-//! `did_set_*`/`expand_*` families, ~150 functions). The translated
-//! callback-valued options and `'complete'` are wired now; remaining
-//! entries and every expansion callback stay `None`. The generic
+//! Deferred: the remaining `opt_did_set_cb`/`opt_expand_cb` real
+//! callback implementations (`option.c`'s `did_set_*`/`optionstr.c`'s
+//! `did_set_*`/`expand_*` families). Every translated did-set callback
+//! is wired now; callbacks not yet translated and every expansion
+//! callback stay `None`. The generic
 //! `get_option_value`/`set_option_value`/
 //! `do_set` engine that would actually DISPATCH through `OPTIONS`
 //! (via `get_varp_from`'s ~30-branch buffer/window-local fallback
@@ -1920,9 +1920,9 @@ mod options_enum_tests {
 /// verified to already exist as a real constant elsewhere in this
 /// crate (`ascii_defs`/`globals`/`buffer_defs`/`option_vars`).
 ///
-/// Translated callback-valued option handlers and `'complete'` are
-/// wired; remaining did-set handlers and every expand handler stay
-/// deferred (see this module's own doc comment).
+/// Every translated did-set option handler is wired; handlers not yet
+/// translated and every expand handler stay deferred (see this
+/// module's own doc comment).
 ///
 /// `var`/`flags_var` are resolved to real addresses into
 /// [`crate::option_vars::OPTION_VARS`] via `GlobalCell::as_ptr()`
@@ -2024,7 +2024,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
     let completeslash_var: *mut c_void = unsafe { std::ptr::addr_of_mut!((*ov).p_csl) as *mut c_void };
     #[cfg(not(windows))]
     let completeslash_var: *mut c_void = std::ptr::null_mut();
-    unsafe {
+    let mut options = unsafe {
 [
     VimoptionT { // [0] "aleph"
         fullname: b"aleph",
@@ -8059,7 +8059,312 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         script_ctx: SctxT::default(),
     },
 ]
+    };
+    wire_translated_did_set_callbacks(&mut options);
+    options
+}
+
+fn wire_translated_did_set_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    wire_option_callbacks(options);
+    wire_optionstr_callbacks(options);
+    wire_callback_option_callbacks(options);
+    wire_other_callbacks(options);
+}
+
+fn wire_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    options[OptIndex::Binary as usize].opt_did_set_cb = Some(crate::option::did_set_binary);
+    options[OptIndex::Bomb as usize].opt_did_set_cb =
+        Some(crate::option::did_set_eof_eol_fixeol_bomb);
+    options[OptIndex::Buflisted as usize].opt_did_set_cb =
+        Some(crate::option::did_set_buflisted);
+    options[OptIndex::Chistory as usize].opt_did_set_cb =
+        Some(crate::option::did_set_xhistory);
+    options[OptIndex::Endoffile as usize].opt_did_set_cb =
+        Some(crate::option::did_set_eof_eol_fixeol_bomb);
+    options[OptIndex::Endofline as usize].opt_did_set_cb =
+        Some(crate::option::did_set_eof_eol_fixeol_bomb);
+    options[OptIndex::Fixendofline as usize].opt_did_set_cb =
+        Some(crate::option::did_set_eof_eol_fixeol_bomb);
+    options[OptIndex::Foldlevel as usize].opt_did_set_cb =
+        Some(crate::option::did_set_foldlevel);
+    options[OptIndex::Foldminlines as usize].opt_did_set_cb =
+        Some(crate::option::did_set_foldminlines);
+    options[OptIndex::Foldnestmax as usize].opt_did_set_cb =
+        Some(crate::option::did_set_foldnestmax);
+    options[OptIndex::Hlsearch as usize].opt_did_set_cb =
+        Some(crate::option::did_set_hlsearch);
+    options[OptIndex::Icon as usize].opt_did_set_cb =
+        Some(crate::option::did_set_title_icon);
+    options[OptIndex::Ignorecase as usize].opt_did_set_cb =
+        Some(crate::option::did_set_ignorecase);
+    options[OptIndex::Iminsert as usize].opt_did_set_cb =
+        Some(crate::option::did_set_iminsert);
+    options[OptIndex::Langnoremap as usize].opt_did_set_cb =
+        Some(crate::option::did_set_langnoremap);
+    options[OptIndex::Langremap as usize].opt_did_set_cb =
+        Some(crate::option::did_set_langremap);
+    options[OptIndex::Lhistory as usize].opt_did_set_cb =
+        Some(crate::option::did_set_xhistory);
+    options[OptIndex::Lisp as usize].opt_did_set_cb =
+        Some(crate::option::did_set_lisp);
+    options[OptIndex::Modifiable as usize].opt_did_set_cb =
+        Some(crate::option::did_set_modifiable);
+    options[OptIndex::Modified as usize].opt_did_set_cb =
+        Some(crate::option::did_set_modified);
+    options[OptIndex::Number as usize].opt_did_set_cb =
+        Some(crate::option::did_set_number_relativenumber);
+    options[OptIndex::Numberwidth as usize].opt_did_set_cb =
+        Some(crate::option::did_set_numberwidth);
+    options[OptIndex::Previewwindow as usize].opt_did_set_cb =
+        Some(crate::option::did_set_previewwindow);
+    options[OptIndex::Readonly as usize].opt_did_set_cb =
+        Some(crate::option::did_set_readonly);
+    options[OptIndex::Relativenumber as usize].opt_did_set_cb =
+        Some(crate::option::did_set_number_relativenumber);
+    options[OptIndex::Scrollback as usize].opt_did_set_cb =
+        Some(crate::option::did_set_scrollback);
+    options[OptIndex::Smoothscroll as usize].opt_did_set_cb =
+        Some(crate::option::did_set_smoothscroll);
+    options[OptIndex::Textwidth as usize].opt_did_set_cb =
+        Some(crate::option::did_set_textwidth);
+    options[OptIndex::Title as usize].opt_did_set_cb =
+        Some(crate::option::did_set_title_icon);
+    options[OptIndex::Titlelen as usize].opt_did_set_cb =
+        Some(crate::option::did_set_titlelen);
+    options[OptIndex::Undolevels as usize].opt_did_set_cb =
+        Some(crate::option::did_set_undolevels);
+    options[OptIndex::Wildchar as usize].opt_did_set_cb =
+        Some(crate::option::did_set_wildchar);
+    options[OptIndex::Wildcharm as usize].opt_did_set_cb =
+        Some(crate::option::did_set_wildchar);
+    options[OptIndex::Winblend as usize].opt_did_set_cb =
+        Some(crate::option::did_set_winblend);
+    options[OptIndex::Window as usize].opt_did_set_cb =
+        Some(crate::option::did_set_window);
+    options[OptIndex::Wrap as usize].opt_did_set_cb =
+        Some(crate::option::did_set_wrap);
+}
+
+fn wire_optionstr_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    options[OptIndex::Ambiwidth as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_ambiwidth);
+    options[OptIndex::Backspace as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_backspace);
+    options[OptIndex::Backupcopy as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_backupcopy);
+    options[OptIndex::Breakindentopt as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_breakindentopt);
+    options[OptIndex::Bufhidden as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_bufhidden);
+    options[OptIndex::Buftype as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_buftype);
+    options[OptIndex::Charconvert as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Cinoptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_cinoptions);
+    options[OptIndex::Colorcolumn as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_colorcolumn);
+    options[OptIndex::Comments as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_comments);
+    options[OptIndex::Commentstring as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_commentstring);
+    options[OptIndex::Complete as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_complete);
+    options[OptIndex::Completeopt as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_completeopt);
+    #[cfg(windows)]
+    {
+        options[OptIndex::Completeslash as usize].opt_did_set_cb =
+            Some(crate::optionstr::did_set_completeslash);
     }
+    options[OptIndex::Concealcursor as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_concealcursor);
+    options[OptIndex::Cpoptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_cpoptions);
+    options[OptIndex::Cursorlineopt as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_cursorlineopt);
+    options[OptIndex::Diffexpr as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Display as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_display);
+    options[OptIndex::Emoji as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_emoji);
+    options[OptIndex::Encoding as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_encoding);
+    options[OptIndex::Eventignore as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_eventignore);
+    options[OptIndex::Eventignorewin as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_eventignore);
+    options[OptIndex::Fileencoding as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_encoding);
+    options[OptIndex::Fileformat as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_fileformat);
+    options[OptIndex::Fileformats as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_str_generic);
+    options[OptIndex::Filetype as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_filetype_or_syntax);
+    options[OptIndex::Fillchars as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_chars_option);
+    options[OptIndex::Foldexpr as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_foldexpr);
+    options[OptIndex::Foldignore as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_foldignore);
+    options[OptIndex::Foldmarker as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_foldmarker);
+    options[OptIndex::Foldmethod as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_foldmethod);
+    options[OptIndex::Foldtext as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Formatexpr as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Formatoptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_formatoptions);
+    options[OptIndex::Helpfile as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_helpfile);
+    options[OptIndex::Highlight as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_highlight);
+    options[OptIndex::Iconstring as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_iconstring);
+    options[OptIndex::Inccommand as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_inccommand);
+    options[OptIndex::Includeexpr as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Indentexpr as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Isfname as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_isopt);
+    options[OptIndex::Isident as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_isopt);
+    options[OptIndex::Iskeyword as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_iskeyword);
+    options[OptIndex::Isprint as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_isopt);
+    options[OptIndex::Keymodel as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_keymodel);
+    options[OptIndex::Lispoptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_lispoptions);
+    options[OptIndex::Listchars as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_chars_option);
+    options[OptIndex::Makeencoding as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_encoding);
+    options[OptIndex::Matchpairs as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_matchpairs);
+    options[OptIndex::Mkspellmem as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_mkspellmem);
+    options[OptIndex::Mouse as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_mouse);
+    options[OptIndex::Mousescroll as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_mousescroll);
+    options[OptIndex::Patchexpr as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_optexpr);
+    options[OptIndex::Pumborder as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_pumborder);
+    options[OptIndex::Rulerformat as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_rulerformat);
+    options[OptIndex::Selection as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_selection);
+    options[OptIndex::Sessionoptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_sessionoptions);
+    options[OptIndex::Shortmess as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_shortmess);
+    options[OptIndex::Showbreak as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_showbreak);
+    options[OptIndex::Showcmdloc as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_showcmdloc);
+    options[OptIndex::Signcolumn as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_signcolumn);
+    options[OptIndex::Spellfile as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_spellfile);
+    options[OptIndex::Spelllang as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_spelllang);
+    options[OptIndex::Spelloptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_spelloptions);
+    options[OptIndex::Spellsuggest as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_spellsuggest);
+    options[OptIndex::Splitkeep as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_splitkeep);
+    options[OptIndex::Statuscolumn as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_statuscolumn);
+    options[OptIndex::Statusline as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_statusline);
+    options[OptIndex::Syntax as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_filetype_or_syntax);
+    options[OptIndex::Tabline as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_tabline);
+    options[OptIndex::Tagcase as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_tagcase);
+    options[OptIndex::Titlestring as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_titlestring);
+    options[OptIndex::Varsofttabstop as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_varsofttabstop);
+    options[OptIndex::Vartabstop as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_vartabstop);
+    options[OptIndex::Verbosefile as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_verbosefile);
+    options[OptIndex::Viewoptions as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_str_generic);
+    options[OptIndex::Virtualedit as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_virtualedit);
+    options[OptIndex::Whichwrap as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_whichwrap);
+    options[OptIndex::Wildmode as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_wildmode);
+    options[OptIndex::Winbar as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_winbar);
+    options[OptIndex::Winborder as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_winborder);
+}
+
+fn wire_callback_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    options[OptIndex::Completefunc as usize].opt_did_set_cb =
+        Some(crate::insexpand::did_set_completefunc);
+    options[OptIndex::Findfunc as usize].opt_did_set_cb =
+        Some(crate::ex_docmd::did_set_findfunc);
+    options[OptIndex::Omnifunc as usize].opt_did_set_cb =
+        Some(crate::insexpand::did_set_omnifunc);
+    options[OptIndex::Operatorfunc as usize].opt_did_set_cb =
+        Some(crate::ops::did_set_operatorfunc);
+    options[OptIndex::Quickfixtextfunc as usize].opt_did_set_cb =
+        Some(crate::quickfix::did_set_quickfixtextfunc);
+    options[OptIndex::Tagfunc as usize].opt_did_set_cb =
+        Some(crate::tag::did_set_tagfunc);
+    options[OptIndex::Thesaurusfunc as usize].opt_did_set_cb =
+        Some(crate::insexpand::did_set_thesaurusfunc);
+}
+
+fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    options[OptIndex::Backupext as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_backupext_or_patchmode);
+    options[OptIndex::Breakat as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_breakat);
+    options[OptIndex::Completeitemalign as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_completeitemalign);
+    options[OptIndex::Diffopt as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_diffopt);
+    options[OptIndex::Helplang as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_helplang);
+    options[OptIndex::Messagesopt as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_messagesopt);
+    options[OptIndex::Packpath as usize].opt_did_set_cb =
+        Some(crate::runtime::did_set_runtimepackpath);
+    options[OptIndex::Patchmode as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_backupext_or_patchmode);
+    options[OptIndex::Runtimepath as usize].opt_did_set_cb =
+        Some(crate::runtime::did_set_runtimepackpath);
+    options[OptIndex::Shada as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_shada);
+    options[OptIndex::Shellpipe as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_shellpipe_redir);
+    options[OptIndex::Shellredir as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_shellpipe_redir);
+    options[OptIndex::Shiftwidth as usize].opt_did_set_cb =
+        Some(crate::indent_c::did_set_shiftwidth_tabstop);
+    options[OptIndex::Tabstop as usize].opt_did_set_cb =
+        Some(crate::indent_c::did_set_shiftwidth_tabstop);
+    options[OptIndex::Winminheight as usize].opt_did_set_cb =
+        Some(crate::window::did_set_winminheight);
+    options[OptIndex::Winminwidth as usize].opt_did_set_cb =
+        Some(crate::window::did_set_winminwidth);
 }
 
 #[cfg(test)]
@@ -8229,17 +8534,152 @@ mod options_table_tests {
     #[test]
     fn translated_option_callbacks_are_wired_and_others_remain_deferred() {
         let opts = unsafe { OPTIONS.get_mut() };
-        let expected: &[&[u8]] = &[
+        let mut expected: Vec<&[u8]> = vec![
+            b"ambiwidth",
+            b"backspace",
+            b"backupcopy",
+            b"binary",
+            b"bomb",
+            b"breakindentopt",
+            b"bufhidden",
+            b"buflisted",
+            b"buftype",
+            b"charconvert",
+            b"chistory",
+            b"cinoptions",
+            b"colorcolumn",
+            b"comments",
+            b"commentstring",
             b"complete",
             b"completefunc",
+            b"completeopt",
+            b"concealcursor",
+            b"cpoptions",
+            b"cursorlineopt",
+            b"diffexpr",
+            b"display",
+            b"emoji",
+            b"encoding",
+            b"endoffile",
+            b"endofline",
+            b"eventignore",
+            b"eventignorewin",
+            b"fileencoding",
+            b"fileformat",
+            b"fileformats",
+            b"filetype",
+            b"fillchars",
             b"findfunc",
+            b"fixendofline",
+            b"foldexpr",
+            b"foldignore",
+            b"foldlevel",
+            b"foldmarker",
+            b"foldmethod",
+            b"foldminlines",
+            b"foldnestmax",
+            b"foldtext",
+            b"formatexpr",
+            b"formatoptions",
+            b"helpfile",
+            b"highlight",
+            b"hlsearch",
+            b"icon",
+            b"iconstring",
+            b"ignorecase",
+            b"iminsert",
+            b"inccommand",
+            b"includeexpr",
+            b"indentexpr",
+            b"isfname",
+            b"isident",
+            b"iskeyword",
+            b"isprint",
+            b"keymodel",
+            b"langnoremap",
+            b"langremap",
+            b"lhistory",
+            b"lisp",
+            b"lispoptions",
+            b"listchars",
+            b"makeencoding",
+            b"matchpairs",
+            b"mkspellmem",
+            b"modifiable",
+            b"modified",
+            b"mouse",
+            b"mousescroll",
+            b"number",
+            b"numberwidth",
             b"omnifunc",
             b"operatorfunc",
+            b"patchexpr",
+            b"previewwindow",
+            b"pumborder",
             b"quickfixtextfunc",
+            b"readonly",
+            b"relativenumber",
+            b"rulerformat",
+            b"scrollback",
+            b"selection",
+            b"sessionoptions",
+            b"shortmess",
+            b"showbreak",
+            b"showcmdloc",
+            b"signcolumn",
+            b"smoothscroll",
+            b"spellfile",
+            b"spelllang",
+            b"spelloptions",
+            b"spellsuggest",
+            b"splitkeep",
+            b"statuscolumn",
+            b"statusline",
+            b"syntax",
+            b"tabline",
+            b"tagcase",
             b"tagfunc",
+            b"textwidth",
             b"thesaurusfunc",
+            b"title",
+            b"titlelen",
+            b"titlestring",
+            b"undolevels",
+            b"varsofttabstop",
+            b"vartabstop",
+            b"verbosefile",
+            b"viewoptions",
+            b"virtualedit",
+            b"whichwrap",
+            b"wildchar",
+            b"wildcharm",
+            b"wildmode",
+            b"winbar",
+            b"winblend",
+            b"winborder",
+            b"window",
+            b"wrap",
+            b"backupext",
+            b"breakat",
+            b"completeitemalign",
+            b"diffopt",
+            b"helplang",
+            b"messagesopt",
+            b"packpath",
+            b"patchmode",
+            b"runtimepath",
+            b"shada",
+            b"shellpipe",
+            b"shellredir",
+            b"shiftwidth",
+            b"tabstop",
+            b"winminheight",
+            b"winminwidth",
         ];
-        for name in expected {
+        if cfg!(windows) {
+            expected.push(b"completeslash");
+        }
+        for name in &expected {
             assert!(opts
                 .iter()
                 .find(|option| option.fullname == *name)
