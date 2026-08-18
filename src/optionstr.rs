@@ -1055,6 +1055,13 @@ pub fn expand_set_shortmess(
     expand_set_opt_listflag(args, SHM_ALL)
 }
 
+/// Expand `'whichwrap'` flag values (`expand_set_whichwrap`).
+pub fn expand_set_whichwrap(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    expand_set_opt_listflag(args, crate::option_vars::WW_ALL.as_bytes())
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5294,6 +5301,20 @@ mod tests {
             matches,
             SHM_ALL.iter().map(|flag| vec![*flag]).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn expand_set_whichwrap_returns_flags_without_the_list_separator() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        let matches = expand_set_whichwrap(&mut args).expect("whichwrap matches");
+        assert_eq!(
+            matches,
+            crate::option_vars::WW_ALL
+                .bytes()
+                .map(|flag| vec![flag])
+                .collect::<Vec<_>>()
+        );
+        assert!(!matches.iter().any(|value| value == b","));
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);
