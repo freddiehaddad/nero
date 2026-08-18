@@ -3,7 +3,8 @@
 //! machinery, the msgpack-rpc dispatch layer, command execution, and
 //! the Lua host, none of which are wired into this API layer yet).
 //!
-//! Translated: [`nvim_list_bufs`], [`nvim_list_wins`], [`nvim_get_current_win`]/
+//! Translated: [`nvim_list_bufs`], [`nvim_list_wins`], [`nvim_list_tabpages`],
+//! [`nvim_get_current_win`]/
 //! [`nvim_get_current_buf`]/[`nvim_get_current_tabpage`] (harvested ahead of the rest of this
 //! file, matching the established "one tractable function ahead of a
 //! huge file" precedent used elsewhere in this crate, e.g.
@@ -55,6 +56,22 @@ pub unsafe fn nvim_list_wins() -> Array {
             result.push(Object::Window(unsafe { (*win).handle }));
             win = unsafe { (*win).w_next };
         }
+        tab = unsafe { (*tab).tp_next };
+    }
+    result
+}
+
+/// List every current tabpage (`nvim_list_tabpages`).
+///
+/// # Safety
+/// `GLOBALS.first_tabpage` and each `tp_next` link must form a live
+/// tabpage list.
+#[must_use]
+pub unsafe fn nvim_list_tabpages() -> Array {
+    let mut result = Vec::new();
+    let mut tab = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tab.is_null() {
+        result.push(Object::Tabpage(unsafe { (*tab).handle }));
         tab = unsafe { (*tab).tp_next };
     }
     result
@@ -286,6 +303,44 @@ mod tests {
             )
         };
         assert!(unsafe { nvim_list_wins() }.is_empty());
+    }
+
+    #[test]
+    fn nvim_list_tabpages_returns_every_linked_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = TabpageT {
+            handle: 102,
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = TabpageT {
+            handle: 101,
+            tp_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.first_tabpage, first_ptr)
+        };
+
+        let tabpages = unsafe { nvim_list_tabpages() };
+
+        assert!(matches!(
+            tabpages.as_slice(),
+            [Object::Tabpage(101), Object::Tabpage(102)]
+        ));
+    }
+
+    #[test]
+    fn nvim_list_tabpages_returns_empty_for_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.first_tabpage,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(unsafe { nvim_list_tabpages() }.is_empty());
     }
 
     struct HighlightNamespaceGuard {
