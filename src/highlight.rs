@@ -39,6 +39,87 @@ static FONTS: crate::globals::GlobalCell<Vec<Vec<u8>>> =
 static URLS: crate::globals::GlobalCell<Vec<Vec<u8>>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+static HLSTATE_ACTIVE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+pub(crate) static ATTR_ENTRIES: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::map::Set<crate::highlight_defs::HlEntry>>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::map::Set::new())
+});
+
+/// Initialize the highlight attribute table (`highlight_init`).
+///
+/// The table's zero entry is the no-attribute sentinel.
+///
+/// # Safety
+/// Mutates the shared attribute table.
+pub unsafe fn highlight_init() {
+    let entries = unsafe { ATTR_ENTRIES.get_mut() };
+    if entries.is_empty() {
+        let _ = entries.put(crate::highlight_defs::HlEntry {
+            attr: Default::default(),
+            kind: crate::highlight_defs::HlKind::Invalid,
+            id1: 0,
+            id2: 0,
+            winid: 0,
+        });
+    }
+}
+
+/// Intern one highlight attribute entry (`get_attr_entry`).
+///
+/// The remote-UI `hl_attr_define` notification is omitted with the UI
+/// dispatch layer; stable IDs and deduplication are complete.
+///
+/// # Safety
+/// Mutates the shared attribute table.
+fn get_attr_entry(mut entry: crate::highlight_defs::HlEntry) -> i32 {
+    if !unsafe { *HLSTATE_ACTIVE.get_mut() } {
+        entry.kind = crate::highlight_defs::HlKind::Unknown;
+        entry.id1 = 0;
+        entry.id2 = 0;
+    }
+    unsafe { highlight_init() };
+    let entries = unsafe { ATTR_ENTRIES.get_mut() };
+    if entries.len() > crate::vim_defs::MAX_TYPENR as usize {
+        return 0;
+    }
+    entries.put(entry).0 as i32
+}
+
+/// Get the attribute ID for a syntax group (`hl_get_syn_attr`).
+///
+/// # Safety
+/// Mutates the shared attribute table when a new combination is seen.
+#[must_use]
+pub unsafe fn hl_get_syn_attr(
+    ns_id: i32,
+    idx: i32,
+    attrs: crate::highlight_defs::HlAttrs,
+) -> i32 {
+    if attrs.cterm_fg_color != 0
+        || attrs.cterm_bg_color != 0
+        || attrs.rgb_fg_color != -1
+        || attrs.rgb_bg_color != -1
+        || attrs.rgb_sp_color != -1
+        || attrs.cterm_ae_attr != 0
+        || attrs.rgb_ae_attr != 0
+        || attrs.font >= 0
+        || ns_id != 0
+    {
+        get_attr_entry(crate::highlight_defs::HlEntry {
+            attr: attrs,
+            kind: crate::highlight_defs::HlKind::Syntax,
+            id1: idx,
+            id2: ns_id,
+            winid: 0,
+        })
+    } else {
+        0
+    }
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -420,6 +501,71 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AttributeEntriesGuard {
+        entries: crate::map::Set<crate::highlight_defs::HlEntry>,
+        active: bool,
+    }
+
+    impl AttributeEntriesGuard {
+        fn empty() -> Self {
+            let entries = std::mem::replace(
+                unsafe { ATTR_ENTRIES.get_mut() },
+                crate::map::Set::new(),
+            );
+            let active = unsafe { *HLSTATE_ACTIVE.get_mut() };
+            unsafe { *HLSTATE_ACTIVE.get_mut() = false };
+            Self { entries, active }
+        }
+    }
+
+    impl Drop for AttributeEntriesGuard {
+        fn drop(&mut self) {
+            *unsafe { ATTR_ENTRIES.get_mut() } =
+                std::mem::replace(&mut self.entries, crate::map::Set::new());
+            unsafe { *HLSTATE_ACTIVE.get_mut() = self.active };
+        }
+    }
+
+    #[test]
+    fn highlight_init_installs_the_zero_attribute_entry_once() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+
+        unsafe { highlight_init() };
+        unsafe { highlight_init() };
+
+        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 1);
+    }
+
+    #[test]
+    fn hl_get_syn_attr_deduplicates_attrs_and_separates_namespaces() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        let first = unsafe { hl_get_syn_attr(4, 2, attrs) };
+        let same = unsafe { hl_get_syn_attr(4, 2, attrs) };
+        let other_namespace = unsafe { hl_get_syn_attr(5, 2, attrs) };
+
+        assert!(first > 0);
+        assert_eq!(same, first);
+        assert_ne!(other_namespace, first);
+    }
+
+    #[test]
+    fn hl_get_syn_attr_returns_zero_for_default_attrs_in_namespace_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        assert_eq!(
+            unsafe { hl_get_syn_attr(0, 3, Default::default()) },
+            0
+        );
+    }
 
     struct NamespaceHighlightsGuard {
         definitions: crate::map::Map<

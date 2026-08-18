@@ -36,7 +36,7 @@ pub const HL_GLOBAL: u32 = 0x4000;
 
 /// Stores a complete highlighting entry, including colors and attributes
 /// for both TUI and GUI (`HlAttrs`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HlAttrs {
     /// `HlAttrFlags`
     pub rgb_ae_attr: i32,
@@ -236,7 +236,7 @@ pub enum HlfT {
     Count,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HlKind {
     Unknown,
     Ui,
@@ -248,7 +248,7 @@ pub enum HlKind {
     Invalid,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HlEntry {
     pub attr: HlAttrs,
     pub kind: HlKind,
