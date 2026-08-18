@@ -14,13 +14,8 @@
 //! table with no dependency on `MapblockT`/the regex engine/file I/O.
 //! `LANGMAP_MAPGA` (the original's own file-static `langmap_mapga`)
 //! starts empty (matching the original's own `GA_EMPTY_INIT_VALUE`)
-//! and is only ever populated by `did_set_langmap` (the `'langmap'`
-//! option's callback, not yet translated), so [`langmap_adjust_mb`]
-//! always returns its input unchanged today - a real, faithful
-//! reflection of "`'langmap'` has never been configured", not a
-//! hardcoded shortcut: the real binary-search algorithm is translated
-//! in full (via `langmap_adjust_mb_impl`, directly unit-tested
-//! against a manually-populated table), not stubbed.
+//! and is populated by [`did_set_langmap`], the real `'langmap'`
+//! option callback.
 //!
 //! `langmap_mapchar[]` (the original's other, single-byte-only lookup
 //! table) is initialized to its identity mapping by [`langmap_init`],
@@ -50,8 +45,7 @@
 //! Deferred: everything else - the whole `:map`/`:unmap`/`:abbreviate`
 //! command family and mapping-table storage/lookup (needs
 //! `MapblockT`'s real fields), `ExpandMappings` (needs the regex
-//! engine), `makemap`/`put_escstr` (real file I/O), `langmap_init`/
-//! `did_set_langmap` (the `'langmap'` option callback itself).
+//! engine), and `makemap`/`put_escstr` (real file I/O).
 
 use crate::globals::GlobalCell;
 use crate::state_defs::mode;
@@ -248,7 +242,6 @@ pub fn langmap_init() {
 /// Search `entries` (sorted by `from`) for `from`; if found, update
 /// its `to`; otherwise insert a new `(from, to)` entry at the correct
 /// sorted position, keeping `entries` sorted (`langmap_set_entry`).
-#[allow(dead_code)] // no real translated caller yet (did_set_langmap, its only real caller, isn't translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
 fn langmap_set_entry(entries: &mut Vec<(i32, i32)>, from: i32, to: i32) {
     match entries.binary_search_by_key(&from, |&(f, _)| f) {
         Ok(idx) => entries[idx].1 = to,
@@ -280,12 +273,120 @@ fn langmap_adjust_mb_impl(entries: &[(i32, i32)], c: i32) -> i32 {
 }
 
 /// Apply `'langmap'` to multi-byte character `c` and return the
-/// result (`langmap_adjust_mb`). See this module's own doc comment
-/// for why this always returns `c` unchanged today.
+/// result (`langmap_adjust_mb`).
 #[must_use]
 pub fn langmap_adjust_mb(c: i32) -> i32 {
     // SAFETY: momentary read.
     langmap_adjust_mb_impl(unsafe { LANGMAP_MAPGA.get_mut() }, c)
+}
+
+/// Parse the updated `'langmap'` option and rebuild both lookup tables
+/// (`did_set_langmap`).
+///
+/// The original's formatted E357/E358 messages are represented by
+/// `e_invarg`; the success/failure behavior and partial table updates
+/// before an error are preserved.
+///
+/// # Safety
+/// Mutates the shared language-map tables and
+/// `GLOBALS.langmap_mapchar`.
+pub unsafe fn did_set_langmap(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_langmap
+        .clone()
+        .unwrap_or_default();
+    langmap_init();
+
+    let advance = |pos: usize| -> usize {
+        if pos >= value.len() || value[pos] == 0 {
+            return pos;
+        }
+        // SAFETY: `pos` points at a byte within `value`.
+        let len = unsafe { crate::mbyte::utfc_ptr2len(&value[pos..]) };
+        pos + len.max(1) as usize
+    };
+
+    let mut p = 0usize;
+    while p < value.len() && value[p] != 0 {
+        let mut p2 = p;
+        while p2 < value.len()
+            && value[p2] != 0
+            && value[p2] != b','
+            && value[p2] != b';'
+        {
+            if value[p2] == b'\\' && value.get(p2 + 1).is_some_and(|byte| *byte != 0) {
+                p2 += 1;
+            }
+            p2 = advance(p2);
+        }
+        let mut paired = if value.get(p2) == Some(&b';') {
+            Some(p2 + 1)
+        } else {
+            None
+        };
+
+        while p < value.len() && value[p] != 0 {
+            if value[p] == b',' {
+                p += 1;
+                break;
+            }
+            if value[p] == b'\\' && value.get(p + 1).is_some_and(|byte| *byte != 0) {
+                p += 1;
+            }
+            // SAFETY: `p` points at a non-NUL byte within `value`.
+            let from = crate::mbyte::utf_ptr2char(&value[p..]);
+            let to = if let Some(ref mut to_pos) = paired {
+                if value.get(*to_pos).is_some_and(|byte| *byte != 0 && *byte != b',') {
+                    if value[*to_pos] == b'\\' {
+                        *to_pos += 1;
+                    }
+                    // SAFETY: `to_pos` points at a non-NUL byte within `value`.
+                    crate::mbyte::utf_ptr2char(&value[*to_pos..])
+                } else {
+                    0
+                }
+            } else {
+                p = advance(p);
+                if value.get(p).is_some_and(|byte| *byte != 0 && *byte != b',') {
+                    if value[p] == b'\\' {
+                        p += 1;
+                    }
+                    // SAFETY: `p` points at a non-NUL byte within `value`.
+                    crate::mbyte::utf_ptr2char(&value[p..])
+                } else {
+                    0
+                }
+            };
+            if to == 0 {
+                return Some(crate::errors::e_invarg.as_bytes());
+            }
+
+            if from >= 256 {
+                langmap_set_entry(unsafe { LANGMAP_MAPGA.get_mut() }, from, to);
+            } else {
+                unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar
+                    [(from & 255) as usize] = to as u8;
+            }
+
+            p = advance(p);
+            if let Some(ref mut to_pos) = paired {
+                *to_pos = advance(*to_pos);
+                if value.get(p) == Some(&b';') {
+                    p = *to_pos;
+                    if p < value.len() && value[p] != 0 {
+                        if value[p] != b',' {
+                            return Some(crate::errors::e_invarg.as_bytes());
+                        }
+                        p += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Encode `m` (a `MODE_*` bitmask) into its `:map`-family prefix
@@ -759,6 +860,95 @@ mod tests {
         assert_eq!(langmap_adjust_mb(0x4e00), 0x7a);
         assert_eq!(langmap_adjust_mb(0x4e01), 0x4e01);
         unsafe { LANGMAP_MAPGA.get_mut() }.clear();
+    }
+
+    struct LangmapValueGuard(Option<Vec<u8>>);
+
+    impl LangmapValueGuard {
+        fn set(value: &[u8]) -> Self {
+            let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let old = options.p_langmap.replace(value.to_vec());
+            Self(old)
+        }
+    }
+
+    impl Drop for LangmapValueGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_langmap = self.0.take();
+        }
+    }
+
+    #[test]
+    fn did_set_langmap_parses_adjacent_character_pairs() {
+        let _lock = global_state_test_lock();
+        let _state = LangmapStateGuard::save();
+        let _value = LangmapValueGuard::set(b"aAbB");
+        let mut args = crate::option_defs::OptsetT::default();
+
+        assert_eq!(unsafe { did_set_langmap(&mut args) }, None);
+        let map = unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar;
+        assert_eq!(map[usize::from(b'a')], b'A');
+        assert_eq!(map[usize::from(b'b')], b'B');
+        assert_eq!(map[usize::from(b'c')], b'c');
+    }
+
+    #[test]
+    fn did_set_langmap_parses_semicolon_separated_halves() {
+        let _lock = global_state_test_lock();
+        let _state = LangmapStateGuard::save();
+        let _value = LangmapValueGuard::set(b"ab;AB");
+        let mut args = crate::option_defs::OptsetT::default();
+
+        assert_eq!(unsafe { did_set_langmap(&mut args) }, None);
+        let map = unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar;
+        assert_eq!(map[usize::from(b'a')], b'A');
+        assert_eq!(map[usize::from(b'b')], b'B');
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "utf8proc FFI is unavailable under Miri")]
+    fn did_set_langmap_populates_the_multibyte_table() {
+        let _lock = global_state_test_lock();
+        let _state = LangmapStateGuard::save();
+        let _value = LangmapValueGuard::set("日本".as_bytes());
+        let mut args = crate::option_defs::OptsetT::default();
+
+        assert_eq!(unsafe { did_set_langmap(&mut args) }, None);
+        assert_eq!(langmap_adjust_mb('日' as i32), '本' as i32);
+    }
+
+    #[test]
+    fn did_set_langmap_rejects_a_missing_matching_character() {
+        let _lock = global_state_test_lock();
+        let _state = LangmapStateGuard::save();
+        let _value = LangmapValueGuard::set(b"a");
+        let mut args = crate::option_defs::OptsetT::default();
+
+        assert_eq!(
+            unsafe { did_set_langmap(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar
+                [usize::from(b'a')],
+            b'a'
+        );
+    }
+
+    #[test]
+    fn did_set_langmap_rejects_extra_characters_after_a_semicolon_mapping() {
+        let _lock = global_state_test_lock();
+        let _state = LangmapStateGuard::save();
+        let _value = LangmapValueGuard::set(b"ab;ABC");
+        let mut args = crate::option_defs::OptsetT::default();
+
+        assert_eq!(
+            unsafe { did_set_langmap(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        let map = unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar;
+        assert_eq!(map[usize::from(b'a')], b'A');
+        assert_eq!(map[usize::from(b'b')], b'B');
     }
 
     // --- map_mode_to_chars (pure, no shared state) ---
