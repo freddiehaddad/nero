@@ -162,6 +162,32 @@ pub unsafe fn nvim_tabpage_set_var(
     };
 }
 
+/// Delete a tabpage-scoped variable (`nvim_tabpage_del_var`).
+///
+/// # Safety
+/// Forwarded from [`find_tab_by_handle`] and the checked
+/// scope-dictionary writer.
+pub unsafe fn nvim_tabpage_del_var(
+    tabpage: Tabpage,
+    name: &NvimString,
+    err: &mut Error,
+) {
+    let tabpage = unsafe { find_tab_by_handle(tabpage, err) };
+    if tabpage.is_null() {
+        return;
+    }
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*tabpage).tp_vars,
+            name,
+            &Object::Nil,
+            true,
+            false,
+            err,
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +235,26 @@ mod tests {
         let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }
             .expect("tabpage variable");
         unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        fx.tab_mut().tp_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn nvim_tabpage_del_var_removes_a_tabpage_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TabFixture::new(33);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"value", 3) },
+            crate::vim_defs::OK
+        );
+        fx.tab_mut().tp_vars = dict;
+        let mut err = Error::default();
+        unsafe {
+            nvim_tabpage_del_var(fx.handle(), &b"value".to_vec(), &mut err)
+        };
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }.is_none());
+        assert!(!err.is_set());
         fx.tab_mut().tp_vars = std::ptr::null_mut();
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
