@@ -7671,6 +7671,63 @@ pub unsafe fn did_set_buflisted(
     None
 }
 
+/// Process a new `'cmdheight'` value (`did_set_cmdheight`).
+///
+/// Clamps the value to the rows available after the current tabpage's
+/// minimum layout. Applying a changed height to a live fullscreen
+/// layout still needs `command_height`.
+///
+/// # Safety
+/// `GLOBALS.curtab` and `GLOBALS.topframe` must point to live values;
+/// forwarded from [`crate::window::min_rows`],
+/// [`crate::window::tabline_height`] and
+/// [`crate::window::global_stl_height`].
+pub unsafe fn did_set_cmdheight(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let old_value = match args.os_oldval {
+        crate::option_defs::OptVal::Number(value) => value,
+        _ => 0,
+    };
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (rows, curtab, topframe, full_screen) = unsafe {
+        (
+            (*globals).Rows,
+            (*globals).curtab,
+            (*globals).topframe,
+            (*globals).full_screen,
+        )
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let minimum = unsafe { crate::window::min_rows(curtab) };
+    let maximum = crate::types_defs::OptInt::from(rows - minimum + 1);
+    let options = crate::option_vars::OPTION_VARS.as_ptr();
+    // SAFETY: `options` points at the process-lifetime option store.
+    if unsafe { (*options).p_ch } > maximum {
+        // SAFETY: same pointer and field as the read above.
+        unsafe { (*options).p_ch = maximum };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let layout_rows = unsafe {
+        crate::window::tabline_height()
+            + crate::window::global_stl_height()
+            + (*topframe).fr_height
+    };
+    // SAFETY: same process-lifetime option pointer as above.
+    let value = unsafe { (*options).p_ch };
+    if (value != old_value
+        || layout_rows != rows - i32::try_from(value).expect("validated cmdheight fits i32"))
+        && full_screen
+    {
+        unimplemented!(
+            "did_set_cmdheight: applying a live fullscreen change needs command_height"
+        );
+    }
+    None
+}
+
 /// Process the updated global or buffer-local `'undolevels'` value
 /// (`did_set_undolevels`).
 ///
@@ -8685,6 +8742,24 @@ mod did_set_title_tests {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window = self.0;
         }
     }
+
+    struct CmdheightGuard(crate::types_defs::OptInt);
+
+    impl CmdheightGuard {
+        fn set(value: crate::types_defs::OptInt) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_ch };
+            unsafe { (*options).p_ch = value };
+            CmdheightGuard(previous)
+        }
+    }
+
+    impl Drop for CmdheightGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ch = self.0 };
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -8912,6 +8987,94 @@ mod did_set_title_tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window = 24;
         assert_eq!(unsafe { did_set_window(&mut args) }, None);
         assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window, 23);
+    }
+
+    #[test]
+    fn did_set_cmdheight_clamps_to_the_rows_available_for_the_layout() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cmdheight = CmdheightGuard::set(99);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let mut frame = crate::buffer_defs::FrameT::default();
+        let frame_ptr = std::ptr::from_mut(&mut frame);
+        let _rows = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 10)
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.first_tabpage,
+                tab_ptr,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let _topframe = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.topframe, frame_ptr)
+        };
+        let _full_screen = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.full_screen, false)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_oldval: crate::option_defs::OptVal::Number(1),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_cmdheight(&mut args) }, None);
+        assert_eq!(
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ch },
+            crate::types_defs::OptInt::from(10 - crate::window::MIN_LINES + 1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "command_height")]
+    fn did_set_cmdheight_live_fullscreen_change_needs_layout_application() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cmdheight = CmdheightGuard::set(3);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_height: 10,
+            ..Default::default()
+        };
+        let frame_ptr = std::ptr::from_mut(&mut frame);
+        let _rows = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 24)
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.first_tabpage,
+                tab_ptr,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let _topframe = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.topframe, frame_ptr)
+        };
+        let _full_screen = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.full_screen, true)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_oldval: crate::option_defs::OptVal::Number(2),
+            ..Default::default()
+        };
+
+        unsafe { did_set_cmdheight(&mut args) };
     }
 
     #[test]
