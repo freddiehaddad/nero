@@ -1114,6 +1114,36 @@ static P_TW_NOBIN: crate::globals::GlobalCell<crate::types_defs::OptInt> =
 static P_WM_NOBIN: crate::globals::GlobalCell<crate::types_defs::OptInt> =
     crate::globals::GlobalCell::new(0);
 
+#[derive(Clone)]
+struct PasteState {
+    old_paste: bool,
+    showmatch: i32,
+    smarttab: i32,
+    ruler: i32,
+    revins: i32,
+    autoindent: i32,
+    expandtab: i32,
+    softtabstop: crate::types_defs::OptInt,
+    textwidth: crate::types_defs::OptInt,
+    wrapmargin: crate::types_defs::OptInt,
+    varsofttabstop: Option<Vec<u8>>,
+}
+
+static PASTE_STATE: crate::globals::GlobalCell<PasteState> =
+    crate::globals::GlobalCell::new(PasteState {
+        old_paste: false,
+        showmatch: 0,
+        smarttab: 0,
+        ruler: 0,
+        revins: 0,
+        autoindent: 0,
+        expandtab: 0,
+        softtabstop: 0,
+        textwidth: 0,
+        wrapmargin: 0,
+        varsofttabstop: None,
+    });
+
 /// Save, clear, or restore the options coupled to `'binary'`
 /// (`set_options_bin`).
 ///
@@ -1200,6 +1230,140 @@ pub unsafe fn did_set_binary(
     };
     unsafe { set_options_bin(old, buf.b_p_bin, args.os_flags as u32) };
     // `redraw_titles()` is redraw scheduling only.
+    None
+}
+
+/// Process an updated `'paste'` value (`did_set_paste`).
+///
+/// Saves, disables and later restores every dependent local/global
+/// option exactly as Neovim does. Redraw scheduling is omitted.
+///
+/// # Safety
+/// `GLOBALS.firstbuf`'s `b_next` chain must consist of live buffers;
+/// shared option/global state must not be mutated concurrently.
+pub unsafe fn did_set_paste(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let options = crate::option_vars::OPTION_VARS.as_ptr();
+    // SAFETY: process-lifetime option storage.
+    let paste = unsafe { (*options).p_paste != 0 };
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { PASTE_STATE.get_mut() };
+
+    if paste {
+        if !state.old_paste {
+            let mut buf = unsafe { (*crate::globals::GLOBALS.as_ptr()).firstbuf };
+            while !buf.is_null() {
+                unsafe {
+                    (*buf).b_p_tw_nopaste = (*buf).b_p_tw;
+                    (*buf).b_p_wm_nopaste = (*buf).b_p_wm;
+                    (*buf).b_p_sts_nopaste = (*buf).b_p_sts;
+                    (*buf).b_p_ai_nopaste = (*buf).b_p_ai;
+                    (*buf).b_p_et_nopaste = (*buf).b_p_et;
+                    (*buf).b_p_vsts_nopaste =
+                        (*buf).b_p_vsts.clone().filter(|value| !value.is_empty());
+                    buf = (*buf).b_next;
+                }
+            }
+
+            unsafe {
+                state.showmatch = (*options).p_sm;
+                state.smarttab = (*options).p_sta;
+                state.ruler = (*options).p_ru;
+                state.revins = (*options).p_ri;
+                state.autoindent = (*options).p_ai;
+                state.expandtab = (*options).p_et;
+                state.softtabstop = (*options).p_sts;
+                state.textwidth = (*options).p_tw;
+                state.wrapmargin = (*options).p_wm;
+                state.varsofttabstop =
+                    (*options).p_vsts.clone().filter(|value| !value.is_empty());
+            }
+        }
+
+        let mut buf = unsafe { (*crate::globals::GLOBALS.as_ptr()).firstbuf };
+        while !buf.is_null() {
+            unsafe {
+                (*buf).b_p_tw = 0;
+                (*buf).b_p_wm = 0;
+                (*buf).b_p_sts = 0;
+                (*buf).b_p_ai = 0;
+                (*buf).b_p_et = 0;
+                (*buf).b_p_vsts = Some(Vec::new());
+                (*buf).b_p_vsts_array = None;
+                buf = (*buf).b_next;
+            }
+        }
+        unsafe {
+            (*options).p_sm = 0;
+            (*options).p_sta = 0;
+            (*options).p_ru = 0;
+            (*options).p_ri = 0;
+            (*options).p_ai = 0;
+            (*options).p_et = 0;
+            (*options).p_sts = 0;
+            (*options).p_tw = 0;
+            (*options).p_wm = 0;
+            (*options).p_vsts = Some(Vec::new());
+        }
+    } else if state.old_paste {
+        let mut buf = unsafe { (*crate::globals::GLOBALS.as_ptr()).firstbuf };
+        while !buf.is_null() {
+            unsafe {
+                (*buf).b_p_tw = (*buf).b_p_tw_nopaste;
+                (*buf).b_p_wm = (*buf).b_p_wm_nopaste;
+                (*buf).b_p_sts = (*buf).b_p_sts_nopaste;
+                (*buf).b_p_ai = (*buf).b_p_ai_nopaste;
+                (*buf).b_p_et = (*buf).b_p_et_nopaste;
+                (*buf).b_p_vsts = Some(
+                    (*buf)
+                        .b_p_vsts_nopaste
+                        .clone()
+                        .unwrap_or_default(),
+                );
+                (*buf).b_p_vsts_array = (*buf)
+                    .b_p_vsts
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| crate::indent::tabstop_set(value).ok().flatten());
+                buf = (*buf).b_next;
+            }
+        }
+        unsafe {
+            (*options).p_sm = state.showmatch;
+            (*options).p_sta = state.smarttab;
+            (*options).p_ru = state.ruler;
+            (*options).p_ri = state.revins;
+            (*options).p_ai = state.autoindent;
+            (*options).p_et = state.expandtab;
+            (*options).p_sts = state.softtabstop;
+            (*options).p_tw = state.textwidth;
+            (*options).p_wm = state.wrapmargin;
+            (*options).p_vsts =
+                Some(state.varsofttabstop.clone().unwrap_or_default());
+        }
+    }
+
+    state.old_paste = paste;
+    unsafe {
+        didset_options_sctx(
+            crate::option_defs::opt_set_flags::OPT_LOCAL
+                | crate::option_defs::opt_set_flags::OPT_GLOBAL,
+            &[
+                OptIndex::Autoindent,
+                OptIndex::Expandtab,
+                OptIndex::Ruler,
+                OptIndex::Showmatch,
+                OptIndex::Smarttab,
+                OptIndex::Softtabstop,
+                OptIndex::Textwidth,
+                OptIndex::Wrapmargin,
+                OptIndex::Revins,
+                OptIndex::Varsofttabstop,
+                OptIndex::Invalid,
+            ],
+        )
+    };
     None
 }
 
@@ -10279,6 +10443,64 @@ mod did_set_title_tests {
         }
     }
 
+    struct PasteOptionsGuard {
+        paste: i32,
+        showmatch: i32,
+        smarttab: i32,
+        ruler: i32,
+        revins: i32,
+        autoindent: i32,
+        expandtab: i32,
+        softtabstop: crate::types_defs::OptInt,
+        textwidth: crate::types_defs::OptInt,
+        wrapmargin: crate::types_defs::OptInt,
+        varsofttabstop: Option<Vec<u8>>,
+        state: PasteState,
+        script_ctx: [SctxT; crate::option_defs::OPT_COUNT],
+    }
+
+    impl PasteOptionsGuard {
+        fn capture() -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            PasteOptionsGuard {
+                paste: unsafe { (*options).p_paste },
+                showmatch: unsafe { (*options).p_sm },
+                smarttab: unsafe { (*options).p_sta },
+                ruler: unsafe { (*options).p_ru },
+                revins: unsafe { (*options).p_ri },
+                autoindent: unsafe { (*options).p_ai },
+                expandtab: unsafe { (*options).p_et },
+                softtabstop: unsafe { (*options).p_sts },
+                textwidth: unsafe { (*options).p_tw },
+                wrapmargin: unsafe { (*options).p_wm },
+                varsofttabstop: unsafe { (*options).p_vsts.clone() },
+                state: unsafe { PASTE_STATE.get_mut() }.clone(),
+                script_ctx: unsafe { *OPTION_SCRIPT_CTX.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for PasteOptionsGuard {
+        fn drop(&mut self) {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            unsafe {
+                (*options).p_paste = self.paste;
+                (*options).p_sm = self.showmatch;
+                (*options).p_sta = self.smarttab;
+                (*options).p_ru = self.ruler;
+                (*options).p_ri = self.revins;
+                (*options).p_ai = self.autoindent;
+                (*options).p_et = self.expandtab;
+                (*options).p_sts = self.softtabstop;
+                (*options).p_tw = self.textwidth;
+                (*options).p_wm = self.wrapmargin;
+                (*options).p_vsts = self.varsofttabstop.take();
+                *PASTE_STATE.get_mut() = self.state.clone();
+                *OPTION_SCRIPT_CTX.get_mut() = self.script_ctx;
+            }
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -10938,6 +11160,151 @@ mod did_set_title_tests {
         let options = crate::option_vars::OPTION_VARS.as_ptr();
         assert_eq!(unsafe { (*options).p_arshape }, 1);
         assert_eq!(unsafe { (*options).p_deco }, 1);
+    }
+
+    #[test]
+    fn did_set_paste_saves_disables_and_restores_all_dependent_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options_guard = PasteOptionsGuard::capture();
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        unsafe {
+            (*options).p_paste = 1;
+            (*options).p_sm = 1;
+            (*options).p_sta = 1;
+            (*options).p_ru = 1;
+            (*options).p_ri = 1;
+            (*options).p_ai = 1;
+            (*options).p_et = 1;
+            (*options).p_sts = 4;
+            (*options).p_tw = 80;
+            (*options).p_wm = 2;
+            (*options).p_vsts = Some(b"4,8".to_vec());
+            *PASTE_STATE.get_mut() = PasteState {
+                old_paste: false,
+                showmatch: 0,
+                smarttab: 0,
+                ruler: 0,
+                revins: 0,
+                autoindent: 0,
+                expandtab: 0,
+                softtabstop: 0,
+                textwidth: 0,
+                wrapmargin: 0,
+                varsofttabstop: None,
+            };
+        }
+
+        let mut second = BufT {
+            b_p_tw: 40,
+            b_p_wm: 3,
+            b_p_sts: 6,
+            b_p_ai: 1,
+            b_p_et: 1,
+            b_p_vsts: Some(b"2,6".to_vec()),
+            b_p_vsts_array: Some(vec![2, 6]),
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::from_mut(&mut second);
+        let mut first = BufT {
+            b_next: second_ptr,
+            b_p_tw: 20,
+            b_p_wm: 1,
+            b_p_sts: 2,
+            b_p_ai: 1,
+            b_p_et: 1,
+            b_p_vsts: Some(b"4,8".to_vec()),
+            b_p_vsts_array: Some(vec![4, 8]),
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::from_mut(&mut first);
+        let _firstbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstbuf, first_ptr)
+        };
+        let mut win = WinT {
+            w_buffer: first_ptr,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, first_ptr)
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+
+        assert_eq!(unsafe { did_set_paste(&mut Default::default()) }, None);
+        for buf in [first_ptr, second_ptr] {
+            assert_eq!(unsafe { (*buf).b_p_tw }, 0);
+            assert_eq!(unsafe { (*buf).b_p_wm }, 0);
+            assert_eq!(unsafe { (*buf).b_p_sts }, 0);
+            assert_eq!(unsafe { (*buf).b_p_ai }, 0);
+            assert_eq!(unsafe { (*buf).b_p_et }, 0);
+            assert_eq!(unsafe { (*buf).b_p_vsts.as_deref() }, Some(b"".as_slice()));
+            assert!(unsafe { (*buf).b_p_vsts_array.is_none() });
+        }
+        assert_eq!(
+            unsafe {
+                (
+                    (*options).p_sm,
+                    (*options).p_sta,
+                    (*options).p_ru,
+                    (*options).p_ri,
+                    (*options).p_ai,
+                    (*options).p_et,
+                    (*options).p_sts,
+                    (*options).p_tw,
+                    (*options).p_wm,
+                )
+            },
+            (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        );
+
+        unsafe { (*options).p_paste = 0 };
+        assert_eq!(unsafe { did_set_paste(&mut Default::default()) }, None);
+        assert_eq!(
+            unsafe {
+                (
+                    (*first_ptr).b_p_tw,
+                    (*first_ptr).b_p_wm,
+                    (*first_ptr).b_p_sts,
+                    (*first_ptr).b_p_ai,
+                    (*first_ptr).b_p_et,
+                )
+            },
+            (20, 1, 2, 1, 1)
+        );
+        assert_eq!(unsafe { (*first_ptr).b_p_vsts.as_deref() }, Some(b"4,8".as_slice()));
+        assert_eq!(unsafe { (*first_ptr).b_p_vsts_array.as_deref() }, Some([4, 8].as_slice()));
+        assert_eq!(
+            unsafe {
+                (
+                    (*second_ptr).b_p_tw,
+                    (*second_ptr).b_p_wm,
+                    (*second_ptr).b_p_sts,
+                    (*second_ptr).b_p_ai,
+                    (*second_ptr).b_p_et,
+                )
+            },
+            (40, 3, 6, 1, 1)
+        );
+        assert_eq!(
+            unsafe {
+                (
+                    (*options).p_sm,
+                    (*options).p_sta,
+                    (*options).p_ru,
+                    (*options).p_ri,
+                    (*options).p_ai,
+                    (*options).p_et,
+                    (*options).p_sts,
+                    (*options).p_tw,
+                    (*options).p_wm,
+                )
+            },
+            (1, 1, 1, 1, 1, 1, 4, 80, 2)
+        );
+        assert_eq!(unsafe { (*options).p_vsts.as_deref() }, Some(b"4,8".as_slice()));
+        assert!(!unsafe { PASTE_STATE.get_mut() }.old_paste);
     }
 
     #[test]
