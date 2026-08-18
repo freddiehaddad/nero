@@ -7811,6 +7811,20 @@ pub unsafe fn did_set_winwidth(
     None
 }
 
+/// Process a new `'showtabline'` value (`did_set_showtabline`).
+///
+/// `win_new_screen_rows` returns immediately before window
+/// initialization. Recomputing an initialized frame layout remains
+/// deferred with that function.
+pub fn did_set_showtabline(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    if unsafe { (*crate::globals::GLOBALS.as_ptr()).firstwin }.is_null() {
+        return None;
+    }
+    unimplemented!("did_set_showtabline: initialized layouts need win_new_screen_rows");
+}
+
 /// Process the updated global or buffer-local `'undolevels'` value
 /// (`did_set_undolevels`).
 ///
@@ -9493,6 +9507,30 @@ mod did_set_title_tests {
         };
 
         unsafe { did_set_winwidth(&mut Default::default()) };
+    }
+
+    #[test]
+    fn did_set_showtabline_returns_before_window_initialization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(did_set_showtabline(&mut Default::default()), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "win_new_screen_rows")]
+    fn did_set_showtabline_initialized_layout_needs_row_recomputation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        did_set_showtabline(&mut Default::default());
     }
 
     #[test]
