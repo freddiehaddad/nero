@@ -969,9 +969,6 @@ pub fn expand_set_encoding(
 pub fn expand_set_str_generic(
     args: &mut crate::option_defs::OptexpandT,
 ) -> Option<Vec<Vec<u8>>> {
-    if !args.oe_regmatch.is_null() {
-        unimplemented!("expand_set_str_generic: regex filtering needs the regexp engine");
-    }
     let values_idx = match args.oe_idx {
         crate::option_defs::OptIndex::Viewoptions => {
             crate::option_defs::OptIndex::Sessionoptions
@@ -981,13 +978,34 @@ pub fn expand_set_str_generic(
         }
         idx => idx,
     };
-    Some(
-        crate::option::get_option(values_idx)
-            .values
-            .iter()
-            .map(|value| value.as_bytes().to_vec())
-            .collect(),
-    )
+    expand_set_opt_string(args, crate::option::get_option(values_idx).values)
+}
+
+/// Expand an option from a fixed set of string values
+/// (`expand_set_opt_string`).
+fn expand_set_opt_string(
+    args: &crate::option_defs::OptexpandT,
+    values: &[&str],
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!("expand_set_opt_string: regex filtering needs the regexp engine");
+    }
+
+    let option_val = args.oe_opt_value.as_deref().unwrap_or(&[]);
+    let include_orig_val = args.oe_include_orig_val && !option_val.is_empty();
+    let mut matches = Vec::with_capacity(values.len() + usize::from(include_orig_val));
+    if include_orig_val {
+        matches.push(option_val.to_vec());
+    }
+
+    for value in values {
+        let value = value.as_bytes();
+        if value.is_empty() || (include_orig_val && value == option_val) {
+            continue;
+        }
+        matches.push(value.to_vec());
+    }
+    (!matches.is_empty()).then_some(matches)
 }
 
 /// Expand an option whose value is a list of one-byte flags
@@ -5273,6 +5291,25 @@ mod tests {
             ..Default::default()
         };
         let _ = expand_set_str_generic(&mut args);
+    }
+
+    #[test]
+    fn expand_set_opt_string_ignores_empty_values_and_deduplicates_the_original() {
+        let args = crate::option_defs::OptexpandT {
+            oe_opt_value: Some(b"one".to_vec()),
+            oe_include_orig_val: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_set_opt_string(&args, &["", "one", "two"]),
+            Some(vec![b"one".to_vec(), b"two".to_vec()])
+        );
+    }
+
+    #[test]
+    fn expand_set_opt_string_fails_when_no_nonempty_value_remains() {
+        let args = crate::option_defs::OptexpandT::default();
+        assert_eq!(expand_set_opt_string(&args, &[""]), None);
     }
 
     #[test]
