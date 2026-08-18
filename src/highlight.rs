@@ -195,9 +195,9 @@ pub static NS_HLS: std::sync::LazyLock<
 
 /// Define one namespace highlight (`ns_hl_def`).
 ///
-/// Link definitions are complete. Direct attribute definitions still
-/// need `hl_get_syn_attr` and stop exactly there. Namespace zero is
-/// the global `:highlight` table and remains with `set_hl_group`.
+/// Namespace-zero definitions remain with the global `:highlight`
+/// table's `set_hl_group`; nonzero link and direct-attribute
+/// definitions are complete.
 ///
 /// # Safety
 /// Mutates the namespace-highlight and decoration-provider registries.
@@ -223,7 +223,7 @@ pub unsafe fn ns_hl_def(
     let attr_id = if link_id > 0 {
         -1
     } else {
-        unimplemented!("ns_hl_def: direct attributes need hl_get_syn_attr");
+        unsafe { hl_get_syn_attr(ns_id, hl_id, attrs) }
     };
     let item = crate::highlight_defs::ColorItem {
         attr_id,
@@ -652,11 +652,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "hl_get_syn_attr")]
-    fn ns_hl_def_direct_attributes_need_the_attribute_registry() {
+    fn ns_hl_def_stores_direct_attributes() {
         let _lock = crate::globals::global_state_test_lock();
         let _state = NamespaceHighlightsGuard::empty();
-        unsafe { ns_hl_def(4, 2, Default::default(), -1) };
+        let _entries = AttributeEntriesGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        unsafe { ns_hl_def(4, 2, attrs, -1) };
+
+        let item = unsafe { NS_HLS.get_mut() }
+            .get(&crate::highlight_defs::ColorKey::new(4, 2))
+            .expect("namespace highlight");
+        assert!(item.attr_id > 0);
+        assert_eq!(item.link_id, -1);
+        assert!(item.link_global);
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);

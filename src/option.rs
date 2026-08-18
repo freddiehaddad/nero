@@ -221,9 +221,6 @@
 //!   [`option_was_set`]'s own doc comment for why).
 //!
 //! Deferred:
-//! - [`parse_winhl_opt`]'s empty-target local mapping form needs
-//!   `hl_get_syn_attr`; ordinary highlight links, global validation,
-//!   and the empty-local reset path are real.
 //! - Cross-window/buffer paths in `get_option_value_for`/
 //!   `set_option_value_for` need the real `ctx_switch`.
 //! - Ten remaining did-set/expand callbacks still need their own
@@ -248,8 +245,7 @@ use std::ffi::c_void;
 /// Parse a `'winhighlight'` value (`parse_winhl_opt`).
 ///
 /// Global validation, clearing a local value, and applying local
-/// highlight links are complete. A local mapping with an empty target
-/// stops in `ns_hl_def` at direct-attribute interning.
+/// highlight links or direct attributes are complete.
 ///
 /// # Safety
 /// Touches the highlight-group registry, and `win`, when present, must
@@ -5346,6 +5342,7 @@ mod tests {
         >,
         providers: Vec<crate::decoration_defs::DecorProvider>,
         next_namespace: i32,
+        attributes: crate::map::Set<crate::highlight_defs::HlEntry>,
     }
 
     impl WinhlGroupGuard {
@@ -5363,12 +5360,17 @@ mod tests {
             let providers =
                 std::mem::take(unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() });
             let next_namespace = *unsafe { crate::api::extmark::NEXT_NAMESPACE_ID.get_mut() };
+            let attributes = std::mem::replace(
+                unsafe { crate::highlight::ATTR_ENTRIES.get_mut() },
+                crate::map::Set::new(),
+            );
             Self {
                 items,
                 names,
                 definitions,
                 providers,
                 next_namespace,
+                attributes,
             }
         }
     }
@@ -5385,6 +5387,8 @@ mod tests {
                 std::mem::take(&mut self.providers);
             *unsafe { crate::api::extmark::NEXT_NAMESPACE_ID.get_mut() } =
                 self.next_namespace;
+            *unsafe { crate::highlight::ATTR_ENTRIES.get_mut() } =
+                std::mem::replace(&mut self.attributes, crate::map::Set::new());
         }
     }
 
@@ -5453,12 +5457,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "hl_get_syn_attr")]
-    fn parse_winhl_opt_empty_local_target_needs_direct_attributes() {
+    fn parse_winhl_opt_empty_local_target_stores_direct_attributes() {
         let _lock = crate::globals::global_state_test_lock();
         let _state = WinhlGroupGuard::empty();
         let mut win = WinT::default();
-        let _ = unsafe { parse_winhl_opt(Some(b"EndOfBuffer:"), Some(&mut win)) };
+
+        assert!(unsafe {
+            parse_winhl_opt(Some(b"EndOfBuffer:"), Some(&mut win))
+        });
+        let source =
+            unsafe { crate::highlight_group::syn_name2id_len(b"EndOfBuffer") };
+        let item = unsafe { crate::highlight::NS_HLS.get_mut() }
+            .get(&crate::highlight_defs::ColorKey::new(
+                win.w_ns_hl_winhl,
+                source,
+            ))
+            .expect("window highlight mapping");
+        assert!(item.attr_id > 0);
+        assert_eq!(item.link_id, -1);
+        assert!(item.link_global);
     }
 
     fn buf_with_ff(ff: &str, bin: bool) -> BufT {
