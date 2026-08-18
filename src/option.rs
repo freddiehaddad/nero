@@ -7728,6 +7728,33 @@ pub unsafe fn did_set_cmdheight(
     None
 }
 
+/// Process a new `'helpheight'` value (`did_set_helpheight`).
+///
+/// A single-window layout needs no action. Enlarging a help window in
+/// a multiwindow layout still needs `win_setheight`.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin`/`firstwin` must point to live values;
+/// forwarded from [`crate::window::one_window`].
+pub unsafe fn did_set_helpheight(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (curbuf, curwin) = unsafe { ((*globals).curbuf, (*globals).curwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::window::one_window(curwin, std::ptr::null()) } {
+        return None;
+    }
+
+    let helpheight = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_hh };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*curbuf).b_help } && i64::from(unsafe { (*curwin).w_view_height }) < helpheight {
+        unimplemented!("did_set_helpheight: enlarging the help window needs win_setheight");
+    }
+    None
+}
+
 /// Process the updated global or buffer-local `'undolevels'` value
 /// (`did_set_undolevels`).
 ///
@@ -8891,6 +8918,23 @@ mod did_set_title_tests {
         }
     }
 
+    struct HelpheightGuard(crate::types_defs::OptInt);
+
+    impl HelpheightGuard {
+        fn set(value: crate::types_defs::OptInt) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_hh };
+            unsafe { (*options).p_hh = value };
+            HelpheightGuard(previous)
+        }
+    }
+
+    impl Drop for HelpheightGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_hh = self.0 };
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9206,6 +9250,69 @@ mod did_set_title_tests {
         };
 
         unsafe { did_set_cmdheight(&mut args) };
+    }
+
+    #[test]
+    fn did_set_helpheight_does_nothing_for_a_single_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _helpheight = HelpheightGuard::set(20);
+        let mut buf = crate::buffer_defs::BufT {
+            b_help: true,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_view_height: 1,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+
+        assert_eq!(
+            unsafe { did_set_helpheight(&mut Default::default()) },
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "win_setheight")]
+    fn did_set_helpheight_small_help_window_needs_live_layout_resizing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _helpheight = HelpheightGuard::set(20);
+        let mut buf = crate::buffer_defs::BufT {
+            b_help: true,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut second = crate::buffer_defs::WinT::default();
+        let second_ptr = std::ptr::from_mut(&mut second);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_view_height: 1,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+
+        unsafe { did_set_helpheight(&mut Default::default()) };
     }
 
     #[test]
