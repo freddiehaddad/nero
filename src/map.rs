@@ -182,6 +182,15 @@ impl<K: Hash + Eq + Clone> Set<K> {
         self.get_index(key).is_some()
     }
 
+    /// Return the key stored at compact-array index `index`.
+    ///
+    /// This is the direct Rust equivalent of the original generic
+    /// sets' public `keys[index]` access.
+    #[inline]
+    pub fn get_at(&self, index: usize) -> Option<&K> {
+        self.keys.get(index)
+    }
+
     /// `mh_rehash`: rebuild `self.hash` from `self.keys` (which must
     /// already be allocated and empty before calling, per the original).
     fn mh_rehash(&mut self) {
@@ -392,6 +401,16 @@ mod tests {
         assert!(removed.is_some());
         assert!(!s.contains(&10));
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn set_get_at_reads_the_compact_key_array() {
+        let mut set = Set::new();
+        set.put(10);
+        set.put(20);
+        assert_eq!(set.get_at(0), Some(&10));
+        assert_eq!(set.get_at(1), Some(&20));
+        assert_eq!(set.get_at(2), None);
     }
 
     #[test]

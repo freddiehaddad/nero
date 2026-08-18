@@ -156,6 +156,23 @@ pub unsafe fn hl_get_term_attr(attrs: &crate::highlight_defs::HlAttrs) -> i32 {
     })
 }
 
+/// Get highlight attributes for an attribute code (`syn_attr2entry`).
+///
+/// Invalid, cleared, and zero IDs return the default attribute set.
+///
+/// # Safety
+/// Reads the shared attribute table.
+#[must_use]
+pub unsafe fn syn_attr2entry(attr: i32) -> crate::highlight_defs::HlAttrs {
+    if attr <= 0 {
+        return Default::default();
+    }
+    unsafe { ATTR_ENTRIES.get_mut() }
+        .get_at(attr as usize)
+        .map(|entry| entry.attr)
+        .unwrap_or_default()
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -638,6 +655,32 @@ mod tests {
         assert!(first > 0);
         assert_eq!(same, first);
         assert_ne!(different, first);
+    }
+
+    #[test]
+    fn syn_attr2entry_returns_interned_attrs_and_defaults_for_bad_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            cterm_fg_color: 6,
+            rgb_fg_color: 0x12_34_56,
+            ..Default::default()
+        };
+        let id = unsafe { hl_get_term_attr(&attrs) };
+
+        assert_eq!(unsafe { syn_attr2entry(id) }, attrs);
+        assert_eq!(
+            unsafe { syn_attr2entry(0) },
+            crate::highlight_defs::HlAttrs::default()
+        );
+        assert_eq!(
+            unsafe { syn_attr2entry(-1) },
+            crate::highlight_defs::HlAttrs::default()
+        );
+        assert_eq!(
+            unsafe { syn_attr2entry(999) },
+            crate::highlight_defs::HlAttrs::default()
+        );
     }
 
     struct NamespaceHighlightsGuard {
