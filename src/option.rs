@@ -8123,6 +8123,31 @@ pub unsafe fn did_set_undofile(
     );
 }
 
+/// Process an updated `'swapfile'` value (`did_set_swapfile`).
+///
+/// Disabling swap files (or keeping them disabled while
+/// `'updatecount'` is zero) closes and removes the current backing file
+/// through the already-real `mf_close_file`. Creating a new swap file
+/// still needs `ml_open_file`.
+///
+/// # Safety
+/// `args.os_buf` must point to a live `BufT`; forwarded from
+/// [`crate::memfile::mf_close_file`].
+pub unsafe fn did_set_swapfile(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf as *mut crate::buffer_defs::BufT;
+    // SAFETY: forwarded from this function's own safety doc.
+    let enabled = unsafe { (*buf).b_p_swf } != 0;
+    let updatecount = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_uc };
+    if enabled && updatecount != 0 {
+        unimplemented!("did_set_swapfile: creating a swap file needs ml_open_file");
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memfile::mf_close_file(&mut *buf, true) };
+    None
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///
@@ -10023,6 +10048,39 @@ mod did_set_title_tests {
             ..Default::default()
         };
         unsafe { did_set_undofile(&mut args) };
+    }
+
+    #[test]
+    fn did_set_swapfile_disabled_path_is_safe_without_a_memfile() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _updatecount = UpdatecountGuard::set(200);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_swf: 0,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_swapfile(&mut args) }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ml_open_file")]
+    fn did_set_swapfile_enabling_needs_swap_file_creation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _updatecount = UpdatecountGuard::set(200);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_swf: 1,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+        unsafe { did_set_swapfile(&mut args) };
     }
 
     #[test]

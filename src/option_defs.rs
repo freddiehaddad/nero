@@ -8371,6 +8371,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::did_set_shellpipe_redir);
     options[OptIndex::Spell as usize].opt_did_set_cb =
         Some(crate::option::did_set_spell);
+    options[OptIndex::Swapfile as usize].opt_did_set_cb =
+        Some(crate::option::did_set_swapfile);
     options[OptIndex::Shiftwidth as usize].opt_did_set_cb =
         Some(crate::indent_c::did_set_shiftwidth_tabstop);
     options[OptIndex::Showtabline as usize].opt_did_set_cb =
@@ -8702,6 +8704,7 @@ mod options_table_tests {
             b"shellpipe",
             b"shellredir",
             b"spell",
+            b"swapfile",
             b"shiftwidth",
             b"showtabline",
             b"tabstop",
