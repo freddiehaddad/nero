@@ -25,12 +25,12 @@
 //! of value an option accepts, with no value attached - `OptVal` itself
 //! doesn't fit that use case).
 //!
-//! Deferred: `opt_did_set_cb`/`opt_expand_cb` real callback function
+//! Deferred: most `opt_did_set_cb`/`opt_expand_cb` real callback
 //! implementations (`option.c`'s `did_set_*`/`optionstr.c`'s
-//! `did_set_*`/`expand_*` families, ~150 functions) - every one of
-//! [`OPTIONS`]'s 377 entries has `opt_did_set_cb: None`/
-//! `opt_expand_cb: None` for now, a substantial, separate future
-//! undertaking. The generic `get_option_value`/`set_option_value`/
+//! `did_set_*`/`expand_*` families, ~150 functions). The translated
+//! callback-valued options and `'complete'` are wired now; remaining
+//! entries and every expansion callback stay `None`. The generic
+//! `get_option_value`/`set_option_value`/
 //! `do_set` engine that would actually DISPATCH through `OPTIONS`
 //! (via `get_varp_from`'s ~30-branch buffer/window-local fallback
 //! logic - the `var`/`flags_var` fields, `scope_idx`, and every
@@ -307,7 +307,12 @@ impl Default for OptsetT {
 ///
 /// Returns `None` if the option value is valid and successfully
 /// applied. Otherwise returns an error message.
-pub type OptDidSetCbT = fn(args: &mut OptsetT) -> Option<&'static [u8]>;
+///
+/// # Safety
+/// The option callback may dereference raw storage/window/buffer
+/// pointers carried by [`OptsetT`].
+pub type OptDidSetCbT =
+    unsafe fn(args: &mut OptsetT) -> Option<&'static [u8]>;
 
 /// Argument for the callback function ([`OptExpandCbT`]) invoked after
 /// a string option value is expanded for cmdline completion
@@ -485,7 +490,10 @@ mod tests {
         }
         let cb: OptDidSetCbT = validator;
         let mut args = OptsetT::default();
-        assert_eq!(cb(&mut args), Some(b"E123: bad value".as_slice()));
+        assert_eq!(
+            unsafe { cb(&mut args) },
+            Some(b"E123: bad value".as_slice())
+        );
     }
 
     #[test]
@@ -1912,8 +1920,9 @@ mod options_enum_tests {
 /// verified to already exist as a real constant elsewhere in this
 /// crate (`ascii_defs`/`globals`/`buffer_defs`/`option_vars`).
 ///
-/// Deliberately deferred in THIS pass (see this module's own doc
-/// comment): every `opt_did_set_cb`/`opt_expand_cb` is `None`.
+/// Translated callback-valued option handlers and `'complete'` are
+/// wired; remaining did-set handlers and every expand handler stay
+/// deferred (see this module's own doc comment).
 ///
 /// `var`/`flags_var` are resolved to real addresses into
 /// [`crate::option_vars::OPTION_VARS`] via `GlobalCell::as_ptr()`
@@ -2844,7 +2853,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [-1, -1, 18, -1],
         immutable: false,
         values: crate::option_vars::OPT_CPT_VALUES,
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::optionstr::did_set_complete),
         opt_expand_cb: None,
         def_val: OptVal::String(b".,w,b,u,t".to_vec()),
         script_ctx: SctxT::default(),
@@ -2860,7 +2869,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [-1, -1, 19, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::insexpand::did_set_completefunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -3612,7 +3621,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [62, -1, 34, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::ex_docmd::did_set_findfunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -5356,7 +5365,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [-1, -1, 63, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::insexpand::did_set_omnifunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -5388,7 +5397,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [138, -1, -1, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::ops::did_set_operatorfunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -5692,7 +5701,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [155, -1, -1, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::quickfix::did_set_quickfixtextfunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -6972,7 +6981,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [-1, -1, 82, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::tag::did_set_tagfunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -7180,7 +7189,7 @@ fn build_options() -> [VimoptionT; OPT_COUNT] {
         scope_idx: [222, -1, 86, -1],
         immutable: false,
         values: &[],
-        opt_did_set_cb: None,
+        opt_did_set_cb: Some(crate::insexpand::did_set_thesaurusfunc),
         opt_expand_cb: None,
         def_val: OptVal::String(b"".to_vec()),
         script_ctx: SctxT::default(),
@@ -8218,9 +8227,29 @@ mod options_table_tests {
     }
 
     #[test]
-    fn every_opt_did_set_cb_and_opt_expand_cb_is_none_in_this_pass() {
+    fn translated_option_callbacks_are_wired_and_others_remain_deferred() {
         let opts = unsafe { OPTIONS.get_mut() };
-        assert!(opts.iter().all(|o| o.opt_did_set_cb.is_none()));
+        let expected: &[&[u8]] = &[
+            b"complete",
+            b"completefunc",
+            b"findfunc",
+            b"omnifunc",
+            b"operatorfunc",
+            b"quickfixtextfunc",
+            b"tagfunc",
+            b"thesaurusfunc",
+        ];
+        for name in expected {
+            assert!(opts
+                .iter()
+                .find(|option| option.fullname == *name)
+                .and_then(|option| option.opt_did_set_cb)
+                .is_some());
+        }
+        assert!(opts.iter().all(|option| {
+            expected.contains(&option.fullname)
+                || option.opt_did_set_cb.is_none()
+        }));
         assert!(opts.iter().all(|o| o.opt_expand_cb.is_none()));
     }
 
