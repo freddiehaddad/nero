@@ -140,6 +140,22 @@ pub unsafe fn hl_get_underline() -> i32 {
     })
 }
 
+/// Get the attribute ID for forwarded terminal highlighting
+/// (`hl_get_term_attr`).
+///
+/// # Safety
+/// Mutates the shared attribute table when first called for `attrs`.
+#[must_use]
+pub unsafe fn hl_get_term_attr(attrs: &crate::highlight_defs::HlAttrs) -> i32 {
+    get_attr_entry(crate::highlight_defs::HlEntry {
+        attr: *attrs,
+        kind: crate::highlight_defs::HlKind::Terminal,
+        id1: 0,
+        id2: 0,
+        winid: 0,
+    })
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -598,6 +614,30 @@ mod tests {
         assert!(first > 0);
         assert_eq!(second, first);
         assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 2);
+    }
+
+    #[test]
+    fn hl_get_term_attr_interns_terminal_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            cterm_fg_color: 4,
+            cterm_bg_color: 2,
+            ..Default::default()
+        };
+
+        let first = unsafe { hl_get_term_attr(&attrs) };
+        let same = unsafe { hl_get_term_attr(&attrs) };
+        let different = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                cterm_fg_color: 5,
+                ..attrs
+            })
+        };
+
+        assert!(first > 0);
+        assert_eq!(same, first);
+        assert_ne!(different, first);
     }
 
     struct NamespaceHighlightsGuard {
