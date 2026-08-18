@@ -23,6 +23,47 @@
 //! UI replay; namespace-zero definitions still belong to
 //! `highlight_group.c`'s global `:highlight` setter.
 
+/// Convert an API highlight color object to an RGB or cterm color
+/// (`object_to_color`).
+///
+/// # Safety
+/// RGB string lookup may read shared Normal-highlight state; cterm
+/// lookup reads the shared cterm color-name table.
+pub unsafe fn object_to_color(
+    value: &crate::api::private::defs::Object,
+    key: &str,
+    rgb: bool,
+    err: &mut crate::api::private::defs::Error,
+) -> i32 {
+    use crate::api::private::defs::{ErrorType, Object};
+    match value {
+        Object::Integer(value) => *value as i32,
+        Object::String(name) => {
+            if name.is_empty() || name.eq_ignore_ascii_case(b"NONE") {
+                return -1;
+            }
+            let color = if rgb {
+                unsafe { crate::highlight_group::name_to_color(name) }.0
+            } else {
+                unsafe { crate::highlight_group::name_to_ctermcolor(name) }
+            };
+            if color < 0 {
+                err.r#type = ErrorType::Validation;
+                err.msg = Some(format!(
+                    "Invalid highlight color: '{}'",
+                    String::from_utf8_lossy(name)
+                ));
+            }
+            color
+        }
+        _ => {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some(format!("Invalid '{key}': expected String or Integer"));
+            0
+        }
+    }
+}
+
 /// Interned font names, indexed by the value `hl_add_font_idx`
 /// returns (`fonts`).
 ///
@@ -1665,6 +1706,94 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_to_color_accepts_integer_none_named_and_cterm_colors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut err = crate::api::private::defs::Error::default();
+        assert_eq!(
+            unsafe {
+                object_to_color(
+                    &crate::api::private::defs::Object::Integer(0x123456),
+                    "fg",
+                    true,
+                    &mut err,
+                )
+            },
+            0x123456
+        );
+        assert_eq!(
+            unsafe {
+                object_to_color(
+                    &crate::api::private::defs::Object::String(b"NONE".to_vec()),
+                    "fg",
+                    true,
+                    &mut err,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                object_to_color(
+                    &crate::api::private::defs::Object::String(b"RebeccaPurple".to_vec()),
+                    "fg",
+                    true,
+                    &mut err,
+                )
+            },
+            0x663399
+        );
+        assert_eq!(
+            unsafe {
+                object_to_color(
+                    &crate::api::private::defs::Object::String(b"DarkBlue".to_vec()),
+                    "ctermfg",
+                    false,
+                    &mut err,
+                )
+            },
+            4
+        );
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn object_to_color_reports_invalid_color_and_value_types() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut color_err = crate::api::private::defs::Error::default();
+        assert_eq!(
+            unsafe {
+                object_to_color(
+                    &crate::api::private::defs::Object::String(b"missing".to_vec()),
+                    "fg",
+                    true,
+                    &mut color_err,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            color_err.msg.as_deref(),
+            Some("Invalid highlight color: 'missing'")
+        );
+        let mut type_err = crate::api::private::defs::Error::default();
+        assert_eq!(
+            unsafe {
+                object_to_color(
+                    &crate::api::private::defs::Object::Boolean(true),
+                    "fg",
+                    true,
+                    &mut type_err,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            type_err.msg.as_deref(),
+            Some("Invalid 'fg': expected String or Integer")
+        );
+    }
 
     struct AttributeEntriesGuard {
         entries: crate::map::Set<crate::highlight_defs::HlEntry>,
