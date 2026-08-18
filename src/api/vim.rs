@@ -342,6 +342,21 @@ pub unsafe fn nvim_del_var(name: &NvimString, err: &mut Error) {
     };
 }
 
+/// Get a special `v:` variable (`nvim_get_vvar`).
+///
+/// # Safety
+/// Reads the shared special-variable dictionary and recursively
+/// converts the selected value.
+pub unsafe fn nvim_get_vvar(name: &NvimString, err: &mut Error) -> Object {
+    unsafe {
+        crate::api::private::helpers::dict_get_value(
+            crate::eval::vars::get_vimvar_dict(),
+            name,
+            err,
+        )
+    }
+}
+
 /// Get the current window's handle (`nvim_get_current_win`).
 ///
 /// # Safety
@@ -667,6 +682,27 @@ mod tests {
         let dict = crate::eval::vars::get_globvar_dict();
         assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) }.is_none());
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_get_vvar_reads_the_special_variable_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut false_err = Error::default();
+        assert!(matches!(
+            unsafe { nvim_get_vvar(&b"false".to_vec(), &mut false_err) },
+            Object::Boolean(false)
+        ));
+        assert!(!false_err.is_set());
+
+        let mut missing_err = Error::default();
+        assert!(matches!(
+            unsafe { nvim_get_vvar(&b"nero_missing_vvar".to_vec(), &mut missing_err) },
+            Object::Nil
+        ));
+        assert_eq!(
+            missing_err.msg.as_deref(),
+            Some("Key not found: nero_missing_vvar")
+        );
     }
 
     #[test]
