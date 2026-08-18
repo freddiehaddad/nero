@@ -8003,6 +8003,29 @@ pub fn did_set_equalalways(
     None
 }
 
+/// Process an updated `'undofile'` value (`did_set_undofile`).
+///
+/// When both the buffer-local and global values are disabled, the
+/// original returns immediately. Any enabled path needs the full
+/// per-buffer undo-file hash/read loop.
+///
+/// # Safety
+/// `args.os_buf` must point to a live `BufT`.
+pub unsafe fn did_set_undofile(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf as *mut crate::buffer_defs::BufT;
+    // SAFETY: forwarded from this function's own safety doc.
+    let local_enabled = unsafe { (*buf).b_p_udf } != 0;
+    let global_enabled = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_udf } != 0;
+    if !local_enabled && !global_enabled {
+        return None;
+    }
+    unimplemented!(
+        "did_set_undofile: enabled values need the per-buffer undo-file hash/read loop"
+    );
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///
@@ -8851,6 +8874,23 @@ mod did_set_title_tests {
         }
     }
 
+    struct UndofileGuard(i32);
+
+    impl UndofileGuard {
+        fn set(value: i32) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_udf };
+            unsafe { (*options).p_udf = value };
+            UndofileGuard(previous)
+        }
+    }
+
+    impl Drop for UndofileGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_udf = self.0 };
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9628,6 +9668,36 @@ mod did_set_title_tests {
             ..Default::default()
         };
         did_set_equalalways(&mut args);
+    }
+
+    #[test]
+    fn did_set_undofile_returns_immediately_when_both_values_are_disabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _undofile = UndofileGuard::set(0);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_udf: 0,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_undofile(&mut args) }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "undo-file hash/read loop")]
+    fn did_set_undofile_enabled_value_needs_undo_file_loading() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _undofile = UndofileGuard::set(1);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+        unsafe { did_set_undofile(&mut args) };
     }
 
     #[test]
