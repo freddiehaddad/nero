@@ -281,6 +281,21 @@ pub unsafe fn nvim_list_tabpages() -> Array {
     result
 }
 
+/// Get a global variable (`nvim_get_var`).
+///
+/// # Safety
+/// Reads the shared global-variable dictionary and recursively
+/// converts the selected value.
+pub unsafe fn nvim_get_var(name: &NvimString, err: &mut Error) -> Object {
+    unsafe {
+        crate::api::private::helpers::dict_get_value(
+            crate::eval::vars::get_globvar_dict(),
+            name,
+            err,
+        )
+    }
+}
+
 /// Get the current window's handle (`nvim_get_current_win`).
 ///
 /// # Safety
@@ -560,6 +575,24 @@ mod tests {
             )
         };
         assert!(unsafe { nvim_list_tabpages() }.is_empty());
+    }
+
+    #[test]
+    fn nvim_get_var_returns_a_real_global_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::vars::get_globvar_dict();
+        let key = b"nero_api_global_answer";
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, key, 42) },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+        let value = unsafe { nvim_get_var(&key.to_vec(), &mut err) };
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) }
+            .expect("global variable");
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        assert!(matches!(value, Object::Integer(42)));
+        assert!(!err.is_set());
     }
 
     #[test]
