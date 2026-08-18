@@ -7755,6 +7755,34 @@ pub unsafe fn did_set_helpheight(
     None
 }
 
+/// Process a new `'winheight'` value (`did_set_winheight`).
+///
+/// Single-window layouts and windows already meeting the requested
+/// minimum need no action. Enlarging the current window still needs
+/// `win_setheight`.
+///
+/// # Safety
+/// `GLOBALS.curwin`/`firstwin` must point to live values; forwarded
+/// from [`crate::window::one_window`].
+pub unsafe fn did_set_winheight(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { (*globals).curwin };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::window::one_window(curwin, std::ptr::null()) } {
+        return None;
+    }
+
+    let minimum = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_wh };
+    // SAFETY: forwarded from this function's own safety doc.
+    if i64::from(unsafe { (*curwin).w_view_height }) < minimum {
+        unimplemented!("did_set_winheight: enlarging the current window needs win_setheight");
+    }
+    None
+}
+
 /// Process the updated global or buffer-local `'undolevels'` value
 /// (`did_set_undolevels`).
 ///
@@ -8935,6 +8963,23 @@ mod did_set_title_tests {
         }
     }
 
+    struct WinheightGuard(crate::types_defs::OptInt);
+
+    impl WinheightGuard {
+        fn set(value: crate::types_defs::OptInt) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_wh };
+            unsafe { (*options).p_wh = value };
+            WinheightGuard(previous)
+        }
+    }
+
+    impl Drop for WinheightGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_wh = self.0 };
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9313,6 +9358,51 @@ mod did_set_title_tests {
         };
 
         unsafe { did_set_helpheight(&mut Default::default()) };
+    }
+
+    #[test]
+    fn did_set_winheight_needs_no_action_for_a_single_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _winheight = WinheightGuard::set(20);
+        let mut win = crate::buffer_defs::WinT {
+            w_view_height: 1,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+
+        assert_eq!(
+            unsafe { did_set_winheight(&mut Default::default()) },
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "win_setheight")]
+    fn did_set_winheight_small_current_window_needs_live_layout_resizing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _winheight = WinheightGuard::set(20);
+        let mut second = crate::buffer_defs::WinT::default();
+        let second_ptr = std::ptr::from_mut(&mut second);
+        let mut win = crate::buffer_defs::WinT {
+            w_view_height: 1,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+
+        unsafe { did_set_winheight(&mut Default::default()) };
     }
 
     #[test]

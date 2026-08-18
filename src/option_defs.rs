@@ -8381,6 +8381,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::option::did_set_updatecount);
     options[OptIndex::Winminheight as usize].opt_did_set_cb =
         Some(crate::window::did_set_winminheight);
+    options[OptIndex::Winheight as usize].opt_did_set_cb =
+        Some(crate::option::did_set_winheight);
     options[OptIndex::Winminwidth as usize].opt_did_set_cb =
         Some(crate::window::did_set_winminwidth);
 }
@@ -8701,6 +8703,7 @@ mod options_table_tests {
             b"undofile",
             b"updatecount",
             b"winminheight",
+            b"winheight",
             b"winminwidth",
         ];
         if cfg!(windows) {
