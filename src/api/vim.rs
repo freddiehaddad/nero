@@ -12,7 +12,9 @@
 //! tabpage in question is the current one), and [`nvim_strwidth`] (via
 //! the already-existing `mbyte.rs::mb_string2cells`).
 
-use crate::api::private::defs::{Buffer, Error, ErrorType, Integer, NvimString, Tabpage, Window};
+use crate::api::private::defs::{
+    Buffer, Error, ErrorType, Integer, NvimString, Tabpage, Window,
+};
 
 /// Get the current window's handle (`nvim_get_current_win`).
 ///
@@ -82,10 +84,114 @@ pub unsafe fn nvim_strwidth(text: &NvimString, err: &mut Error) -> Integer {
     (unsafe { crate::mbyte::mb_string2cells(text) }) as i64
 }
 
+/// Get the active highlight namespace (`nvim_get_hl_ns`).
+///
+/// `winid == None` selects the global namespace; a window ID returns
+/// that window's local namespace.
+///
+/// # Safety
+/// Forwarded from `find_window_by_handle` when `winid` is present, and
+/// otherwise reads shared highlight state.
+pub unsafe fn nvim_get_hl_ns(winid: Option<Window>, err: &mut Error) -> Integer {
+    if let Some(winid) = winid {
+        let win = unsafe { crate::api::private::helpers::find_window_by_handle(winid, err) };
+        if win.is_null() {
+            0
+        } else {
+            i64::from(unsafe { (*win).w_ns_hl })
+        }
+    } else {
+        i64::from(unsafe { *crate::highlight::NS_HL_GLOBAL.get_mut() })
+    }
+}
+
+/// Set the active global highlight namespace (`nvim_set_hl_ns`).
+///
+/// # Safety
+/// Mutates shared highlight namespace/provider/group state and
+/// schedules a redraw for every live window.
+pub unsafe fn nvim_set_hl_ns(ns_id: Integer, err: &mut Error) {
+    if ns_id < 0 {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Invalid 'namespace': {ns_id}"));
+        return;
+    }
+    unsafe { *crate::highlight::NS_HL_GLOBAL.get_mut() = ns_id as i32 };
+    let _ = unsafe { crate::highlight::hl_check_ns() };
+    unsafe { crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_NOT_VALID) };
+}
+
+/// Set the fast-callback highlight namespace
+/// (`nvim_set_hl_ns_fast`).
+///
+/// Unlike [`nvim_set_hl_ns`], the original deliberately performs no
+/// nonnegative validation.
+///
+/// # Safety
+/// Mutates shared highlight namespace/provider/group state.
+pub unsafe fn nvim_set_hl_ns_fast(ns_id: Integer) {
+    unsafe { *crate::highlight::NS_HL_FAST.get_mut() = ns_id as i32 };
+    let _ = unsafe { crate::highlight::hl_check_ns() };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, TabpageT, WinT};
+
+    struct HighlightNamespaceGuard {
+        global: i32,
+        win: i32,
+        fast: i32,
+        active: i32,
+        need_changed: bool,
+        firstwin: *mut WinT,
+        first_tabpage: *mut TabpageT,
+        curtab: *mut TabpageT,
+    }
+
+    impl HighlightNamespaceGuard {
+        fn set(global: i32, win: i32, fast: i32, active: i32) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = Self {
+                global: unsafe { *crate::highlight::NS_HL_GLOBAL.get_mut() },
+                win: unsafe { *crate::highlight::NS_HL_WIN.get_mut() },
+                fast: unsafe { *crate::highlight::NS_HL_FAST.get_mut() },
+                active: unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() },
+                need_changed: globals.need_highlight_changed,
+                firstwin: globals.firstwin,
+                first_tabpage: globals.first_tabpage,
+                curtab: globals.curtab,
+            };
+            unsafe {
+                *crate::highlight::NS_HL_GLOBAL.get_mut() = global;
+                *crate::highlight::NS_HL_WIN.get_mut() = win;
+                *crate::highlight::NS_HL_FAST.get_mut() = fast;
+                *crate::highlight::NS_HL_ACTIVE.get_mut() = active;
+            }
+            globals.need_highlight_changed = false;
+            globals.firstwin = std::ptr::null_mut();
+            globals.first_tabpage = std::ptr::null_mut();
+            globals.curtab = std::ptr::null_mut();
+            guard
+        }
+    }
+
+    impl Drop for HighlightNamespaceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *crate::highlight::NS_HL_GLOBAL.get_mut() = self.global;
+                *crate::highlight::NS_HL_WIN.get_mut() = self.win;
+                *crate::highlight::NS_HL_FAST.get_mut() = self.fast;
+                *crate::highlight::NS_HL_ACTIVE.get_mut() = self.active;
+                let globals = crate::globals::GLOBALS.get_mut();
+                globals.need_highlight_changed = self.need_changed;
+                globals.firstwin = self.firstwin;
+                globals.first_tabpage = self.first_tabpage;
+                globals.curtab = self.curtab;
+            }
+        }
+    }
 
     #[test]
     fn nvim_get_current_win_returns_curwin_handle() {
@@ -177,5 +283,63 @@ mod tests {
     #[test]
     fn text_length_ok_false_just_past_the_i32_max_boundary() {
         assert!(!text_length_ok(i32::MAX as usize + 1));
+    }
+
+    #[test]
+    fn nvim_get_hl_ns_returns_global_or_window_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _namespace = HighlightNamespaceGuard::set(6, -1, -1, -1);
+        let mut err = Error::default();
+        assert_eq!(unsafe { nvim_get_hl_ns(None, &mut err) }, 6);
+        assert!(!err.is_set());
+
+        let mut win = WinT {
+            handle: 42,
+            w_ns_hl: 9,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let mut tab = TabpageT::default();
+        let tab_ptr = std::ptr::addr_of_mut!(tab);
+        unsafe {
+            let globals = crate::globals::GLOBALS.get_mut();
+            globals.firstwin = win_ptr;
+            globals.first_tabpage = tab_ptr;
+            globals.curtab = tab_ptr;
+        }
+        assert_eq!(unsafe { nvim_get_hl_ns(Some(42), &mut err) }, 9);
+
+        assert_eq!(unsafe { nvim_get_hl_ns(Some(99), &mut err) }, 0);
+        assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
+    }
+
+    #[test]
+    fn nvim_set_hl_ns_validates_and_selects_global_namespace_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _namespace = HighlightNamespaceGuard::set(7, -1, -1, 7);
+        let mut err = Error::default();
+
+        unsafe { nvim_set_hl_ns(-1, &mut err) };
+        assert_eq!(err.r#type, ErrorType::Validation);
+        assert_eq!(err.msg.as_deref(), Some("Invalid 'namespace': -1"));
+        assert_eq!(unsafe { *crate::highlight::NS_HL_GLOBAL.get_mut() }, 7);
+
+        err = Error::default();
+        unsafe { nvim_set_hl_ns(0, &mut err) };
+        assert!(!err.is_set());
+        assert_eq!(unsafe { *crate::highlight::NS_HL_GLOBAL.get_mut() }, 0);
+        assert_eq!(unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() }, 0);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed);
+    }
+
+    #[test]
+    fn nvim_set_hl_ns_fast_accepts_negative_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _namespace = HighlightNamespaceGuard::set(0, -1, 3, 3);
+
+        unsafe { nvim_set_hl_ns_fast(-1) };
+
+        assert_eq!(unsafe { *crate::highlight::NS_HL_FAST.get_mut() }, -1);
+        assert_eq!(unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() }, 0);
     }
 }
