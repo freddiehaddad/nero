@@ -5,7 +5,7 @@
 //! layer yet).
 //!
 //! Translated: [`nvim_buf_line_count`], [`nvim_buf_get_changedtick`],
-//! [`nvim_buf_get_name`], [`nvim_buf_is_loaded`],
+//! [`nvim_buf_get_mark`], [`nvim_buf_get_name`], [`nvim_buf_is_loaded`],
 //! [`nvim_buf_is_valid`] - every one of these is a thin, real
 //! `find_buffer_by_handle` + one-field read, with no other
 //! dependency.
@@ -20,11 +20,13 @@
 //! `Object`-to-`typval_T` bridge), `nvim_buf_get_keymap`/`set_keymap`/
 //! `del_keymap` (the mapping subsystem), `nvim_buf_set_name` (needs
 //! `rename_buffer`/`ctx_switch`), `nvim_buf_delete` (needs `do_buffer`),
-//! `nvim_buf_del_mark`/`nvim_buf_set_mark` (needs `Array`/`ArrayOf`
-//! conversion plus mark-setting machinery), `nvim_buf_call` (needs the
+//! `nvim_buf_del_mark`/`nvim_buf_set_mark` (needs mark-setting
+//! machinery), `nvim_buf_call` (needs the
 //! Lua host).
 
-use crate::api::private::defs::{Boolean, Buffer, Error, Integer, NvimString};
+use crate::api::private::defs::{
+    Array, Boolean, Buffer, Error, ErrorType, Integer, NvimString, Object,
+};
 use crate::api::private::helpers::find_buffer_by_handle;
 
 /// Get the number of lines in buffer `buf` (`0` for the current
@@ -60,6 +62,54 @@ pub unsafe fn nvim_buf_get_changedtick(buf: Buffer, err: &mut Error) -> Integer 
     }
     // SAFETY: `b` is non-null per the check above.
     crate::buffer::buf_get_changedtick(unsafe { &*b })
+}
+
+/// Return the `(row, column)` position of named mark `name`
+/// (`nvim_buf_get_mark`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and
+/// [`crate::mark::mark_get`]; `GLOBALS.curwin` must point to a live
+/// window.
+pub unsafe fn nvim_buf_get_mark(buf: Buffer, name: &NvimString, err: &mut Error) -> Array {
+    let b = unsafe { find_buffer_by_handle(buf, err) };
+    if b.is_null() {
+        return Vec::new();
+    }
+    if name.len() != 1 {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(if name.is_empty() {
+            "Invalid mark name (must be a single char)".to_string()
+        } else {
+            format!(
+                "Invalid mark name (must be a single char): '{}'",
+                String::from_utf8_lossy(name)
+            )
+        });
+        return Vec::new();
+    }
+
+    let mark = unsafe {
+        crate::mark::mark_get(
+            &mut *b,
+            crate::globals::GLOBALS.get_mut().curwin,
+            None,
+            crate::mark_defs::MarkGet::AllNoResolve,
+            i32::from(name[0]),
+        )
+    };
+    if mark.is_null() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Invalid mark name: '{}'", String::from_utf8_lossy(name)));
+        return Vec::new();
+    }
+
+    let pos = if unsafe { (*mark).fnum } == unsafe { (*b).handle } {
+        unsafe { (*mark).mark }
+    } else {
+        crate::pos_defs::PosT::default()
+    };
+    vec![Object::Integer(i64::from(pos.lnum)), Object::Integer(i64::from(pos.col))]
 }
 
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
@@ -115,7 +165,7 @@ pub unsafe fn nvim_buf_is_valid(buf: Buffer) -> Boolean {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer_defs::BufT;
+    use crate::buffer_defs::{BufT, WinT};
     use crate::memfile_defs::{MemfileT, MfdirtyT};
 
     fn test_memfile() -> MemfileT {
@@ -139,8 +189,10 @@ mod tests {
 
     struct BufFixture {
         buf_ptr: *mut BufT,
+        win_ptr: *mut WinT,
         prev_lastbuf: *mut BufT,
         prev_curbuf: *mut BufT,
+        prev_curwin: *mut WinT,
     }
 
     impl BufFixture {
@@ -156,15 +208,19 @@ mod tests {
             // a raw pointer up front, then manually reconstructing
             // the `Box` only once, in `Drop`, avoids this entirely.
             let buf_ptr = Box::into_raw(Box::new(BufT { handle, ..Default::default() }));
+            let win_ptr =
+                Box::into_raw(Box::new(WinT { w_buffer: buf_ptr, ..Default::default() }));
 
             // SAFETY: single-threaded test, GLOBALS restored in Drop.
             unsafe {
                 let g = crate::globals::GLOBALS.get_mut();
                 let prev_lastbuf = g.lastbuf;
                 let prev_curbuf = g.curbuf;
+                let prev_curwin = g.curwin;
                 g.lastbuf = buf_ptr;
                 g.curbuf = buf_ptr;
-                BufFixture { buf_ptr, prev_lastbuf, prev_curbuf }
+                g.curwin = win_ptr;
+                BufFixture { buf_ptr, win_ptr, prev_lastbuf, prev_curbuf, prev_curwin }
             }
         }
 
@@ -190,6 +246,8 @@ mod tests {
                 let g = crate::globals::GLOBALS.get_mut();
                 g.lastbuf = self.prev_lastbuf;
                 g.curbuf = self.prev_curbuf;
+                g.curwin = self.prev_curwin;
+                drop(Box::from_raw(self.win_ptr));
                 drop(Box::from_raw(self.buf_ptr));
             }
         }
@@ -251,6 +309,53 @@ mod tests {
         let tick = unsafe { nvim_buf_get_changedtick(9999, &mut err) };
         assert_eq!(tick, -1);
         assert!(err.is_set());
+    }
+
+    #[test]
+    fn nvim_buf_get_mark_returns_the_local_mark_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(41);
+        fx.buf_mut().b_namedm[0].mark = crate::pos_defs::PosT {
+            lnum: 7,
+            col: 3,
+            coladd: 0,
+        };
+        fx.buf_mut().b_namedm[0].fnum = 41;
+        let mut err = Error::default();
+
+        let position =
+            unsafe { nvim_buf_get_mark(fx.handle(), &b"a".to_vec(), &mut err) };
+
+        assert!(!err.is_set());
+        assert!(matches!(
+            position.as_slice(),
+            [Object::Integer(7), Object::Integer(3)]
+        ));
+    }
+
+    #[test]
+    fn nvim_buf_get_mark_rejects_a_multibyte_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = BufFixture::new(42);
+        let mut err = Error::default();
+        assert!(
+            unsafe { nvim_buf_get_mark(fx.handle(), &b"ab".to_vec(), &mut err) }.is_empty()
+        );
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("Invalid mark name (must be a single char): 'ab'")
+        );
+    }
+
+    #[test]
+    fn nvim_buf_get_mark_rejects_an_invalid_single_character_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = BufFixture::new(43);
+        let mut err = Error::default();
+        assert!(
+            unsafe { nvim_buf_get_mark(fx.handle(), &b"~".to_vec(), &mut err) }.is_empty()
+        );
+        assert_eq!(err.msg.as_deref(), Some("Invalid mark name: '~'"));
     }
 
     #[test]
