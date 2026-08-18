@@ -5,7 +5,7 @@
 //! layer yet).
 //!
 //! Translated: [`nvim_buf_get_lines`], [`nvim_buf_get_text`], [`nvim_buf_line_count`],
-//! [`nvim_buf_get_changedtick`],
+//! [`nvim_buf_get_changedtick`], [`nvim_buf_get_var`],
 //! [`nvim_buf_get_mark`], [`nvim_buf_get_name`], [`nvim_buf_is_loaded`],
 //! [`nvim_buf_is_valid`] - every one of these is a thin, real
 //! `find_buffer_by_handle` + one-field read, with no other
@@ -224,6 +224,7 @@ pub unsafe fn nvim_buf_get_mark(buf: Buffer, name: &NvimString, err: &mut Error)
     if b.is_null() {
         return Vec::new();
     }
+
     if name.len() != 1 {
         err.r#type = ErrorType::Validation;
         err.msg = Some(if name.is_empty() {
@@ -258,6 +259,19 @@ pub unsafe fn nvim_buf_get_mark(buf: Buffer, name: &NvimString, err: &mut Error)
         crate::pos_defs::PosT::default()
     };
     vec![Object::Integer(i64::from(pos.lnum)), Object::Integer(i64::from(pos.col))]
+}
+
+/// Get a buffer-scoped variable (`nvim_buf_get_var`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and
+/// [`crate::api::private::helpers::dict_get_value`].
+pub unsafe fn nvim_buf_get_var(buf: Buffer, name: &NvimString, err: &mut Error) -> Object {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return Object::Nil;
+    }
+    unsafe { crate::api::private::helpers::dict_get_value((*buf).b_vars, name, err) }
 }
 
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
@@ -609,6 +623,43 @@ mod tests {
             unsafe { nvim_buf_get_mark(fx.handle(), &b"~".to_vec(), &mut err) }.is_empty()
         );
         assert_eq!(err.msg.as_deref(), Some("Invalid mark name: '~'"));
+    }
+
+    #[test]
+    fn nvim_buf_get_var_returns_a_real_buffer_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(49);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"answer", 42) },
+            crate::vim_defs::OK
+        );
+        fx.buf_mut().b_vars = dict;
+        let mut err = Error::default();
+
+        let value =
+            unsafe { nvim_buf_get_var(fx.handle(), &b"answer".to_vec(), &mut err) };
+
+        assert!(matches!(value, Object::Integer(42)));
+        assert!(!err.is_set());
+        fx.buf_mut().b_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn nvim_buf_get_var_reports_a_missing_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(50);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        fx.buf_mut().b_vars = dict;
+        let mut err = Error::default();
+        assert!(matches!(
+            unsafe { nvim_buf_get_var(fx.handle(), &b"missing".to_vec(), &mut err) },
+            Object::Nil
+        ));
+        assert_eq!(err.msg.as_deref(), Some("Key not found: missing"));
+        fx.buf_mut().b_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
 
     #[test]
