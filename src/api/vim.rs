@@ -199,6 +199,16 @@ pub unsafe fn nvim_get_hl(
     result
 }
 
+/// Get or create a highlight-group ID by name
+/// (`nvim_get_hl_id_by_name`).
+///
+/// # Safety
+/// Mutates the shared highlight-group registry when `name` is new.
+#[must_use]
+pub unsafe fn nvim_get_hl_id_by_name(name: &NvimString) -> Integer {
+    i64::from(unsafe { crate::highlight_group::syn_check_group(name) })
+}
+
 /// Return the complete named RGB color map (`nvim_get_color_map`).
 #[must_use]
 pub fn nvim_get_color_map() -> Dict {
@@ -838,6 +848,16 @@ mod tests {
             .is_empty()
         );
         assert_eq!(id_err.msg.as_deref(), Some("Highlight id out of bounds"));
+    }
+
+    #[test]
+    fn nvim_get_hl_id_by_name_creates_once_and_reuses_the_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let name = b"NeroApiHighlightIdLookup".to_vec();
+        let first = unsafe { nvim_get_hl_id_by_name(&name) };
+        let second = unsafe { nvim_get_hl_id_by_name(&name) };
+        assert!(first > 0);
+        assert_eq!(first, second);
     }
 
     struct HighlightNamespaceGuard {
