@@ -7,7 +7,7 @@
 //! subsystems.
 
 use crate::api::private::defs::{
-    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, StringArray,
+    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, StringArray, Window,
 };
 use crate::option_defs::OptScope;
 
@@ -231,6 +231,35 @@ pub unsafe fn buffer_del_var(
             name,
             &Object::Nil,
             true,
+            true,
+            err,
+        )
+    }
+}
+
+/// Set a window variable and return its previous value
+/// (`window_set_var`).
+///
+/// # Safety
+/// Forwarded from window-handle lookup and the checked dictionary
+/// writer.
+pub unsafe fn window_set_var(
+    window: Window,
+    name: &NvimString,
+    value: &Object,
+    err: &mut Error,
+) -> Object {
+    let window =
+        unsafe { crate::api::private::helpers::find_window_by_handle(window, err) };
+    if window.is_null() {
+        return Object::Nil;
+    }
+    unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*window).w_vars,
+            name,
+            value,
+            false,
             true,
             err,
         )
@@ -539,6 +568,36 @@ mod tests {
         unsafe {
             crate::eval::typval::tv_dict_unref(dict);
             drop(Box::from_raw(buf));
+        }
+    }
+
+    #[test]
+    fn window_set_var_returns_the_previous_window_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"value", 3) },
+            crate::vim_defs::OK
+        );
+        let win = Box::into_raw(Box::new(crate::buffer_defs::WinT {
+            w_vars: dict,
+            ..Default::default()
+        }));
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win) };
+        let mut err = Error::default();
+        let old =
+            unsafe { window_set_var(0, &b"value".to_vec(), &Object::Integer(7), &mut err) };
+        assert!(matches!(old, Object::Integer(3)));
+        assert!(!err.is_set());
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }
+            .expect("window variable");
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        unsafe { (*win).w_vars = std::ptr::null_mut() };
+        drop(_curwin);
+        unsafe {
+            crate::eval::typval::tv_dict_unref(dict);
+            drop(Box::from_raw(win));
         }
     }
 
