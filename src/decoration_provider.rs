@@ -20,7 +20,8 @@
 //! established "translate the real early-return condition, not a
 //! hardcoded shortcut" pattern (e.g. `autocmd.rs`'s `AU_NEED_CLEAN`).
 //!
-//! Deferred: everything else in the file.
+//! Also [`get_decor_provider`] - lookup or create a provider by
+//! namespace ID. Deferred: everything else in the file.
 
 use crate::decoration_defs::{DecorProvider, DecorProviderState};
 use crate::globals::GlobalCell;
@@ -30,6 +31,32 @@ use crate::types_defs::LuaRef;
 /// provider. Always empty today: nothing translated can register a
 /// real one (`nvim_set_decoration_provider`, not translated).
 static DECOR_PROVIDERS: GlobalCell<Vec<DecorProvider>> = GlobalCell::new(Vec::new());
+
+/// Look up a decoration provider by namespace, creating one when
+/// `force` is true (`get_decor_provider`).
+///
+/// Returns a raw pointer because pushing another provider may
+/// reallocate the vector, exactly as the original's growable-array
+/// storage invalidates pointers after a later append.
+///
+/// # Safety
+/// The provider registry must not be accessed concurrently. The
+/// returned pointer is valid only until the next operation that may
+/// grow or clear the registry.
+#[must_use]
+pub unsafe fn get_decor_provider(ns_id: i32, force: bool) -> *mut DecorProvider {
+    assert!(ns_id > 0);
+    let providers = unsafe { DECOR_PROVIDERS.get_mut() };
+    if let Some(index) = providers.iter().position(|provider| provider.ns_id == ns_id) {
+        return std::ptr::addr_of_mut!(providers[index]);
+    }
+    if !force {
+        return std::ptr::null_mut();
+    }
+    providers.push(DecorProvider::new(ns_id));
+    let index = providers.len() - 1;
+    std::ptr::addr_of_mut!(providers[index])
+}
 
 /// Clear one Lua-ref field, matching `NLUA_CLEAR_REF`'s own contract:
 /// if genuinely holding a real reference, release it via
@@ -118,6 +145,51 @@ mod tests {
         assert_eq!(p.redraw_end, LUA_NOREF);
         assert_eq!(p.spell_nav, LUA_NOREF);
         assert_eq!(p.conceal_line, LUA_NOREF);
+    }
+
+    struct ProviderRegistryGuard(Vec<DecorProvider>);
+
+    impl ProviderRegistryGuard {
+        fn empty() -> Self {
+            Self(std::mem::take(unsafe { DECOR_PROVIDERS.get_mut() }))
+        }
+    }
+
+    impl Drop for ProviderRegistryGuard {
+        fn drop(&mut self) {
+            *unsafe { DECOR_PROVIDERS.get_mut() } = std::mem::take(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn get_decor_provider_returns_null_without_force() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _providers = ProviderRegistryGuard::empty();
+
+        assert!(unsafe { get_decor_provider(7, false) }.is_null());
+        assert!(unsafe { DECOR_PROVIDERS.get_mut() }.is_empty());
+    }
+
+    #[test]
+    fn get_decor_provider_creates_and_reuses_a_namespace_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _providers = ProviderRegistryGuard::empty();
+
+        let first = unsafe { get_decor_provider(7, true) };
+        assert!(!first.is_null());
+        assert_eq!(unsafe { (*first).ns_id }, 7);
+        unsafe { (*first).hl_valid = 42 };
+
+        let second = unsafe { get_decor_provider(7, false) };
+        assert_eq!(second, first);
+        assert_eq!(unsafe { (*second).hl_valid }, 42);
+        assert_eq!(unsafe { DECOR_PROVIDERS.get_mut() }.len(), 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn get_decor_provider_requires_a_positive_namespace() {
+        let _ = unsafe { get_decor_provider(0, true) };
     }
 
     #[test]
