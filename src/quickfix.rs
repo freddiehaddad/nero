@@ -1628,6 +1628,55 @@ pub unsafe fn copy_loclist(from: &QfListT, to: &mut QfListT) -> i32 {
     crate::vim_defs::OK
 }
 
+/// Copy one window's complete location-list stack to another
+/// (`copy_loclist_stack`).
+///
+/// # Safety
+/// `from` and `to` must be distinct live windows; `to.w_llist` must be
+/// null. All source stack pointers and callback/typval referents must
+/// remain valid.
+pub unsafe fn copy_loclist_stack(from: *mut WinT, to: *mut WinT) {
+    let source = if unsafe { is_ll_window(&*from) } {
+        unsafe { (*from).w_llist_ref }
+    } else {
+        unsafe { (*from).w_llist }
+    };
+    if source.is_null() {
+        return;
+    }
+
+    let count = i32::try_from(unsafe { (*from).w_onebuf_opt.wo_lhi })
+        .unwrap_or(0);
+    let dest = Box::into_raw(Box::new(qf_alloc_stack(
+        QfltypeT::Location,
+        count,
+    )));
+    unsafe {
+        (*to).w_llist = dest;
+        (*to).w_onebuf_opt.wo_lhi = i64::from((*dest).qf_maxcount);
+        (*dest).qf_listcount = (*source).qf_listcount;
+    }
+
+    let live = usize::try_from(unsafe { (*source).qf_listcount })
+        .unwrap_or(0)
+        .min(unsafe { (*source).qf_lists.len() })
+        .min(unsafe { (*dest).qf_lists.len() });
+    for idx in 0..live {
+        unsafe { (*dest).qf_curlist = i32::try_from(idx).unwrap_or(i32::MAX) };
+        let source_list = unsafe { &(&(*source).qf_lists)[idx] };
+        let dest_list = unsafe {
+            std::ptr::addr_of_mut!((&mut (*dest).qf_lists)[idx])
+        };
+        if unsafe { copy_loclist(source_list, &mut *dest_list) }
+            == crate::vim_defs::FAIL
+        {
+            unsafe { qf_free_all(Some(to)) };
+            return;
+        }
+    }
+    unsafe { (*dest).qf_curlist = (*source).qf_curlist };
+}
+
 /// Whether an entry is still present in a quickfix list
 /// (`is_qf_entry_present`).
 #[allow(dead_code)]
@@ -12678,6 +12727,113 @@ mod tests {
         assert_eq!(dest.qf_index, 1);
         assert!(dest.qf_nonevalid);
         qf_free(&mut dest);
+    }
+
+    #[test]
+    fn copy_loclist_stack_copies_history_and_current_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut source_stack = qf_alloc_stack(QfltypeT::Location, 3);
+        source_stack.qf_listcount = 2;
+        source_stack.qf_curlist = 1;
+        source_stack.qf_lists[0].qf_title = Some(b"one".to_vec());
+        source_stack.qf_lists[0].qf_entries.push(QflineT {
+            qf_lnum: 4,
+            ..Default::default()
+        });
+        source_stack.qf_lists[1].qf_title = Some(b"two".to_vec());
+        source_stack.qf_lists[1].qf_entries.push(QflineT {
+            qf_lnum: 8,
+            ..Default::default()
+        });
+        let source_stack = Box::into_raw(Box::new(source_stack));
+        let mut source = Box::new(WinT {
+            w_llist: source_stack,
+            ..Default::default()
+        });
+        source.w_onebuf_opt.wo_lhi = 3;
+        let source_ptr = std::ptr::addr_of_mut!(*source);
+        let mut dest = Box::new(WinT::default());
+        let dest_ptr = std::ptr::addr_of_mut!(*dest);
+
+        unsafe { copy_loclist_stack(source_ptr, dest_ptr) };
+
+        let copied = unsafe { (*dest_ptr).w_llist };
+        assert!(!copied.is_null());
+        assert_ne!(copied, source_stack);
+        assert_eq!(unsafe { (*dest_ptr).w_onebuf_opt.wo_lhi }, 3);
+        assert_eq!(unsafe { (*copied).qf_listcount }, 2);
+        assert_eq!(unsafe { (*copied).qf_curlist }, 1);
+        assert_eq!(
+            unsafe { (&(*copied).qf_lists)[0].qf_title.as_deref() },
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            unsafe { (&(*copied).qf_lists)[1].qf_entries[0].qf_lnum },
+            8
+        );
+
+        unsafe {
+            qf_free_all(Some(source_ptr));
+            qf_free_all(Some(dest_ptr));
+        }
+    }
+
+    #[test]
+    fn copy_loclist_stack_is_a_noop_without_source_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut source = WinT::default();
+        let mut dest = WinT::default();
+        unsafe {
+            copy_loclist_stack(
+                std::ptr::from_mut(&mut source),
+                std::ptr::from_mut(&mut dest),
+            )
+        };
+        assert!(dest.w_llist.is_null());
+    }
+
+    #[test]
+    fn copy_loclist_stack_uses_a_location_list_windows_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut referenced = qf_alloc_stack(QfltypeT::Location, 2);
+        referenced.qf_listcount = 1;
+        referenced.qf_lists[0].qf_title = Some(b"referenced".to_vec());
+        let referenced = Box::into_raw(Box::new(referenced));
+        let mut qf_buf = Box::new(crate::buffer_defs::BufT {
+            handle: 9,
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        });
+        let qf_buf_ptr = std::ptr::addr_of_mut!(*qf_buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                qf_buf_ptr,
+            )
+        };
+        let mut source = Box::new(WinT {
+            w_buffer: qf_buf_ptr,
+            w_llist_ref: referenced,
+            ..Default::default()
+        });
+        source.w_onebuf_opt.wo_lhi = 2;
+        let source_ptr = std::ptr::addr_of_mut!(*source);
+        let mut dest = Box::new(WinT::default());
+        let dest_ptr = std::ptr::addr_of_mut!(*dest);
+
+        unsafe { copy_loclist_stack(source_ptr, dest_ptr) };
+
+        let copied = unsafe { (*dest_ptr).w_llist };
+        assert_eq!(
+            unsafe { (&(*copied).qf_lists)[0].qf_title.as_deref() },
+            Some(&b"referenced"[..])
+        );
+        unsafe {
+            qf_free_all(Some(source_ptr));
+            qf_free_all(Some(dest_ptr));
+        }
     }
 
     fn items_property(
