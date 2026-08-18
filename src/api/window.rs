@@ -23,7 +23,7 @@
 //! (needs `win_find_tabpage`), `nvim_win_close`/`nvim_win_hide`
 //! (real window-closing machinery).
 
-use crate::api::private::defs::{Boolean, Buffer, Error, Integer, Window};
+use crate::api::private::defs::{Array, Boolean, Buffer, Error, Integer, Object, Window};
 use crate::api::private::helpers::find_window_by_handle;
 
 /// Get the buffer handle shown in window `win` (`0` for the current
@@ -40,6 +40,23 @@ pub unsafe fn nvim_win_get_buf(win: Window, err: &mut Error) -> Buffer {
     // SAFETY: `w` is non-null per the check above, and every real
     // `WinT` always has a live `w_buffer`.
     unsafe { (*(*w).w_buffer).handle }
+}
+
+/// Get the `(1, 0)`-indexed buffer-relative cursor position
+/// (`nvim_win_get_cursor`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`].
+#[must_use]
+pub unsafe fn nvim_win_get_cursor(win: Window, err: &mut Error) -> Array {
+    let window = unsafe { find_window_by_handle(win, err) };
+    if window.is_null() {
+        return Vec::new();
+    }
+    vec![
+        Object::Integer(i64::from(unsafe { (*window).w_cursor.lnum })),
+        Object::Integer(i64::from(unsafe { (*window).w_cursor.col })),
+    ]
 }
 
 /// Get the height (row count) of window `win` (`0` for the current
@@ -282,6 +299,36 @@ mod tests {
         let buf = unsafe { nvim_win_get_buf(0, &mut err) };
         assert_eq!(buf, 600);
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_win_get_cursor_returns_one_based_line_and_zero_based_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(13);
+        let win = fx.win;
+        unsafe {
+            (*win).w_cursor = crate::pos_defs::PosT {
+                lnum: 7,
+                col: 11,
+                coladd: 3,
+            };
+        }
+        let handle = unsafe { (*win).handle };
+        let mut err = Error::default();
+
+        let position = unsafe { nvim_win_get_cursor(handle, &mut err) };
+
+        assert!(!err.is_set());
+        assert!(matches!(position.as_slice(), [Object::Integer(7), Object::Integer(11)]));
+    }
+
+    #[test]
+    fn nvim_win_get_cursor_returns_empty_for_an_unknown_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = WinFixture::new(14);
+        let mut err = Error::default();
+        assert!(unsafe { nvim_win_get_cursor(99, &mut err) }.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
     }
 
     #[test]
