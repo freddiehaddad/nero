@@ -9376,6 +9376,25 @@ pub fn did_set_equalalways(
     None
 }
 
+/// Process an updated `'diff'` value (`did_set_diff`).
+///
+/// # Safety
+/// `args.os_win` must point to a live window; forwarded from
+/// [`crate::diff::diff_buf_adjust`] and
+/// [`crate::fold::fold_update_all`].
+pub unsafe fn did_set_diff(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win.cast::<WinT>();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::diff::diff_buf_adjust(win) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::fold::foldmethod_is_diff(unsafe { &*win }) {
+        unsafe { crate::fold::fold_update_all(win) };
+    }
+    None
+}
+
 /// Process an updated `'autochdir'` value (`did_set_autochdir`).
 ///
 /// # Safety

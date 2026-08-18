@@ -8350,6 +8350,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::did_set_completeitemalign);
     options[OptIndex::Diffopt as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_diffopt);
+    options[OptIndex::Diff as usize].opt_did_set_cb =
+        Some(crate::option::did_set_diff);
     options[OptIndex::Equalalways as usize].opt_did_set_cb =
         Some(crate::option::did_set_equalalways);
     options[OptIndex::Helplang as usize].opt_did_set_cb =
@@ -8703,6 +8705,7 @@ mod options_table_tests {
             b"cmdheight",
             b"completeitemalign",
             b"diffopt",
+            b"diff",
             b"equalalways",
             b"helplang",
             b"helpheight",

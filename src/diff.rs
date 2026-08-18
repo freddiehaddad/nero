@@ -17,29 +17,22 @@
 //! [`diffopt_horizontal`]/[`diffopt_hiddenoff`] (pure bit tests);
 //! [`diff_check_with_linestatus`]/
 //! [`diff_check_fill`] - real, faithful translations of their "no
-//! diffs at all in this tab page" early-return path (`curtab.
-//! tp_first_diff.is_null()`, always true today since nothing in this
-//! crate can create a diff - `:diffthis`/diff-computation machinery
-//! not translated), matching this session's established "translate
-//! the real always-taken early-return condition, not a hardcoded
-//! shortcut" pattern (e.g. `autocmd.rs`'s `apply_autocmds` bypass
-//! path). The `curtab.tp_diff_invalid` check (which would call the
-//! substantial, untranslated `ex_diffupdate`) is ALSO always false
-//! today (nothing sets it), so it's checked for real too rather than
-//! assumed away; and `diff_buf_idx`/[`diff_mode_buf`] - `diff_buf_idx`
+//! diff blocks in this tab page" early-return path (`curtab.
+//! tp_first_diff.is_null()`). The substantial diff-block search and
+//! `ex_diffupdate` remain deferred. Also `diff_buf_idx`/
+//! [`diff_mode_buf`] - `diff_buf_idx`
 //! is a plain linear scan through `TabpageT.tp_diffbuf[]` (already a
 //! real field), and `diff_mode_buf` walks every tabpage via
 //! `GLOBALS.first_tabpage`/`tp_next` (the same walk already
 //! established by `window.rs`'s `win_valid_any_tab`) - genuinely
-//! COMPLETE translations, not fast-path-only, since nothing about
-//! either depends on a real diff actually existing.
+//! COMPLETE translations. [`diff_buf_add`]/[`diff_buf_adjust`] now
+//! populate that registry and back `option.rs`'s real `'diff'`
+//! callback; actual diff-block computation remains deferred.
 //!
 //! Also translated: [`diff_get_corresponding_line`]/[`diff_lnum_win`]/
 //! [`diff_move_to`] (plus the private `diff_get_corresponding_line_int`) -
-//! real, faithful translations of their "current buffer isn't a diff
-//! buffer" early-return path (always taken today since `diff_buf_idx`
-//! always returns `DB_COUNT`, matching the same reasoning as
-//! `diff_check_with_linestatus`), translated ahead of any real caller
+//! real, faithful translations of their no-registry/no-diff-block
+//! early-return paths, translated ahead of any real caller
 //! (none of `winfloat.c`/`move.c`/`window.c`'s own diff-aware
 //! scroll-binding callers are translated yet).
 //!
@@ -51,18 +44,14 @@
 //! taken today, for the same reason as the functions above.
 //!
 //! Also translated: [`diff_infold`] - its own `idx`/`other`-computing
-//! loop over `tp_diffbuf[]` is real, complete logic (not stubbed),
-//! since it only reads already-real fields; only its OWN early-return
-//! condition (`idx == -1 || !other`) happens to always be taken today,
-//! for the same underlying reason as the functions above.
+//! loop over `tp_diffbuf[]` is real, complete logic (not stubbed).
 //!
 //! Also translated: [`diff_mark_adjust`] - `mark_adjust_buf`'s
 //! (`mark.c`) own third real dependency (alongside `quickfix.c`'s
 //! `qf_mark_adjust` and `fold.c`'s `foldMarkAdjust`). Walks tab pages
-//! the same way [`diff_mode_buf`] already does; its own real
-//! per-tabpage adjustment (`diff_mark_adjust_tp`) is genuinely,
-//! provably unreachable today (same `diff_buf_idx` reasoning as
-//! everything else in this file) and is not translated at all.
+//! the same way [`diff_mode_buf`] already does; its own real per-
+//! tabpage adjustment (`diff_mark_adjust_tp`) remains deferred and is
+//! now an explicit boundary once a buffer enters diff mode.
 //!
 //! Also translated: [`diff_equal_char`] (compares 2 characters,
 //! honoring `'diffopt'`'s `icase` flag - a genuinely self-contained
@@ -359,6 +348,74 @@ pub unsafe fn diff_alloc_new(
     }
 
     dnew
+}
+
+/// Add `buf` to the current tabpage's diff-buffer registry
+/// (`diff_buf_add`).
+///
+/// The original's immediate `diff_redraw(true)` is represented by
+/// `NEED_DIFF_REDRAW`, matching [`diff_buf_delete`]'s established
+/// deferred-redraw treatment.
+///
+/// # Safety
+/// `buf` and `GLOBALS.curtab` must point to live values.
+pub unsafe fn diff_buf_add(buf: *mut crate::buffer_defs::BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { (*crate::globals::GLOBALS.as_ptr()).curtab };
+    if diff_buf_idx(buf, curtab) != crate::buffer_defs::DB_COUNT {
+        return;
+    }
+    for index in 0..crate::buffer_defs::DB_COUNT {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*curtab).tp_diffbuf[index].is_null() } {
+            unsafe {
+                (*curtab).tp_diffbuf[index] = buf;
+                (*curtab).tp_diff_invalid = 1;
+                *NEED_DIFF_REDRAW.get_mut() = true;
+            }
+            return;
+        }
+    }
+    // E96 display omitted; the full registry is left unchanged.
+}
+
+/// Add or remove a window's buffer from the current diff registry
+/// (`diff_buf_adjust`).
+///
+/// # Safety
+/// `win`, `GLOBALS.curtab`, and the current tab's `firstwin`/`w_next`
+/// chain must consist of live values.
+pub unsafe fn diff_buf_adjust(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*win).w_onebuf_opt.wo_diff != 0 } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { diff_buf_add((*win).w_buffer) };
+        return;
+    }
+
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let buffer = unsafe { (*win).w_buffer };
+    let mut wp = unsafe { (*globals).firstwin };
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*wp).w_buffer == buffer && (*wp).w_onebuf_opt.wo_diff != 0 } {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { (*globals).curtab };
+    let index = diff_buf_idx(buffer, curtab);
+    if index != crate::buffer_defs::DB_COUNT {
+        unsafe {
+            (*curtab).tp_diffbuf[index] = std::ptr::null_mut();
+            (*curtab).tp_diff_invalid = 1;
+            *NEED_DIFF_REDRAW.get_mut() = true;
+        }
+    }
 }
 
 /// Remove `buf` from every tab page's list of diff buffers
@@ -873,11 +930,9 @@ pub unsafe fn diff_equal_char(p1: &[u8], p2: &[u8]) -> Option<usize> {
 /// (`diff_check_with_linestatus`). This should only be used for
 /// windows where `'diff'` is set.
 ///
-/// Only the "no diffs at all in this tab page" early-return path is
+/// Only the "no diff blocks in this tab page" early-return path is
 /// translated (see this module's own doc comment) - the real diff-
-/// hunk search (the `tp_first_diff` linked-list walk, now using the
-/// already-real `diff_buf_idx`) is `unimplemented!()`, unreachable
-/// in practice today since nothing in this crate can create a diff.
+/// hunk search and `ex_diffupdate` remain explicit deferred branches.
 /// `lnum` is accepted for signature fidelity (the real function's own
 /// later "lnum must be a buffer line" safety check, and the diff-hunk
 /// search itself, both need it) but genuinely unused by the
@@ -901,12 +956,9 @@ pub unsafe fn diff_check_with_linestatus(
 
     if curtab.tp_diff_invalid != 0 {
         // update after a big change - needs the real, substantial
-        // ex_diffupdate, not yet translated. Unreachable in practice
-        // today: nothing in this crate can currently set
-        // tp_diff_invalid to a nonzero value.
+        // ex_diffupdate, not yet translated.
         unimplemented!(
-            "diff::diff_check_with_linestatus: ex_diffupdate is not yet translated - \
-             unreachable in practice today since tp_diff_invalid is always 0"
+            "diff::diff_check_with_linestatus: ex_diffupdate is not yet translated"
         );
     }
 
@@ -916,9 +968,7 @@ pub unsafe fn diff_check_with_linestatus(
     }
 
     unimplemented!(
-        "diff::diff_check_with_linestatus: the real diff-hunk search is not yet translated - \
-         unreachable in practice today since tp_first_diff is always null, see this module's \
-         own doc comment"
+        "diff::diff_check_with_linestatus: the real diff-hunk search is not yet translated"
     );
 }
 
@@ -1033,14 +1083,9 @@ pub unsafe fn diff_mode_buf(buf: *mut crate::buffer_defs::BufT) -> bool {
 ///
 /// Walks tab pages the same way [`diff_mode_buf`] already does. The
 /// original's own real per-tabpage adjustment (`diff_mark_adjust_tp`)
-/// is called only when `diff_buf_idx(buf, tp) != DB_COUNT` - since
-/// that never happens today (see this module's own doc comment,
-/// nothing can register a buffer into any `tp_diffbuf[]`), this
-/// function's loop body never actually runs, and
-/// `diff_mark_adjust_tp` itself is not translated at all (not even as
-/// an `unimplemented!()` stub) - genuinely, provably unreachable
-/// today, matching `qf_mark_adjust`'s own established precedent for
-/// this exact situation.
+/// is still deferred. The callback can now register diff buffers, so
+/// this is an explicit reachable boundary rather than an impossible
+/// state.
 ///
 /// # Safety
 /// Same as [`diff_mode_buf`].
@@ -1055,9 +1100,8 @@ pub unsafe fn diff_mark_adjust(
     let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
     while !tp.is_null() {
         if diff_buf_idx(buf, tp) != crate::buffer_defs::DB_COUNT {
-            unreachable!(
-                "diff_mark_adjust: diff_buf_idx never returns anything but DB_COUNT today, see \
-                 this function's own doc comment"
+            unimplemented!(
+                "diff_mark_adjust: registered buffers need diff_mark_adjust_tp"
             );
         }
         // SAFETY: forwarded from this function's own safety doc.
@@ -1067,12 +1111,8 @@ pub unsafe fn diff_mark_adjust(
 
 /// Find the corresponding line in a diff (`diff_get_corresponding_line_int`).
 ///
-/// Only the "no diffs at all" early-return path is translated (see
-/// this module's own doc comment) - the real diff-block search
-/// (walking `tp_first_diff`) is `unimplemented!()`, unreachable in
-/// practice today since `diff_buf_idx` always returns `DB_COUNT`
-/// (nothing in this crate can currently register a buffer as a diff
-/// buffer).
+/// The no-registry/no-diff-block early-return path is translated; the
+/// real diff-block search remains deferred.
 ///
 /// # Safety
 /// `GLOBALS.curbuf`/`curwin`/`curtab` must each be a valid, non-null
@@ -1097,9 +1137,7 @@ unsafe fn diff_get_corresponding_line_int(
     }
 
     unimplemented!(
-        "diff::diff_get_corresponding_line_int: the real diff-block search is not yet \
-         translated - unreachable in practice today since diff_buf_idx always returns \
-         DB_COUNT, see this module's own doc comment"
+        "diff::diff_get_corresponding_line_int: the real diff-block search is not yet translated"
     );
 }
 
@@ -1129,10 +1167,9 @@ pub unsafe fn diff_get_corresponding_line(
 /// number in window `wp`, compensating for inserted/deleted lines
 /// (`diff_lnum_win`).
 ///
-/// Only the "current buffer isn't a diff buffer" safety-check
-/// early-return is translated - always taken today since
-/// `diff_buf_idx` always returns `DB_COUNT` (see this module's own
-/// doc comment). The real diff-block search is `unimplemented!()`.
+/// The "current buffer isn't a diff buffer" safety-check early return
+/// is translated. The registered-buffer diff-block search remains
+/// deferred.
 ///
 /// # Safety
 /// `GLOBALS.curbuf`/`curtab` must each be a valid, non-null pointer to
@@ -1152,20 +1189,16 @@ pub unsafe fn diff_lnum_win(
     }
 
     unimplemented!(
-        "diff::diff_lnum_win: the real diff-block search is not yet translated - unreachable \
-         in practice today since diff_buf_idx always returns DB_COUNT, see this module's own \
-         doc comment"
+        "diff::diff_lnum_win: the real diff-block search is not yet translated"
     );
 }
 
 /// Move `count` times in direction `dir` to the next diff block
 /// (`diff_move_to`).
 ///
-/// Only the "current buffer isn't a diff buffer, or there are no
-/// diffs at all" early-return path is translated - always taken today
-/// since `diff_buf_idx` always returns `DB_COUNT` (see this module's
-/// own doc comment). The real diff-block search/cursor-move logic
-/// beyond that point is `unimplemented!()`.
+/// The "current buffer isn't a diff buffer, or there are no diff
+/// blocks" early-return path is translated. The real diff-block
+/// search/cursor-move logic remains deferred.
 ///
 /// # Safety
 /// `GLOBALS.curbuf`/`curwin`/`curtab` must each be a valid, non-null
@@ -1183,9 +1216,7 @@ pub unsafe fn diff_move_to(_dir: i32, _count: i32) -> i32 {
     }
 
     unimplemented!(
-        "diff::diff_move_to: the real diff-block search/cursor-move logic is not yet \
-         translated - unreachable in practice today since diff_buf_idx always returns \
-         DB_COUNT, see this module's own doc comment"
+        "diff::diff_move_to: the real diff-block search/cursor-move logic is not yet translated"
     );
 }
 
@@ -1199,10 +1230,8 @@ pub unsafe fn diff_move_to(_dir: i32, _count: i32) -> i32 {
 /// `inline:char`, setting `DIFF_INLINE_CHAR` - so this crate's own
 /// `DIFF_FLAGS` default already has a bit of `ALL_INLINE_DIFF` set,
 /// and this check is translated for real rather than assumed always
-/// true. It is the SECOND check (`diff_buf_idx` returning `DB_COUNT`)
-/// that is always taken today, for the same reason as this file's
-/// other `diff_buf_idx`-gated functions. The real diff-block search
-/// beyond both checks is `unimplemented!()`.
+/// true. The no-registry check is also real; registered-buffer
+/// diff-block search remains deferred.
 ///
 /// # Safety
 /// `GLOBALS.curbuf`/`curtab` must each be a valid, non-null pointer to
@@ -1222,9 +1251,7 @@ pub unsafe fn diff_update_line(_lnum: crate::pos_defs::LinenrT) {
     }
 
     unimplemented!(
-        "diff::diff_update_line: the real diff-block search is not yet translated - \
-         unreachable in practice today since diff_buf_idx always returns DB_COUNT, see this \
-         module's own doc comment"
+        "diff::diff_update_line: the real diff-block search is not yet translated"
     );
 }
 
@@ -1234,11 +1261,8 @@ pub unsafe fn diff_update_line(_lnum: crate::pos_defs::LinenrT) {
 /// The "does this window's own buffer appear in `tp_diffbuf[]`, and is
 /// there at least one OTHER real diff buffer too" loop is translated
 /// in full (not stubbed) - it's genuine, self-contained logic over
-/// already-real fields, faithfully correct for any future test that
-/// manually populates `tp_diffbuf`. Its own early return (`idx == -1 ||
-/// !other`) is always taken today (nothing in this crate can currently
-/// register a buffer in `tp_diffbuf`, so `idx` always stays `-1`). The
-/// real diff-block search beyond that point is `unimplemented!()`.
+/// already-real fields. The real diff-block search beyond that point
+/// is `unimplemented!()`.
 ///
 /// # Safety
 /// `crate::globals::GLOBALS.curtab` must be a valid, non-null pointer
@@ -1324,6 +1348,113 @@ pub unsafe fn find_top_diff_block(
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    struct NeedDiffGuard(bool);
+
+    impl NeedDiffGuard {
+        fn clear() -> Self {
+            let previous = unsafe { *NEED_DIFF_REDRAW.get_mut() };
+            unsafe { *NEED_DIFF_REDRAW.get_mut() = false };
+            NeedDiffGuard(previous)
+        }
+    }
+
+    impl Drop for NeedDiffGuard {
+        fn drop(&mut self) {
+            unsafe { *NEED_DIFF_REDRAW.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn diff_buf_add_registers_once_and_marks_the_tab_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _need = NeedDiffGuard::clear();
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let mut buf = BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+
+        unsafe { diff_buf_add(buf_ptr) };
+        unsafe { diff_buf_add(buf_ptr) };
+
+        assert_eq!(unsafe { (*tab_ptr).tp_diffbuf[0] }, buf_ptr);
+        assert_eq!(
+            unsafe { (*tab_ptr).tp_diffbuf.iter().filter(|&&p| p == buf_ptr).count() },
+            1
+        );
+        assert_eq!(unsafe { (*tab_ptr).tp_diff_invalid }, 1);
+        assert!(unsafe { *NEED_DIFF_REDRAW.get_mut() });
+    }
+
+    #[test]
+    fn diff_buf_adjust_removes_an_unshown_buffer_but_keeps_a_shared_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _need = NeedDiffGuard::clear();
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let mut buf = BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        unsafe { (*tab_ptr).tp_diffbuf[2] = buf_ptr };
+
+        let mut second = WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        second.w_onebuf_opt.wo_diff = 1;
+        let second_ptr = std::ptr::from_mut(&mut second);
+        let mut first = WinT {
+            w_buffer: buf_ptr,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::from_mut(&mut first);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, first_ptr)
+        };
+
+        unsafe { diff_buf_adjust(first_ptr) };
+        assert_eq!(unsafe { (*tab_ptr).tp_diffbuf[2] }, buf_ptr);
+
+        unsafe { (*second_ptr).w_onebuf_opt.wo_diff = 0 };
+        unsafe { diff_buf_adjust(first_ptr) };
+        assert!(unsafe { (*tab_ptr).tp_diffbuf[2].is_null() });
+        assert!(unsafe { *NEED_DIFF_REDRAW.get_mut() });
+    }
+
+    #[test]
+    fn did_set_diff_registers_the_enabled_windows_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _need = NeedDiffGuard::clear();
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let mut buf = BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_diff = 1;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { crate::option::did_set_diff(&mut args) }, None);
+        assert_eq!(unsafe { (*tab_ptr).tp_diffbuf[0] }, buf_ptr);
+    }
 
     struct DiffoptGuard {
         flags: i32,
@@ -2668,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "diff_buf_idx never returns anything but DB_COUNT today")]
+    #[should_panic(expected = "diff_mark_adjust_tp")]
     fn diff_mark_adjust_panics_when_buf_is_actually_registered() {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = BufT::default();
