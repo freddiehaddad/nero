@@ -409,6 +409,28 @@ pub unsafe fn hl_add_url(attr: i32, url: &[u8]) -> i32 {
     unsafe { hl_combine_attr(attr, new_attr) }
 }
 
+/// Apply a window's `'winblend'` value to an attribute
+/// (`hl_apply_winblend`).
+///
+/// An explicitly set `blend` attribute always wins. Otherwise a
+/// positive window blend creates or reuses an interned copy of the
+/// original entry with that blend value.
+///
+/// # Safety
+/// `attr` must identify a live entry in the shared attribute table.
+#[must_use]
+pub unsafe fn hl_apply_winblend(winbl: i32, attr: i32) -> i32 {
+    let mut entry = *unsafe { ATTR_ENTRIES.get_mut() }
+        .get_at(attr as usize)
+        .expect("hl_apply_winblend: invalid attribute ID");
+    if entry.attr.hl_blend == -1 && winbl > 0 {
+        entry.attr.hl_blend = winbl;
+        get_attr_entry(entry)
+    } else {
+        attr
+    }
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -1233,6 +1255,53 @@ mod tests {
 
         assert_eq!(unsafe { syn_attr2entry(combined) }.url, 0);
         assert_eq!(unsafe { URLS.get_mut() }.len(), 2);
+    }
+
+    #[test]
+    fn hl_apply_winblend_sets_an_unset_blend_and_preserves_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x12_34_56,
+            ..Default::default()
+        };
+        let attr = unsafe { hl_get_syn_attr(4, 7, attrs) };
+
+        let blended = unsafe { hl_apply_winblend(35, attr) };
+        let entry = *unsafe { ATTR_ENTRIES.get_mut() }
+            .get_at(blended as usize)
+            .expect("blended entry");
+
+        assert_ne!(blended, attr);
+        assert_eq!(entry.attr.hl_blend, 35);
+        assert_eq!(entry.attr.rgb_fg_color, 0x12_34_56);
+        assert_eq!(entry.kind, crate::highlight_defs::HlKind::Syntax);
+        assert_eq!(entry.id1, 7);
+        assert_eq!(entry.id2, 4);
+    }
+
+    #[test]
+    fn hl_apply_winblend_leaves_an_explicit_blend_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let attr = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                hl_blend: 20,
+                ..Default::default()
+            })
+        };
+
+        assert_eq!(unsafe { hl_apply_winblend(40, attr) }, attr);
+        assert_eq!(unsafe { hl_apply_winblend(0, attr) }, attr);
+    }
+
+    #[test]
+    #[should_panic(expected = "hl_apply_winblend: invalid attribute ID")]
+    fn hl_apply_winblend_rejects_an_invalid_attribute_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let _ = unsafe { hl_apply_winblend(20, 99) };
     }
 
     struct NamespaceHighlightsGuard {
