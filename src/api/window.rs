@@ -24,8 +24,8 @@
 //! (real window-closing machinery).
 
 use crate::api::private::defs::{
-    Array, Boolean, Buffer, Dict, Error, ErrorType, Integer, KeyValuePair, Object, Tabpage,
-    Window,
+    Array, Boolean, Buffer, Dict, Error, ErrorType, Integer, KeyValuePair, NvimString, Object,
+    Tabpage, Window,
 };
 use crate::api::private::helpers::find_window_by_handle;
 
@@ -121,12 +121,26 @@ pub unsafe fn nvim_win_get_tabpage(win: Window, err: &mut Error) -> Tabpage {
     if window.is_null() {
         return 0;
     }
+
     let tab = unsafe { crate::window::win_find_tabpage(window) };
     if tab.is_null() {
         0
     } else {
         unsafe { (*tab).handle }
     }
+}
+
+/// Get a window-scoped variable (`nvim_win_get_var`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`] and the scope-dictionary
+/// converter.
+pub unsafe fn nvim_win_get_var(win: Window, name: &NvimString, err: &mut Error) -> Object {
+    let win = unsafe { find_window_by_handle(win, err) };
+    if win.is_null() {
+        return Object::Nil;
+    }
+    unsafe { crate::api::private::helpers::dict_get_value((*win).w_vars, name, err) }
 }
 
 /// Optional range controls for [`nvim_win_text_height`].
@@ -571,6 +585,27 @@ mod tests {
         let mut err = Error::default();
         assert_eq!(unsafe { nvim_win_get_tabpage(99, &mut err) }, 0);
         assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
+    }
+
+    #[test]
+    fn nvim_win_get_var_returns_a_real_window_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(21);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"answer", 42) },
+            crate::vim_defs::OK
+        );
+        unsafe { (*fx.win).w_vars = dict };
+        let mut err = Error::default();
+        let value =
+            unsafe { nvim_win_get_var((*fx.win).handle, &b"answer".to_vec(), &mut err) };
+        assert!(matches!(value, Object::Integer(42)));
+        assert!(!err.is_set());
+        unsafe {
+            (*fx.win).w_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_unref(dict);
+        }
     }
 
     fn integer_in_dict(dict: &Dict, key: &[u8]) -> Integer {
