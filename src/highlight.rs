@@ -433,16 +433,16 @@ pub unsafe fn hl_apply_winblend(winbl: i32, attr: i32) -> i32 {
 
 /// Invalidate cached blend combinations (`hl_invalidate_blends`).
 ///
-/// The original also schedules highlight redraw and refreshes the
-/// current window. Those rendering-side effects remain with the
-/// untranslated redraw/window-highlight pipeline; the complete cache
-/// invalidation is performed here.
-///
 /// # Safety
-/// Mutates the two shared blend caches.
+/// Mutates all shared highlight/group/namespace tables and requires
+/// `GLOBALS.curwin` to point at a live window.
 pub unsafe fn hl_invalidate_blends() {
     unsafe { BLEND_ATTR_ENTRIES.get_mut() }.clear();
     unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.clear();
+    unsafe { highlight_changed() };
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    assert!(!curwin.is_null(), "hl_invalidate_blends: curwin is null");
+    unsafe { update_window_hl(curwin, true) };
 }
 
 /// Clear every highlight table (`clear_hl_tables`).
@@ -1978,7 +1978,13 @@ mod tests {
     #[test]
     fn hl_invalidate_blends_clears_both_blend_caches() {
         let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, 0);
         let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _curwin = HighlightCurwinGuard::set(win_ptr);
         unsafe { *HLSTATE_ACTIVE.get_mut() = true };
         let back = unsafe {
             hl_get_term_attr(&crate::highlight_defs::HlAttrs {
@@ -2426,6 +2432,23 @@ mod tests {
                 crate::globals::GLOBALS.get_mut().clear_cmdline = false;
             }
             guard
+        }
+    }
+
+    struct HighlightCurwinGuard(*mut crate::buffer_defs::WinT);
+
+    impl HighlightCurwinGuard {
+        fn set(curwin: *mut crate::buffer_defs::WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let old = globals.curwin;
+            globals.curwin = curwin;
+            Self(old)
+        }
+    }
+
+    impl Drop for HighlightCurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.0;
         }
     }
 
