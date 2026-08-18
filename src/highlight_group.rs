@@ -161,6 +161,12 @@ pub const MAX_HL_ID: i32 = 20000;
 
 /// "no colour index" sentinel (`kColorIdxNone`).
 pub const COLOR_IDX_NONE: i32 = -1;
+/// Explicit hexadecimal colour (`kColorIdxHex`).
+pub const COLOR_IDX_HEX: i32 = -2;
+/// Follow the active `Normal` foreground (`kColorIdxFg`).
+pub const COLOR_IDX_FG: i32 = -3;
+/// Follow the active `Normal` background (`kColorIdxBg`).
+pub const COLOR_IDX_BG: i32 = -4;
 
 /// Append a new highlight group and return its 1-based ID, or `0` on
 /// failure (`syn_add_group`).
@@ -766,6 +772,43 @@ pub unsafe fn set_hl_attr(idx: i32) {
     }
 }
 
+/// Refresh every highlight group's resolved colors and attribute ID
+/// (`highlight_attr_set_all`).
+///
+/// Groups using symbolic `fg`/`bg` colors first pick up the current
+/// `Normal` colors, then every group is reinterned through
+/// [`set_hl_attr`].
+///
+/// # Safety
+/// Mutates the shared highlight-group and attribute tables and reads
+/// the shared `Normal` colors.
+pub unsafe fn highlight_attr_set_all() {
+    let normal_fg = unsafe { *crate::highlight::NORMAL_FG.get_mut() };
+    let normal_bg = unsafe { *crate::highlight::NORMAL_BG.get_mut() };
+    let len = unsafe { HL_TABLE.get_mut() }.ga_len();
+    for idx in 0..len {
+        {
+            let group = &mut unsafe { HL_TABLE.get_mut() }.items[idx as usize];
+            if group.sg_rgb_bg_idx == COLOR_IDX_FG {
+                group.sg_rgb_bg = normal_fg;
+            } else if group.sg_rgb_bg_idx == COLOR_IDX_BG {
+                group.sg_rgb_bg = normal_bg;
+            }
+            if group.sg_rgb_fg_idx == COLOR_IDX_FG {
+                group.sg_rgb_fg = normal_fg;
+            } else if group.sg_rgb_fg_idx == COLOR_IDX_BG {
+                group.sg_rgb_fg = normal_bg;
+            }
+            if group.sg_rgb_sp_idx == COLOR_IDX_FG {
+                group.sg_rgb_sp = normal_fg;
+            } else if group.sg_rgb_sp_idx == COLOR_IDX_BG {
+                group.sg_rgb_sp = normal_bg;
+            }
+        }
+        unsafe { set_hl_attr(idx) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +921,34 @@ mod tests {
         fn drop(&mut self) {
             *unsafe { crate::highlight::ATTR_ENTRIES.get_mut() } =
                 std::mem::replace(&mut self.0, crate::map::Set::new());
+        }
+    }
+
+    struct NormalColorsGuard {
+        fg: crate::highlight_defs::RgbValue,
+        bg: crate::highlight_defs::RgbValue,
+    }
+
+    impl NormalColorsGuard {
+        fn set(fg: i32, bg: i32) -> Self {
+            let old = Self {
+                fg: unsafe { *crate::highlight::NORMAL_FG.get_mut() },
+                bg: unsafe { *crate::highlight::NORMAL_BG.get_mut() },
+            };
+            unsafe {
+                *crate::highlight::NORMAL_FG.get_mut() = fg;
+                *crate::highlight::NORMAL_BG.get_mut() = bg;
+            }
+            old
+        }
+    }
+
+    impl Drop for NormalColorsGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *crate::highlight::NORMAL_FG.get_mut() = self.fg;
+                *crate::highlight::NORMAL_BG.get_mut() = self.bg;
+            }
         }
     }
 
@@ -1046,6 +1117,37 @@ mod tests {
         unsafe { set_hl_attr(0) };
 
         assert_eq!(unsafe { HL_TABLE.get_mut() }.items[0].sg_attr, 0);
+    }
+
+    #[test]
+    fn highlight_attr_set_all_resolves_symbolic_normal_colors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"One", b"Two"]);
+        let _attrs = AttributeTableGuard::empty();
+        let _colors = NormalColorsGuard::set(0x11_22_33, 0x44_55_66);
+        {
+            let table = unsafe { HL_TABLE.get_mut() };
+            table.items[0].sg_rgb_fg_idx = COLOR_IDX_FG;
+            table.items[0].sg_rgb_bg_idx = COLOR_IDX_BG;
+            table.items[0].sg_rgb_sp_idx = COLOR_IDX_FG;
+            table.items[1].sg_rgb_fg_idx = COLOR_IDX_HEX;
+            table.items[1].sg_rgb_fg = 0x77_88_99;
+        }
+
+        unsafe { highlight_attr_set_all() };
+
+        let table = unsafe { HL_TABLE.get_mut() };
+        assert_eq!(
+            (
+                table.items[0].sg_rgb_fg,
+                table.items[0].sg_rgb_bg,
+                table.items[0].sg_rgb_sp,
+            ),
+            (0x11_22_33, 0x44_55_66, 0x11_22_33)
+        );
+        assert_eq!(table.items[1].sg_rgb_fg, 0x77_88_99);
+        assert!(table.items[0].sg_attr > 0);
+        assert!(table.items[1].sg_attr > 0);
     }
 
     /// IDs are 1-based, so the first group is id 1 and id 0 is "no
