@@ -1,19 +1,15 @@
 //! Translated from `src/nvim/highlight.c` (tractable core only).
 //!
-//! `highlight.c` is the highlight-attribute-table/color-blending file
-//! (thousands of lines - needs the whole highlight-group registry,
-//! attribute-table allocation, and UI-attribute dispatch machinery,
-//! not attempted here). Translated: [`hl_cterm2rgb_color`]/
+//! `highlight.c` is the highlight-attribute-table/color-blending file.
+//! Its core tables, namespace/window resolution, blending, rebuilding,
+//! and API dictionary conversion are translated. This began with
+//! [`hl_cterm2rgb_color`]/
 //! [`hl_rgb2cterm_color`] (the 8-bit terminal-color <-> packed-RGB
 //! conversions, pure table lookups/bit arithmetic with no external
 //! dependencies) and [`rgb_blend`]/[`cterm_blend`] (blend two RGB/
 //! terminal colors by a percentage ratio) - a self-contained group of
 //! 4 pure color-math functions, harvested together as this file's
-//! first translated content, ahead of their real caller
-//! (`hl_blend_attrs`, needing the full `HlAttrs`-table/highlight-group
-//! machinery, not yet translated), matching this crate's established
-//! "translate ahead of a real caller" precedent for small,
-//! self-contained pieces with no design freedom of their own.
+//! first translated content.
 //!
 //! Also translated: [`hl_combine_ae`] (combine two attribute-flag
 //! bitmasks, e.g. for spelling combined with syntax highlighting - the
@@ -23,7 +19,9 @@
 //! [`hl_combine_attr`] (the cached, full attribute combination built
 //! on it).
 //!
-//! Deferred: everything else in the file.
+//! Deferred: API dictionary-to-attribute parsing/inspection and remote
+//! UI replay; namespace-zero definitions still belong to
+//! `highlight_group.c`'s global `:highlight` setter.
 
 /// Interned font names, indexed by the value `hl_add_font_idx`
 /// returns (`fonts`).
@@ -543,6 +541,131 @@ pub unsafe fn hl_get_font(index: i32) -> Option<Vec<u8>> {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { FONTS.get_mut() }.get(index as usize).cloned()
+}
+
+/// Convert highlight attributes to an API dictionary
+/// (`hlattrs2dict`).
+///
+/// `use_rgb` selects GUI/RGB versus terminal colors. `short_keys`
+/// switches the color names to the compact forms used by
+/// `nvim_get_hl()`.
+///
+/// The original fills caller-provided arena dictionaries. This returns
+/// one owned Rust dictionary; callers that need separate RGB and cterm
+/// dictionaries invoke it once for each representation.
+///
+/// # Safety
+/// Reads the shared font interning table.
+#[must_use]
+pub unsafe fn hlattrs2dict(
+    attrs: crate::highlight_defs::HlAttrs,
+    use_rgb: bool,
+    short_keys: bool,
+) -> crate::api::private::defs::Dict {
+    use crate::api::private::defs::{KeyValuePair, Object};
+
+    let mut dict = Vec::with_capacity(crate::highlight_defs::HLATTRS_DICT_SIZE as usize);
+    let mut put = |key: &[u8], value: Object| {
+        dict.push(KeyValuePair {
+            key: key.to_vec(),
+            value,
+        });
+    };
+    let mask = if use_rgb {
+        attrs.rgb_ae_attr
+    } else {
+        attrs.cterm_ae_attr
+    };
+    for (flag, name) in [
+        (crate::highlight_defs::HL_INVERSE, b"reverse".as_slice()),
+        (crate::highlight_defs::HL_BOLD, b"bold".as_slice()),
+        (crate::highlight_defs::HL_ITALIC, b"italic".as_slice()),
+    ] {
+        if mask & flag as i32 != 0 {
+            put(name, Object::Boolean(true));
+        }
+    }
+    let underline_name = match mask & crate::highlight_defs::HL_UNDERLINE_MASK as i32 {
+        value if value == crate::highlight_defs::HL_UNDERLINE as i32 => Some(b"underline".as_slice()),
+        value if value == crate::highlight_defs::HL_UNDERCURL as i32 => Some(b"undercurl".as_slice()),
+        value if value == crate::highlight_defs::HL_UNDERDOUBLE as i32 => {
+            Some(b"underdouble".as_slice())
+        }
+        value if value == crate::highlight_defs::HL_UNDERDOTTED as i32 => {
+            Some(b"underdotted".as_slice())
+        }
+        value if value == crate::highlight_defs::HL_UNDERDASHED as i32 => {
+            Some(b"underdashed".as_slice())
+        }
+        _ => None,
+    };
+    if let Some(name) = underline_name {
+        put(name, Object::Boolean(true));
+    }
+    for (flag, name) in [
+        (crate::highlight_defs::HL_STANDOUT, b"standout".as_slice()),
+        (
+            crate::highlight_defs::HL_STRIKETHROUGH,
+            b"strikethrough".as_slice(),
+        ),
+        (crate::highlight_defs::HL_ALTFONT, b"altfont".as_slice()),
+        (crate::highlight_defs::HL_DIM, b"dim".as_slice()),
+        (crate::highlight_defs::HL_BLINK, b"blink".as_slice()),
+        (crate::highlight_defs::HL_CONCEALED, b"conceal".as_slice()),
+        (crate::highlight_defs::HL_OVERLINE, b"overline".as_slice()),
+        (crate::highlight_defs::HL_NOCOMBINE, b"nocombine".as_slice()),
+    ] {
+        if mask & flag as i32 != 0 {
+            put(name, Object::Boolean(true));
+        }
+    }
+
+    if use_rgb {
+        if attrs.rgb_fg_color != -1 {
+            put(
+                if short_keys { b"fg" } else { b"foreground" },
+                Object::Integer(i64::from(attrs.rgb_fg_color)),
+            );
+        }
+        if attrs.rgb_bg_color != -1 {
+            put(
+                if short_keys { b"bg" } else { b"background" },
+                Object::Integer(i64::from(attrs.rgb_bg_color)),
+            );
+        }
+        if attrs.rgb_sp_color != -1 {
+            put(
+                if short_keys { b"sp" } else { b"special" },
+                Object::Integer(i64::from(attrs.rgb_sp_color)),
+            );
+        }
+        if mask & crate::highlight_defs::HL_FG_INDEXED as i32 != 0 {
+            put(b"fg_indexed", Object::Boolean(true));
+        }
+        if mask & crate::highlight_defs::HL_BG_INDEXED as i32 != 0 {
+            put(b"bg_indexed", Object::Boolean(true));
+        }
+        if let Some(font) = unsafe { hl_get_font(attrs.font) } {
+            put(b"font", Object::String(font));
+        }
+    } else {
+        if attrs.cterm_fg_color != 0 {
+            put(
+                if short_keys { b"ctermfg" } else { b"foreground" },
+                Object::Integer(i64::from(attrs.cterm_fg_color - 1)),
+            );
+        }
+        if attrs.cterm_bg_color != 0 {
+            put(
+                if short_keys { b"ctermbg" } else { b"background" },
+                Object::Integer(i64::from(attrs.cterm_bg_color - 1)),
+            );
+        }
+    }
+    if attrs.hl_blend > -1 && (use_rgb || !short_keys) {
+        put(b"blend", Object::Integer(i64::from(attrs.hl_blend)));
+    }
+    dict
 }
 
 /// Global highlight namespace (`ns_hl_global`).
@@ -3147,6 +3270,112 @@ mod tests {
         let _g = FontsGuard::new();
         let a = unsafe { hl_add_font_idx(b"Mono\0junk") };
         assert_eq!(unsafe { hl_get_font(a) }.as_deref(), Some(&b"Mono"[..]));
+    }
+
+    fn api_dict_value<'a>(
+        dict: &'a crate::api::private::defs::Dict,
+        key: &[u8],
+    ) -> Option<&'a crate::api::private::defs::Object> {
+        dict.iter().find(|item| item.key == key).map(|item| &item.value)
+    }
+
+    #[test]
+    fn hlattrs2dict_emits_rgb_flags_colors_font_and_blend() {
+        let _fonts = FontsGuard::new();
+        let font = unsafe { hl_add_font_idx(b"Mono") };
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: (crate::highlight_defs::HL_INVERSE
+                | crate::highlight_defs::HL_BOLD
+                | crate::highlight_defs::HL_UNDERCURL
+                | crate::highlight_defs::HL_STRIKETHROUGH
+                | crate::highlight_defs::HL_FG_INDEXED
+                | crate::highlight_defs::HL_BG_INDEXED) as i32,
+            rgb_fg_color: 0x11_22_33,
+            rgb_bg_color: 0x44_55_66,
+            rgb_sp_color: 0x77_88_99,
+            hl_blend: 30,
+            font,
+            ..Default::default()
+        };
+
+        let dict = unsafe { hlattrs2dict(attrs, true, true) };
+
+        for key in [
+            b"reverse".as_slice(),
+            b"bold".as_slice(),
+            b"undercurl".as_slice(),
+            b"strikethrough".as_slice(),
+            b"fg_indexed".as_slice(),
+            b"bg_indexed".as_slice(),
+        ] {
+            assert!(matches!(
+                api_dict_value(&dict, key),
+                Some(crate::api::private::defs::Object::Boolean(true))
+            ));
+        }
+        assert!(api_dict_value(&dict, b"underline").is_none());
+        assert!(matches!(
+            api_dict_value(&dict, b"fg"),
+            Some(crate::api::private::defs::Object::Integer(0x11_22_33))
+        ));
+        assert!(matches!(
+            api_dict_value(&dict, b"bg"),
+            Some(crate::api::private::defs::Object::Integer(0x44_55_66))
+        ));
+        assert!(matches!(
+            api_dict_value(&dict, b"sp"),
+            Some(crate::api::private::defs::Object::Integer(0x77_88_99))
+        ));
+        assert!(matches!(
+            api_dict_value(&dict, b"font"),
+            Some(crate::api::private::defs::Object::String(name)) if name == b"Mono"
+        ));
+        assert!(matches!(
+            api_dict_value(&dict, b"blend"),
+            Some(crate::api::private::defs::Object::Integer(30))
+        ));
+    }
+
+    #[test]
+    fn hlattrs2dict_emits_cterm_colors_with_zero_based_api_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let attrs = crate::highlight_defs::HlAttrs {
+            cterm_ae_attr: (crate::highlight_defs::HL_ITALIC
+                | crate::highlight_defs::HL_UNDERDASHED) as i32,
+            cterm_fg_color: 3,
+            cterm_bg_color: 8,
+            hl_blend: 20,
+            ..Default::default()
+        };
+
+        let long = unsafe { hlattrs2dict(attrs, false, false) };
+        assert!(matches!(
+            api_dict_value(&long, b"foreground"),
+            Some(crate::api::private::defs::Object::Integer(2))
+        ));
+        assert!(matches!(
+            api_dict_value(&long, b"background"),
+            Some(crate::api::private::defs::Object::Integer(7))
+        ));
+        assert!(matches!(
+            api_dict_value(&long, b"blend"),
+            Some(crate::api::private::defs::Object::Integer(20))
+        ));
+
+        let short = unsafe { hlattrs2dict(attrs, false, true) };
+        assert!(matches!(
+            api_dict_value(&short, b"ctermfg"),
+            Some(crate::api::private::defs::Object::Integer(2))
+        ));
+        assert!(matches!(
+            api_dict_value(&short, b"ctermbg"),
+            Some(crate::api::private::defs::Object::Integer(7))
+        ));
+        assert!(api_dict_value(&short, b"blend").is_none());
+        assert!(matches!(
+            api_dict_value(&short, b"underdashed"),
+            Some(crate::api::private::defs::Object::Boolean(true))
+        ));
     }
 
     // ---- win_bg_attr ----
