@@ -301,6 +301,28 @@ pub unsafe fn nvim_buf_set_var(
     };
 }
 
+/// Delete a buffer-scoped variable (`nvim_buf_del_var`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and the checked
+/// scope-dictionary writer.
+pub unsafe fn nvim_buf_del_var(buf: Buffer, name: &NvimString, err: &mut Error) {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return;
+    }
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*buf).b_vars,
+            name,
+            &Object::Nil,
+            true,
+            false,
+            err,
+        )
+    };
+}
+
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
 /// current buffer), or an empty string on failure/if the buffer has
 /// no file name (`nvim_buf_get_name`).
@@ -715,6 +737,24 @@ mod tests {
         let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"items") }
             .expect("buffer variable");
         unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        fx.buf_mut().b_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn nvim_buf_del_var_removes_a_buffer_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(52);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"value", 3) },
+            crate::vim_defs::OK
+        );
+        fx.buf_mut().b_vars = dict;
+        let mut err = Error::default();
+        unsafe { nvim_buf_del_var(fx.handle(), &b"value".to_vec(), &mut err) };
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }.is_none());
+        assert!(!err.is_set());
         fx.buf_mut().b_vars = std::ptr::null_mut();
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
