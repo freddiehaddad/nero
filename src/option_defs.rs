@@ -8371,6 +8371,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::indent_c::did_set_shiftwidth_tabstop);
     options[OptIndex::Tabstop as usize].opt_did_set_cb =
         Some(crate::indent_c::did_set_shiftwidth_tabstop);
+    options[OptIndex::Updatecount as usize].opt_did_set_cb =
+        Some(crate::option::did_set_updatecount);
     options[OptIndex::Winminheight as usize].opt_did_set_cb =
         Some(crate::window::did_set_winminheight);
     options[OptIndex::Winminwidth as usize].opt_did_set_cb =
@@ -8688,6 +8690,7 @@ mod options_table_tests {
             b"spell",
             b"shiftwidth",
             b"tabstop",
+            b"updatecount",
             b"winminheight",
             b"winminwidth",
         ];

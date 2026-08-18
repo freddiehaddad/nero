@@ -7965,6 +7965,26 @@ pub unsafe fn did_set_spell(
     unimplemented!("did_set_spell: enabling spell checking needs parse_spelllang");
 }
 
+/// Process a new `'updatecount'` value (`did_set_updatecount`).
+///
+/// Only the zero-to-nonzero transition needs further work: opening
+/// swap files for all loaded buffers via `ml_open_files`.
+pub fn did_set_updatecount(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let old_value = match args.os_oldval {
+        crate::option_defs::OptVal::Number(value) => value,
+        _ => 0,
+    };
+    let updatecount = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_uc };
+    if updatecount != 0 && old_value == 0 {
+        unimplemented!(
+            "did_set_updatecount: zero-to-nonzero transition needs ml_open_files"
+        );
+    }
+    None
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///
@@ -8779,6 +8799,23 @@ mod did_set_title_tests {
         }
     }
 
+    struct UpdatecountGuard(crate::types_defs::OptInt);
+
+    impl UpdatecountGuard {
+        fn set(value: crate::types_defs::OptInt) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_uc };
+            unsafe { (*options).p_uc = value };
+            UpdatecountGuard(previous)
+        }
+    }
+
+    impl Drop for UpdatecountGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_uc = self.0 };
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9493,6 +9530,35 @@ mod did_set_title_tests {
             ..Default::default()
         };
         unsafe { did_set_spell(&mut args) };
+    }
+
+    #[test]
+    fn did_set_updatecount_needs_no_action_when_staying_zero_or_nonzero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut args = crate::option_defs::OptsetT {
+            os_oldval: crate::option_defs::OptVal::Number(0),
+            ..Default::default()
+        };
+        {
+            let _updatecount = UpdatecountGuard::set(0);
+            assert_eq!(did_set_updatecount(&mut args), None);
+        }
+
+        let _updatecount = UpdatecountGuard::set(200);
+        args.os_oldval = crate::option_defs::OptVal::Number(100);
+        assert_eq!(did_set_updatecount(&mut args), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ml_open_files")]
+    fn did_set_updatecount_zero_to_nonzero_needs_global_swapfile_opening() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _updatecount = UpdatecountGuard::set(200);
+        let mut args = crate::option_defs::OptsetT {
+            os_oldval: crate::option_defs::OptVal::Number(0),
+            ..Default::default()
+        };
+        did_set_updatecount(&mut args);
     }
 
     #[test]
