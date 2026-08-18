@@ -926,10 +926,177 @@ pub unsafe fn update_window_hl(wp: *mut crate::buffer_defs::WinT, invalid: bool)
     }
 }
 
+/// Apply the difference between `UserN` and `StatusLine` to an
+/// alternate status-line group (`combine_stl_hlt`).
+///
+/// # Safety
+/// All IDs and table indices must be valid in the shared highlight
+/// group table. Mutates the temporary group at `hlcnt + i`, the
+/// attribute table, and `output[i]`.
+unsafe fn combine_stl_hlt(
+    id: i32,
+    id_statusline: i32,
+    id_alt: i32,
+    hlcnt: i32,
+    i: usize,
+    hlf: crate::highlight_defs::HlfT,
+    output: &mut [i32; 9],
+) {
+    let target = hlcnt as usize + i;
+    let mut combined = if id_alt == 0 {
+        let attr = unsafe { HIGHLIGHT_ATTR.get_mut()[hlf as usize] };
+        crate::highlight_group::HlGroup {
+            sg_cterm: attr,
+            sg_gui: attr,
+            ..Default::default()
+        }
+    } else {
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items
+            [(id_alt - 1) as usize]
+            .clone()
+    };
+    combined.sg_link = 0;
+
+    let (user, statusline) = {
+        let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+        (
+            table.items[(id - 1) as usize].clone(),
+            table.items[(id_statusline - 1) as usize].clone(),
+        )
+    };
+    combined.sg_cterm ^= user.sg_cterm ^ statusline.sg_cterm;
+    if user.sg_cterm_fg != statusline.sg_cterm_fg {
+        combined.sg_cterm_fg = user.sg_cterm_fg;
+    }
+    if user.sg_cterm_bg != statusline.sg_cterm_bg {
+        combined.sg_cterm_bg = user.sg_cterm_bg;
+    }
+    combined.sg_gui ^= user.sg_gui ^ statusline.sg_gui;
+    if user.sg_rgb_fg != statusline.sg_rgb_fg {
+        combined.sg_rgb_fg = user.sg_rgb_fg;
+    }
+    if user.sg_rgb_bg != statusline.sg_rgb_bg {
+        combined.sg_rgb_bg = user.sg_rgb_bg;
+    }
+    if user.sg_rgb_sp != statusline.sg_rgb_sp {
+        combined.sg_rgb_sp = user.sg_rgb_sp;
+    }
+    unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[target] = combined;
+    unsafe { crate::highlight_group::set_hl_attr(target as i32) };
+    output[i] = unsafe { crate::highlight_group::syn_id2attr(target as i32 + 1) };
+}
+
+/// Rebuild global builtin and `User1`-`User9` highlight attributes
+/// (`highlight_changed`).
+///
+/// Remote-UI group notifications and the message-grid blending flag
+/// remain with the untranslated UI/message dispatch layer. All
+/// highlight tables, change detection, command-line invalidation,
+/// user-statusline combinations, and provider invalidation are real.
+///
+/// # Safety
+/// Mutates the shared group/attribute/namespace/provider tables and
+/// global redraw state.
+pub unsafe fn highlight_changed() {
+    let mut statusline_id = -1;
+    let mut statusline_nc_id = 0;
+    unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed = false;
+    unsafe { HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::None as usize] = 0 };
+
+    for (hlf, name) in crate::highlight_defs::HLF_NAMES
+        .iter()
+        .enumerate()
+        .skip(1)
+    {
+        let id = unsafe {
+            crate::highlight_group::syn_check_group(name.expect("builtin highlight name"))
+        };
+        assert!(id != 0, "highlight_changed: failed to create builtin group");
+        let mut ns_id = -1;
+        let mut final_id = id;
+        let _ = unsafe {
+            crate::highlight_group::syn_ns_get_final_id(&mut ns_id, &mut final_id)
+        };
+        if hlf == crate::highlight_defs::HlfT::Snc as usize {
+            statusline_nc_id = final_id;
+        } else if hlf == crate::highlight_defs::HlfT::S as usize {
+            statusline_id = final_id;
+        }
+
+        let attr = unsafe {
+            hl_get_ui_attr(
+                ns_id,
+                hlf as i32,
+                final_id,
+                hlf == crate::highlight_defs::HlfT::Inactive as usize,
+            )
+        };
+        unsafe { HIGHLIGHT_ATTR.get_mut()[hlf] = attr };
+        if attr != unsafe { HIGHLIGHT_ATTR_LAST.get_mut()[hlf] } {
+            if hlf == crate::highlight_defs::HlfT::Msg as usize {
+                unsafe { crate::globals::GLOBALS.get_mut() }.clear_cmdline = true;
+            }
+            unsafe { HIGHLIGHT_ATTR_LAST.get_mut()[hlf] = attr };
+        }
+    }
+
+    let original_len = unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items.len();
+    unsafe { crate::highlight_group::HL_TABLE.get_mut() }
+        .items
+        .resize(original_len + 10, crate::highlight_group::HlGroup::default());
+    if statusline_id == -1 {
+        statusline_id = original_len as i32 + 10;
+    }
+    for index in 0..9 {
+        let name = format!("User{}", index + 1);
+        let id = unsafe { crate::highlight_group::syn_name2id(name.as_bytes()) };
+        if id == 0 {
+            unsafe {
+                HIGHLIGHT_USER.get_mut()[index] = 0;
+                HIGHLIGHT_STLNC.get_mut()[index] = 0;
+            }
+        } else {
+            unsafe { HIGHLIGHT_USER.get_mut()[index] =
+                crate::highlight_group::syn_id2attr(id) };
+            unsafe {
+                combine_stl_hlt(
+                    id,
+                    statusline_id,
+                    statusline_nc_id,
+                    original_len as i32,
+                    index,
+                    crate::highlight_defs::HlfT::Snc,
+                    HIGHLIGHT_STLNC.get_mut(),
+                )
+            };
+        }
+    }
+    unsafe { crate::highlight_group::HL_TABLE.get_mut() }
+        .items
+        .truncate(original_len);
+
+    if unsafe { *NS_HL_ACTIVE.get_mut() } == 0 {
+        unsafe { *HL_ATTR_ACTIVE.get_mut() = *HIGHLIGHT_ATTR.get_mut() };
+    }
+    unsafe { crate::decoration_provider::decor_provider_invalidate_hl() };
+}
+
 /// Global UI highlight attributes (`highlight_attr`).
 pub static HIGHLIGHT_ATTR: crate::globals::GlobalCell<
     [i32; crate::highlight_defs::HlfT::Count as usize],
 > = crate::globals::GlobalCell::new([0; crate::highlight_defs::HlfT::Count as usize]);
+/// Previous global UI highlight attributes, for change detection
+/// (`highlight_attr_last`).
+pub static HIGHLIGHT_ATTR_LAST: crate::globals::GlobalCell<
+    [i32; crate::highlight_defs::HlfT::Count as usize],
+> = crate::globals::GlobalCell::new([0; crate::highlight_defs::HlfT::Count as usize]);
+/// Attributes for `User1` through `User9` (`highlight_user`).
+pub static HIGHLIGHT_USER: crate::globals::GlobalCell<[i32; 9]> =
+    crate::globals::GlobalCell::new([0; 9]);
+/// `User1` through `User9` combined over `StatusLineNC`
+/// (`highlight_stlnc`).
+pub static HIGHLIGHT_STLNC: crate::globals::GlobalCell<[i32; 9]> =
+    crate::globals::GlobalCell::new([0; 9]);
 
 /// The currently active UI highlight attribute for each `HlfT`
 /// (`hl_attr_active`).
@@ -2226,8 +2393,12 @@ mod tests {
         fast: i32,
         active: i32,
         base_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        last_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
         active_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        user_attrs: [i32; 9],
+        stlnc_attrs: [i32; 9],
         need_changed: bool,
+        clear_cmdline: bool,
     }
 
     impl HighlightNamespaceSelectionGuard {
@@ -2238,9 +2409,13 @@ mod tests {
                 fast: unsafe { *NS_HL_FAST.get_mut() },
                 active: unsafe { *NS_HL_ACTIVE.get_mut() },
                 base_attrs: unsafe { *HIGHLIGHT_ATTR.get_mut() },
+                last_attrs: unsafe { *HIGHLIGHT_ATTR_LAST.get_mut() },
                 active_attrs: unsafe { *HL_ATTR_ACTIVE.get_mut() },
+                user_attrs: unsafe { *HIGHLIGHT_USER.get_mut() },
+                stlnc_attrs: unsafe { *HIGHLIGHT_STLNC.get_mut() },
                 need_changed: unsafe { crate::globals::GLOBALS.get_mut() }
                     .need_highlight_changed,
+                clear_cmdline: unsafe { crate::globals::GLOBALS.get_mut() }.clear_cmdline,
             };
             unsafe {
                 *NS_HL_GLOBAL.get_mut() = global;
@@ -2248,6 +2423,7 @@ mod tests {
                 *NS_HL_FAST.get_mut() = fast;
                 *NS_HL_ACTIVE.get_mut() = active;
                 crate::globals::GLOBALS.get_mut().need_highlight_changed = false;
+                crate::globals::GLOBALS.get_mut().clear_cmdline = false;
             }
             guard
         }
@@ -2261,8 +2437,12 @@ mod tests {
                 *NS_HL_FAST.get_mut() = self.fast;
                 *NS_HL_ACTIVE.get_mut() = self.active;
                 *HIGHLIGHT_ATTR.get_mut() = self.base_attrs;
+                *HIGHLIGHT_ATTR_LAST.get_mut() = self.last_attrs;
                 *HL_ATTR_ACTIVE.get_mut() = self.active_attrs;
+                *HIGHLIGHT_USER.get_mut() = self.user_attrs;
+                *HIGHLIGHT_STLNC.get_mut() = self.stlnc_attrs;
                 crate::globals::GLOBALS.get_mut().need_highlight_changed = self.need_changed;
+                crate::globals::GLOBALS.get_mut().clear_cmdline = self.clear_cmdline;
             }
         }
     }
@@ -2625,6 +2805,176 @@ mod tests {
             .all(|&attr| unsafe { syn_attr2entry(attr) }.hl_blend == 25));
         assert!(win.w_config.shadow);
         assert!(win.w_grid_alloc.blending);
+    }
+
+    #[test]
+    fn combine_stl_hlt_applies_user_statusline_difference_to_alt_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, -1);
+        let _entries = AttributeEntriesGuard::empty();
+        let base = || crate::highlight_group::HlGroup {
+            sg_rgb_fg_idx: crate::highlight_group::COLOR_IDX_NONE,
+            sg_rgb_bg_idx: crate::highlight_group::COLOR_IDX_NONE,
+            sg_rgb_sp_idx: crate::highlight_group::COLOR_IDX_NONE,
+            sg_blend: -1,
+            ..Default::default()
+        };
+        let mut statusline = base();
+        statusline.sg_cterm = crate::highlight_defs::HL_BOLD as i32;
+        statusline.sg_cterm_fg = 2;
+        let mut alt = base();
+        alt.sg_cterm = crate::highlight_defs::HL_UNDERLINE as i32;
+        alt.sg_cterm_bg = 7;
+        let mut user = base();
+        user.sg_cterm = crate::highlight_defs::HL_ITALIC as i32;
+        user.sg_cterm_fg = 5;
+        let _groups =
+            HighlightGroupTableGuard::install(vec![statusline, alt, user, base()]);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let mut output = [0; 9];
+
+        unsafe {
+            combine_stl_hlt(
+                3,
+                1,
+                2,
+                3,
+                0,
+                crate::highlight_defs::HlfT::Snc,
+                &mut output,
+            )
+        };
+
+        assert!(output[0] > 0);
+        let attrs = unsafe { syn_attr2entry(output[0]) };
+        assert_eq!(
+            attrs.cterm_ae_attr,
+            (crate::highlight_defs::HL_UNDERLINE
+                | crate::highlight_defs::HL_ITALIC
+                | crate::highlight_defs::HL_BOLD) as i32
+        );
+        assert_eq!(attrs.cterm_fg_color, 5);
+        assert_eq!(attrs.cterm_bg_color, 7);
+        assert_eq!(
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[3].sg_link,
+            0
+        );
+    }
+
+    #[test]
+    fn highlight_changed_rebuilds_global_builtin_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, 0);
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
+        unsafe {
+            *HIGHLIGHT_ATTR.get_mut() =
+                [0; crate::highlight_defs::HlfT::Count as usize];
+            *HIGHLIGHT_ATTR_LAST.get_mut() =
+                [0; crate::highlight_defs::HlfT::Count as usize];
+            *HIGHLIGHT_USER.get_mut() = [0; 9];
+            *HIGHLIGHT_STLNC.get_mut() = [0; 9];
+            *HLSTATE_ACTIVE.get_mut() = true;
+        }
+        let error_id = unsafe { crate::highlight_group::syn_check_group(b"ErrorMsg") };
+        {
+            let group = &mut unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items
+                [(error_id - 1) as usize];
+            group.sg_gui = crate::highlight_defs::HL_BOLD as i32;
+            group.sg_rgb_fg = 0x12_34_56;
+            group.sg_rgb_fg_idx = crate::highlight_group::COLOR_IDX_HEX;
+            group.sg_rgb_bg_idx = crate::highlight_group::COLOR_IDX_NONE;
+            group.sg_rgb_sp_idx = crate::highlight_group::COLOR_IDX_NONE;
+            group.sg_blend = -1;
+        }
+        unsafe { crate::highlight_group::set_hl_attr(error_id - 1) };
+
+        unsafe { highlight_changed() };
+
+        let error_attr =
+            unsafe { HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::E as usize] };
+        let attrs = unsafe { syn_attr2entry(error_attr) };
+        assert_eq!(attrs.rgb_ae_attr, crate::highlight_defs::HL_BOLD as i32);
+        assert_eq!(attrs.rgb_fg_color, 0x12_34_56);
+        assert_eq!(
+            unsafe { HIGHLIGHT_ATTR_LAST.get_mut() }
+                [crate::highlight_defs::HlfT::E as usize],
+            error_attr
+        );
+        assert_eq!(
+            unsafe { crate::highlight_group::highlight_num_groups() },
+            crate::highlight_defs::HlfT::Count as i32 - 1
+        );
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed);
+        assert_eq!(
+            unsafe { *HL_ATTR_ACTIVE.get_mut() },
+            unsafe { *HIGHLIGHT_ATTR.get_mut() }
+        );
+    }
+
+    #[test]
+    fn highlight_changed_builds_user_and_statusline_nc_combinations() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, 0);
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
+        unsafe {
+            *HIGHLIGHT_ATTR.get_mut() =
+                [0; crate::highlight_defs::HlfT::Count as usize];
+            *HIGHLIGHT_ATTR_LAST.get_mut() =
+                [0; crate::highlight_defs::HlfT::Count as usize];
+            *HIGHLIGHT_USER.get_mut() = [0; 9];
+            *HIGHLIGHT_STLNC.get_mut() = [0; 9];
+            *HLSTATE_ACTIVE.get_mut() = true;
+        }
+        let status = unsafe { crate::highlight_group::syn_check_group(b"StatusLine") };
+        let status_nc = unsafe { crate::highlight_group::syn_check_group(b"StatusLineNC") };
+        let user = unsafe { crate::highlight_group::syn_check_group(b"User1") };
+        for id in [status, status_nc, user] {
+            let group = &mut unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items
+                [(id - 1) as usize];
+            group.sg_rgb_fg_idx = crate::highlight_group::COLOR_IDX_NONE;
+            group.sg_rgb_bg_idx = crate::highlight_group::COLOR_IDX_NONE;
+            group.sg_rgb_sp_idx = crate::highlight_group::COLOR_IDX_NONE;
+            group.sg_blend = -1;
+        }
+        unsafe {
+            let table = crate::highlight_group::HL_TABLE.get_mut();
+            table.items[(status - 1) as usize].sg_cterm =
+                crate::highlight_defs::HL_BOLD as i32;
+            table.items[(status - 1) as usize].sg_cterm_fg = 2;
+            table.items[(status_nc - 1) as usize].sg_cterm =
+                crate::highlight_defs::HL_UNDERLINE as i32;
+            table.items[(status_nc - 1) as usize].sg_cterm_bg = 7;
+            table.items[(user - 1) as usize].sg_cterm =
+                crate::highlight_defs::HL_ITALIC as i32;
+            table.items[(user - 1) as usize].sg_cterm_fg = 5;
+        }
+        unsafe { crate::highlight_group::set_hl_attr(status - 1) };
+        unsafe { crate::highlight_group::set_hl_attr(status_nc - 1) };
+        unsafe { crate::highlight_group::set_hl_attr(user - 1) };
+
+        unsafe { highlight_changed() };
+
+        assert_eq!(
+            unsafe { HIGHLIGHT_USER.get_mut()[0] },
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[(user - 1) as usize]
+                .sg_attr
+        );
+        let combined = unsafe { syn_attr2entry(HIGHLIGHT_STLNC.get_mut()[0]) };
+        assert_eq!(
+            combined.cterm_ae_attr,
+            (crate::highlight_defs::HL_UNDERLINE
+                | crate::highlight_defs::HL_ITALIC
+                | crate::highlight_defs::HL_BOLD) as i32
+        );
+        assert_eq!((combined.cterm_fg_color, combined.cterm_bg_color), (5, 7));
+        assert_eq!(
+            unsafe { crate::highlight_group::highlight_num_groups() },
+            crate::highlight_defs::HlfT::Count as i32
+        );
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);
