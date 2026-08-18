@@ -19,6 +19,7 @@
 //! [`buf_get_text`] returns a bounded byte range from one buffer line.
 //! [`dict_get_value`] bridges a scope dictionary item to an API object.
 //! [`dict_set_var`] performs the matching checked write/delete.
+//! [`set_mark`] validates and delegates API mark writes.
 //!
 //! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
 //! generic, variadic/printf-style message formatters; this crate uses
@@ -285,6 +286,7 @@ pub unsafe fn dict_set_var(
                 crate::eval::vars::BeforeSetVvar::SetNormally => {}
             }
         }
+
         unsafe { crate::eval::typval::tv_clear_simple(&(*item).di_tv) };
         unsafe { (*item).di_tv = std::mem::take(&mut converted) };
         old
@@ -294,6 +296,60 @@ pub unsafe fn dict_set_var(
         let _ = unsafe { crate::eval::typval::tv_dict_add(&mut *dict, item) };
         Object::Nil
     }
+}
+
+/// Set or delete one validated named mark (`set_mark`).
+///
+/// A zero line deletes the mark.
+///
+/// # Safety
+/// `buf`, when non-null, must point to a live buffer. Otherwise
+/// `GLOBALS.curbuf` must be live. Forwarded to
+/// [`crate::mark::setmark_pos`].
+pub unsafe fn set_mark(
+    buf: *mut BufT,
+    name: u8,
+    line: i64,
+    mut col: i64,
+    err: &mut Error,
+) -> bool {
+    let buf = if buf.is_null() {
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf
+    } else {
+        buf
+    };
+    let deleting = line == 0;
+    if deleting {
+        col = 0;
+    } else {
+        if col > i64::from(crate::pos_defs::MAXCOL) {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some("Invalid 'column': out of range".to_string());
+            return false;
+        }
+        if line < 1 || line > i64::from(unsafe { (*buf).b_ml.ml_line_count }) {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some("Invalid 'line': out of range".to_string());
+            return false;
+        }
+    }
+    let pos = crate::pos_defs::PosT {
+        lnum: line as crate::pos_defs::LinenrT,
+        col: col as crate::pos_defs::ColnrT,
+        coladd: 0,
+    };
+    let result =
+        unsafe { crate::mark::setmark_pos(i32::from(name), &pos, (*buf).handle, None) }
+            == crate::vim_defs::OK;
+    if !result {
+        err.r#type = ErrorType::Exception;
+        err.msg = Some(format!(
+            "Failed to {} named mark: {}",
+            if deleting { "delete" } else { "set" },
+            char::from(name)
+        ));
+    }
+    result
 }
 
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
@@ -474,6 +530,54 @@ mod tests {
             crate::eval::typval_defs::TypvalValue::String(Some(value)) if value == b"42"
         ));
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn set_mark_sets_and_deletes_a_buffer_local_mark() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            handle: 17,
+            ..Default::default()
+        };
+        buf.b_ml.ml_line_count = 10;
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+        let mut err = Error::default();
+        assert!(unsafe { set_mark(buf_ptr, b'a', 4, 2, &mut err) });
+        assert_eq!(
+            unsafe { (*buf_ptr).b_namedm[0].mark },
+            crate::pos_defs::PosT {
+                lnum: 4,
+                col: 2,
+                coladd: 0
+            }
+        );
+        assert!(unsafe { set_mark(buf_ptr, b'a', 0, 99, &mut err) });
+        assert_eq!(unsafe { (*buf_ptr).b_namedm[0].mark.lnum }, 0);
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn set_mark_rejects_out_of_range_lines_and_columns() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut line_err = Error::default();
+        assert!(!unsafe { set_mark(buf_ptr, b'a', 4, 0, &mut line_err) });
+        assert_eq!(line_err.msg.as_deref(), Some("Invalid 'line': out of range"));
+        let mut col_err = Error::default();
+        assert!(!unsafe {
+            set_mark(
+                buf_ptr,
+                b'a',
+                1,
+                i64::from(crate::pos_defs::MAXCOL) + 1,
+                &mut col_err,
+            )
+        });
+        assert_eq!(col_err.msg.as_deref(), Some("Invalid 'column': out of range"));
     }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
