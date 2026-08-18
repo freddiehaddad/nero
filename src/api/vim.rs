@@ -18,6 +18,13 @@ use crate::api::private::defs::{
     Array, Buffer, Error, ErrorType, Integer, NvimString, Object, Tabpage, Window,
 };
 
+/// Return a deep owned copy of `obj` (`nvim__id`).
+#[must_use]
+#[allow(non_snake_case)]
+pub fn nvim__id(obj: &Object) -> Object {
+    obj.clone()
+}
+
 /// List every current buffer, including unlisted and unloaded buffers
 /// (`nvim_list_bufs`).
 ///
@@ -400,6 +407,26 @@ mod tests {
             drop(Box::from_raw(win_ptr));
             drop(Box::from_raw(buf_ptr));
         }
+
+    }
+
+    #[test]
+    fn nvim_id_returns_an_independent_nested_object_copy() {
+        let input = Object::Array(vec![Object::String(b"one".to_vec())]);
+        let mut output = nvim__id(&input);
+        if let Object::Array(items) = &mut output
+            && let Object::String(text) = &mut items[0]
+        {
+            text[0] = b'd';
+        }
+        assert!(matches!(
+            input,
+            Object::Array(ref items) if matches!(&items[0], Object::String(text) if text == b"one")
+        ));
+        assert!(matches!(
+            output,
+            Object::Array(ref items) if matches!(&items[0], Object::String(text) if text == b"dne")
+        ));
     }
 
     struct HighlightNamespaceGuard {
