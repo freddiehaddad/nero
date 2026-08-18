@@ -83,6 +83,7 @@ pub unsafe fn nvim_get_color_by_name(name: &NvimString) -> Integer {
 /// Mutates shared highlight-group, namespace, provider, attribute,
 /// font, redraw, and script-context state.
 pub unsafe fn nvim_set_hl(
+    channel_id: u64,
     ns_id: Integer,
     name: &NvimString,
     value: &crate::highlight::HighlightDict,
@@ -112,6 +113,8 @@ pub unsafe fn nvim_set_hl(
     let attrs =
         unsafe { crate::highlight::dict2hlattrs(value, true, Some(&mut link_id), base, err) };
     if !err.is_set() {
+        let previous_sctx =
+            unsafe { crate::api::private::helpers::api_set_sctx(channel_id) };
         unsafe {
             crate::highlight::ns_hl_def(
                 ns_id as i32,
@@ -121,6 +124,7 @@ pub unsafe fn nvim_set_hl(
                 Some(value),
             )
         };
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = previous_sctx;
     }
 }
 
@@ -980,6 +984,7 @@ mod tests {
         let mut err = Error::default();
         unsafe {
             nvim_set_hl(
+                0,
                 namespace,
                 &name,
                 &crate::highlight::HighlightDict {
@@ -1010,6 +1015,7 @@ mod tests {
         let mut err = Error::default();
         unsafe {
             nvim_set_hl(
+                0,
                 4002,
                 &b"NeroApiUrlHighlight".to_vec(),
                 &crate::highlight::HighlightDict {
@@ -1032,9 +1038,11 @@ mod tests {
                 std::ptr::null_mut(),
             )
         };
+        let previous_sctx = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
         let mut set_err = Error::default();
         unsafe {
             nvim_set_hl(
+                99,
                 0,
                 &name,
                 &crate::highlight::HighlightDict {
@@ -1045,6 +1053,11 @@ mod tests {
                 &mut set_err,
             )
         };
+        let hl_id = unsafe { crate::highlight_group::syn_name2id(&name) };
+        let group_sctx = unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items
+            [(hl_id - 1) as usize]
+            .sg_script_ctx;
+        let restored_sctx = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
         let mut err = Error::default();
         let definition = unsafe {
             nvim_get_hl(
@@ -1059,6 +1072,9 @@ mod tests {
 
         assert!(!set_err.is_set());
         assert!(!err.is_set());
+        assert_eq!(group_sctx.sc_sid, crate::globals::SID_API_CLIENT);
+        assert_eq!(group_sctx.sc_chan, 99);
+        assert_eq!(restored_sctx, previous_sctx);
         assert!(definition.iter().any(|pair| {
             pair.key == b"italic" && matches!(pair.value, Object::Boolean(true))
         }));
