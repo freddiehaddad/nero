@@ -8406,6 +8406,12 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
 }
 
 fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    for option in &mut *options {
+        if !option.values.is_empty() {
+            option.opt_expand_cb = Some(crate::optionstr::expand_set_str_generic);
+        }
+    }
+
     options[OptIndex::Concealcursor as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_concealcursor);
     options[OptIndex::Cpoptions as usize].opt_expand_cb =
@@ -8786,7 +8792,7 @@ mod options_table_tests {
             expected.contains(&option.fullname)
                 || option.opt_did_set_cb.is_none()
         }));
-        let expanded: &[&[u8]] = &[
+        let explicitly_expanded: &[&[u8]] = &[
             b"concealcursor",
             b"cpoptions",
             b"diffopt",
@@ -8805,16 +8811,22 @@ mod options_table_tests {
             b"whichwrap",
             b"winhighlight",
         ];
-        for name in expanded {
-            assert!(opts
-                .iter()
-                .find(|option| option.fullname == *name)
-                .and_then(|option| option.opt_expand_cb)
-                .is_some());
+        for option in opts.iter() {
+            let expected =
+                !option.values.is_empty() || explicitly_expanded.contains(&option.fullname);
+            assert_eq!(
+                option.opt_expand_cb.is_some(),
+                expected,
+                "unexpected expansion callback state for {}",
+                String::from_utf8_lossy(option.fullname)
+            );
         }
-        assert!(opts.iter().all(|option| {
-            expanded.contains(&option.fullname) || option.opt_expand_cb.is_none()
-        }));
+        assert_eq!(
+            opts.iter()
+                .filter(|option| option.opt_expand_cb.is_some())
+                .count(),
+            68
+        );
     }
 
     #[test]
