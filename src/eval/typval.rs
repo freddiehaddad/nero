@@ -1369,6 +1369,33 @@ pub fn callback_free(callback: &mut Callback) {
     *callback = Callback::None;
 }
 
+/// Copy a callback, incrementing its held reference
+/// (`callback_copy`).
+///
+/// The destination must already be cleared, matching the original
+/// helper's contract. Lua callbacks remain deferred pending
+/// `api_new_luaref`.
+///
+/// # Safety
+/// A partial callback must contain a valid live pointer.
+pub unsafe fn callback_copy(dest: &mut Callback, src: &Callback) {
+    *dest = match src {
+        Callback::Partial(partial) => {
+            assert!(!partial.is_null(), "callback_copy: null partial");
+            unsafe { (**partial).pt_refcount += 1 };
+            Callback::Partial(*partial)
+        }
+        Callback::Funcref(name) => {
+            crate::eval::userfunc::func_ref(Some(name));
+            Callback::Funcref(name.clone())
+        }
+        Callback::Lua(_) => {
+            unimplemented!("callback_copy: Lua callbacks need api_new_luaref")
+        }
+        Callback::None => Callback::None,
+    };
+}
+
 /// Copy a callback into a typval, incrementing held references
 /// (`callback_put`).
 ///
@@ -6630,6 +6657,65 @@ mod tests {
         let mut cb = Callback::None;
         callback_free(&mut cb);
         assert_eq!(cb.kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn callback_copy_partial_increments_its_reference() {
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            ..Default::default()
+        }));
+        let mut source = Callback::Partial(partial);
+        let mut dest = Callback::None;
+        unsafe { callback_copy(&mut dest, &source) };
+        assert_eq!(unsafe { (*partial).pt_refcount }, 2);
+        callback_free(&mut dest);
+        assert_eq!(unsafe { (*partial).pt_refcount }, 1);
+        callback_free(&mut source);
+    }
+
+    #[test]
+    fn callback_copy_funcref_increments_its_function_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_refcount: 2,
+            uf_name: b"88\0".to_vec(),
+            ..Default::default()
+        };
+        let function_ptr =
+            std::ptr::from_mut::<crate::eval::typval_defs::UfuncT>(
+                &mut function,
+            );
+        unsafe { crate::eval::userfunc::func_hashtab_add(function_ptr) };
+        let mut source = Callback::Funcref(b"88".to_vec());
+        let mut dest = Callback::None;
+
+        unsafe { callback_copy(&mut dest, &source) };
+
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 3);
+        assert!(matches!(
+            &dest,
+            Callback::Funcref(name) if name == b"88"
+        ));
+        callback_free(&mut dest);
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 2);
+        callback_free(&mut source);
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 1);
+    }
+
+    #[test]
+    fn callback_copy_none_remains_none() {
+        let mut dest = Callback::None;
+        unsafe { callback_copy(&mut dest, &Callback::None) };
+        assert_eq!(dest.kind(), CallbackType::None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Lua callbacks need api_new_luaref")]
+    fn callback_copy_defers_lua_references() {
+        let mut dest = Callback::None;
+        unsafe { callback_copy(&mut dest, &Callback::Lua(1)) };
     }
 
     #[test]
