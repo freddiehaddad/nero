@@ -1,12 +1,36 @@
-//! Translated from `src/nvim/api/deprecated.c` (highlight lookup
-//! subset).
+//! Translated from `src/nvim/api/deprecated.c` (highlight lookup and
+//! read-only buffer-line compatibility subsets).
 //!
 //! The deprecated highlight-by-ID/name wrappers are retained because
 //! they are public API compatibility surfaces. Other functions in the
 //! source file remain with their respective not-yet-translated API
 //! subsystems.
 
-use crate::api::private::defs::{Boolean, Dict, Error, ErrorType, Integer, NvimString};
+use crate::api::private::defs::{Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString};
+
+fn convert_index(index: Integer) -> Integer {
+    if index < 0 {
+        index - 1
+    } else {
+        index
+    }
+}
+
+/// Get one buffer line through the deprecated API (`buffer_get_line`).
+///
+/// # Safety
+/// Forwarded from [`crate::api::buffer::nvim_buf_get_lines`].
+pub unsafe fn buffer_get_line(buffer: Buffer, index: Integer, err: &mut Error) -> NvimString {
+    let index = convert_index(index);
+    let lines = unsafe {
+        crate::api::buffer::nvim_buf_get_lines(0, buffer, index, index + 1, true, err)
+    };
+    if err.is_set() {
+        Vec::new()
+    } else {
+        lines.into_iter().next().unwrap_or_default()
+    }
+}
 
 /// Get a highlight definition by group ID (`nvim_get_hl_by_id`).
 ///
@@ -47,6 +71,29 @@ pub unsafe fn nvim_get_hl_by_name(name: &NvimString, rgb: Boolean, err: &mut Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convert_index_preserves_positive_and_shifts_negative_indexes() {
+        assert_eq!(convert_index(0), 0);
+        assert_eq!(convert_index(3), 3);
+        assert_eq!(convert_index(-1), -2);
+        assert_eq!(convert_index(-5), -6);
+    }
+
+    #[test]
+    fn buffer_get_line_returns_empty_and_an_error_for_an_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut err = Error::default();
+        let line = unsafe { buffer_get_line(999, 0, &mut err) };
+        assert!(line.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid buffer id: 999"));
+    }
 
     struct HighlightApiGuard {
         groups: Vec<crate::highlight_group::HlGroup>,
