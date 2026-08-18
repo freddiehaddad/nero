@@ -370,6 +370,57 @@ pub unsafe fn nvim_buf_set_mark(
     unsafe { crate::api::private::helpers::set_mark(buf, name[0], line, col, err) }
 }
 
+/// Delete a named mark when it is set in the requested buffer
+/// (`nvim_buf_del_mark`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`],
+/// [`crate::mark::mark_get`], and the shared API mark writer.
+pub unsafe fn nvim_buf_del_mark(
+    buf: Buffer,
+    name: &NvimString,
+    err: &mut Error,
+) -> Boolean {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return false;
+    }
+    if name.len() != 1 {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(if name.is_empty() {
+            "Invalid mark name (must be a single char)".to_string()
+        } else {
+            format!(
+                "Invalid mark name (must be a single char): '{}'",
+                String::from_utf8_lossy(name)
+            )
+        });
+        return false;
+    }
+    let mark = unsafe {
+        crate::mark::mark_get(
+            &mut *buf,
+            crate::globals::GLOBALS.get_mut().curwin,
+            None,
+            crate::mark_defs::MarkGet::AllNoResolve,
+            i32::from(name[0]),
+        )
+    };
+    if mark.is_null() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid mark name: '{}'",
+            String::from_utf8_lossy(name)
+        ));
+        return false;
+    }
+    if unsafe { (*mark).mark.lnum } != 0 && unsafe { (*mark).fnum } == unsafe { (*buf).handle } {
+        unsafe { crate::api::private::helpers::set_mark(buf, name[0], 0, 0, err) }
+    } else {
+        false
+    }
+}
+
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
 /// current buffer), or an empty string on failure/if the buffer has
 /// no file name (`nvim_buf_get_name`).
@@ -831,6 +882,20 @@ mod tests {
         assert_eq!(fx.buf_mut().b_namedm[0].mark.lnum, 0);
         assert!(!err.is_set());
         fx.buf_mut().b_ml.ml_mfp = std::ptr::null_mut();
+    }
+
+    #[test]
+    fn nvim_buf_del_mark_removes_a_mark_in_the_requested_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(54);
+        fx.buf_mut().b_namedm[0].mark.lnum = 4;
+        fx.buf_mut().b_namedm[0].fnum = 54;
+        let mut err = Error::default();
+        assert!(unsafe {
+            nvim_buf_del_mark(fx.handle(), &b"a".to_vec(), &mut err)
+        });
+        assert_eq!(fx.buf_mut().b_namedm[0].mark.lnum, 0);
+        assert!(!err.is_set());
     }
 
     #[test]
