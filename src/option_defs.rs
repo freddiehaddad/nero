@@ -30,14 +30,9 @@
 //! `did_set_*`/`expand_*` families). Every translated did-set callback
 //! is wired now; callbacks not yet translated and every expansion
 //! callback stay `None`. The generic
-//! `get_option_value`/`set_option_value`/
-//! `do_set` engine that would actually DISPATCH through `OPTIONS`
-//! (via `get_varp_from`'s ~30-branch buffer/window-local fallback
-//! logic - the `var`/`flags_var` fields, `scope_idx`, and every
-//! other piece of per-entry *metadata* are already real and correct)
-//! is likewise not started - matching the `OptIndex`-before-the-real-
-//! engine split already established this session for
-//! `ex_cmds_defs.rs`'s `CommandDefinition`.
+//! `get_option_value`/`set_option_value` engine now dispatches through
+//! this table; only the `do_set`/`ex_set` command-line parser remains
+//! deferred.
 
 use crate::api::private::defs::NvimString;
 use crate::eval::typval_defs::SctxT;

@@ -3,8 +3,8 @@
 //! `option.c` is a massive (~6897-line) file implementing the entire
 //! `:set`/options-parsing engine, deeply entangled with the eval
 //! engine, autocmd triggers, and nearly every other subsystem: the
-//! `:set` command parser (`do_set`/`ex_set`) and the typed
-//! `set_option_value` entry point are not attempted here.
+//! `:set` command parser (`do_set`/`ex_set`) remains deferred, while
+//! the typed get/set engine and its scoped/direct wrappers are real.
 //!
 //! Translated: `get_fileformat` (harvested first because it directly
 //! unblocks part of `memline.c`'s `ml_open`); `get_fileformat_force`
@@ -122,10 +122,7 @@
 //! `did_set_option`'s own early "is this string value shaped like a
 //! real file/directory name, or does it contain a shell-wildcard/
 //! separator character that shouldn't be there" guard, needing only
-//! `GLOBALS.secure`. Translated ahead of `did_set_option` itself
-//! (still deferred, see below), matching this crate's established
-//! "small, simple, mechanically correct piece ahead of its real
-//! caller" precedent.
+//! `GLOBALS.secure`.
 //!
 //! Also translated: `do_syntax_autocmd` - `did_set_option`'s own
 //! `'syntax'`-changed handler, called once `varp == &curbuf->b_p_syn`
@@ -136,9 +133,6 @@
 //! beyond its own `SYN_RECURSIVE` recursion-depth bookkeeping and the
 //! `BF_SYN_SET` flag update - becomes fully correct automatically once
 //! a future session adds real `Syntax` autocmd registration).
-//! Translated ahead of `did_set_option` itself, matching the same
-//! "small, simple, mechanically correct piece ahead of its real
-//! caller" precedent.
 //!
 //! **STALE-NOTE FIX**: `find_option`/`find_option_len` (below) were
 //! previously (incorrectly) described here as still needing the
@@ -183,11 +177,11 @@
 //! `set_option_sctx`/`check_illegal_path_names` (previous paragraph).
 //!
 //! **`did_set_option` itself is now translated** (see its own doc
-//! comment for its precise remaining gaps: the per-option callback
-//! dispatch - currently unreachable for every option in this crate's
-//! own table, see that doc comment -, `'spelllang'`'s
+//! comment for its precise remaining gaps: `'spelllang'`'s
 //! `do_spelllang_source`, and `'winbar'`'s real frame-layout
-//! resizing). Every other piece of its own real body is genuinely
+//! resizing). Every translated per-option callback is wired and
+//! dispatched through `OptsetT`. Every other piece of its own real body is
+//! genuinely
 //! correct and complete today: `set_option_varp`'s error-path value
 //! restoration, `set_option_sctx`'s script-context tracking,
 //! `scope_both`'s global-local-unset handling, the 3 autocmd-trigger
@@ -196,18 +190,15 @@
 //! redraw-only calls in its own tail (`setmouse`/`redraw_all_later`/
 //! `check_redraw`) are omitted per this crate's established
 //! `redraw_later`-omission precedent (see that function's own doc
-//! comment for the exact reasoning at each call site). Its own real
-//! callers (`set_option`/`set_option_value`/`do_set`) remain
-//! untranslated - harvested ahead of them, matching this crate's
-//! established "small, simple, mechanically correct piece ahead of
-//! its real caller" precedent (here, simply a much larger "piece"
-//! than usual, given how much groundwork had already accumulated
-//! across many earlier commits this session).
+//! comment for the exact reasoning at each call site).
 //!
-//! Deferred: the full `set_option_value`/`set_option`/
-//! `validate_option_value` write pipeline around `did_set_option` -
-//! each layer found to need a currently-blocked subsystem while
-//! scoping this pass:
+//! Also translated: the full typed read/write pipeline around that
+//! callback dispatcher - `validate_option_value`, `set_option`,
+//! `set_option_value`, `set_option_value_handle_tty`,
+//! `set_option_value_give_err`, `set_option_direct`,
+//! `set_option_direct_for`, `unset_option_local_value`,
+//! `get_option_value_for`, and the currently-supported paths of
+//! `set_option_value_for`.
 //! - `validate_option_value`/`validate_num_option`/
 //!   `check_num_option_bounds` are now FULLY translated (no remaining
 //!   panics): `OptIndex::Lines`/`OptIndex::Scroll` (previously the
@@ -228,9 +219,16 @@
 //!   (see below) - via a dedicated `OPTION_WAS_SET` side-table rather
 //!   than mutating `OPTIONS[idx].flags` directly (see
 //!   [`option_was_set`]'s own doc comment for why).
+//!
+//! Deferred:
 //! - `parse_winhl_opt` needs the decoration/highlight-group subsystem
 //!   (`nvim_create_namespace`/`get_decor_provider`/`syn_check_group`/
 //!   `ns_hl_def`).
+//! - Cross-window/buffer paths in `get_option_value_for`/
+//!   `set_option_value_for` need the real `ctx_switch`.
+//! - Ten remaining did-set/expand callbacks still need their own
+//!   major subsystems (diff, mapping/keymap, syntax regex/highlight,
+//!   paste-mode state, or live statusline layout).
 //! - `do_set`/`ex_set`'s command-line parsing itself, plus
 //!   `get_vimoption`/etc. (everything needing the full parsed-`:set`-
 //!   argument machinery, not just a resolved storage address and a
@@ -8884,7 +8882,7 @@ pub fn did_set_showtabline(
 /// # Safety
 /// `args.os_win` must point to a live `WinT` whose `w_buffer` points
 /// to a live `BufT`; forwarded from
-/// [`crate::r#move::changed_window_setting`].
+/// `crate::r#move::changed_window_setting`.
 pub unsafe fn did_set_arabic(
     args: &mut crate::option_defs::OptsetT,
 ) -> Option<&'static [u8]> {
