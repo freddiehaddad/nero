@@ -13,9 +13,10 @@
 //! `decor_conceal_line`/`decor_virt_lines`, all since translated - this
 //! was a small, genuinely self-contained piece worth harvesting ahead
 //! of its callers at the time), and [`nvim_create_namespace`] (via the
-//! now-real `NAMESPACE_IDS`/`NEXT_NAMESPACE_ID` file-statics).
+//! now-real `NAMESPACE_IDS`/`NEXT_NAMESPACE_ID` file-statics), plus
+//! [`nvim_get_namespaces`].
 
-use crate::api::private::defs::{Integer, NvimString};
+use crate::api::private::defs::{Dict, Integer, KeyValuePair, NvimString, Object};
 use crate::buffer_defs::WinT;
 use crate::globals::GlobalCell;
 use crate::map::{Map, Set};
@@ -85,6 +86,24 @@ pub unsafe fn nvim_create_namespace(name: &NvimString) -> Integer {
     i64::from(id)
 }
 
+/// Return all existing named namespaces (`nvim_get_namespaces`).
+///
+/// Anonymous namespaces are absent because they are never inserted
+/// into [`NAMESPACE_IDS`].
+///
+/// # Safety
+/// Reads the shared [`NAMESPACE_IDS`] registry.
+#[must_use]
+pub unsafe fn nvim_get_namespaces() -> Dict {
+    unsafe { NAMESPACE_IDS.get_mut() }
+        .iter()
+        .map(|(name, id)| KeyValuePair {
+            key: name.clone(),
+            value: Object::Integer(i64::from(*id)),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +166,23 @@ mod tests {
         let id_a = unsafe { nvim_create_namespace(&a) };
         let id_b = unsafe { nvim_create_namespace(&b) };
         assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn nvim_get_namespaces_returns_named_but_not_anonymous_namespaces() {
+        let _lock = crate::globals::global_state_test_lock();
+        let name: NvimString = b"nero-test-ns-listing".to_vec();
+        let named = unsafe { nvim_create_namespace(&name) };
+        let anonymous = unsafe { nvim_create_namespace(&Vec::new()) };
+
+        let namespaces = unsafe { nvim_get_namespaces() };
+
+        assert!(namespaces.iter().any(|pair| {
+            pair.key == name && matches!(pair.value, Object::Integer(id) if id == named)
+        }));
+        assert!(!namespaces
+            .iter()
+            .any(|pair| matches!(pair.value, Object::Integer(id) if id == anonymous)));
     }
 
     #[test]
