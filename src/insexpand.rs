@@ -2269,6 +2269,83 @@ pub unsafe fn set_buflocal_cpt_callbacks(
     };
 }
 
+/// Parse `'complete'` F-function sources into callback arrays
+/// (`set_cpt_callbacks`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must be null or point to a live buffer. Every
+/// callback referent must remain valid.
+pub unsafe fn set_cpt_callbacks(
+    args: &crate::option_defs::OptsetT,
+) -> i32 {
+    let local =
+        args.os_flags as u32 & crate::option_defs::opt_set_flags::OPT_LOCAL != 0;
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    if curbuf.is_null() {
+        return crate::vim_defs::FAIL;
+    }
+
+    clear_cpt_callbacks(unsafe { &mut (*curbuf).b_p_cpt_cb });
+    let count = unsafe { get_cpt_sources_count() };
+    if count == 0 {
+        return crate::vim_defs::OK;
+    }
+    let count = usize::try_from(count).unwrap_or(0);
+    unsafe { &mut (*curbuf).b_p_cpt_cb }
+        .resize_with(count, || crate::eval::typval_defs::Callback::None);
+
+    let value = unsafe { (*curbuf).b_p_cpt.clone() }.unwrap_or_default();
+    let mut offset = 0usize;
+    let mut idx = 0usize;
+    while value.get(offset).is_some_and(|&byte| byte != 0) {
+        while value
+            .get(offset)
+            .is_some_and(|&byte| byte == b',' || byte == b' ')
+        {
+            offset += 1;
+        }
+        if !value.get(offset).is_some_and(|&byte| byte != 0) {
+            break;
+        }
+        let (mut part, next) =
+            crate::option::copy_option_part(
+                &value,
+                offset,
+                crate::tag::LSIZE,
+                b",",
+            );
+        if part.first() == Some(&b'F') && part.len() > 1 {
+            if let Some(caret) = part.iter().position(|&byte| byte == b'^') {
+                part.truncate(caret);
+            }
+            let callbacks =
+                unsafe { std::ptr::addr_of_mut!((*curbuf).b_p_cpt_cb) };
+            let callback = unsafe { &mut *callbacks }
+                .get_mut(idx)
+                .expect("complete callback index must be in range");
+            if crate::option::option_set_callback_func(
+                Some(&part[1..]),
+                callback,
+            ) != crate::vim_defs::OK
+            {
+                crate::eval::typval::callback_free(callback);
+            }
+        }
+        idx += 1;
+        offset = next;
+    }
+
+    if !local {
+        unsafe {
+            copy_cpt_callbacks(
+                CPT_CB.get_mut(),
+                &(*curbuf).b_p_cpt_cb,
+            )
+        };
+    }
+    crate::vim_defs::OK
+}
+
 /// Mark `copy_id` on every callback in `callbacks` so none of them are
 /// garbage collected (`set_ref_in_cpt_callbacks`).
 ///
@@ -5145,5 +5222,130 @@ mod tests {
         assert_eq!(unsafe { (*buf_ptr).b_p_cpt_cb.len() }, 1);
         assert_eq!(unsafe { (*local_partial).pt_refcount }, 1);
         clear_cpt_callbacks(unsafe { &mut (*buf_ptr).b_p_cpt_cb });
+    }
+
+    #[test]
+    fn set_cpt_callbacks_parses_aligned_function_slots() {
+        let _lock = global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt: Some(b".,FMyFunc,w,F123bad^10".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+        let args = crate::option_defs::OptsetT {
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { set_cpt_callbacks(&args) }, crate::vim_defs::OK);
+        let callbacks = unsafe { &(*buf_ptr).b_p_cpt_cb };
+        assert_eq!(callbacks.len(), 4);
+        assert_eq!(
+            callbacks[0].kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(matches!(
+            &callbacks[1],
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"MyFunc"
+        ));
+        assert_eq!(
+            callbacks[2].kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert_eq!(
+            callbacks[3].kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        clear_cpt_callbacks(unsafe { &mut (*buf_ptr).b_p_cpt_cb });
+    }
+
+    #[test]
+    fn set_cpt_callbacks_nonlocal_update_refreshes_global_cache() {
+        let _lock = global_state_test_lock();
+        let _global = CptGuard::install(Vec::new());
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt: Some(b"FGlobalComplete".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+
+        assert_eq!(
+            unsafe { set_cpt_callbacks(&crate::option_defs::OptsetT::default()) },
+            crate::vim_defs::OK
+        );
+        assert!(matches!(
+            unsafe { &(&(*buf_ptr).b_p_cpt_cb)[0] },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalComplete"
+        ));
+        assert!(matches!(
+            &unsafe { CPT_CB.get_mut() }[0],
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalComplete"
+        ));
+        clear_cpt_callbacks(unsafe { &mut (*buf_ptr).b_p_cpt_cb });
+    }
+
+    #[test]
+    fn set_cpt_callbacks_empty_value_clears_local_but_keeps_global_cache() {
+        let _lock = global_state_test_lock();
+        let _global = CptGuard::install(vec![
+            crate::eval::typval_defs::Callback::None,
+        ]);
+        let local_partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt: Some(Vec::new()),
+            b_p_cpt_cb: vec![
+                crate::eval::typval_defs::Callback::Partial(local_partial),
+            ],
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+
+        assert_eq!(
+            unsafe { set_cpt_callbacks(&crate::option_defs::OptsetT::default()) },
+            crate::vim_defs::OK
+        );
+        assert!(unsafe { (*buf_ptr).b_p_cpt_cb.is_empty() });
+        assert_eq!(unsafe { CPT_CB.get_mut() }.len(), 1);
+    }
+
+    #[test]
+    fn set_cpt_callbacks_fails_without_current_buffer() {
+        let _lock = global_state_test_lock();
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            unsafe { set_cpt_callbacks(&crate::option_defs::OptsetT::default()) },
+            crate::vim_defs::FAIL
+        );
     }
 }
