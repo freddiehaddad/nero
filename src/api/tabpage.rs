@@ -135,6 +135,33 @@ pub unsafe fn nvim_tabpage_get_var(
     }
 }
 
+/// Set a tabpage-scoped variable (`nvim_tabpage_set_var`).
+///
+/// # Safety
+/// Forwarded from [`find_tab_by_handle`] and the checked
+/// scope-dictionary writer.
+pub unsafe fn nvim_tabpage_set_var(
+    tabpage: Tabpage,
+    name: &NvimString,
+    value: &Object,
+    err: &mut Error,
+) {
+    let tabpage = unsafe { find_tab_by_handle(tabpage, err) };
+    if tabpage.is_null() {
+        return;
+    }
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*tabpage).tp_vars,
+            name,
+            value,
+            false,
+            false,
+            err,
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +183,32 @@ mod tests {
         };
         assert!(matches!(value, Object::Integer(42)));
         assert!(!err.is_set());
+        fx.tab_mut().tp_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn nvim_tabpage_set_var_stores_a_tabpage_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TabFixture::new(32);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        fx.tab_mut().tp_vars = dict;
+        let mut err = Error::default();
+        unsafe {
+            nvim_tabpage_set_var(
+                fx.handle(),
+                &b"value".to_vec(),
+                &Object::Integer(7),
+                &mut err,
+            )
+        };
+        let value =
+            unsafe { nvim_tabpage_get_var(fx.handle(), &b"value".to_vec(), &mut err) };
+        assert!(matches!(value, Object::Integer(7)));
+        assert!(!err.is_set());
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }
+            .expect("tabpage variable");
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
         fx.tab_mut().tp_vars = std::ptr::null_mut();
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
