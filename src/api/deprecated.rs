@@ -209,6 +209,34 @@ pub unsafe fn buffer_set_var(
     }
 }
 
+/// Delete a buffer variable and return its previous value
+/// (`buffer_del_var`).
+///
+/// # Safety
+/// Forwarded from buffer-handle lookup and the checked dictionary
+/// writer.
+pub unsafe fn buffer_del_var(
+    buffer: Buffer,
+    name: &NvimString,
+    err: &mut Error,
+) -> Object {
+    let buffer =
+        unsafe { crate::api::private::helpers::find_buffer_by_handle(buffer, err) };
+    if buffer.is_null() {
+        return Object::Nil;
+    }
+    unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*buffer).b_vars,
+            name,
+            &Object::Nil,
+            true,
+            true,
+            err,
+        )
+    }
+}
+
 /// Get one buffer line through the deprecated API (`buffer_get_line`).
 ///
 /// # Safety
@@ -479,6 +507,33 @@ mod tests {
         let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }
             .expect("buffer variable");
         unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        unsafe { (*buf).b_vars = std::ptr::null_mut() };
+        drop(_curbuf);
+        unsafe {
+            crate::eval::typval::tv_dict_unref(dict);
+            drop(Box::from_raw(buf));
+        }
+    }
+
+    #[test]
+    fn buffer_del_var_returns_the_deleted_buffer_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"value", 9) },
+            crate::vim_defs::OK
+        );
+        let buf = Box::into_raw(Box::new(crate::buffer_defs::BufT {
+            b_vars: dict,
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf) };
+        let mut err = Error::default();
+        let old = unsafe { buffer_del_var(0, &b"value".to_vec(), &mut err) };
+        assert!(matches!(old, Object::Integer(9)));
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }.is_none());
+        assert!(!err.is_set());
         unsafe { (*buf).b_vars = std::ptr::null_mut() };
         drop(_curbuf);
         unsafe {
