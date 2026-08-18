@@ -7,7 +7,8 @@
 //! subsystems.
 
 use crate::api::private::defs::{
-    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, StringArray, Window,
+    Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, StringArray, Tabpage,
+    Window,
 };
 use crate::option_defs::OptScope;
 
@@ -288,6 +289,35 @@ pub unsafe fn window_del_var(
             name,
             &Object::Nil,
             true,
+            true,
+            err,
+        )
+    }
+}
+
+/// Set a tabpage variable and return its previous value
+/// (`tabpage_set_var`).
+///
+/// # Safety
+/// Forwarded from tabpage-handle lookup and the checked dictionary
+/// writer.
+pub unsafe fn tabpage_set_var(
+    tabpage: Tabpage,
+    name: &NvimString,
+    value: &Object,
+    err: &mut Error,
+) -> Object {
+    let tabpage =
+        unsafe { crate::api::private::helpers::find_tab_by_handle(tabpage, err) };
+    if tabpage.is_null() {
+        return Object::Nil;
+    }
+    unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*tabpage).tp_vars,
+            name,
+            value,
+            false,
             true,
             err,
         )
@@ -653,6 +683,36 @@ mod tests {
         unsafe {
             crate::eval::typval::tv_dict_unref(dict);
             drop(Box::from_raw(win));
+        }
+    }
+
+    #[test]
+    fn tabpage_set_var_returns_the_previous_tabpage_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"value", 3) },
+            crate::vim_defs::OK
+        );
+        let tab = Box::into_raw(Box::new(crate::buffer_defs::TabpageT {
+            tp_vars: dict,
+            ..Default::default()
+        }));
+        let _curtab =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab) };
+        let mut err = Error::default();
+        let old =
+            unsafe { tabpage_set_var(0, &b"value".to_vec(), &Object::Integer(7), &mut err) };
+        assert!(matches!(old, Object::Integer(3)));
+        assert!(!err.is_set());
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }
+            .expect("tabpage variable");
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        unsafe { (*tab).tp_vars = std::ptr::null_mut() };
+        drop(_curtab);
+        unsafe {
+            crate::eval::typval::tv_dict_unref(dict);
+            drop(Box::from_raw(tab));
         }
     }
 
