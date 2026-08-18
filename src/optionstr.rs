@@ -1104,6 +1104,37 @@ pub fn expand_set_eventignore(
     (!matches.is_empty()).then_some(matches)
 }
 
+/// Expand `'fillchars'` or `'listchars'` field names
+/// (`expand_set_chars_option`).
+///
+/// Regex filtering remains deferred with the regexp engine.
+pub fn expand_set_chars_option(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!("expand_set_chars_option: regex filtering needs the regexp engine");
+    }
+
+    let getter: fn(i32) -> Option<&'static str> = match args.oe_idx {
+        crate::option_defs::OptIndex::Fillchars => get_fillchars_name,
+        crate::option_defs::OptIndex::Listchars => get_listchars_name,
+        _ => return None,
+    };
+    let mut matches = Vec::new();
+    if args.oe_include_orig_val
+        && let Some(value) = args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
+    {
+        matches.push(value.to_vec());
+    }
+
+    let mut idx = 0;
+    while let Some(name) = getter(idx) {
+        matches.push(name.as_bytes().to_vec());
+        idx += 1;
+    }
+    (!matches.is_empty()).then_some(matches)
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5436,6 +5467,62 @@ mod tests {
             ..Default::default()
         };
         let _ = expand_set_eventignore(&mut args);
+    }
+
+    #[test]
+    fn expand_set_chars_option_uses_the_fillchars_field_table() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Fillchars,
+            ..Default::default()
+        };
+        let matches = expand_set_chars_option(&mut args).expect("fillchars fields");
+        assert_eq!(matches.len(), FCS_TAB.len());
+        assert_eq!(matches.first().map(Vec::as_slice), Some(b"stl".as_slice()));
+        assert_eq!(
+            matches.last().map(Vec::as_slice),
+            Some(b"truncrl".as_slice())
+        );
+    }
+
+    #[test]
+    fn expand_set_chars_option_uses_the_listchars_field_table() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Listchars,
+            oe_opt_value: Some(b"tab:> ".to_vec()),
+            oe_include_orig_val: true,
+            ..Default::default()
+        };
+        let matches = expand_set_chars_option(&mut args).expect("listchars fields");
+        assert_eq!(matches.len(), LCS_TAB.len() + 1);
+        assert_eq!(
+            matches.first().map(Vec::as_slice),
+            Some(b"tab:> ".as_slice())
+        );
+        assert_eq!(matches.get(1).map(Vec::as_slice), Some(b"eol".as_slice()));
+        assert_eq!(
+            matches.last().map(Vec::as_slice),
+            Some(b"leadmultispace".as_slice())
+        );
+    }
+
+    #[test]
+    fn expand_set_chars_option_rejects_an_unrelated_option() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Mouse,
+            ..Default::default()
+        };
+        assert_eq!(expand_set_chars_option(&mut args), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "regexp engine")]
+    fn expand_set_chars_option_filtered_completion_needs_the_regexp_engine() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Listchars,
+            oe_regmatch: std::ptr::NonNull::dangling().as_ptr(),
+            ..Default::default()
+        };
+        let _ = expand_set_chars_option(&mut args);
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);

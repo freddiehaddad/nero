@@ -8414,6 +8414,8 @@ fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::expand_set_eventignore);
     options[OptIndex::Eventignorewin as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_eventignore);
+    options[OptIndex::Fillchars as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_chars_option);
     options[OptIndex::Fileencoding as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_encoding);
     options[OptIndex::Fileencodings as usize].opt_expand_cb =
@@ -8430,6 +8432,8 @@ fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::expand_set_str_generic);
     options[OptIndex::Formatoptions as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_formatoptions);
+    options[OptIndex::Listchars as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_chars_option);
     options[OptIndex::Viewoptions as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_str_generic);
 }
@@ -8786,7 +8790,9 @@ mod options_table_tests {
             b"fileencoding",
             b"fileencodings",
             b"fileformats",
+            b"fillchars",
             b"formatoptions",
+            b"listchars",
             b"makeencoding",
             b"mouse",
             b"shortmess",
