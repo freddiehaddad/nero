@@ -1585,6 +1585,49 @@ pub unsafe fn copy_loclist_entries(
     crate::vim_defs::OK
 }
 
+/// Copy one complete location list (`copy_loclist`).
+///
+/// The destination must be freshly initialized, matching the original
+/// caller contract.
+///
+/// # Safety
+/// All context, callback, and entry user-data referents must remain
+/// valid. Touches the global quickfix-list ID counter.
+pub unsafe fn copy_loclist(from: &QfListT, to: &mut QfListT) -> i32 {
+    to.qfl_type = from.qfl_type;
+    to.qf_nonevalid = from.qf_nonevalid;
+    to.qf_has_user_data = from.qf_has_user_data;
+    to.qf_index = 0;
+    to.qf_title = from.qf_title.clone();
+    if let Some(context) = from.qf_ctx.as_deref() {
+        let mut copied = Box::new(crate::eval::typval_defs::TypvalT::default());
+        unsafe { crate::eval::typval::tv_copy(context, &mut copied) };
+        to.qf_ctx = Some(copied);
+    }
+    unsafe {
+        crate::eval::typval::callback_copy(
+            &mut to.qf_qftf_cb,
+            &from.qf_qftf_cb,
+        )
+    };
+
+    if !from.qf_entries.is_empty()
+        && unsafe { copy_loclist_entries(from, to) } == crate::vim_defs::FAIL
+    {
+        return crate::vim_defs::FAIL;
+    }
+    to.qf_index = from.qf_index;
+
+    let id = unsafe { LAST_QF_ID.get_mut() };
+    *id += 1;
+    to.qf_id = *id;
+    to.qf_changedtick = 0;
+    if to.qf_nonevalid {
+        to.qf_index = 1;
+    }
+    crate::vim_defs::OK
+}
+
 /// Whether an entry is still present in a quickfix list
 /// (`is_qf_entry_present`).
 #[allow(dead_code)]
@@ -12557,6 +12600,84 @@ mod tests {
             crate::vim_defs::OK
         );
         assert!(dest.qf_entries.is_empty());
+    }
+
+    #[test]
+    fn copy_loclist_copies_metadata_entries_and_assigns_a_new_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        *unsafe { LAST_QF_ID.get_mut() } = 100;
+        let context = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(context) };
+        let callback = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut source = QfListT {
+            qf_id: 7,
+            qfl_type: QfltypeT::Location,
+            qf_entries: vec![QflineT {
+                qf_lnum: 9,
+                qf_fnum: 3,
+                qf_type: b'W',
+                qf_valid: true,
+                ..Default::default()
+            }],
+            qf_index: 1,
+            qf_nonevalid: false,
+            qf_title: Some(b"source".to_vec()),
+            qf_ctx: Some(Box::new(crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(context),
+                ..Default::default()
+            })),
+            qf_qftf_cb: crate::eval::typval_defs::Callback::Partial(callback),
+            qf_changedtick: 12,
+            ..Default::default()
+        };
+        let mut dest = QfListT::default();
+
+        assert_eq!(
+            unsafe { copy_loclist(&source, &mut dest) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(dest.qfl_type, QfltypeT::Location);
+        assert_eq!(dest.qf_title.as_deref(), Some(&b"source"[..]));
+        assert_eq!(dest.qf_entries[0].qf_lnum, 9);
+        assert_eq!(dest.qf_entries[0].qf_fnum, 3);
+        assert_eq!(dest.qf_entries[0].qf_type, b'W');
+        assert_eq!(dest.qf_index, 1);
+        assert_eq!(dest.qf_id, 101);
+        assert_eq!(dest.qf_changedtick, 0);
+        assert_eq!(unsafe { (*context).lv_refcount }, 2);
+        assert_eq!(unsafe { (*callback).pt_refcount }, 2);
+
+        qf_free(&mut dest);
+        assert_eq!(unsafe { (*context).lv_refcount }, 1);
+        assert_eq!(unsafe { (*callback).pt_refcount }, 1);
+        qf_free(&mut source);
+    }
+
+    #[test]
+    fn copy_loclist_nonevalid_forces_first_index_even_when_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let source = QfListT {
+            qfl_type: QfltypeT::Location,
+            qf_index: 7,
+            qf_nonevalid: true,
+            ..Default::default()
+        };
+        let mut dest = QfListT::default();
+
+        assert_eq!(
+            unsafe { copy_loclist(&source, &mut dest) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(dest.qf_index, 1);
+        assert!(dest.qf_nonevalid);
+        qf_free(&mut dest);
     }
 
     fn items_property(
