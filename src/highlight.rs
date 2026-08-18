@@ -100,6 +100,61 @@ pub static NS_HL_WIN: crate::globals::GlobalCell<i32> = crate::globals::GlobalCe
 /// what lets per-window highlight overrides apply.
 pub static NS_HL_FAST: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
 
+/// Namespace highlight definitions (`ns_hls`).
+pub static NS_HLS: std::sync::LazyLock<
+    crate::globals::GlobalCell<
+        crate::map::Map<
+            crate::highlight_defs::ColorKey,
+            crate::highlight_defs::ColorItem,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::map::Map::new())
+});
+
+/// Define one namespace highlight (`ns_hl_def`).
+///
+/// Link definitions are complete. Direct attribute definitions still
+/// need `hl_get_syn_attr` and stop exactly there. Namespace zero is
+/// the global `:highlight` table and remains with `set_hl_group`.
+///
+/// # Safety
+/// Mutates the namespace-highlight and decoration-provider registries.
+pub unsafe fn ns_hl_def(
+    ns_id: i32,
+    hl_id: i32,
+    attrs: crate::highlight_defs::HlAttrs,
+    link_id: i32,
+) {
+    if ns_id == 0 {
+        unimplemented!("ns_hl_def: namespace zero needs set_hl_group");
+    }
+    let key = crate::highlight_defs::ColorKey::new(ns_id, hl_id);
+    if attrs.rgb_ae_attr & crate::highlight_defs::HL_DEFAULT as i32 != 0
+        && unsafe { NS_HLS.get_mut() }.contains_key(&key)
+    {
+        return;
+    }
+
+    let provider = unsafe {
+        crate::decoration_provider::get_decor_provider(ns_id, true)
+    };
+    let attr_id = if link_id > 0 {
+        -1
+    } else {
+        unimplemented!("ns_hl_def: direct attributes need hl_get_syn_attr");
+    };
+    let item = crate::highlight_defs::ColorItem {
+        attr_id,
+        link_id,
+        version: unsafe { (*provider).hl_valid },
+        is_default: attrs.rgb_ae_attr & crate::highlight_defs::HL_DEFAULT as i32 != 0,
+        link_global: attrs.rgb_ae_attr & crate::highlight_defs::HL_GLOBAL as i32 != 0,
+    };
+    unsafe { NS_HLS.get_mut() }.insert(key, item);
+    unsafe { (*provider).hl_cached = false };
+}
+
 /// The currently active UI highlight attribute for each `HlfT`
 /// (`hl_attr_active`).
 pub static HL_ATTR_ACTIVE: crate::globals::GlobalCell<
@@ -365,6 +420,98 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NamespaceHighlightsGuard {
+        definitions: crate::map::Map<
+            crate::highlight_defs::ColorKey,
+            crate::highlight_defs::ColorItem,
+        >,
+        providers: Vec<crate::decoration_defs::DecorProvider>,
+    }
+
+    impl NamespaceHighlightsGuard {
+        fn empty() -> Self {
+            let definitions = std::mem::replace(
+                unsafe { NS_HLS.get_mut() },
+                crate::map::Map::new(),
+            );
+            let providers =
+                std::mem::take(unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() });
+            Self {
+                definitions,
+                providers,
+            }
+        }
+    }
+
+    impl Drop for NamespaceHighlightsGuard {
+        fn drop(&mut self) {
+            *unsafe { NS_HLS.get_mut() } =
+                std::mem::replace(&mut self.definitions, crate::map::Map::new());
+            *unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() } =
+                std::mem::take(&mut self.providers);
+        }
+    }
+
+    #[test]
+    fn ns_hl_def_stores_a_link_with_the_provider_version() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let provider = unsafe { crate::decoration_provider::get_decor_provider(12, true) };
+        unsafe {
+            (*provider).hl_valid = 7;
+            (*provider).hl_cached = true;
+        }
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        unsafe { ns_hl_def(12, 3, attrs, 9) };
+
+        let item = *unsafe { NS_HLS.get_mut() }
+            .get(&crate::highlight_defs::ColorKey::new(12, 3))
+            .expect("namespace highlight");
+        assert_eq!(item.attr_id, -1);
+        assert_eq!(item.link_id, 9);
+        assert_eq!(item.version, 7);
+        assert!(item.link_global);
+        assert!(!item.is_default);
+        let provider = unsafe { crate::decoration_provider::get_decor_provider(12, false) };
+        assert!(!unsafe { (*provider).hl_cached });
+    }
+
+    #[test]
+    fn ns_hl_def_keeps_an_existing_definition_for_default_attrs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
+            ..Default::default()
+        };
+        unsafe { ns_hl_def(4, 2, attrs, 8) };
+
+        let default_attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: (crate::highlight_defs::HL_GLOBAL
+                | crate::highlight_defs::HL_DEFAULT) as i32,
+            ..Default::default()
+        };
+        unsafe { ns_hl_def(4, 2, default_attrs, 11) };
+
+        let item = unsafe { NS_HLS.get_mut() }
+            .get(&crate::highlight_defs::ColorKey::new(4, 2))
+            .expect("namespace highlight");
+        assert_eq!(item.link_id, 8);
+        assert!(!item.is_default);
+    }
+
+    #[test]
+    #[should_panic(expected = "hl_get_syn_attr")]
+    fn ns_hl_def_direct_attributes_need_the_attribute_registry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        unsafe { ns_hl_def(4, 2, Default::default(), -1) };
+    }
 
     struct UrlsGuard(Vec<Vec<u8>>);
 

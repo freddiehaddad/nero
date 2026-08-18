@@ -30,7 +30,8 @@ use crate::types_defs::LuaRef;
 /// `decor_providers` - every currently-registered decoration
 /// provider. Always empty today: nothing translated can register a
 /// real one (`nvim_set_decoration_provider`, not translated).
-static DECOR_PROVIDERS: GlobalCell<Vec<DecorProvider>> = GlobalCell::new(Vec::new());
+pub(crate) static DECOR_PROVIDERS: GlobalCell<Vec<DecorProvider>> =
+    GlobalCell::new(Vec::new());
 
 /// Look up a decoration provider by namespace, creating one when
 /// `force` is true (`get_decor_provider`).
