@@ -425,6 +425,22 @@ pub unsafe fn highlight_exists(name: &[u8]) -> bool {
     id > 0
 }
 
+/// Look up a highlight group name and return its active attribute code
+/// (`syn_name2attr`), or zero when the group does not exist.
+///
+/// # Safety
+/// Forwards [`syn_name2id`] and [`syn_id2attr`]'s shared-state
+/// requirements.
+#[must_use]
+pub unsafe fn syn_name2attr(name: &[u8]) -> i32 {
+    let id = unsafe { syn_name2id(name) };
+    if id == 0 {
+        0
+    } else {
+        unsafe { syn_id2attr(id) }
+    }
+}
+
 /// Whether highlight group `id` has attribute `flag` set, reported as
 /// the original's `"1"` string or nothing (`highlight_has_attr`).
 ///
@@ -1572,6 +1588,17 @@ mod tests {
         assert!(unsafe { highlight_exists(b"Normal") });
         assert!(unsafe { highlight_exists(b"NORMAL") }, "case-insensitive");
         assert!(!unsafe { highlight_exists(b"Nope") });
+    }
+
+    #[test]
+    fn syn_name2attr_resolves_case_insensitive_names_or_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Comment"]);
+        let _namespace = NamespaceStateGuard::empty();
+        unsafe { HL_TABLE.get_mut() }.items[0].sg_attr = 42;
+
+        assert_eq!(unsafe { syn_name2attr(b"comment") }, 42);
+        assert_eq!(unsafe { syn_name2attr(b"missing") }, 0);
     }
 
     /// Asking whether an `@` capture group exists CREATES it, so the
