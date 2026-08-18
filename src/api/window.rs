@@ -24,7 +24,8 @@
 //! (real window-closing machinery).
 
 use crate::api::private::defs::{
-    Array, Boolean, Buffer, Error, Integer, Object, Tabpage, Window,
+    Array, Boolean, Buffer, Dict, Error, ErrorType, Integer, KeyValuePair, Object, Tabpage,
+    Window,
 };
 use crate::api::private::helpers::find_window_by_handle;
 
@@ -128,6 +129,144 @@ pub unsafe fn nvim_win_get_tabpage(win: Window, err: &mut Error) -> Tabpage {
     }
 }
 
+/// Optional range controls for [`nvim_win_text_height`].
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct WinTextHeightOpts {
+        pub start_row: Option<Integer>,
+        pub start_vcol: Option<Integer>,
+        pub end_row: Option<Integer>,
+        pub end_vcol: Option<Integer>,
+        pub max_height: Option<Integer>,
+    }
+
+    fn text_height_pair(key: &[u8], value: Integer) -> KeyValuePair {
+        KeyValuePair {
+            key: key.to_vec(),
+            value: Object::Integer(value),
+        }
+    }
+
+    /// Get screen-line height information for a window range
+    /// (`nvim_win_text_height`).
+    ///
+    /// # Safety
+    /// Forwarded from [`find_window_by_handle`] and
+    /// [`crate::plines::win_text_height`].
+    #[must_use]
+    pub unsafe fn nvim_win_text_height(
+        win: Window,
+        opts: WinTextHeightOpts,
+        err: &mut Error,
+    ) -> Dict {
+        let window = unsafe { find_window_by_handle(win, err) };
+        if window.is_null() {
+            return Vec::new();
+        }
+        let buf = unsafe { (*window).w_buffer };
+        let line_count = unsafe { (*buf).b_ml.ml_line_count };
+        let mut start_lnum = 1;
+        let mut end_lnum = line_count;
+        let mut start_vcol = -1;
+        let mut end_vcol = -1;
+        let mut oob = false;
+
+        if let Some(start_row) = opts.start_row {
+            start_lnum = crate::api::private::helpers::normalize_index(
+                unsafe { &*buf },
+                start_row,
+                false,
+                &mut oob,
+            ) as crate::pos_defs::LinenrT;
+        }
+        if let Some(end_row) = opts.end_row {
+            end_lnum = crate::api::private::helpers::normalize_index(
+                unsafe { &*buf },
+                end_row,
+                false,
+                &mut oob,
+            ) as crate::pos_defs::LinenrT;
+        }
+        if oob {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some("Line index out of bounds".to_string());
+            return Vec::new();
+        }
+        if start_lnum > end_lnum {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some("'start_row' is higher than 'end_row'".to_string());
+            return Vec::new();
+        }
+
+        if let Some(value) = opts.start_vcol {
+            if opts.start_row.is_none() {
+                err.r#type = ErrorType::Validation;
+                err.msg = Some("'start_vcol' specified without 'start_row'".to_string());
+                return Vec::new();
+            }
+            if !(0..=i64::from(crate::pos_defs::MAXCOL)).contains(&value) {
+                err.r#type = ErrorType::Validation;
+                err.msg = Some("Invalid 'start_vcol': out of range".to_string());
+                return Vec::new();
+            }
+            start_vcol = value;
+        }
+        if let Some(value) = opts.end_vcol {
+            if opts.end_row.is_none() {
+                err.r#type = ErrorType::Validation;
+                err.msg = Some("'end_vcol' specified without 'end_row'".to_string());
+                return Vec::new();
+            }
+            if !(0..=i64::from(crate::pos_defs::MAXCOL)).contains(&value) {
+                err.r#type = ErrorType::Validation;
+                err.msg = Some("Invalid 'end_vcol': out of range".to_string());
+                return Vec::new();
+            }
+            end_vcol = value;
+        }
+        let max = match opts.max_height {
+            Some(value) if value <= 0 => {
+                err.r#type = ErrorType::Validation;
+                err.msg = Some("Invalid 'max_height': out of range".to_string());
+                return Vec::new();
+            }
+            Some(value) => value,
+            None => i64::MAX,
+        };
+        if start_lnum == end_lnum
+            && start_vcol >= 0
+            && end_vcol >= 0
+            && start_vcol > end_vcol
+        {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some("'start_vcol' is higher than 'end_vcol'".to_string());
+            return Vec::new();
+        }
+
+        let mut fill = 0;
+        let mut all = unsafe {
+            crate::plines::win_text_height(
+                window,
+                start_lnum,
+                start_vcol,
+                &mut end_lnum,
+                &mut end_vcol,
+                Some(&mut fill),
+                max,
+            )
+        };
+        if opts.end_row.is_none() {
+            let end_fill =
+                i64::from(unsafe { crate::plines::win_get_fill(&*window, line_count + 1) });
+            fill += end_fill;
+            all += end_fill;
+        }
+        vec![
+            text_height_pair(b"all", all),
+            text_height_pair(b"fill", fill),
+            text_height_pair(b"end_row", i64::from(end_lnum - 1)),
+            text_height_pair(b"end_vcol", end_vcol),
+        ]
+    }
 /// Get the 1-based, current-tabpage-relative window number of window
 /// `win` (`0` for the current window), or `0` on failure/if `win` is
 /// not counted per [`crate::window::win_has_winnr`]
@@ -432,6 +571,87 @@ mod tests {
         let mut err = Error::default();
         assert_eq!(unsafe { nvim_win_get_tabpage(99, &mut err) }, 0);
         assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
+    }
+
+    fn integer_in_dict(dict: &Dict, key: &[u8]) -> Integer {
+        dict.iter()
+            .find(|pair| pair.key == key)
+            .and_then(|pair| match pair.value {
+                Object::Integer(value) => Some(value),
+                _ => None,
+            })
+            .expect("integer key exists")
+    }
+
+    #[test]
+    fn nvim_win_text_height_returns_real_screen_line_counts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(19);
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut *fx.buf), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut *fx.buf, 1, b"hello\0"),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut *fx.buf, 1, b"hello\0", 6, false),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut *fx.buf, 2, b"hello\0", 6, false),
+                crate::vim_defs::OK
+            );
+            (*fx.win).w_view_width = 10;
+            (*fx.win).w_onebuf_opt.wo_wrap = 1;
+        }
+        let mut err = Error::default();
+
+        let result = unsafe {
+            nvim_win_text_height(
+                (*fx.win).handle,
+                WinTextHeightOpts {
+                    end_row: Some(2),
+                    ..Default::default()
+                },
+                &mut err,
+            )
+        };
+
+        assert!(!err.is_set());
+        assert_eq!(integer_in_dict(&result, b"all"), 3);
+        assert_eq!(integer_in_dict(&result, b"fill"), 0);
+        assert_eq!(integer_in_dict(&result, b"end_row"), 2);
+        assert_eq!(integer_in_dict(&result, b"end_vcol"), 5);
+        unsafe {
+            let mfp = (*fx.buf).b_ml.ml_mfp;
+            (*fx.buf).b_ml.ml_mfp = std::ptr::null_mut();
+            crate::memfile::mf_close(*Box::from_raw(mfp), false);
+        }
+    }
+
+    #[test]
+    fn nvim_win_text_height_rejects_start_vcol_without_start_row() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(20);
+        unsafe { (*fx.buf).b_ml.ml_line_count = 1 };
+        let mut err = Error::default();
+        assert!(
+            unsafe {
+                nvim_win_text_height(
+                    (*fx.win).handle,
+                    WinTextHeightOpts {
+                        start_vcol: Some(0),
+                        ..Default::default()
+                    },
+                    &mut err,
+                )
+            }
+            .is_empty()
+        );
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("'start_vcol' specified without 'start_row'")
+        );
     }
 
     #[test]
