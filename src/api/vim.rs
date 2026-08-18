@@ -209,6 +209,62 @@ pub unsafe fn nvim_get_hl_id_by_name(name: &NvimString) -> Integer {
     i64::from(unsafe { crate::highlight_group::syn_check_group(name) })
 }
 
+/// Return an uppercase/file mark tuple (`nvim_get_mark`).
+///
+/// # Safety
+/// Reads the shared global-mark and buffer registries.
+#[must_use]
+pub unsafe fn nvim_get_mark(name: &NvimString, err: &mut Error) -> Array {
+    if name.len() != 1 {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(if name.is_empty() {
+            "Invalid mark name (must be a single char)".to_string()
+        } else {
+            format!(
+                "Invalid mark name (must be a single char): '{}'",
+                String::from_utf8_lossy(name)
+            )
+        });
+        return Vec::new();
+    }
+    let mark_name = name[0];
+    if !mark_name.is_ascii_uppercase() && !mark_name.is_ascii_digit() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!(
+            "Invalid mark name (must be file/uppercase): '{}'",
+            String::from_utf8_lossy(name)
+        ));
+        return Vec::new();
+    }
+    let mark = unsafe { crate::mark::mark_get_global(false, i32::from(mark_name)) };
+    let position = unsafe { (*mark).fmark.mark };
+    let (buffer, filename) = if unsafe { (*mark).fmark.fnum } != 0 {
+        let buffer = unsafe { (*mark).fmark.fnum };
+        (
+            buffer,
+            unsafe { crate::buffer::buflist_nr2name(buffer, true, true) },
+        )
+    } else {
+        (0, unsafe { (*mark).fname.clone() })
+    };
+    let (row, col, buffer, filename) = if filename.is_none() || position.lnum <= 0 {
+        (0, 0, 0, Vec::new())
+    } else {
+        (
+            i64::from(position.lnum),
+            i64::from(position.col),
+            i64::from(buffer),
+            filename.unwrap_or_default(),
+        )
+    };
+    vec![
+        Object::Integer(row),
+        Object::Integer(col),
+        Object::Integer(buffer),
+        Object::String(filename),
+    ]
+}
+
 /// Return the complete named RGB color map (`nvim_get_color_map`).
 #[must_use]
 pub fn nvim_get_color_map() -> Dict {
@@ -1046,6 +1102,46 @@ mod tests {
             crate::eval::typval_defs::TypvalValue::String(Some(value)) if value == b"42"
         ));
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_get_mark_returns_a_shada_file_mark_tuple() {
+        let _lock = crate::globals::global_state_test_lock();
+        let marks = unsafe { crate::mark::NAMEDFM.get_mut() };
+        let saved = marks.clone();
+        let index = crate::mark::mark_global_index(b'Q') as usize;
+        marks[index].fmark.mark = crate::pos_defs::PosT {
+            lnum: 12,
+            col: 4,
+            coladd: 0,
+        };
+        marks[index].fmark.fnum = 0;
+        marks[index].fname = Some(b"/tmp/marked".to_vec());
+        let mut err = Error::default();
+        let result = unsafe { nvim_get_mark(&b"Q".to_vec(), &mut err) };
+        *unsafe { crate::mark::NAMEDFM.get_mut() } = saved;
+        assert!(!err.is_set());
+        assert!(matches!(
+            result.as_slice(),
+            [
+                Object::Integer(12),
+                Object::Integer(4),
+                Object::Integer(0),
+                Object::String(filename)
+            ] if filename == b"/tmp/marked"
+        ));
+    }
+
+    #[test]
+    fn nvim_get_mark_rejects_buffer_local_names() {
+        let mut err = Error::default();
+        assert!(
+            unsafe { nvim_get_mark(&b"a".to_vec(), &mut err) }.is_empty()
+        );
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("Invalid mark name (must be file/uppercase): 'a'")
+        );
     }
 
     struct HighlightNamespaceGuard {
