@@ -944,6 +944,24 @@ pub unsafe fn did_set_encoding(
     None
 }
 
+/// Expand canonical encoding names (`expand_set_encoding`).
+///
+/// Returning all names when no regex filter is supplied is complete.
+/// Filtering through `oe_regmatch` still needs the real regexp engine.
+pub fn expand_set_encoding(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!("expand_set_encoding: regex filtering needs the regexp engine");
+    }
+    Some(
+        crate::mbyte::ENC_CANON_TABLE
+            .iter()
+            .map(|entry| entry.name.as_bytes().to_vec())
+            .collect(),
+    )
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5024,6 +5042,28 @@ mod tests {
         };
         assert_eq!(unsafe { did_set_encoding(&mut args) }, None);
         assert_eq!(value, Some(b"macroman".to_vec()));
+    }
+
+    #[test]
+    fn expand_set_encoding_returns_every_canonical_name_without_a_filter() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        let matches = expand_set_encoding(&mut args).expect("encoding matches");
+        assert_eq!(matches.len(), crate::mbyte::ENC_CANON_TABLE.len());
+        assert_eq!(matches.first().map(Vec::as_slice), Some(b"latin1".as_slice()));
+        assert_eq!(
+            matches.last().map(Vec::as_slice),
+            Some(b"hp-roman8".as_slice())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "regexp engine")]
+    fn expand_set_encoding_filtered_completion_needs_the_regexp_engine() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_regmatch: std::ptr::NonNull::dangling().as_ptr(),
+            ..Default::default()
+        };
+        let _ = expand_set_encoding(&mut args);
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);

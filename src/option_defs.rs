@@ -28,8 +28,8 @@
 //! Deferred: the remaining `opt_did_set_cb`/`opt_expand_cb` real
 //! callback implementations (`option.c`'s `did_set_*`/`optionstr.c`'s
 //! `did_set_*`/`expand_*` families). Every translated did-set callback
-//! is wired now; callbacks not yet translated and every expansion
-//! callback stay `None`. The generic
+//! is wired now, as is encoding-name expansion; callbacks not yet
+//! translated stay `None`. The generic
 //! `get_option_value`/`set_option_value` engine now dispatches through
 //! this table; only the `do_set`/`ex_set` command-line parser remains
 //! deferred.
@@ -1915,8 +1915,8 @@ mod options_enum_tests {
 /// verified to already exist as a real constant elsewhere in this
 /// crate (`ascii_defs`/`globals`/`buffer_defs`/`option_vars`).
 ///
-/// Every translated did-set option handler is wired; handlers not yet
-/// translated and every expand handler stay deferred (see this
+/// Every translated did-set option handler and encoding-name expansion
+/// are wired; handlers not yet translated stay deferred (see this
 /// module's own doc comment).
 ///
 /// `var`/`flags_var` are resolved to real addresses into
@@ -8064,6 +8064,7 @@ fn wire_translated_did_set_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
     wire_optionstr_callbacks(options);
     wire_callback_option_callbacks(options);
     wire_other_callbacks(options);
+    wire_translated_expand_callbacks(options);
 }
 
 fn wire_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
@@ -8402,6 +8403,11 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::window::did_set_winminwidth);
     options[OptIndex::Winwidth as usize].opt_did_set_cb =
         Some(crate::option::did_set_winwidth);
+}
+
+fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    options[OptIndex::Fileencodings as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_encoding);
 }
 
 #[cfg(test)]
@@ -8748,7 +8754,14 @@ mod options_table_tests {
             expected.contains(&option.fullname)
                 || option.opt_did_set_cb.is_none()
         }));
-        assert!(opts.iter().all(|o| o.opt_expand_cb.is_none()));
+        assert!(opts
+            .iter()
+            .find(|option| option.fullname == b"fileencodings")
+            .and_then(|option| option.opt_expand_cb)
+            .is_some());
+        assert!(opts.iter().all(|option| {
+            option.fullname == b"fileencodings" || option.opt_expand_cb.is_none()
+        }));
     }
 
     #[test]
