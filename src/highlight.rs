@@ -463,6 +463,7 @@ pub unsafe fn clear_hl_tables(reinit: bool) {
         unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.clear();
         unsafe { BLEND_ATTR_ENTRIES.get_mut() }.clear();
         unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.clear();
+        unsafe { crate::highlight_group::highlight_attr_set_all() };
     } else {
         *unsafe { ATTR_ENTRIES.get_mut() } = crate::map::Set::new();
         *unsafe { COMBINE_ATTR_ENTRIES.get_mut() } = crate::map::Map::new();
@@ -1026,6 +1027,22 @@ mod tests {
         }
     }
 
+    struct HighlightGroupTableGuard(Vec<crate::highlight_group::HlGroup>);
+
+    impl HighlightGroupTableGuard {
+        fn install(groups: Vec<crate::highlight_group::HlGroup>) -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            Self(std::mem::replace(&mut table.items, groups))
+        }
+    }
+
+    impl Drop for HighlightGroupTableGuard {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.0);
+        }
+    }
+
     #[test]
     fn highlight_init_installs_the_zero_attribute_entry_once() {
         let _lock = crate::globals::global_state_test_lock();
@@ -1572,6 +1589,34 @@ mod tests {
         assert!(attr > 0);
         assert!(!unsafe { highlight_use_hlstate() });
         assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 2);
+    }
+
+    #[test]
+    fn clear_hl_tables_rebuilds_every_highlight_group_attribute() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tables = AllHighlightTablesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup {
+                sg_name: b"Comment".to_vec(),
+                sg_name_u: b"COMMENT".to_vec(),
+                sg_gui: crate::highlight_defs::HL_ITALIC as i32,
+                sg_rgb_fg: 0x12_34_56,
+                sg_rgb_fg_idx: crate::highlight_group::COLOR_IDX_HEX,
+                sg_rgb_bg_idx: crate::highlight_group::COLOR_IDX_NONE,
+                sg_rgb_sp_idx: crate::highlight_group::COLOR_IDX_NONE,
+                sg_blend: -1,
+                ..Default::default()
+            },
+        ]);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+
+        unsafe { clear_hl_tables(true) };
+
+        let attr_id = unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0].sg_attr;
+        assert!(attr_id > 0);
+        let attrs = unsafe { syn_attr2entry(attr_id) };
+        assert_eq!(attrs.rgb_ae_attr, crate::highlight_defs::HL_ITALIC as i32);
+        assert_eq!(attrs.rgb_fg_color, 0x12_34_56);
     }
 
     struct NamespaceHighlightsGuard {
