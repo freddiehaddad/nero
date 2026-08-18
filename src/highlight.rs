@@ -800,11 +800,71 @@ pub unsafe fn update_ns_hl(ns_id: i32) {
     unsafe { (*provider).hl_cached = true };
 }
 
+/// Global UI highlight attributes (`highlight_attr`).
+pub static HIGHLIGHT_ATTR: crate::globals::GlobalCell<
+    [i32; crate::highlight_defs::HlfT::Count as usize],
+> = crate::globals::GlobalCell::new([0; crate::highlight_defs::HlfT::Count as usize]);
+
 /// The currently active UI highlight attribute for each `HlfT`
 /// (`hl_attr_active`).
 pub static HL_ATTR_ACTIVE: crate::globals::GlobalCell<
     [i32; crate::highlight_defs::HlfT::Count as usize],
 > = crate::globals::GlobalCell::new([0; crate::highlight_defs::HlfT::Count as usize]);
+
+/// Select the active highlight namespace (`hl_check_ns`).
+///
+/// Fast-callback namespace wins over the current window namespace,
+/// which wins over the global namespace. The selected builtin
+/// attribute array is cached in [`HL_ATTR_ACTIVE`].
+///
+/// # Safety
+/// Reads and mutates shared namespace, provider, highlight, and global
+/// redraw state.
+#[must_use]
+pub unsafe fn hl_check_ns() -> bool {
+    let fast = unsafe { *NS_HL_FAST.get_mut() };
+    let win = unsafe { *NS_HL_WIN.get_mut() };
+    let ns = if fast > 0 {
+        fast
+    } else if win >= 0 {
+        win
+    } else {
+        unsafe { *NS_HL_GLOBAL.get_mut() }
+    };
+    if unsafe { *NS_HL_ACTIVE.get_mut() } == ns {
+        return false;
+    }
+
+    unsafe { *NS_HL_ACTIVE.get_mut() = ns };
+    unsafe { *HL_ATTR_ACTIVE.get_mut() = *HIGHLIGHT_ATTR.get_mut() };
+    if ns > 0 {
+        unsafe { update_ns_hl(ns) };
+        if let Some(attrs) = unsafe { NS_HL_ATTR.get_mut() }.get(&ns) {
+            unsafe { *HL_ATTR_ACTIVE.get_mut() = *attrs };
+        }
+    }
+    unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed = true;
+    true
+}
+
+/// Select the highlight namespace for drawing `wp`
+/// (`win_check_ns_hl`).
+///
+/// A null pointer selects global drawing context.
+///
+/// # Safety
+/// `wp`, when non-null, must point at a live window. Forwards
+/// [`hl_check_ns`]'s shared-state requirements.
+#[must_use]
+pub unsafe fn win_check_ns_hl(wp: *const crate::buffer_defs::WinT) -> bool {
+    let ns_hl_win = unsafe { NS_HL_WIN.get_mut() };
+    *ns_hl_win = if wp.is_null() {
+        -1
+    } else {
+        unsafe { (*wp).w_ns_hl }
+    };
+    unsafe { hl_check_ns() }
+}
 
 /// The background highlight attribute for window `wp`
 /// (`win_bg_attr`).
@@ -2034,6 +2094,53 @@ mod tests {
         }
     }
 
+    struct HighlightNamespaceSelectionGuard {
+        global: i32,
+        win: i32,
+        fast: i32,
+        active: i32,
+        base_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        active_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        need_changed: bool,
+    }
+
+    impl HighlightNamespaceSelectionGuard {
+        fn set(global: i32, win: i32, fast: i32, active: i32) -> Self {
+            let guard = Self {
+                global: unsafe { *NS_HL_GLOBAL.get_mut() },
+                win: unsafe { *NS_HL_WIN.get_mut() },
+                fast: unsafe { *NS_HL_FAST.get_mut() },
+                active: unsafe { *NS_HL_ACTIVE.get_mut() },
+                base_attrs: unsafe { *HIGHLIGHT_ATTR.get_mut() },
+                active_attrs: unsafe { *HL_ATTR_ACTIVE.get_mut() },
+                need_changed: unsafe { crate::globals::GLOBALS.get_mut() }
+                    .need_highlight_changed,
+            };
+            unsafe {
+                *NS_HL_GLOBAL.get_mut() = global;
+                *NS_HL_WIN.get_mut() = win;
+                *NS_HL_FAST.get_mut() = fast;
+                *NS_HL_ACTIVE.get_mut() = active;
+                crate::globals::GLOBALS.get_mut().need_highlight_changed = false;
+            }
+            guard
+        }
+    }
+
+    impl Drop for HighlightNamespaceSelectionGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *NS_HL_GLOBAL.get_mut() = self.global;
+                *NS_HL_WIN.get_mut() = self.win;
+                *NS_HL_FAST.get_mut() = self.fast;
+                *NS_HL_ACTIVE.get_mut() = self.active;
+                *HIGHLIGHT_ATTR.get_mut() = self.base_attrs;
+                *HL_ATTR_ACTIVE.get_mut() = self.active_attrs;
+                crate::globals::GLOBALS.get_mut().need_highlight_changed = self.need_changed;
+            }
+        }
+    }
+
     impl Drop for PumblendGuard {
         fn drop(&mut self) {
             unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_pb = self.pumblend };
@@ -2183,6 +2290,78 @@ mod tests {
             unsafe { NS_HL_ATTR.get_mut() }.get(&3),
             Some(&[77; crate::highlight_defs::HlfT::Count as usize])
         );
+    }
+
+    #[test]
+    fn hl_check_ns_selects_fast_then_window_then_global_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(2, 3, 4, -1);
+        for ns in [2, 3, 4] {
+            let provider = unsafe { crate::decoration_provider::get_decor_provider(ns, true) };
+            unsafe { (*provider).hl_cached = true };
+            unsafe { NS_HL_ATTR.get_mut() }
+                .insert(ns, [ns; crate::highlight_defs::HlfT::Count as usize]);
+        }
+
+        assert!(unsafe { hl_check_ns() });
+        assert_eq!(unsafe { *NS_HL_ACTIVE.get_mut() }, 4);
+        assert_eq!(
+            unsafe { HL_ATTR_ACTIVE.get_mut() }[0],
+            4,
+            "fast namespace wins"
+        );
+
+        unsafe { *NS_HL_FAST.get_mut() = -1 };
+        assert!(unsafe { hl_check_ns() });
+        assert_eq!(unsafe { *NS_HL_ACTIVE.get_mut() }, 3);
+        assert_eq!(unsafe { HL_ATTR_ACTIVE.get_mut() }[0], 3);
+
+        unsafe { *NS_HL_WIN.get_mut() = -1 };
+        assert!(unsafe { hl_check_ns() });
+        assert_eq!(unsafe { *NS_HL_ACTIVE.get_mut() }, 2);
+        assert_eq!(unsafe { HL_ATTR_ACTIVE.get_mut() }[0], 2);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed);
+    }
+
+    #[test]
+    fn hl_check_ns_uses_global_attributes_for_namespace_zero_and_skips_same_ns() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, -1);
+        let base_attrs = unsafe { HIGHLIGHT_ATTR.get_mut() };
+        *base_attrs = [9; crate::highlight_defs::HlfT::Count as usize];
+
+        assert!(unsafe { hl_check_ns() });
+        assert_eq!(
+            unsafe { *HL_ATTR_ACTIVE.get_mut() },
+            [9; crate::highlight_defs::HlfT::Count as usize]
+        );
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed = false;
+        assert!(!unsafe { hl_check_ns() });
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed);
+    }
+
+    #[test]
+    fn win_check_ns_hl_sets_window_or_global_drawing_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, -1);
+        let provider = unsafe { crate::decoration_provider::get_decor_provider(7, true) };
+        unsafe { (*provider).hl_cached = true };
+        unsafe { NS_HL_ATTR.get_mut() }
+            .insert(7, [7; crate::highlight_defs::HlfT::Count as usize]);
+        let win = crate::buffer_defs::WinT {
+            w_ns_hl: 7,
+            ..Default::default()
+        };
+
+        assert!(unsafe { win_check_ns_hl(std::ptr::addr_of!(win)) });
+        assert_eq!(unsafe { *NS_HL_WIN.get_mut() }, 7);
+        assert_eq!(unsafe { *NS_HL_ACTIVE.get_mut() }, 7);
+
+        assert!(unsafe { win_check_ns_hl(std::ptr::null()) });
+        assert_eq!(unsafe { *NS_HL_WIN.get_mut() }, -1);
+        assert_eq!(unsafe { *NS_HL_ACTIVE.get_mut() }, 0);
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);
