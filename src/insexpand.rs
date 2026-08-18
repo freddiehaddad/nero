@@ -2122,6 +2122,60 @@ pub unsafe fn did_set_completefunc(
     }
 }
 
+/// Copy global `'omnifunc'` callback state to a buffer
+/// (`set_buflocal_ofu_callback`).
+///
+/// # Safety
+/// `buf` and every callback referent must remain valid.
+pub unsafe fn set_buflocal_ofu_callback(
+    buf: *mut crate::buffer_defs::BufT,
+) {
+    unsafe {
+        copy_global_to_buflocal_cb(
+            &*OFU_CB.as_ptr(),
+            &mut (*buf).b_ofu_cb,
+        )
+    };
+}
+
+/// Process the `'omnifunc'` option (`did_set_omnifunc`).
+///
+/// # Safety
+/// `args.os_buf` must point to a live buffer. Touches callback and
+/// function-reference state.
+pub unsafe fn did_set_omnifunc(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf.cast::<crate::buffer_defs::BufT>();
+    assert!(!buf.is_null(), "did_set_omnifunc: missing buffer");
+    let flags = args.os_flags as u32;
+    let retval = if flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        let value = unsafe { (*buf).b_p_ofu.clone() };
+        crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { &mut (*buf).b_ofu_cb },
+        )
+    } else {
+        let value =
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ofu.clone();
+        let retval = crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { OFU_CB.get_mut() },
+        );
+        if retval == crate::vim_defs::OK
+            && flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0
+        {
+            unsafe { set_buflocal_ofu_callback(buf) };
+        }
+        retval
+    };
+    if retval == crate::vim_defs::FAIL {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
+
 /// Free an array of `'complete'` callbacks (`clear_cpt_callbacks`).
 #[allow(dead_code)]
 fn clear_cpt_callbacks(callbacks: &mut Vec<crate::eval::typval_defs::Callback>) {
@@ -2219,6 +2273,10 @@ mod tests {
         callback: crate::eval::typval_defs::Callback,
         option: Option<Vec<u8>>,
     }
+    struct OfuGuard {
+        callback: crate::eval::typval_defs::Callback,
+        option: Option<Vec<u8>>,
+    }
 
     impl CfuGuard {
         fn install(value: Option<&[u8]>) -> Self {
@@ -2246,6 +2304,36 @@ mod tests {
                 crate::eval::typval_defs::Callback::None,
             );
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cfu =
+                self.option.take();
+        }
+    }
+
+    impl OfuGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self {
+                callback: std::mem::replace(
+                    unsafe { OFU_CB.get_mut() },
+                    crate::eval::typval_defs::Callback::None,
+                ),
+                option: std::mem::replace(
+                    &mut unsafe {
+                        crate::option_vars::OPTION_VARS.get_mut()
+                    }
+                    .p_ofu,
+                    value.map(<[u8]>::to_vec),
+                ),
+            }
+        }
+    }
+
+    impl Drop for OfuGuard {
+        fn drop(&mut self) {
+            crate::eval::typval::callback_free(unsafe { OFU_CB.get_mut() });
+            *unsafe { OFU_CB.get_mut() } = std::mem::replace(
+                &mut self.callback,
+                crate::eval::typval_defs::Callback::None,
+            );
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ofu =
                 self.option.take();
         }
     }
@@ -4621,6 +4709,90 @@ mod tests {
         ));
         crate::eval::typval::callback_free(unsafe {
             &mut (*buf_ptr).b_cfu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_omnifunc_plain_set_updates_global_and_local_callbacks() {
+        let _lock = global_state_test_lock();
+        let _guard = OfuGuard::install(Some(b"GlobalOmni"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_omnifunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { OFU_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalOmni"
+        ));
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_ofu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalOmni"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_ofu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_omnifunc_local_set_updates_only_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = OfuGuard::install(Some(b"GlobalOmni"));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_ofu: Some(b"LocalOmni".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_omnifunc(&mut args) }, None);
+        assert_eq!(
+            unsafe { OFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_ofu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"LocalOmni"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_ofu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_omnifunc_global_only_preserves_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = OfuGuard::install(Some(b"NewGlobalOmni"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalOmni"),
+            unsafe { &mut (*buf_ptr).b_ofu_cb },
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_omnifunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_ofu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldLocalOmni"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_ofu_cb
         });
     }
 
