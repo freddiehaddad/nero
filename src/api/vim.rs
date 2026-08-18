@@ -427,16 +427,6 @@ mod tests {
             text[0] = b'd';
         }
 
-        #[test]
-        fn nvim_id_array_returns_an_independent_copy() {
-            let input = vec![Object::String(b"one".to_vec())];
-            let mut output = nvim__id_array(&input);
-            if let Object::String(text) = &mut output[0] {
-                text[0] = b'd';
-            }
-            assert!(matches!(&input[0], Object::String(text) if text == b"one"));
-            assert!(matches!(&output[0], Object::String(text) if text == b"dne"));
-        }
         assert!(matches!(
             input,
             Object::Array(ref items) if matches!(&items[0], Object::String(text) if text == b"one")
@@ -445,6 +435,17 @@ mod tests {
             output,
             Object::Array(ref items) if matches!(&items[0], Object::String(text) if text == b"dne")
         ));
+    }
+
+    #[test]
+    fn nvim_id_array_returns_an_independent_copy() {
+        let input = vec![Object::String(b"one".to_vec())];
+        let mut output = nvim__id_array(&input);
+        if let Object::String(text) = &mut output[0] {
+            text[0] = b'd';
+        }
+        assert!(matches!(&input[0], Object::String(text) if text == b"one"));
+        assert!(matches!(&output[0], Object::String(text) if text == b"dne"));
     }
 
     struct HighlightNamespaceGuard {
