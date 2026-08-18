@@ -15,7 +15,7 @@
 //! the already-existing `mbyte.rs::mb_string2cells`).
 
 use crate::api::private::defs::{
-    Array, Buffer, Error, ErrorType, Integer, NvimString, Object, Tabpage, Window,
+    Array, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, Tabpage, Window,
 };
 
 /// Return a deep owned copy of `obj` (`nvim__id`).
@@ -30,6 +30,13 @@ pub fn nvim__id(obj: &Object) -> Object {
 #[allow(non_snake_case)]
 pub fn nvim__id_array(arr: &Array) -> Array {
     arr.clone()
+}
+
+/// Return a deep owned copy of `dict` (`nvim__id_dict`).
+#[must_use]
+#[allow(non_snake_case)]
+pub fn nvim__id_dict(dict: &Dict) -> Dict {
+    dict.clone()
 }
 
 /// List every current buffer, including unlisted and unloaded buffers
@@ -446,6 +453,23 @@ mod tests {
         }
         assert!(matches!(&input[0], Object::String(text) if text == b"one"));
         assert!(matches!(&output[0], Object::String(text) if text == b"dne"));
+    }
+
+    #[test]
+    fn nvim_id_dict_returns_an_independent_copy() {
+        let input = vec![crate::api::private::defs::KeyValuePair {
+            key: b"name".to_vec(),
+            value: Object::String(b"one".to_vec()),
+        }];
+        let mut output = nvim__id_dict(&input);
+        output[0].key[0] = b'g';
+        if let Object::String(text) = &mut output[0].value {
+            text[0] = b'd';
+        }
+        assert_eq!(input[0].key, b"name");
+        assert_eq!(output[0].key, b"game");
+        assert!(matches!(&input[0].value, Object::String(text) if text == b"one"));
+        assert!(matches!(&output[0].value, Object::String(text) if text == b"dne"));
     }
 
     struct HighlightNamespaceGuard {
