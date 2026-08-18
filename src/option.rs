@@ -3638,6 +3638,127 @@ pub unsafe fn validate_option_value(
     None
 }
 
+/// Set one typed option value and process its side effects
+/// (`set_option`).
+///
+/// OptionSet autocmd and attached-UI notifications are omitted: no
+/// OptionSet autocmd can be registered and no UI option event
+/// dispatcher exists yet. Storage, scope resolution, secure-mode
+/// escalation, callback dispatch and rollback are complete.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin` and the option's resolved storage pointers
+/// must be live; forwarded from [`validate_option_value`],
+/// [`get_varp_scope`], [`set_option_varp`] and [`did_set_option`].
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn set_option(
+    opt_idx: OptIndex,
+    mut value: OptVal,
+    opt_flags: u32,
+    set_sid: crate::eval::typval_defs::ScidT,
+    direct: bool,
+    value_replaced: bool,
+) -> Option<&'static str> {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+
+    if !direct {
+        // SAFETY: forwarded from this function's own safety doc.
+        if let Some(error) = unsafe {
+            validate_option_value(opt_idx, &mut value, opt_flags)
+        } {
+            return Some(error);
+        }
+    }
+
+    #[cfg(windows)]
+    if get_option(opt_idx).flags & crate::option_defs::opt_flags::EXPAND != 0
+        && !matches!(
+            opt_idx,
+            OptIndex::Equalprg
+                | OptIndex::Formatprg
+                | OptIndex::Grepprg
+                | OptIndex::Keywordprg
+                | OptIndex::Makeprg
+                | OptIndex::Shell
+        )
+        && let OptVal::String(string) = &mut value
+    {
+        let allow_comma =
+            get_option(opt_idx).flags & crate::option_defs::opt_flags::COMMA != 0;
+        let allow_space = matches!(opt_idx, OptIndex::Cdpath | OptIndex::Path | OptIndex::Tags);
+        let mut index = 0;
+        while index < string.len() {
+            if string[index] == b'\\'
+                && !(string.get(index + 1) == Some(&b',') && allow_comma)
+                && !(string.get(index + 1) == Some(&b' ') && allow_space)
+            {
+                string[index] = b'/';
+            }
+            index += 1;
+        }
+    }
+
+    let scope_local = opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0;
+    let scope_global = opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL != 0;
+    let scope_both = !scope_local && !scope_global;
+    // SAFETY: forwarded from this function's own safety doc.
+    let local_unset = unsafe { is_option_local_value_unset(opt_idx) };
+    let option = get_option(opt_idx);
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = if scope_both && option_is_global_local(opt_idx) {
+        option.var
+    } else {
+        unsafe { get_varp_scope(opt_idx, opt_flags) }
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_value = unsafe { optval_from_varp(opt_idx, varp) };
+
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { (*globals).curwin };
+    // SAFETY: forwarded from this function's own safety doc.
+    let insecure = unsafe { insecure_flag(curwin, opt_idx, opt_flags) };
+    // SAFETY: same process-lifetime global pointer.
+    let secure_saved = unsafe { (*globals).secure };
+    let sandbox = unsafe { (*globals).sandbox };
+    let was_insecure = !value_replaced
+        // SAFETY: `insecure` points at the resolved live option flags.
+        && unsafe { *insecure } & crate::option_defs::opt_flags::INSECURE != 0;
+    if opt_flags & crate::option_defs::opt_set_flags::OPT_MODELINE != 0
+        || sandbox != 0
+        || was_insecure
+    {
+        unsafe { (*globals).secure = 1 };
+    }
+
+    // Store a clone because `did_set_option` needs the same typed value
+    // after ownership has moved into the option storage.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_option_varp(opt_idx, varp, value.clone()) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe {
+        did_set_option(
+            opt_idx,
+            varp,
+            old_value,
+            value,
+            opt_flags,
+            set_sid,
+            direct,
+            value_replaced,
+        )
+    };
+    // SAFETY: same process-lifetime global pointer.
+    unsafe { (*globals).secure = secure_saved };
+
+    // `local_unset` is computed before the write in the original
+    // because OptionSet autocmd uses it to choose its old local value.
+    // Keep the read ordering even while that autocmd remains inert.
+    let _ = local_unset;
+    result
+}
+
 /// Skip to next part of an option argument: skip a leading comma and
 /// any following spaces (`skip_to_option_part`).
 ///
@@ -7510,6 +7631,77 @@ mod did_set_option_tests {
 
         assert!(!unsafe { was_set_insecurely(win, OptIndex::Allowrevins, 0) });
         reset_shared_state();
+    }
+
+    #[test]
+    fn set_option_stores_a_valid_global_value_and_runs_the_common_tail() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let previous = unsafe { (*options).p_ari };
+        unsafe { (*options).p_ari = 0 };
+
+        let result = unsafe {
+            set_option(
+                OptIndex::Allowrevins,
+                OptVal::Boolean(TriState::True),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                true,
+            )
+        };
+
+        assert_eq!(result, None);
+        assert_eq!(unsafe { (*options).p_ari }, 1);
+        assert!(option_was_set(OptIndex::Allowrevins));
+        unsafe { (*options).p_ari = previous };
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_option_validation_failure_leaves_the_old_value_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+        unsafe { (*buf).b_p_ts = 8 };
+
+        let result = unsafe {
+            set_option(
+                OptIndex::Tabstop,
+                OptVal::Number(0),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                crate::globals::SID_NONE,
+                false,
+                true,
+            )
+        };
+
+        assert_eq!(result, Some(crate::errors::e_positive));
+        assert_eq!(unsafe { (*buf).b_p_ts }, 8);
+    }
+
+    #[test]
+    fn set_option_direct_skips_validation_but_still_stores_the_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+        unsafe { (*buf).b_p_ts = 8 };
+
+        let result = unsafe {
+            set_option(
+                OptIndex::Tabstop,
+                OptVal::Number(0),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                crate::globals::SID_NONE,
+                true,
+                true,
+            )
+        };
+
+        assert_eq!(result, None);
+        assert_eq!(unsafe { (*buf).b_p_ts }, 0);
     }
 }
 
