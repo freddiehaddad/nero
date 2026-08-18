@@ -324,6 +324,24 @@ pub unsafe fn nvim_set_var(name: &NvimString, value: &Object, err: &mut Error) {
     };
 }
 
+/// Delete a global variable (`nvim_del_var`).
+///
+/// # Safety
+/// Mutates the shared global-variable dictionary and may release
+/// nested eval containers.
+pub unsafe fn nvim_del_var(name: &NvimString, err: &mut Error) {
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            crate::eval::vars::get_globvar_dict(),
+            name,
+            &Object::Nil,
+            true,
+            false,
+            err,
+        )
+    };
+}
+
 /// Get the current window's handle (`nvim_get_current_win`).
 ///
 /// # Safety
@@ -636,6 +654,18 @@ mod tests {
         let stored = unsafe { (*item).di_tv.clone() };
         unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
         assert!(matches!(stored.value, crate::eval::typval_defs::TypvalValue::Number(7)));
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_del_var_removes_a_global_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let key = b"nero_api_del_global";
+        let mut err = Error::default();
+        unsafe { nvim_set_var(&key.to_vec(), &Object::Integer(3), &mut err) };
+        unsafe { nvim_del_var(&key.to_vec(), &mut err) };
+        let dict = crate::eval::vars::get_globvar_dict();
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) }.is_none());
         assert!(!err.is_set());
     }
 
