@@ -162,6 +162,24 @@ pub unsafe fn vim_set_var(name: &NvimString, value: &Object, err: &mut Error) ->
     }
 }
 
+/// Delete a global variable and return its previous value
+/// (`vim_del_var`).
+///
+/// # Safety
+/// Mutates the shared global-variable dictionary.
+pub unsafe fn vim_del_var(name: &NvimString, err: &mut Error) -> Object {
+    unsafe {
+        crate::api::private::helpers::dict_set_var(
+            crate::eval::vars::get_globvar_dict(),
+            name,
+            &Object::Nil,
+            true,
+            true,
+            err,
+        )
+    }
+}
+
 /// Get one buffer line through the deprecated API (`buffer_get_line`).
 ///
 /// # Safety
@@ -391,6 +409,22 @@ mod tests {
             new.value,
             crate::eval::typval_defs::TypvalValue::Number(7)
         ));
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn vim_del_var_returns_the_deleted_global_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let key = b"nero_deprecated_del_var";
+        let dict = crate::eval::vars::get_globvar_dict();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, key, 9) },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+        let old = unsafe { vim_del_var(&key.to_vec(), &mut err) };
+        assert!(matches!(old, Object::Integer(9)));
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) }.is_none());
         assert!(!err.is_set());
     }
 
