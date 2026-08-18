@@ -3759,6 +3759,26 @@ pub unsafe fn set_option(
     result
 }
 
+/// Set one non-TTY option value (`set_option_value`).
+///
+/// # Safety
+/// Forwarded from [`set_option`].
+#[must_use]
+pub unsafe fn set_option_value(
+    opt_idx: OptIndex,
+    value: OptVal,
+    opt_flags: u32,
+) -> Option<&'static str> {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    let option = get_option(opt_idx);
+    let sandbox = unsafe { (*crate::globals::GLOBALS.as_ptr()).sandbox };
+    if sandbox > 0 && option.flags & crate::option_defs::opt_flags::SECURE != 0 {
+        return Some(crate::errors::e_sandbox);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_option(opt_idx, value, opt_flags, 0, false, true) }
+}
+
 /// Skip to next part of an option argument: skip a leading comma and
 /// any following spaces (`skip_to_option_part`).
 ///
@@ -7702,6 +7722,48 @@ mod did_set_option_tests {
 
         assert_eq!(result, None);
         assert_eq!(unsafe { (*buf).b_p_ts }, 0);
+    }
+
+    #[test]
+    fn set_option_value_delegates_to_the_typed_write_core() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let previous = unsafe { (*options).p_ari };
+        unsafe { (*options).p_ari = 0 };
+
+        assert_eq!(
+            unsafe {
+                set_option_value(
+                    OptIndex::Allowrevins,
+                    OptVal::Boolean(TriState::True),
+                    0,
+                )
+            },
+            None
+        );
+        assert_eq!(unsafe { (*options).p_ari }, 1);
+        unsafe { (*options).p_ari = previous };
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_option_value_rejects_secure_options_in_the_sandbox() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.sandbox, 1)
+        };
+        assert_eq!(
+            unsafe {
+                set_option_value(
+                    OptIndex::Shell,
+                    OptVal::String(b"ignored".to_vec()),
+                    0,
+                )
+            },
+            Some(crate::errors::e_sandbox)
+        );
     }
 }
 
