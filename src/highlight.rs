@@ -668,6 +668,32 @@ pub unsafe fn hlattrs2dict(
     dict
 }
 
+/// Return an attribute dictionary for one interned attribute ID
+/// (`hl_get_attr_by_id`).
+///
+/// Attribute zero is the empty dictionary. Invalid IDs set an API
+/// exception and also return an empty dictionary.
+///
+/// # Safety
+/// Reads the shared attribute and font tables.
+#[must_use]
+pub unsafe fn hl_get_attr_by_id(
+    attr_id: crate::api::private::defs::Integer,
+    rgb: bool,
+    err: &mut crate::api::private::defs::Error,
+) -> crate::api::private::defs::Dict {
+    if attr_id == 0 {
+        return Vec::new();
+    }
+    let len = unsafe { ATTR_ENTRIES.get_mut() }.len() as i64;
+    if attr_id < 0 || attr_id >= len {
+        err.r#type = crate::api::private::defs::ErrorType::Exception;
+        err.msg = Some(format!("Invalid attribute id: {attr_id}"));
+        return Vec::new();
+    }
+    unsafe { hlattrs2dict(syn_attr2entry(attr_id as i32), rgb, false) }
+}
+
 /// Global highlight namespace (`ns_hl_global`).
 pub static NS_HL_GLOBAL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 /// Highlight namespace for the current window (`ns_hl_win`).
@@ -3375,6 +3401,46 @@ mod tests {
         assert!(matches!(
             api_dict_value(&short, b"underdashed"),
             Some(crate::api::private::defs::Object::Boolean(true))
+        ));
+    }
+
+    #[test]
+    fn hl_get_attr_by_id_returns_empty_for_zero_and_errors_for_invalid_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { highlight_init() };
+        let mut err = crate::api::private::defs::Error::default();
+
+        assert!(unsafe { hl_get_attr_by_id(0, true, &mut err) }.is_empty());
+        assert!(!err.is_set());
+        assert!(unsafe { hl_get_attr_by_id(-1, true, &mut err) }.is_empty());
+        assert_eq!(err.r#type, crate::api::private::defs::ErrorType::Exception);
+        assert_eq!(err.msg.as_deref(), Some("Invalid attribute id: -1"));
+    }
+
+    #[test]
+    fn hl_get_attr_by_id_returns_rgb_or_cterm_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x12_34_56,
+            cterm_fg_color: 4,
+            ..Default::default()
+        };
+        let attr_id = unsafe { hl_get_term_attr(&attrs) };
+
+        let mut err = crate::api::private::defs::Error::default();
+        let rgb = unsafe { hl_get_attr_by_id(i64::from(attr_id), true, &mut err) };
+        assert!(!err.is_set());
+        assert!(matches!(
+            api_dict_value(&rgb, b"foreground"),
+            Some(crate::api::private::defs::Object::Integer(0x12_34_56))
+        ));
+
+        let cterm = unsafe { hl_get_attr_by_id(i64::from(attr_id), false, &mut err) };
+        assert!(matches!(
+            api_dict_value(&cterm, b"foreground"),
+            Some(crate::api::private::defs::Object::Integer(3))
         ));
     }
 
