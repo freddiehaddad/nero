@@ -15,7 +15,8 @@
 //! the already-existing `mbyte.rs::mb_string2cells`).
 
 use crate::api::private::defs::{
-    Array, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, Tabpage, Window,
+    Array, Boolean, Buffer, Dict, Error, ErrorType, Integer, NvimString, Object, Tabpage,
+    Window,
 };
 
 /// Return a deep owned copy of `obj` (`nvim__id`).
@@ -91,6 +92,7 @@ pub unsafe fn nvim_set_hl(
     if hl_id == 0 {
         return;
     }
+
     if value.url.is_some() {
         err.r#type = ErrorType::Validation;
         err.msg = Some("Invalid key: 'url'".to_string());
@@ -120,6 +122,81 @@ pub unsafe fn nvim_set_hl(
             )
         };
     }
+}
+
+/// Selection controls for [`nvim_get_hl`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GetHighlightOpts {
+    pub create: Option<Boolean>,
+    pub id: Option<Integer>,
+    pub link: Option<Boolean>,
+    pub name: Option<NvimString>,
+}
+
+/// Return one or all highlight definitions from a namespace
+/// (`nvim_get_hl`).
+///
+/// # Safety
+/// Reads and may extend shared highlight-group state, and reads
+/// namespace/provider/attribute/font state.
+#[must_use]
+pub unsafe fn nvim_get_hl(
+    ns_id: Integer,
+    opts: &GetHighlightOpts,
+    err: &mut Error,
+) -> Dict {
+    let link = opts.link.unwrap_or(true);
+    let mut id = -1;
+    if let Some(name) = &opts.name {
+        id = if opts.create.unwrap_or(true) {
+            unsafe { crate::highlight_group::syn_check_group(name) }
+        } else {
+            unsafe { crate::highlight_group::syn_name2id_len(name) }
+        };
+        if id == 0 && !opts.create.unwrap_or(true) {
+            return Vec::new();
+        }
+    } else if let Some(requested) = opts.id {
+        id = requested as i32;
+    }
+    let len = unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items.len() as i32;
+    if id != -1 {
+        if !(1..=len).contains(&id) {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some("Highlight id out of bounds".to_string());
+            return Vec::new();
+        }
+        let resolved = if link {
+            id
+        } else {
+            unsafe { crate::highlight_group::syn_get_final_id(id) }
+        };
+        return unsafe { crate::highlight_group::hlgroup2dict(ns_id as i32, resolved) }
+            .unwrap_or_default();
+    }
+
+    let mut result = Vec::with_capacity(len as usize);
+    for id in 1..=len {
+        let Some(attrs) = (unsafe {
+            crate::highlight_group::hlgroup2dict(ns_id as i32, id)
+        }) else {
+            continue;
+        };
+        let name_id = if link {
+            id
+        } else {
+            unsafe { crate::highlight_group::syn_get_final_id(id) }
+        };
+        let name = unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items
+            [(name_id - 1) as usize]
+            .sg_name
+            .clone();
+        result.push(crate::api::private::defs::KeyValuePair {
+            key: name,
+            value: Object::Dict(attrs),
+        });
+    }
+    result
 }
 
 /// Return the complete named RGB color map (`nvim_get_color_map`).
@@ -679,6 +756,88 @@ mod tests {
             )
         };
         assert_eq!(err.msg.as_deref(), Some("Invalid key: 'url'"));
+    }
+
+    #[test]
+    fn nvim_get_hl_returns_a_global_definition_by_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let name = b"NeroApiReadableHighlight".to_vec();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut set_err = Error::default();
+        unsafe {
+            nvim_set_hl(
+                0,
+                &name,
+                &crate::highlight::HighlightDict {
+                    italic: Some(true),
+                    fg: Some(Object::Integer(0xabcdef)),
+                    ..Default::default()
+                },
+                &mut set_err,
+            )
+        };
+        let mut err = Error::default();
+        let definition = unsafe {
+            nvim_get_hl(
+                0,
+                &GetHighlightOpts {
+                    name: Some(name),
+                    ..Default::default()
+                },
+                &mut err,
+            )
+        };
+
+        assert!(!set_err.is_set());
+        assert!(!err.is_set());
+        assert!(definition.iter().any(|pair| {
+            pair.key == b"italic" && matches!(pair.value, Object::Boolean(true))
+        }));
+        assert!(definition.iter().any(|pair| {
+            pair.key == b"fg" && matches!(pair.value, Object::Integer(0xabcdef))
+        }));
+    }
+
+    #[test]
+    fn nvim_get_hl_handles_missing_names_and_invalid_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut missing_err = Error::default();
+        assert!(
+            unsafe {
+                nvim_get_hl(
+                    0,
+                    &GetHighlightOpts {
+                        create: Some(false),
+                        name: Some(b"NeroApiMissingHighlight".to_vec()),
+                        ..Default::default()
+                    },
+                    &mut missing_err,
+                )
+            }
+            .is_empty()
+        );
+        assert!(!missing_err.is_set());
+
+        let mut id_err = Error::default();
+        assert!(
+            unsafe {
+                nvim_get_hl(
+                    0,
+                    &GetHighlightOpts {
+                        id: Some(i64::from(i32::MAX)),
+                        ..Default::default()
+                    },
+                    &mut id_err,
+                )
+            }
+            .is_empty()
+        );
+        assert_eq!(id_err.msg.as_deref(), Some("Highlight id out of bounds"));
     }
 
     struct HighlightNamespaceGuard {

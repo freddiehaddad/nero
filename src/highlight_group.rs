@@ -1834,6 +1834,67 @@ pub unsafe fn set_hl_group(
     }
 }
 
+/// Convert one global or namespaced highlight group to an API
+/// dictionary (`hlgroup2dict`).
+///
+/// Returns `None` when the namespace does not define the group or a
+/// global group was created but never set.
+///
+/// # Safety
+/// Reads shared highlight group, namespace, attribute, and font state.
+#[must_use]
+pub unsafe fn hlgroup2dict(
+    ns_id: i32,
+    hl_id: i32,
+) -> Option<crate::api::private::defs::Dict> {
+    use crate::api::private::defs::{KeyValuePair, Object};
+    let (cleared, set, global_link, global_attr) = {
+        let group = &unsafe { HL_TABLE.get_mut() }.items[(hl_id - 1) as usize];
+        (group.sg_cleared, group.sg_set, group.sg_link, group.sg_attr)
+    };
+    let mut namespace = ns_id;
+    let link = if ns_id == 0 {
+        global_link
+    } else {
+        unsafe { crate::highlight::ns_get_hl(&mut namespace, hl_id, true, set != 0) }
+    };
+    if link == -1 || (ns_id == 0 && cleared && set == 0) {
+        return None;
+    }
+    namespace = ns_id;
+    let attr_id = if ns_id == 0 {
+        global_attr
+    } else {
+        unsafe { crate::highlight::ns_get_hl(&mut namespace, hl_id, false, set != 0) }
+    };
+    let attrs = unsafe { crate::highlight::syn_attr2entry(attr_id) };
+    let mut result = Vec::new();
+    if attrs.rgb_ae_attr & crate::highlight_defs::HL_DEFAULT as i32 != 0 {
+        result.push(KeyValuePair {
+            key: b"default".to_vec(),
+            value: Object::Boolean(true),
+        });
+    }
+    if link > 0 {
+        let name = unsafe { HL_TABLE.get_mut() }.items[(link - 1) as usize]
+            .sg_name
+            .clone();
+        result.push(KeyValuePair {
+            key: b"link".to_vec(),
+            value: Object::String(name),
+        });
+    }
+    result.extend(unsafe { crate::highlight::hlattrs2dict(attrs, true, true) });
+    let cterm = unsafe { crate::highlight::hlattrs2dict(attrs, false, true) };
+    if !cterm.is_empty() {
+        result.push(KeyValuePair {
+            key: b"cterm".to_vec(),
+            value: Object::Dict(cterm),
+        });
+    }
+    Some(result)
+}
+
 /// Configure command-line completion for `:highlight`
 /// (`set_context_in_highlight_cmd`).
 ///
