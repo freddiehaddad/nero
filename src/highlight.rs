@@ -572,7 +572,7 @@ static NS_HL_ATTR: std::sync::LazyLock<
     crate::globals::GlobalCell<
         crate::map::Map<
             i32,
-            [i32; crate::highlight_defs::HlfT::Count as usize],
+            Box<[i32; crate::highlight_defs::HlfT::Count as usize]>,
         >,
     >,
 > = std::sync::LazyLock::new(|| {
@@ -792,7 +792,7 @@ pub unsafe fn update_ns_hl(ns_id: i32) {
     let normal = unsafe { crate::highlight_group::syn_check_group(b"Normal") };
     attrs[crate::highlight_defs::HlfT::None as usize] =
         unsafe { hl_get_ui_attr(ns_id, -1, normal, true) };
-    unsafe { NS_HL_ATTR.get_mut() }.insert(ns_id, attrs);
+    unsafe { NS_HL_ATTR.get_mut() }.insert(ns_id, Box::new(attrs));
 
     let provider = unsafe {
         crate::decoration_provider::get_decor_provider(ns_id, true)
@@ -840,7 +840,7 @@ pub unsafe fn hl_check_ns() -> bool {
     if ns > 0 {
         unsafe { update_ns_hl(ns) };
         if let Some(attrs) = unsafe { NS_HL_ATTR.get_mut() }.get(&ns) {
-            unsafe { *HL_ATTR_ACTIVE.get_mut() = *attrs };
+            unsafe { *HL_ATTR_ACTIVE.get_mut() = **attrs };
         }
     }
     unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed = true;
@@ -1826,7 +1826,7 @@ mod tests {
         >,
         attributes: crate::map::Map<
             i32,
-            [i32; crate::highlight_defs::HlfT::Count as usize],
+            Box<[i32; crate::highlight_defs::HlfT::Count as usize]>,
         >,
         providers: Vec<crate::decoration_defs::DecorProvider>,
         active: i32,
@@ -2284,10 +2284,13 @@ mod tests {
         assert_eq!(unsafe { syn_attr2entry(error_attr) }, expected);
 
         unsafe { NS_HL_ATTR.get_mut() }
-            .insert(3, [77; crate::highlight_defs::HlfT::Count as usize]);
+            .insert(
+                3,
+                Box::new([77; crate::highlight_defs::HlfT::Count as usize]),
+            );
         unsafe { update_ns_hl(3) };
         assert_eq!(
-            unsafe { NS_HL_ATTR.get_mut() }.get(&3),
+            unsafe { NS_HL_ATTR.get_mut() }.get(&3).map(Box::as_ref),
             Some(&[77; crate::highlight_defs::HlfT::Count as usize])
         );
     }
@@ -2301,7 +2304,10 @@ mod tests {
             let provider = unsafe { crate::decoration_provider::get_decor_provider(ns, true) };
             unsafe { (*provider).hl_cached = true };
             unsafe { NS_HL_ATTR.get_mut() }
-                .insert(ns, [ns; crate::highlight_defs::HlfT::Count as usize]);
+                .insert(
+                    ns,
+                    Box::new([ns; crate::highlight_defs::HlfT::Count as usize]),
+                );
         }
 
         assert!(unsafe { hl_check_ns() });
@@ -2349,7 +2355,10 @@ mod tests {
         let provider = unsafe { crate::decoration_provider::get_decor_provider(7, true) };
         unsafe { (*provider).hl_cached = true };
         unsafe { NS_HL_ATTR.get_mut() }
-            .insert(7, [7; crate::highlight_defs::HlfT::Count as usize]);
+            .insert(
+                7,
+                Box::new([7; crate::highlight_defs::HlfT::Count as usize]),
+            );
         let win = crate::buffer_defs::WinT {
             w_ns_hl: 7,
             ..Default::default()
