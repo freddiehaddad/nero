@@ -4,7 +4,7 @@
 //! `rename_buffer`/`do_buffer`, none of which are wired into this API
 //! layer yet).
 //!
-//! Translated: [`nvim_buf_line_count`], [`nvim_buf_get_changedtick`],
+//! Translated: [`nvim_buf_get_lines`], [`nvim_buf_line_count`], [`nvim_buf_get_changedtick`],
 //! [`nvim_buf_get_mark`], [`nvim_buf_get_name`], [`nvim_buf_is_loaded`],
 //! [`nvim_buf_is_valid`] - every one of these is a thin, real
 //! `find_buffer_by_handle` + one-field read, with no other
@@ -25,9 +25,63 @@
 //! Lua host).
 
 use crate::api::private::defs::{
-    Array, Boolean, Buffer, Error, ErrorType, Integer, NvimString, Object,
+    Array, Boolean, Buffer, Error, ErrorType, Integer, NvimString, Object, StringArray,
 };
 use crate::api::private::helpers::find_buffer_by_handle;
+
+/// Return buffer lines from the 0-based, end-exclusive range
+/// `[start, end)` (`nvim_buf_get_lines`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and
+/// [`crate::memline::ml_get_buf`].
+pub unsafe fn nvim_buf_get_lines(
+    channel_id: u64,
+    buf: Buffer,
+    start: Integer,
+    end: Integer,
+    strict_indexing: Boolean,
+    err: &mut Error,
+) -> StringArray {
+    let b = unsafe { find_buffer_by_handle(buf, err) };
+    if b.is_null() || unsafe { (*b).b_ml.ml_mfp }.is_null() {
+        return Vec::new();
+    }
+
+    let mut oob = false;
+    let start = crate::api::private::helpers::normalize_index(
+        unsafe { &*b },
+        start,
+        true,
+        &mut oob,
+    );
+    let end =
+        crate::api::private::helpers::normalize_index(unsafe { &*b }, end, true, &mut oob);
+    if strict_indexing && oob {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Index out of bounds".to_string());
+        return Vec::new();
+    }
+
+    let count = end.saturating_sub(start);
+    let replace_nl = channel_id != crate::api::private::defs::VIML_INTERNAL_CALL;
+    let mut lines = Vec::with_capacity(count as usize);
+    for offset in 0..count {
+        let lnum = (start + offset) as crate::pos_defs::LinenrT;
+        let line = unsafe { crate::memline::ml_get_buf(&mut *b, lnum) };
+        let len = unsafe { crate::memline::ml_get_buf_len(&mut *b, lnum) } as usize;
+        let mut line = line[..len].to_vec();
+        if replace_nl {
+            for byte in &mut line {
+                if *byte == b'\n' {
+                    *byte = 0;
+                }
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
 
 /// Get the number of lines in buffer `buf` (`0` for the current
 /// buffer), or `0` on failure/if the buffer is unloaded
@@ -251,6 +305,15 @@ mod tests {
                 drop(Box::from_raw(self.buf_ptr));
             }
         }
+
+    }
+
+    unsafe fn close_memline(fx: &mut BufFixture) {
+        let mfp = fx.buf_mut().b_ml.ml_mfp;
+        if !mfp.is_null() {
+            fx.buf_mut().b_ml.ml_mfp = std::ptr::null_mut();
+            unsafe { crate::memfile::mf_close(*Box::from_raw(mfp), false) };
+        }
     }
 
     #[test]
@@ -263,6 +326,52 @@ mod tests {
         // buffer's own b_ml.ml_mfp is null (unloaded) by default.
         let count = unsafe { nvim_buf_line_count(handle, &mut err) };
         assert_eq!(count, 0);
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_buf_get_lines_returns_the_requested_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(44);
+        assert_eq!(unsafe { crate::memline::ml_open(fx.buf_mut()) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(fx.buf_mut(), 1, b"one\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(fx.buf_mut(), 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+
+        let lines = unsafe { nvim_buf_get_lines(0, fx.handle(), 0, -1, true, &mut err) };
+
+        assert!(!err.is_set());
+        assert_eq!(lines, vec![b"one".to_vec(), b"two".to_vec()]);
+        unsafe { close_memline(&mut fx) };
+    }
+
+    #[test]
+    fn nvim_buf_get_lines_strict_indexing_rejects_out_of_bounds_ranges() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(45);
+        assert_eq!(unsafe { crate::memline::ml_open(fx.buf_mut()) }, crate::vim_defs::OK);
+        let mut err = Error::default();
+        assert!(
+            unsafe { nvim_buf_get_lines(0, fx.handle(), 0, 99, true, &mut err) }.is_empty()
+        );
+        assert_eq!(err.msg.as_deref(), Some("Index out of bounds"));
+        unsafe { close_memline(&mut fx) };
+    }
+
+    #[test]
+    fn nvim_buf_get_lines_returns_empty_for_an_unloaded_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = BufFixture::new(46);
+        let mut err = Error::default();
+        assert!(
+            unsafe { nvim_buf_get_lines(0, fx.handle(), 0, -1, true, &mut err) }.is_empty()
+        );
         assert!(!err.is_set());
     }
 
