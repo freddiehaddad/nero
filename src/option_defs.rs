@@ -8406,7 +8406,11 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
 }
 
 fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
+    options[OptIndex::Fileencoding as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_encoding);
     options[OptIndex::Fileencodings as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_encoding);
+    options[OptIndex::Makeencoding as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_encoding);
 }
 
@@ -8754,13 +8758,17 @@ mod options_table_tests {
             expected.contains(&option.fullname)
                 || option.opt_did_set_cb.is_none()
         }));
-        assert!(opts
-            .iter()
-            .find(|option| option.fullname == b"fileencodings")
-            .and_then(|option| option.opt_expand_cb)
-            .is_some());
+        let expanded: &[&[u8]] =
+            &[b"fileencoding", b"fileencodings", b"makeencoding"];
+        for name in expanded {
+            assert!(opts
+                .iter()
+                .find(|option| option.fullname == *name)
+                .and_then(|option| option.opt_expand_cb)
+                .is_some());
+        }
         assert!(opts.iter().all(|option| {
-            option.fullname == b"fileencodings" || option.opt_expand_cb.is_none()
+            expanded.contains(&option.fullname) || option.opt_expand_cb.is_none()
         }));
     }
 

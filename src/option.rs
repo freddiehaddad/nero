@@ -4147,7 +4147,7 @@ unsafe fn option_expand(
 /// (`get_option_default`).
 ///
 /// # Safety
-/// Forwarded from [`get_option_unset_value`] and [`option_expand`].
+/// Forwarded from [`get_option_unset_value`] and `option_expand`.
 #[must_use]
 pub unsafe fn get_option_default(opt_idx: OptIndex, opt_flags: u32) -> OptVal {
     #[cfg(unix)]
