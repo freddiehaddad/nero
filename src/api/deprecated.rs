@@ -18,6 +18,21 @@ fn convert_index(index: Integer) -> Integer {
     }
 }
 
+/// Return the buffer number, which equals its API handle
+/// (`nvim_buf_get_number`).
+///
+/// # Safety
+/// Forwarded from
+/// [`crate::api::private::helpers::find_buffer_by_handle`].
+pub unsafe fn nvim_buf_get_number(buffer: Buffer, err: &mut Error) -> Integer {
+    let buf = unsafe { crate::api::private::helpers::find_buffer_by_handle(buffer, err) };
+    if buf.is_null() {
+        0
+    } else {
+        i64::from(unsafe { (*buf).handle })
+    }
+}
+
 /// Get one buffer line through the deprecated API (`buffer_get_line`).
 ///
 /// # Safety
@@ -109,6 +124,36 @@ mod tests {
         assert_eq!(convert_index(3), 3);
         assert_eq!(convert_index(-1), -2);
         assert_eq!(convert_index(-5), -6);
+    }
+
+    #[test]
+    fn nvim_buf_get_number_returns_current_buffer_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf_ptr = Box::into_raw(Box::new(crate::buffer_defs::BufT {
+            handle: 123,
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let mut err = Error::default();
+        assert_eq!(unsafe { nvim_buf_get_number(0, &mut err) }, 123);
+        assert!(!err.is_set());
+        drop(_curbuf);
+        unsafe { drop(Box::from_raw(buf_ptr)) };
+    }
+
+    #[test]
+    fn nvim_buf_get_number_returns_zero_for_an_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut err = Error::default();
+        assert_eq!(unsafe { nvim_buf_get_number(99, &mut err) }, 0);
+        assert_eq!(err.msg.as_deref(), Some("Invalid buffer id: 99"));
     }
 
     #[test]
