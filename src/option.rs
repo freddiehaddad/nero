@@ -7873,6 +7873,22 @@ pub unsafe fn did_set_scrollbind(
     None
 }
 
+/// Process an updated `'pumblend'` value (`did_set_pumblend`).
+///
+/// The blend-attribute caches don't exist in this crate yet, so there
+/// is nothing corresponding to `hl_invalidate_blends` to clear. When
+/// the popup menu is not drawn (the only reachable state today), the
+/// original performs no other work. Redrawing a live popup still needs
+/// the popup-menu grid renderer.
+pub fn did_set_pumblend(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    if crate::popupmenu::pum_drawn() {
+        unimplemented!("did_set_pumblend: a drawn popup needs pum_redraw");
+    }
+    None
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///

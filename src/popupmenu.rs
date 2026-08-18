@@ -459,6 +459,24 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn did_set_pumblend_is_complete_while_the_popup_is_not_drawn() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _visible = PumVisibleGuard::set(false);
+        assert_eq!(
+            crate::option::did_set_pumblend(&mut Default::default()),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "pum_redraw")]
+    fn did_set_pumblend_drawn_popup_needs_the_grid_renderer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _visible = PumVisibleGuard::set(true);
+        crate::option::did_set_pumblend(&mut Default::default());
+    }
+
     // ---- pum_clear / pum_invalidate / pum_ext_select_item ----
 
     /// Restores `PUM_FIRST`, `PUM_INVALID`, `PUM_SIZE` and `PUM_WANT`
