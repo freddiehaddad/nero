@@ -128,6 +128,7 @@ pub unsafe fn nvim_win_get_option(
 }
 
 unsafe fn set_option_to(
+    channel_id: u64,
     to: *mut std::ffi::c_void,
     scope: OptScope,
     name: &NvimString,
@@ -166,9 +167,11 @@ unsafe fn set_option_to(
     } else {
         crate::option_defs::opt_set_flags::OPT_LOCAL
     };
-    if let Some(message) =
-        unsafe { crate::option::set_option_value_for(name, opt_idx, value, opt_flags, scope, to) }
-    {
+    let previous_sctx = unsafe { crate::api::private::helpers::api_set_sctx(channel_id) };
+    let result =
+        unsafe { crate::option::set_option_value_for(name, opt_idx, value, opt_flags, scope, to) };
+    unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = previous_sctx;
+    if let Some(message) = result {
         err.r#type = ErrorType::Validation;
         err.msg = Some(message.to_string());
     }
@@ -178,8 +181,22 @@ unsafe fn set_option_to(
 ///
 /// # Safety
 /// Forwarded from [`crate::option::set_option_value_for`].
-pub unsafe fn nvim_set_option(name: &NvimString, value: Object, err: &mut Error) {
-    unsafe { set_option_to(std::ptr::null_mut(), OptScope::Global, name, value, err) };
+pub unsafe fn nvim_set_option(
+    channel_id: u64,
+    name: &NvimString,
+    value: Object,
+    err: &mut Error,
+) {
+    unsafe {
+        set_option_to(
+            channel_id,
+            std::ptr::null_mut(),
+            OptScope::Global,
+            name,
+            value,
+            err,
+        )
+    };
 }
 
 /// Set a global variable and return its previous value (`vim_set_var`).
@@ -622,6 +639,7 @@ mod tests {
         let mut err = Error::default();
         unsafe {
             nvim_set_option(
+                0,
                 &b"ignorecase".to_vec(),
                 Object::Boolean(true),
                 &mut err,
@@ -646,6 +664,7 @@ mod tests {
         let mut err = Error::default();
         unsafe {
             nvim_set_option(
+                0,
                 &b"ignorecase".to_vec(),
                 Object::Float(1.0),
                 &mut err,
