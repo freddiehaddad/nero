@@ -25,6 +25,13 @@ pub fn nvim__id(obj: &Object) -> Object {
     obj.clone()
 }
 
+/// Return a deep owned copy of `arr` (`nvim__id_array`).
+#[must_use]
+#[allow(non_snake_case)]
+pub fn nvim__id_array(arr: &Array) -> Array {
+    arr.clone()
+}
+
 /// List every current buffer, including unlisted and unloaded buffers
 /// (`nvim_list_bufs`).
 ///
@@ -418,6 +425,17 @@ mod tests {
             && let Object::String(text) = &mut items[0]
         {
             text[0] = b'd';
+        }
+
+        #[test]
+        fn nvim_id_array_returns_an_independent_copy() {
+            let input = vec![Object::String(b"one".to_vec())];
+            let mut output = nvim__id_array(&input);
+            if let Object::String(text) = &mut output[0] {
+                text[0] = b'd';
+            }
+            assert!(matches!(&input[0], Object::String(text) if text == b"one"));
+            assert!(matches!(&output[0], Object::String(text) if text == b"dne"));
         }
         assert!(matches!(
             input,
