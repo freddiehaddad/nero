@@ -699,6 +699,55 @@ pub unsafe fn hl_ns_get_attrs(
     true
 }
 
+/// Get the attribute code for one builtin UI highlight group
+/// (`hl_get_ui_attr`).
+///
+/// Popup-menu groups inherit `'pumblend'` when they do not set their
+/// own blend value, and a drawn popup menu is marked for redraw.
+///
+/// # Safety
+/// Reads and mutates shared highlight, option, popup-menu, and global
+/// redraw state.
+#[must_use]
+pub unsafe fn hl_get_ui_attr(
+    ns_id: i32,
+    idx: i32,
+    final_id: i32,
+    mut optional: bool,
+) -> i32 {
+    let mut attrs = crate::highlight_defs::HlAttrs::default();
+    let mut available = false;
+    if final_id > 0 {
+        available = unsafe {
+            hl_ns_get_attrs(ns_id, final_id, Some(&mut optional), &mut attrs)
+        };
+    }
+
+    if (crate::highlight_defs::HlfT::Pni as i32
+        ..=crate::highlight_defs::HlfT::Pst as i32)
+        .contains(&idx)
+    {
+        let pumblend = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_pb };
+        if attrs.hl_blend == -1 && pumblend > 0 {
+            attrs.hl_blend = pumblend as i32;
+        }
+        if crate::popupmenu::pum_drawn() {
+            unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw_pum = true;
+        }
+    }
+
+    if optional && !available {
+        return 0;
+    }
+    get_attr_entry(crate::highlight_defs::HlEntry {
+        attr: attrs,
+        kind: crate::highlight_defs::HlKind::Ui,
+        id1: idx,
+        id2: final_id,
+        winid: 0,
+    })
+}
+
 /// The currently active UI highlight attribute for each `HlfT`
 /// (`hl_attr_active`).
 pub static HL_ATTR_ACTIVE: crate::globals::GlobalCell<
@@ -1892,6 +1941,122 @@ mod tests {
 
         assert!(!unsafe { hl_ns_get_attrs(0, 1, None, &mut attrs) });
         assert_eq!(attrs.rgb_fg_color, 7);
+    }
+
+    struct PumblendGuard {
+        pumblend: crate::types_defs::OptInt,
+        must_redraw: bool,
+    }
+
+    impl PumblendGuard {
+        fn set(value: crate::types_defs::OptInt) -> Self {
+            let option = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_pb };
+            let must_redraw = unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw_pum;
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_pb = value };
+            unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw_pum = false;
+            Self {
+                pumblend: option,
+                must_redraw,
+            }
+        }
+    }
+
+    impl Drop for PumblendGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_pb = self.pumblend };
+            unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw_pum = self.must_redraw;
+        }
+    }
+
+    #[test]
+    fn hl_get_ui_attr_applies_default_pumblend_to_popup_groups() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup::default(),
+        ]);
+        let _pumblend = PumblendGuard::set(35);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let group_attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x12_34_56,
+            ..Default::default()
+        };
+        let group_attr = unsafe { hl_get_term_attr(&group_attrs) };
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0].sg_attr = group_attr;
+
+        let attr = unsafe {
+            hl_get_ui_attr(
+                0,
+                crate::highlight_defs::HlfT::Pni as i32,
+                1,
+                false,
+            )
+        };
+        let attrs = unsafe { syn_attr2entry(attr) };
+
+        assert_eq!(attrs.rgb_fg_color, 0x12_34_56);
+        assert_eq!(attrs.hl_blend, 35);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw_pum);
+    }
+
+    #[test]
+    fn hl_get_ui_attr_preserves_an_explicit_blend_and_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup::default(),
+        ]);
+        let _pumblend = PumblendGuard::set(35);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let group_attr = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                hl_blend: 12,
+                ..Default::default()
+            })
+        };
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0].sg_attr = group_attr;
+
+        let attr = unsafe {
+            hl_get_ui_attr(
+                0,
+                crate::highlight_defs::HlfT::Pni as i32,
+                1,
+                false,
+            )
+        };
+        let entry = *unsafe { ATTR_ENTRIES.get_mut() }
+            .get_at(attr as usize)
+            .expect("UI highlight entry");
+
+        assert_eq!(entry.attr.hl_blend, 12);
+        assert_eq!(entry.kind, crate::highlight_defs::HlKind::Ui);
+        assert_eq!(entry.id1, crate::highlight_defs::HlfT::Pni as i32);
+        assert_eq!(entry.id2, 1);
+    }
+
+    #[test]
+    fn hl_get_ui_attr_returns_zero_for_an_unavailable_optional_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup::default(),
+        ]);
+        let _ = unsafe { crate::decoration_provider::get_decor_provider(8, true) };
+
+        assert_eq!(
+            unsafe {
+                hl_get_ui_attr(
+                    8,
+                    crate::highlight_defs::HlfT::None as i32,
+                    1,
+                    true,
+                )
+            },
+            0
+        );
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);
