@@ -1132,9 +1132,8 @@ static NS_HL_ATTR: std::sync::LazyLock<
 
 /// Define one namespace highlight (`ns_hl_def`).
 ///
-/// Namespace-zero definitions remain with the global `:highlight`
-/// table's `set_hl_group`; nonzero link and direct-attribute
-/// definitions are complete.
+/// Namespace-zero definitions delegate to the global highlight-group
+/// table's setter; nonzero definitions update the namespace table.
 ///
 /// # Safety
 /// Mutates the namespace-highlight and decoration-provider registries.
@@ -1143,9 +1142,12 @@ pub unsafe fn ns_hl_def(
     hl_id: i32,
     attrs: crate::highlight_defs::HlAttrs,
     link_id: i32,
+    dict: Option<&HighlightDict>,
 ) {
     if ns_id == 0 {
-        unimplemented!("ns_hl_def: namespace zero needs set_hl_group");
+        let dict = dict.expect("ns_hl_def: namespace zero requires a highlight dictionary");
+        unsafe { crate::highlight_group::set_hl_group(hl_id, attrs, dict, link_id) };
+        return;
     }
     let key = crate::highlight_defs::ColorKey::new(ns_id, hl_id);
     if attrs.rgb_ae_attr & crate::highlight_defs::HL_DEFAULT as i32 != 0
@@ -2994,12 +2996,13 @@ mod tests {
             (*provider).hl_valid = 7;
             (*provider).hl_cached = true;
         }
+
         let attrs = crate::highlight_defs::HlAttrs {
             rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
             ..Default::default()
         };
 
-        unsafe { ns_hl_def(12, 3, attrs, 9) };
+        unsafe { ns_hl_def(12, 3, attrs, 9, None) };
 
         let item = *unsafe { NS_HLS.get_mut() }
             .get(&crate::highlight_defs::ColorKey::new(12, 3))
@@ -3014,6 +3017,46 @@ mod tests {
     }
 
     #[test]
+    fn ns_hl_def_namespace_zero_updates_the_global_group_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tables = AllHighlightTablesGuard::empty();
+        let _groups =
+            HighlightGroupTableGuard::install(vec![crate::highlight_group::HlGroup {
+                sg_name: b"ApiGroup".to_vec(),
+                sg_name_u: b"APIGROUP".to_vec(),
+                ..Default::default()
+            }]);
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let old_changed = unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed;
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_BOLD as i32,
+            rgb_fg_color: 0x123456,
+            ..Default::default()
+        };
+        let dict = HighlightDict {
+            fg: Some(crate::api::private::defs::Object::Integer(0x123456)),
+            ..Default::default()
+        };
+
+        unsafe { ns_hl_def(0, 1, attrs, -1, Some(&dict)) };
+
+        let group = unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0].clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed = old_changed;
+        assert_eq!(group.sg_gui, crate::highlight_defs::HL_BOLD as i32);
+        assert_eq!(group.sg_rgb_fg, 0x123456);
+        assert_eq!(
+            group.sg_rgb_fg_idx,
+            crate::highlight_group::COLOR_IDX_HEX
+        );
+        assert!(group.sg_attr > 0);
+    }
+
+    #[test]
     fn ns_hl_def_keeps_an_existing_definition_for_default_attrs() {
         let _lock = crate::globals::global_state_test_lock();
         let _state = NamespaceHighlightsGuard::empty();
@@ -3021,14 +3064,14 @@ mod tests {
             rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
             ..Default::default()
         };
-        unsafe { ns_hl_def(4, 2, attrs, 8) };
+        unsafe { ns_hl_def(4, 2, attrs, 8, None) };
 
         let default_attrs = crate::highlight_defs::HlAttrs {
             rgb_ae_attr: (crate::highlight_defs::HL_GLOBAL
                 | crate::highlight_defs::HL_DEFAULT) as i32,
             ..Default::default()
         };
-        unsafe { ns_hl_def(4, 2, default_attrs, 11) };
+        unsafe { ns_hl_def(4, 2, default_attrs, 11, None) };
 
         let item = unsafe { NS_HLS.get_mut() }
             .get(&crate::highlight_defs::ColorKey::new(4, 2))
@@ -3047,7 +3090,7 @@ mod tests {
             ..Default::default()
         };
 
-        unsafe { ns_hl_def(4, 2, attrs, -1) };
+        unsafe { ns_hl_def(4, 2, attrs, -1, None) };
 
         let item = unsafe { NS_HLS.get_mut() }
             .get(&crate::highlight_defs::ColorKey::new(4, 2))
@@ -3067,7 +3110,7 @@ mod tests {
             rgb_fg_color: 0x12_34_56,
             ..Default::default()
         };
-        unsafe { ns_hl_def(7, 3, attrs, -1) };
+        unsafe { ns_hl_def(7, 3, attrs, -1, None) };
         unsafe { *NS_HL_ACTIVE.get_mut() = 7 };
         let mut ns_id = -1;
 
@@ -3087,7 +3130,7 @@ mod tests {
             rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
             ..Default::default()
         };
-        unsafe { ns_hl_def(4, 2, attrs, 9) };
+        unsafe { ns_hl_def(4, 2, attrs, 9, None) };
         let mut ns_id = 4;
 
         assert_eq!(unsafe { ns_get_hl(&mut ns_id, 2, true, false) }, 9);
@@ -3102,7 +3145,7 @@ mod tests {
             rgb_ae_attr: crate::highlight_defs::HL_DEFAULT as i32,
             ..Default::default()
         };
-        unsafe { ns_hl_def(4, 2, attrs, 8) };
+        unsafe { ns_hl_def(4, 2, attrs, 8, None) };
         let mut ns_id = 4;
         assert_eq!(unsafe { ns_get_hl(&mut ns_id, 2, true, true) }, -1);
 
@@ -3429,7 +3472,7 @@ mod tests {
             rgb_fg_color: 0xAB_CD_EF,
             ..Default::default()
         };
-        unsafe { ns_hl_def(3, error_id, expected, -1) };
+        unsafe { ns_hl_def(3, error_id, expected, -1, None) };
 
         unsafe { update_ns_hl(3) };
 

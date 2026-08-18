@@ -334,6 +334,7 @@ pub unsafe fn parse_winhl_opt(
                     source_id,
                     attrs,
                     target_id,
+                    None,
                 );
             }
         }
