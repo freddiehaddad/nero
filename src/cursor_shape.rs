@@ -1,11 +1,9 @@
 //! Translated from `src/nvim/cursor_shape.c` (tractable core only).
 //!
 //! `cursor_shape.c` handles cursor/mouse-pointer shape configuration via
-//! the `'guicursor'`/`'mouseshape'` options. The option-string *parser*
-//! (`parse_shape_opt`, needing `syn_check_group`/UI mode-info plumbing,
-//! neither translated) and everything depending on real syntax-
-//! highlight attribute lookup (`syn_id2attr`, needing the syntax
-//! subsystem) are not attempted here.
+//! the `'guicursor'`/`'mouseshape'` options. The option-string parser
+//! is translated for shape/blink/mode syntax; highlight-group names
+//! remain deferred on `syn_check_group`.
 //!
 //! Translated: `SHAPE_TABLE` (`shape_table`, with its own real static
 //! initializer values - `parse_shape_opt`, the only thing that would
@@ -34,7 +32,8 @@
 //! `crate::ex_getln`'s newly-real `cmdline_at_end`/`cmdline_overstrike`.
 //!
 //! Deferred: `mode_style_array` (needs `Arena`/`Dict`/`Array`, the API
-//! layer), `parse_shape_opt`, `update_mouseshape`/`ui_cursor_shape_*`
+//! layer), highlight-group resolution in [`parse_shape_opt`],
+//! `update_mouseshape`/`ui_cursor_shape_*`
 //! (UI dispatch), `get_default_cursor_shape` and friends.
 
 use crate::globals::GlobalCell;
@@ -350,6 +349,10 @@ static SHAPE_TABLE: GlobalCell<[CursorentryT; SHAPE_IDX_COUNT]> = GlobalCell::ne
 pub fn clear_shape_table() {
     // SAFETY: a plain write through one exclusive borrow.
     let table = unsafe { SHAPE_TABLE.get_mut() };
+    clear_shape_entries(table);
+}
+
+fn clear_shape_entries(table: &mut [CursorentryT; SHAPE_IDX_COUNT]) {
     for entry in table.iter_mut() {
         entry.shape = CursorShape::Block;
         entry.blinkwait = 0;
@@ -358,6 +361,153 @@ pub fn clear_shape_table() {
         entry.id = 0;
         entry.id_lm = 0;
     }
+}
+
+const E_MISSING_COLON: &[u8] = b"E545: Missing colon";
+const E_ILLEGAL_MODE: &[u8] = b"E546: Illegal mode";
+const E_ILLEGAL_PERCENTAGE: &[u8] = b"E549: Illegal percentage";
+
+#[derive(Clone, Copy)]
+enum ShapeAttribute {
+    Block,
+    Vertical(i32),
+    Horizontal(i32),
+    BlinkWait(i32),
+    BlinkOn(i32),
+    BlinkOff(i32),
+}
+
+fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Parse `'guicursor'` shape/blink/mode syntax (`parse_shape_opt`).
+///
+/// Highlight-group tokens still need `syn_check_group` and stop at
+/// that exact dependency. Successful parses replace `SHAPE_TABLE`
+/// atomically, matching the original's validate-then-apply two rounds.
+#[must_use]
+pub fn parse_shape_opt(what: u8) -> Option<&'static [u8]> {
+    let value = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_guicursor.clone() }
+        .unwrap_or_default();
+    let mut table = unsafe { *SHAPE_TABLE.get_mut() };
+    clear_shape_entries(&mut table);
+    if value.is_empty() {
+        unsafe { *SHAPE_TABLE.get_mut() = table };
+        return None;
+    }
+
+    let mut found_ve = false;
+    for part in value.split(|&byte| byte == b',') {
+        let Some(colon) = part.iter().position(|&byte| byte == b':') else {
+            return Some(E_MISSING_COLON);
+        };
+        if colon == 0 {
+            return Some(E_ILLEGAL_MODE);
+        }
+
+        let mut modes = Vec::new();
+        for mode in part[..colon].split(|&byte| byte == b'-') {
+            if mode.len() == 1 && mode[0].eq_ignore_ascii_case(&b'a') {
+                modes.extend(0..SHAPE_IDX_COUNT);
+                continue;
+            }
+            let Some(index) = table.iter().position(|entry| {
+                entry.name.as_bytes().eq_ignore_ascii_case(mode)
+            }) else {
+                return Some(E_ILLEGAL_MODE);
+            };
+            if table[index].used_for & what == 0 {
+                return Some(E_ILLEGAL_MODE);
+            }
+            found_ve |= index == SHAPE_IDX_VE;
+            modes.push(index);
+        }
+
+        let mut attributes = Vec::new();
+        let tail = &part[colon + 1..];
+        if !tail.is_empty() {
+            for attribute in tail.split(|&byte| byte == b'-') {
+                let parsed = if attribute.eq_ignore_ascii_case(b"block") {
+                    ShapeAttribute::Block
+                } else {
+                    let (kind, prefix_len) = if starts_with_ignore_ascii_case(attribute, b"ver") {
+                        (0, 3)
+                    } else if starts_with_ignore_ascii_case(attribute, b"hor") {
+                        (1, 3)
+                    } else if starts_with_ignore_ascii_case(attribute, b"blinkwait") {
+                        (2, 9)
+                    } else if starts_with_ignore_ascii_case(attribute, b"blinkon") {
+                        (3, 7)
+                    } else if starts_with_ignore_ascii_case(attribute, b"blinkoff") {
+                        (4, 8)
+                    } else {
+                        unimplemented!(
+                            "parse_shape_opt: highlight-group names need syn_check_group"
+                        );
+                    };
+                    let digits = &attribute[prefix_len..];
+                    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                        return Some(crate::gettext_defs::gettext_noop(
+                            "E5080: Digit expected",
+                        )
+                        .as_bytes());
+                    }
+                    let number = digits
+                        .iter()
+                        .fold(0i32, |value, &digit| {
+                            value
+                                .saturating_mul(10)
+                                .saturating_add(i32::from(digit - b'0'))
+                        });
+                    match kind {
+                        0 if number == 0 => return Some(E_ILLEGAL_PERCENTAGE),
+                        1 if number == 0 => return Some(E_ILLEGAL_PERCENTAGE),
+                        0 => ShapeAttribute::Vertical(number),
+                        1 => ShapeAttribute::Horizontal(number),
+                        2 => ShapeAttribute::BlinkWait(number),
+                        3 => ShapeAttribute::BlinkOn(number),
+                        _ => ShapeAttribute::BlinkOff(number),
+                    }
+                };
+                attributes.push(parsed);
+            }
+        }
+
+        for index in modes {
+            for attribute in &attributes {
+                match *attribute {
+                    ShapeAttribute::Block => table[index].shape = CursorShape::Block,
+                    ShapeAttribute::Vertical(percent) => {
+                        table[index].shape = CursorShape::Ver;
+                        table[index].percentage = percent;
+                    }
+                    ShapeAttribute::Horizontal(percent) => {
+                        table[index].shape = CursorShape::Hor;
+                        table[index].percentage = percent;
+                    }
+                    ShapeAttribute::BlinkWait(value) => table[index].blinkwait = value,
+                    ShapeAttribute::BlinkOn(value) => table[index].blinkon = value,
+                    ShapeAttribute::BlinkOff(value) => table[index].blinkoff = value,
+                }
+            }
+        }
+    }
+
+    if !found_ve {
+        let visual = table[SHAPE_IDX_V];
+        table[SHAPE_IDX_VE].shape = visual.shape;
+        table[SHAPE_IDX_VE].percentage = visual.percentage;
+        table[SHAPE_IDX_VE].blinkwait = visual.blinkwait;
+        table[SHAPE_IDX_VE].blinkon = visual.blinkon;
+        table[SHAPE_IDX_VE].blinkoff = visual.blinkoff;
+        table[SHAPE_IDX_VE].id = visual.id;
+        table[SHAPE_IDX_VE].id_lm = visual.id_lm;
+    }
+    unsafe { *SHAPE_TABLE.get_mut() = table };
+    None
 }
 
 /// Return the index into `SHAPE_TABLE` for the current mode
@@ -478,6 +628,99 @@ pub(crate) mod tests {
         let old = table[mode_idx];
         table[mode_idx] = entry;
         old
+    }
+
+    struct ShapeParseGuard {
+        table: [CursorentryT; SHAPE_IDX_COUNT],
+        option: Option<Vec<u8>>,
+    }
+
+    impl ShapeParseGuard {
+        fn set(value: &[u8]) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let guard = ShapeParseGuard {
+                table: unsafe { *SHAPE_TABLE.get_mut() },
+                option: unsafe { (*options).p_guicursor.clone() },
+            };
+            unsafe { (*options).p_guicursor = Some(value.to_vec()) };
+            guard
+        }
+
+        fn replace_option(value: &[u8]) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_guicursor = Some(value.to_vec()) };
+        }
+    }
+
+    impl Drop for ShapeParseGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *SHAPE_TABLE.get_mut() = self.table;
+                (*crate::option_vars::OPTION_VARS.as_ptr()).p_guicursor =
+                    self.option.take();
+            }
+        }
+    }
+
+    #[test]
+    fn parse_shape_opt_applies_shape_blink_and_mode_lists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShapeParseGuard::set(
+            b"n:block-blinkon0,i-ci-ve:ver25-blinkwait100,r-cr-o:hor20",
+        );
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), None);
+        let table = unsafe { SHAPE_TABLE.get_mut() };
+        assert_eq!(table[SHAPE_IDX_N].shape, CursorShape::Block);
+        assert_eq!(table[SHAPE_IDX_N].blinkon, 0);
+        for index in [SHAPE_IDX_I, SHAPE_IDX_CI, SHAPE_IDX_VE] {
+            assert_eq!(table[index].shape, CursorShape::Ver);
+            assert_eq!(table[index].percentage, 25);
+            assert_eq!(table[index].blinkwait, 100);
+        }
+        for index in [SHAPE_IDX_R, SHAPE_IDX_CR, SHAPE_IDX_O] {
+            assert_eq!(table[index].shape, CursorShape::Hor);
+            assert_eq!(table[index].percentage, 20);
+        }
+    }
+
+    #[test]
+    fn parse_shape_opt_all_mode_and_visual_fallback_match_the_original() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShapeParseGuard::set(b"a:block-blinkwait123");
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), None);
+        assert!(unsafe { SHAPE_TABLE.get_mut() }
+            .iter()
+            .all(|entry| entry.shape == CursorShape::Block && entry.blinkwait == 123));
+
+        ShapeParseGuard::replace_option(b"v:hor30-blinkon0");
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), None);
+        let table = unsafe { SHAPE_TABLE.get_mut() };
+        assert_eq!(table[SHAPE_IDX_VE].shape, CursorShape::Hor);
+        assert_eq!(table[SHAPE_IDX_VE].percentage, 30);
+        assert_eq!(table[SHAPE_IDX_VE].blinkon, 0);
+    }
+
+    #[test]
+    fn parse_shape_opt_rejects_malformed_mode_and_numeric_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShapeParseGuard::set(b"nblock");
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), Some(E_MISSING_COLON));
+
+        ShapeParseGuard::replace_option(b"x:block");
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), Some(E_ILLEGAL_MODE));
+
+        ShapeParseGuard::replace_option(b"n:ver0");
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), Some(E_ILLEGAL_PERCENTAGE));
+
+        ShapeParseGuard::replace_option(b"n:blinkon");
+        assert!(parse_shape_opt(SHAPE_CURSOR).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "syn_check_group")]
+    fn parse_shape_opt_highlight_names_need_the_highlight_registry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShapeParseGuard::set(b"n:TermCursor");
+        let _ = parse_shape_opt(SHAPE_CURSOR);
     }
 
     #[test]
