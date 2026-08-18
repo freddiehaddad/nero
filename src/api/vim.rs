@@ -357,6 +357,24 @@ pub unsafe fn nvim_get_vvar(name: &NvimString, err: &mut Error) -> Object {
     }
 }
 
+/// Set a writable special `v:` variable (`nvim_set_vvar`).
+///
+/// # Safety
+/// Mutates the shared special-variable dictionary and may update
+/// search/redraw state for special variables with assignment hooks.
+pub unsafe fn nvim_set_vvar(name: &NvimString, value: &Object, err: &mut Error) {
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            crate::eval::vars::get_vimvar_dict(),
+            name,
+            value,
+            false,
+            false,
+            err,
+        )
+    };
+}
+
 /// Get the current window's handle (`nvim_get_current_win`).
 ///
 /// # Safety
@@ -1001,6 +1019,33 @@ mod tests {
         let second = unsafe { nvim_get_hl_id_by_name(&name) };
         assert!(first > 0);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn nvim_set_vvar_coerces_writable_special_variables() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::vars::get_vimvar_dict();
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"errmsg") }
+            .expect("v:errmsg");
+        let previous = unsafe { (*item).di_tv.clone() };
+        let mut err = Error::default();
+        unsafe {
+            nvim_set_vvar(
+                &b"errmsg".to_vec(),
+                &Object::Integer(42),
+                &mut err,
+            )
+        };
+        let written = unsafe { (*item).di_tv.clone() };
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&(*item).di_tv);
+            (*item).di_tv = previous;
+        }
+        assert!(matches!(
+            written.value,
+            crate::eval::typval_defs::TypvalValue::String(Some(value)) if value == b"42"
+        ));
+        assert!(!err.is_set());
     }
 
     struct HighlightNamespaceGuard {
