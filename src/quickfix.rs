@@ -3609,6 +3609,30 @@ unsafe fn qf_cmd_get_stack(
     qi
 }
 
+/// Select or allocate the quickfix/location stack for an Ex command
+/// (`qf_cmd_get_or_alloc_stack`).
+///
+/// # Safety
+/// The global quickfix stack must be initialized; `GLOBALS.curwin`
+/// and `pwinp` must be valid for location-list commands.
+pub unsafe fn qf_cmd_get_or_alloc_stack(
+    eap: &crate::ex_cmds_defs::ExargT,
+    pwinp: *mut *mut WinT,
+) -> *mut crate::types_defs::QfInfoT {
+    let global = unsafe { &mut *QL_INFO.as_ptr() };
+    let mut qi = global
+        .as_mut()
+        .map_or(std::ptr::null_mut(), std::ptr::from_mut);
+    assert!(!qi.is_null(), "global quickfix stack must be initialized");
+
+    if crate::ex_docmd::is_loclist_cmd(eap.cmdidx) {
+        let window = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        qi = unsafe { ll_get_or_alloc_list(window) };
+        unsafe { *pwinp = window };
+    }
+    qi
+}
+
 /// Number of entries in the current quickfix/location list
 /// (`qf_get_size`).
 ///
@@ -8923,6 +8947,65 @@ mod tests {
         };
         assert_eq!(unsafe { qf_get_size(&location_cmd) }, 2);
         unsafe { qf_free_all(Some(winp)) };
+    }
+
+    #[test]
+    fn qf_cmd_get_or_alloc_stack_returns_global_stack_for_quickfix_command() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 2));
+        let mut window = std::ptr::null_mut();
+        let command = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::copen,
+            ..Default::default()
+        };
+
+        let stack = unsafe {
+            qf_cmd_get_or_alloc_stack(
+                &command,
+                std::ptr::addr_of_mut!(window),
+            )
+        };
+
+        assert!(!stack.is_null());
+        assert_eq!(unsafe { (*stack).qfl_type }, QfltypeT::Quickfix);
+        assert!(window.is_null());
+    }
+
+    #[test]
+    fn qf_cmd_get_or_alloc_stack_allocates_current_window_location_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 2));
+        let mut current = Box::new(WinT::default());
+        current.w_onebuf_opt.wo_lhi = 4;
+        let current_ptr = std::ptr::addr_of_mut!(*current);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                current_ptr,
+            )
+        };
+        let mut window = std::ptr::null_mut();
+        let command = crate::ex_cmds_defs::ExargT {
+            cmdidx: crate::ex_cmds_defs::CmdIdxT::lopen,
+            ..Default::default()
+        };
+
+        let stack = unsafe {
+            qf_cmd_get_or_alloc_stack(
+                &command,
+                std::ptr::addr_of_mut!(window),
+            )
+        };
+
+        assert_eq!(window, current_ptr);
+        assert_eq!(unsafe { (*current_ptr).w_llist }, stack);
+        assert_eq!(unsafe { (*stack).qfl_type }, QfltypeT::Location);
+        assert_eq!(unsafe { (*stack).qf_maxcount }, 4);
+        unsafe { qf_free_all(Some(current_ptr)) };
     }
 
     #[test]
