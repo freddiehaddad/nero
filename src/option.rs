@@ -247,6 +247,48 @@ use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
 use crate::types_defs::{OptInt, TriState};
 use std::ffi::c_void;
 
+/// Set a callback-valued option from its textual value
+/// (`option_set_callback_func`).
+///
+/// Empty values clear the callback and ordinary text is treated as a
+/// function name. Lambda, `function(...)`, and `funcref(...)`
+/// expressions remain explicit gaps pending `eval_expr`.
+pub fn option_set_callback_func(
+    optval: Option<&[u8]>,
+    callback: &mut crate::eval::typval_defs::Callback,
+) -> i32 {
+    let Some(optval) = optval.filter(|value| !value.is_empty()) else {
+        crate::eval::typval::callback_free(callback);
+        return crate::vim_defs::OK;
+    };
+    if optval.starts_with(b"{")
+        || optval.starts_with(b"function(")
+        || optval.starts_with(b"funcref(")
+    {
+        unimplemented!(
+            "option_set_callback_func: callback expressions need eval_expr"
+        );
+    }
+
+    let value = crate::eval::typval_defs::TypvalT {
+        value: crate::eval::typval_defs::TypvalValue::String(Some(
+            optval.to_vec(),
+        )),
+        ..Default::default()
+    };
+    let Some(new_callback) =
+        (unsafe { crate::eval::typval::callback_from_typval(&value) })
+    else {
+        return crate::vim_defs::FAIL;
+    };
+    if new_callback.kind() == crate::eval::typval_defs::CallbackType::None {
+        return crate::vim_defs::FAIL;
+    }
+    crate::eval::typval::callback_free(callback);
+    *callback = new_callback;
+    crate::vim_defs::OK
+}
+
 /// Gets the `'fileformat'` of `buf` as an `EOL_*` constant
 /// (`get_fileformat`).
 #[must_use]
@@ -4333,6 +4375,71 @@ mod tests {
             b_p_bin: i32::from(bin),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn option_set_callback_func_installs_an_ordinary_function_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut callback = crate::eval::typval_defs::Callback::None;
+        assert_eq!(
+            option_set_callback_func(Some(b"MyFunc"), &mut callback),
+            crate::vim_defs::OK
+        );
+        assert!(matches!(
+            &callback,
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"MyFunc"
+        ));
+        crate::eval::typval::callback_free(&mut callback);
+    }
+
+    #[test]
+    fn option_set_callback_func_rejects_invalid_names_without_replacing_old_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut callback = crate::eval::typval_defs::Callback::None;
+        assert_eq!(
+            option_set_callback_func(Some(b"OldFunc"), &mut callback),
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            option_set_callback_func(Some(b"123bad"), &mut callback),
+            crate::vim_defs::FAIL
+        );
+        assert!(matches!(
+            &callback,
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldFunc"
+        ));
+        crate::eval::typval::callback_free(&mut callback);
+    }
+
+    #[test]
+    fn option_set_callback_func_empty_value_clears_the_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut callback = crate::eval::typval_defs::Callback::None;
+        option_set_callback_func(Some(b"MyFunc"), &mut callback);
+        assert_eq!(
+            option_set_callback_func(Some(b""), &mut callback),
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            callback.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert_eq!(
+            option_set_callback_func(None, &mut callback),
+            crate::vim_defs::OK
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "callback expressions need eval_expr")]
+    fn option_set_callback_func_defers_callback_expressions() {
+        let mut callback = crate::eval::typval_defs::Callback::None;
+        option_set_callback_func(
+            Some(b"function('MyFunc')"),
+            &mut callback,
+        );
     }
 
     #[test]
