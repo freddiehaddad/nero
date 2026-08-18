@@ -7,10 +7,9 @@
 //!
 //! Translated so far: the registry's own storage - [`HlGroup`], the
 //! [`sg_set`] flags and the [`HL_TABLE`] file-static - together with
-//! [`syn_id2name`], the ID-to-name lookup. That lookup is what several
-//! already-translated call sites elsewhere were waiting on (for
-//! example `match.rs`'s `f_getmatches` item conversion and
-//! `f_matcharg`'s reporting branch).
+//! [`syn_id2name`], the ID-to-name lookup, and the namespace-aware
+//! [`syn_ns_get_final_id`]/[`syn_ns_id2attr`] link and attribute
+//! resolution used by [`syn_id2attr`].
 //!
 //! Deferred: `syn_name2id`/`syn_name2id_len` need the separate
 //! `highlight_unames` name-to-ID hash map (and `syn_check_group` for
@@ -579,6 +578,118 @@ pub unsafe fn syn_id2name(id: i32) -> Vec<u8> {
     table.items[(id - 1) as usize].sg_name.clone()
 }
 
+/// Follow global and namespace highlight links to their final group ID
+/// (`syn_ns_get_final_id`).
+///
+/// Returns whether a namespace definition participated in resolving
+/// the link. At most 100 links are followed, matching the original's
+/// loop guard.
+///
+/// # Safety
+/// Reads the shared highlight registry and namespace/provider state.
+pub unsafe fn syn_ns_get_final_id(ns_id: &mut i32, hl_id: &mut i32) -> bool {
+    let table_len = unsafe { HL_TABLE.get_mut() }.ga_len();
+    if *hl_id > table_len || *hl_id < 1 {
+        *hl_id = 0;
+        return false;
+    }
+
+    let mut current = *hl_id;
+    let mut used = false;
+    for _ in 0..100 {
+        let (sg_set, sg_link, sg_cleared, sg_parent) = {
+            let table = unsafe { HL_TABLE.get_mut() };
+            let group = &table.items[(current - 1) as usize];
+            (
+                group.sg_set,
+                group.sg_link,
+                group.sg_cleared,
+                group.sg_parent,
+            )
+        };
+
+        let check =
+            unsafe { crate::highlight::ns_get_hl(ns_id, current, true, sg_set != 0) };
+        if check == 0 {
+            *hl_id = current;
+            return true;
+        } else if check > 0 {
+            used = true;
+            current = check;
+            continue;
+        }
+
+        if sg_link > 0 && sg_link <= table_len {
+            current = sg_link;
+        } else if sg_cleared && sg_parent > 0 {
+            current = sg_parent;
+        } else {
+            break;
+        }
+    }
+
+    *hl_id = current;
+    used
+}
+
+/// Resolve one group ID to its namespace-aware attribute code
+/// (`syn_ns_id2attr`).
+///
+/// `optional` prevents falling back to the global attribute when a
+/// positive namespace does not define the group.
+///
+/// # Safety
+/// Reads the shared highlight registry and namespace/provider state.
+#[must_use]
+pub unsafe fn syn_ns_id2attr(mut ns_id: i32, mut hl_id: i32, optional: &mut bool) -> i32 {
+    if unsafe { syn_ns_get_final_id(&mut ns_id, &mut hl_id) } {
+        *optional = false;
+    }
+    if hl_id < 1 {
+        return 0;
+    }
+    let (sg_set, sg_attr) = {
+        let table = unsafe { HL_TABLE.get_mut() };
+        let Some(group) = table.items.get((hl_id - 1) as usize) else {
+            return 0;
+        };
+        (group.sg_set, group.sg_attr)
+    };
+
+    let attr = unsafe { crate::highlight::ns_get_hl(&mut ns_id, hl_id, false, sg_set != 0) };
+    if attr >= 0 || (*optional && ns_id > 0) {
+        attr
+    } else {
+        sg_attr
+    }
+}
+
+/// Translate a highlight group ID to its active attribute code
+/// (`syn_id2attr`).
+///
+/// # Safety
+/// Reads the shared highlight registry and namespace/provider state.
+#[must_use]
+pub unsafe fn syn_id2attr(hl_id: i32) -> i32 {
+    let mut optional = false;
+    unsafe { syn_ns_id2attr(-1, hl_id, &mut optional) }
+}
+
+/// Translate a group ID to its final linked group ID
+/// (`syn_get_final_id`).
+///
+/// # Safety
+/// `GLOBALS.curwin` must point at a live window, and the shared
+/// highlight registry/provider state must be accessed serially.
+#[must_use]
+pub unsafe fn syn_get_final_id(mut hl_id: i32) -> i32 {
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    assert!(!curwin.is_null(), "syn_get_final_id: curwin is null");
+    let mut ns_id = unsafe { (*curwin).w_ns_hl_active };
+    let _ = unsafe { syn_ns_get_final_id(&mut ns_id, &mut hl_id) };
+    hl_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +731,172 @@ mod tests {
             *unsafe { HIGHLIGHT_UNAMES.get_mut() } =
                 std::mem::replace(&mut self.saved_names, crate::map::Map::new());
         }
+    }
+
+    struct NamespaceStateGuard {
+        definitions: crate::map::Map<
+            crate::highlight_defs::ColorKey,
+            crate::highlight_defs::ColorItem,
+        >,
+        providers: Vec<crate::decoration_defs::DecorProvider>,
+        active: i32,
+    }
+
+    impl NamespaceStateGuard {
+        fn empty() -> Self {
+            let definitions = std::mem::replace(
+                unsafe { crate::highlight::NS_HLS.get_mut() },
+                crate::map::Map::new(),
+            );
+            let providers =
+                std::mem::take(unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() });
+            let active = unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() };
+            unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() = 0 };
+            Self {
+                definitions,
+                providers,
+                active,
+            }
+        }
+    }
+
+    impl Drop for NamespaceStateGuard {
+        fn drop(&mut self) {
+            *unsafe { crate::highlight::NS_HLS.get_mut() } =
+                std::mem::replace(&mut self.definitions, crate::map::Map::new());
+            *unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() } =
+                std::mem::take(&mut self.providers);
+            unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() = self.active };
+        }
+    }
+
+    struct CurwinGuard(*mut crate::buffer_defs::WinT);
+
+    impl CurwinGuard {
+        fn set(curwin: *mut crate::buffer_defs::WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let old = globals.curwin;
+            globals.curwin = curwin;
+            Self(old)
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.0;
+        }
+    }
+
+    #[test]
+    fn syn_ns_get_final_id_follows_global_links_and_scoped_parents() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"A", b"B", b"C"]);
+        let _namespace = NamespaceStateGuard::empty();
+        {
+            let table = unsafe { HL_TABLE.get_mut() };
+            table.items[0].sg_link = 2;
+            table.items[1].sg_link = 3;
+        }
+        let mut ns_id = 0;
+        let mut hl_id = 1;
+        assert!(!unsafe { syn_ns_get_final_id(&mut ns_id, &mut hl_id) });
+        assert_eq!(hl_id, 3);
+
+        {
+            let table = unsafe { HL_TABLE.get_mut() };
+            table.items[0].sg_link = 0;
+            table.items[2].sg_cleared = true;
+            table.items[2].sg_parent = 1;
+        }
+        hl_id = 3;
+        assert!(!unsafe { syn_ns_get_final_id(&mut ns_id, &mut hl_id) });
+        assert_eq!(hl_id, 1);
+    }
+
+    #[test]
+    fn syn_ns_get_final_id_obeys_namespace_links_and_direct_breaks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"A", b"B"]);
+        let _namespace = NamespaceStateGuard::empty();
+        let _ = unsafe { crate::decoration_provider::get_decor_provider(4, true) };
+        unsafe { crate::highlight::NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(4, 1),
+            crate::highlight_defs::ColorItem {
+                attr_id: -1,
+                link_id: 2,
+                version: -1,
+                ..Default::default()
+            },
+        );
+        let mut ns_id = 4;
+        let mut hl_id = 1;
+        assert!(unsafe { syn_ns_get_final_id(&mut ns_id, &mut hl_id) });
+        assert_eq!(hl_id, 2);
+
+        unsafe { crate::highlight::NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(4, 1),
+            crate::highlight_defs::ColorItem {
+                attr_id: 77,
+                version: -1,
+                ..Default::default()
+            },
+        );
+        hl_id = 1;
+        assert!(unsafe { syn_ns_get_final_id(&mut ns_id, &mut hl_id) });
+        assert_eq!(hl_id, 1);
+    }
+
+    #[test]
+    fn syn_ns_id2attr_uses_namespace_then_optional_or_global_fallback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"A"]);
+        let _namespace = NamespaceStateGuard::empty();
+        unsafe { HL_TABLE.get_mut() }.items[0].sg_attr = 11;
+        let _ = unsafe { crate::decoration_provider::get_decor_provider(4, true) };
+
+        let mut optional = false;
+        assert_eq!(unsafe { syn_ns_id2attr(4, 1, &mut optional) }, 11);
+        optional = true;
+        assert_eq!(unsafe { syn_ns_id2attr(4, 1, &mut optional) }, -1);
+
+        unsafe { crate::highlight::NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(4, 1),
+            crate::highlight_defs::ColorItem {
+                attr_id: 77,
+                version: -1,
+                ..Default::default()
+            },
+        );
+        optional = true;
+        assert_eq!(unsafe { syn_ns_id2attr(4, 1, &mut optional) }, 77);
+        assert_eq!(unsafe { syn_id2attr(1) }, 11);
+    }
+
+    #[test]
+    fn syn_get_final_id_uses_the_current_windows_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"A", b"B"]);
+        let _namespace = NamespaceStateGuard::empty();
+        let _ = unsafe { crate::decoration_provider::get_decor_provider(5, true) };
+        unsafe { crate::highlight::NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(5, 1),
+            crate::highlight_defs::ColorItem {
+                attr_id: -1,
+                link_id: 2,
+                version: -1,
+                ..Default::default()
+            },
+        );
+        let mut win = crate::buffer_defs::WinT {
+            w_ns_hl_active: 5,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _curwin = CurwinGuard::set(win_ptr);
+
+        let result = unsafe { syn_get_final_id(1) };
+
+        assert_eq!(result, 2);
     }
 
     /// IDs are 1-based, so the first group is id 1 and id 0 is "no
