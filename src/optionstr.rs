@@ -1041,6 +1041,13 @@ pub fn expand_set_formatoptions(
     expand_set_opt_listflag(args, crate::option_vars::FO_ALL.as_bytes())
 }
 
+/// Expand `'mouse'` flag values (`expand_set_mouse`).
+pub fn expand_set_mouse(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    expand_set_opt_listflag(args, crate::option_vars::MOUSE_ALL.as_bytes())
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5255,6 +5262,20 @@ mod tests {
         assert!(matches.iter().any(|value| value == b","));
         assert!(matches.iter().any(|value| value == b"p"));
         assert!(matches.iter().all(|value| value.len() == 1));
+    }
+
+    #[test]
+    fn expand_set_mouse_returns_each_valid_flag() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        assert_eq!(
+            expand_set_mouse(&mut args),
+            Some(
+                crate::option_vars::MOUSE_ALL
+                    .bytes()
+                    .map(|flag| vec![flag])
+                    .collect()
+            )
+        );
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);

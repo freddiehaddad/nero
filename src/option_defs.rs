@@ -8416,6 +8416,8 @@ fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::expand_set_encoding);
     options[OptIndex::Makeencoding as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_encoding);
+    options[OptIndex::Mouse as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_mouse);
     options[OptIndex::Fileformats as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_str_generic);
     options[OptIndex::Formatoptions as usize].opt_expand_cb =
@@ -8776,6 +8778,7 @@ mod options_table_tests {
             b"fileformats",
             b"formatoptions",
             b"makeencoding",
+            b"mouse",
             b"viewoptions",
         ];
         for name in expanded {
