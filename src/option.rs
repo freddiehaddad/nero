@@ -3779,6 +3779,32 @@ pub unsafe fn set_option_value(
     unsafe { set_option(opt_idx, value, opt_flags, 0, false, true) }
 }
 
+/// Set an option value while accepting legacy TTY option names
+/// (`set_option_value_handle_tty`).
+///
+/// Unknown non-TTY names return the untranslated static `E355`
+/// template; TTY options fail silently, matching old vimrc handling.
+///
+/// # Safety
+/// Forwarded from [`set_option_value`].
+#[must_use]
+pub unsafe fn set_option_value_handle_tty(
+    name: &[u8],
+    opt_idx: OptIndex,
+    value: OptVal,
+    opt_flags: u32,
+) -> Option<&'static str> {
+    if opt_idx == OptIndex::Invalid {
+        return if is_tty_option(name) {
+            None
+        } else {
+            Some(crate::errors::e_unknown_option2)
+        };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_option_value(opt_idx, value, opt_flags) }
+}
+
 /// Set an option directly without validation or side effects
 /// (`set_option_direct`).
 ///
@@ -7857,6 +7883,56 @@ mod did_set_option_tests {
             },
             Some(crate::errors::e_sandbox)
         );
+    }
+
+    #[test]
+    fn set_option_value_handle_tty_silently_accepts_legacy_tty_names() {
+        assert_eq!(
+            unsafe {
+                set_option_value_handle_tty(
+                    b"t_ab",
+                    OptIndex::Invalid,
+                    OptVal::String(b"value".to_vec()),
+                    0,
+                )
+            },
+            None
+        );
+        assert_eq!(
+            unsafe {
+                set_option_value_handle_tty(
+                    b"not-an-option",
+                    OptIndex::Invalid,
+                    OptVal::Nil,
+                    0,
+                )
+            },
+            Some(crate::errors::e_unknown_option2)
+        );
+    }
+
+    #[test]
+    fn set_option_value_handle_tty_delegates_known_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let previous = unsafe { (*options).p_ari };
+        unsafe { (*options).p_ari = 0 };
+        assert_eq!(
+            unsafe {
+                set_option_value_handle_tty(
+                    b"allowrevins",
+                    OptIndex::Allowrevins,
+                    OptVal::Boolean(TriState::True),
+                    0,
+                )
+            },
+            None
+        );
+        assert_eq!(unsafe { (*options).p_ari }, 1);
+        unsafe { (*options).p_ari = previous };
+        reset_shared_state();
     }
 
     #[test]
