@@ -168,6 +168,105 @@ pub const COLOR_IDX_FG: i32 = -3;
 /// Follow the active `Normal` background (`kColorIdxBg`).
 pub const COLOR_IDX_BG: i32 = -4;
 
+const CTERM_COLOR_NAMES: [&[u8]; 28] = [
+    b"Black",
+    b"DarkBlue",
+    b"DarkGreen",
+    b"DarkCyan",
+    b"DarkRed",
+    b"DarkMagenta",
+    b"Brown",
+    b"DarkYellow",
+    b"Gray",
+    b"Grey",
+    b"LightGray",
+    b"LightGrey",
+    b"DarkGray",
+    b"DarkGrey",
+    b"Blue",
+    b"LightBlue",
+    b"Green",
+    b"LightGreen",
+    b"Cyan",
+    b"LightCyan",
+    b"Red",
+    b"LightRed",
+    b"Magenta",
+    b"LightMagenta",
+    b"Yellow",
+    b"LightYellow",
+    b"White",
+    b"NONE",
+];
+const CTERM_COLORS_16: [i32; 28] = [
+    0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14,
+    14, 15, -1,
+];
+const CTERM_COLORS_88: [i32; 28] = [
+    0, 4, 2, 6, 1, 5, 32, 72, 84, 84, 7, 7, 82, 82, 12, 43, 10, 61, 14, 63, 9, 74, 13,
+    75, 11, 78, 15, -1,
+];
+const CTERM_COLORS_256: [i32; 28] = [
+    0, 4, 2, 6, 1, 5, 130, 3, 248, 248, 7, 7, 242, 242, 12, 81, 10, 121, 14, 159, 9, 224,
+    13, 225, 11, 229, 15, -1,
+];
+const CTERM_COLORS_8: [i32; 28] = [
+    0, 4, 2, 6, 1, 5, 3, 3, 7, 7, 7, 7, 8, 8, 12, 12, 10, 10, 14, 14, 9, 9, 13, 13, 11,
+    11, 15, -1,
+];
+
+/// Resolve one indexed cterm color for the active terminal palette
+/// (`lookup_color`).
+///
+/// # Safety
+/// Reads `GLOBALS.t_colors`.
+fn lookup_color(
+    idx: usize,
+    foreground: bool,
+    bold: &mut crate::types_defs::TriState,
+) -> i32 {
+    let mut color = CTERM_COLORS_16[idx];
+    if color < 0 {
+        return -1;
+    }
+    let t_colors = unsafe { crate::globals::GLOBALS.get_mut() }.t_colors;
+    if t_colors == 8 {
+        color = CTERM_COLORS_8[idx];
+        if foreground {
+            *bold = if color & 8 != 0 {
+                crate::types_defs::TriState::True
+            } else {
+                crate::types_defs::TriState::False
+            };
+        }
+        color &= 7;
+    } else if t_colors == 16 {
+        color = CTERM_COLORS_8[idx];
+    } else if t_colors == 88 {
+        color = CTERM_COLORS_88[idx];
+    } else if t_colors >= 256 {
+        color = CTERM_COLORS_256[idx];
+    }
+    color
+}
+
+/// Translate a named cterm color to its terminal color number
+/// (`name_to_ctermcolor`).
+///
+/// # Safety
+/// Reads `GLOBALS.t_colors`.
+#[must_use]
+pub unsafe fn name_to_ctermcolor(name: &[u8]) -> i32 {
+    let Some(index) = CTERM_COLOR_NAMES
+        .iter()
+        .rposition(|candidate| candidate.eq_ignore_ascii_case(name))
+    else {
+        return -1;
+    };
+    let mut bold = crate::types_defs::TriState::None;
+    lookup_color(index, false, &mut bold)
+}
+
 /// Append a new highlight group and return its 1-based ID, or `0` on
 /// failure (`syn_add_group`).
 ///
@@ -959,6 +1058,23 @@ mod tests {
         }
     }
 
+    struct TerminalColorsGuard(i32);
+
+    impl TerminalColorsGuard {
+        fn set(value: i32) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let old = globals.t_colors;
+            globals.t_colors = value;
+            Self(old)
+        }
+    }
+
+    impl Drop for TerminalColorsGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = self.0;
+        }
+    }
+
     impl Drop for NormalColorsGuard {
         fn drop(&mut self) {
             unsafe {
@@ -1164,6 +1280,42 @@ mod tests {
         assert_eq!(table.items[1].sg_rgb_fg, 0x77_88_99);
         assert!(table.items[0].sg_attr > 0);
         assert!(table.items[1].sg_attr > 0);
+    }
+
+    #[test]
+    fn name_to_ctermcolor_uses_the_active_terminal_palette() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _colors = TerminalColorsGuard::set(256);
+        assert_eq!(unsafe { name_to_ctermcolor(b"Brown") }, 130);
+        assert_eq!(unsafe { name_to_ctermcolor(b"gray") }, 248);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = 88;
+        assert_eq!(unsafe { name_to_ctermcolor(b"Brown") }, 32);
+        assert_eq!(unsafe { name_to_ctermcolor(b"Gray") }, 84);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = 16;
+        assert_eq!(unsafe { name_to_ctermcolor(b"Brown") }, 3);
+        assert_eq!(unsafe { name_to_ctermcolor(b"Gray") }, 7);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = 8;
+        assert_eq!(unsafe { name_to_ctermcolor(b"Brown") }, 3);
+        assert_eq!(unsafe { name_to_ctermcolor(b"Gray") }, 7);
+        assert_eq!(unsafe { name_to_ctermcolor(b"DarkGray") }, 0);
+        assert_eq!(unsafe { name_to_ctermcolor(b"NONE") }, -1);
+        assert_eq!(unsafe { name_to_ctermcolor(b"missing") }, -1);
+    }
+
+    #[test]
+    fn lookup_color_reports_bold_for_light_colors_in_eight_color_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _colors = TerminalColorsGuard::set(8);
+        let mut bold = crate::types_defs::TriState::None;
+        assert_eq!(lookup_color(15, true, &mut bold), 4);
+        assert_eq!(bold, crate::types_defs::TriState::True);
+
+        bold = crate::types_defs::TriState::None;
+        assert_eq!(lookup_color(1, true, &mut bold), 4);
+        assert_eq!(bold, crate::types_defs::TriState::False);
     }
 
     /// IDs are 1-based, so the first group is id 1 and id 0 is "no
