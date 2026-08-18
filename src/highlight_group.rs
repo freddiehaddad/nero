@@ -881,6 +881,46 @@ pub static COLOR_NAME_TABLE: &[(&[u8], crate::highlight_defs::RgbValue)] = &[
     (b"Yellow4", 0x8b8b00),
     (b"YellowGreen", 0x9acd32),
 ];
+
+fn ascii_case_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    left.iter()
+        .map(u8::to_ascii_lowercase)
+        .cmp(right.iter().map(u8::to_ascii_lowercase))
+}
+
+/// Resolve a hexadecimal, special, or named RGB colour
+/// (`name_to_color`).
+///
+/// Returns `(value, color_index)`, replacing the original's
+/// `color_idx` out-parameter.
+///
+/// # Safety
+/// The `fg`/`background` special names read shared Normal-highlight
+/// state.
+#[must_use]
+pub unsafe fn name_to_color(name: &[u8]) -> (crate::highlight_defs::RgbValue, i32) {
+    let name = &name[..name.iter().position(|byte| *byte == 0).unwrap_or(name.len())];
+    if name.len() == 7 && name[0] == b'#' && name[1..].iter().all(u8::is_ascii_hexdigit) {
+        let value = name[1..].iter().fold(0, |value, byte| {
+            value * 16 + crate::charset::hex2nr(i32::from(*byte))
+        });
+        return (value, COLOR_IDX_HEX);
+    }
+    if name.eq_ignore_ascii_case(b"bg") || name.eq_ignore_ascii_case(b"background") {
+        return (unsafe { *crate::highlight::NORMAL_BG.get_mut() }, COLOR_IDX_BG);
+    }
+    if name.eq_ignore_ascii_case(b"fg") || name.eq_ignore_ascii_case(b"foreground") {
+        return (unsafe { *crate::highlight::NORMAL_FG.get_mut() }, COLOR_IDX_FG);
+    }
+
+    match COLOR_NAME_TABLE
+        .binary_search_by(|(color_name, _)| ascii_case_cmp(color_name, name))
+    {
+        Ok(index) => (COLOR_NAME_TABLE[index].1, index as i32),
+        Err(_) => (-1, COLOR_IDX_NONE),
+    }
+}
+
 const CTERM_COLOR_NAMES: [&[u8]; 28] = [
     b"Black",
     b"DarkBlue",
@@ -1710,6 +1750,33 @@ mod tests {
             .all(|pair| pair[0].0.to_ascii_lowercase() < pair[1].0.to_ascii_lowercase()));
         assert!(COLOR_NAME_TABLE.contains(&(b"RebeccaPurple", 0x663399)));
         assert!(COLOR_NAME_TABLE.contains(&(b"X11Gray", 0xbebebe)));
+    }
+
+    #[test]
+    fn name_to_color_resolves_hex_special_and_named_colors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_fg = unsafe { *crate::highlight::NORMAL_FG.get_mut() };
+        let old_bg = unsafe { *crate::highlight::NORMAL_BG.get_mut() };
+        unsafe {
+            *crate::highlight::NORMAL_FG.get_mut() = 0x112233;
+            *crate::highlight::NORMAL_BG.get_mut() = 0x445566;
+        }
+        let hex = unsafe { name_to_color(b"#a1B2c3") };
+        let fg = unsafe { name_to_color(b"foreground") };
+        let bg = unsafe { name_to_color(b"BG") };
+        let named = unsafe { name_to_color(b"rebeccapurple") };
+        let invalid = unsafe { name_to_color(b"not-a-color") };
+        unsafe {
+            *crate::highlight::NORMAL_FG.get_mut() = old_fg;
+            *crate::highlight::NORMAL_BG.get_mut() = old_bg;
+        }
+
+        assert_eq!(hex, (0xa1b2c3, COLOR_IDX_HEX));
+        assert_eq!(fg, (0x112233, COLOR_IDX_FG));
+        assert_eq!(bg, (0x445566, COLOR_IDX_BG));
+        assert_eq!(named.0, 0x663399);
+        assert!(named.1 >= 0);
+        assert_eq!(invalid, (-1, COLOR_IDX_NONE));
     }
 
     /// Installs a table of groups AND the matching uppercase name
