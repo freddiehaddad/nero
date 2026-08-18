@@ -3384,6 +3384,69 @@ pub unsafe fn qf_free_all(wp: Option<*mut WinT>) {
     }
 }
 
+/// Free an entire quickfix/location-list stack (`qf_free_stack`).
+///
+/// When a location-list window remains open, a fresh empty stack is
+/// attached to both that window and its file window. The original's
+/// `qf_update_buffer` call that clears displayed text remains deferred.
+///
+/// # Safety
+/// `wp`, `qi`, global window/buffer chains, and all location-list
+/// references must remain valid. Forwarded from `qf_find_win`,
+/// `qf_free_all`, and `ll_free_all`.
+pub unsafe fn qf_free_stack(
+    mut wp: Option<*mut WinT>,
+    qi: *mut crate::types_defs::QfInfoT,
+) {
+    let qfwin = unsafe { qf_find_win(qi) };
+    if !qfwin.is_null()
+        && unsafe { (*qi).qf_curlist < (*qi).qf_listcount }
+    {
+        let idx = usize::try_from(unsafe { (*qi).qf_curlist })
+            .expect("current quickfix index must be nonnegative");
+        let qfl = unsafe {
+            std::ptr::addr_of_mut!((&mut (*qi).qf_lists)[idx])
+        };
+        qf_free(unsafe { &mut *qfl });
+    }
+    // qf_update_buffer(qi, NULL), when qfwin is non-null, remains display-only.
+
+    if let Some(window) = wp
+        && unsafe { is_ll_window(&*window) }
+    {
+        let file_window = unsafe { qf_find_win_with_loclist(qi) };
+        if !file_window.is_null() {
+            wp = Some(file_window);
+        }
+    }
+
+    unsafe { qf_free_all(wp) };
+    if let Some(window) = wp {
+        if !qfwin.is_null() {
+            let count =
+                i32::try_from(unsafe { (*window).w_onebuf_opt.wo_lhi })
+                    .unwrap_or(0);
+            let mut new_stack =
+                Box::new(qf_alloc_stack(QfltypeT::Location, count));
+            new_stack.qf_bufnr = unsafe { (*(*qfwin).w_buffer).handle };
+            let new_stack = Box::into_raw(new_stack);
+
+            unsafe {
+                ll_free_all(std::ptr::addr_of_mut!((*qfwin).w_llist_ref));
+                (*qfwin).w_llist_ref = new_stack;
+            }
+            if !std::ptr::eq(window, qfwin) {
+                unsafe { win_set_loclist(window, new_stack) };
+            }
+        }
+    } else {
+        unsafe {
+            (*qi).qf_curlist = 0;
+            (*qi).qf_listcount = 0;
+        }
+    }
+}
+
 /// Select the quickfix/location-list stack for an Ex command
 /// (`qf_cmd_get_stack`), or null when a location list is absent.
 ///
@@ -8574,6 +8637,115 @@ mod tests {
         unsafe { qf_free_all(Some(winp)) };
         assert!(unsafe { (*winp).w_llist }.is_null());
         assert!(unsafe { (*winp).w_llist_ref }.is_null());
+    }
+
+    #[test]
+    fn qf_free_stack_resets_global_stack_indices() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _global = QlInfoGuard::save();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut stack = stack_with(2);
+        stack.qf_curlist = 1;
+        stack.qf_maxcount = 2;
+        *unsafe { QL_INFO.get_mut() } = Some(stack);
+        let qi = unsafe { QL_INFO.get_mut() }
+            .as_mut()
+            .map_or(std::ptr::null_mut(), std::ptr::from_mut);
+
+        unsafe { qf_free_stack(None, qi) };
+
+        let stack = unsafe { QL_INFO.get_mut() }.as_ref().unwrap();
+        assert_eq!(stack.qf_curlist, 0);
+        assert_eq!(stack.qf_listcount, 0);
+        assert!(stack.qf_lists.iter().all(|list| list.qf_count() == 0));
+    }
+
+    #[test]
+    fn qf_free_stack_releases_a_closed_window_location_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+        let stack =
+            Box::into_raw(Box::new(qf_alloc_stack(QfltypeT::Location, 2)));
+        let mut win = Box::new(WinT {
+            w_llist: stack,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+
+        unsafe { qf_free_stack(Some(win_ptr), stack) };
+
+        assert!(unsafe { (*win_ptr).w_llist }.is_null());
+    }
+
+    #[test]
+    fn qf_free_stack_rebuilds_an_open_location_list_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut old_stack = qf_alloc_stack(QfltypeT::Location, 2);
+        old_stack.qf_refcount = 2;
+        old_stack.qf_listcount = 1;
+        old_stack.qf_lists[0].qf_entries.push(QflineT::default());
+        let old_stack = Box::into_raw(Box::new(old_stack));
+
+        let mut file_buf = Box::new(crate::buffer_defs::BufT::default());
+        let file_buf_ptr = std::ptr::addr_of_mut!(*file_buf);
+        let mut qf_buf = Box::new(crate::buffer_defs::BufT {
+            handle: 7,
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        });
+        let qf_buf_ptr = std::ptr::addr_of_mut!(*qf_buf);
+        let mut file_win = Box::new(WinT {
+            w_buffer: file_buf_ptr,
+            w_llist: old_stack,
+            ..Default::default()
+        });
+        file_win.w_onebuf_opt.wo_lhi = 3;
+        let file_win_ptr = std::ptr::addr_of_mut!(*file_win);
+        let mut list_win = Box::new(WinT {
+            w_buffer: qf_buf_ptr,
+            w_llist_ref: old_stack,
+            ..Default::default()
+        });
+        let list_win_ptr = std::ptr::addr_of_mut!(*list_win);
+        unsafe { (*file_win_ptr).w_next = list_win_ptr };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                file_win_ptr,
+            )
+        };
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                qf_buf_ptr,
+            )
+        };
+
+        unsafe { qf_free_stack(Some(file_win_ptr), old_stack) };
+
+        let rebuilt = unsafe { (*list_win_ptr).w_llist_ref };
+        assert!(!rebuilt.is_null());
+        assert_ne!(rebuilt, old_stack);
+        assert_eq!(unsafe { (*file_win_ptr).w_llist }, rebuilt);
+        assert_eq!(unsafe { (*rebuilt).qf_refcount }, 2);
+        assert_eq!(unsafe { (*rebuilt).qf_maxcount }, 3);
+        assert_eq!(unsafe { (*rebuilt).qf_bufnr }, 7);
+
+        unsafe {
+            (*rebuilt).qf_bufnr = 0;
+            qf_free_all(Some(file_win_ptr));
+            qf_free_all(Some(list_win_ptr));
+        }
     }
 
     #[test]
