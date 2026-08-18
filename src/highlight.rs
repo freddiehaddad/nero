@@ -694,6 +694,102 @@ pub unsafe fn hl_get_attr_by_id(
     unsafe { hlattrs2dict(syn_attr2entry(attr_id as i32), rgb, false) }
 }
 
+/// Number of provenance entries produced by [`hl_inspect`]
+/// (`hl_inspect_size`).
+fn hl_inspect_size(attr: i32) -> usize {
+    if attr <= 0 {
+        return 0;
+    }
+    let Some(entry) = unsafe { ATTR_ENTRIES.get_mut() }.get_at(attr as usize) else {
+        return 0;
+    };
+    match entry.kind {
+        crate::highlight_defs::HlKind::Combine
+        | crate::highlight_defs::HlKind::Blend
+        | crate::highlight_defs::HlKind::BlendThrough => {
+            hl_inspect_size(entry.id1) + hl_inspect_size(entry.id2)
+        }
+        _ => 1,
+    }
+}
+
+fn hl_inspect_impl(result: &mut crate::api::private::defs::Array, attr: i32) {
+    use crate::api::private::defs::{KeyValuePair, Object};
+
+    if attr <= 0 {
+        return;
+    }
+    let Some(entry) = unsafe { ATTR_ENTRIES.get_mut() }.get_at(attr as usize).copied() else {
+        return;
+    };
+    let mut dict = Vec::new();
+    let mut put = |key: &[u8], value: Object| {
+        dict.push(KeyValuePair {
+            key: key.to_vec(),
+            value,
+        });
+    };
+    match entry.kind {
+        crate::highlight_defs::HlKind::Syntax => {
+            put(b"kind", Object::String(b"syntax".to_vec()));
+            put(
+                b"hi_name",
+                Object::String(unsafe { crate::highlight_group::syn_id2name(entry.id1) }),
+            );
+        }
+        crate::highlight_defs::HlKind::Ui => {
+            put(b"kind", Object::String(b"ui".to_vec()));
+            let name = if entry.id1 == -1 {
+                b"Normal".as_slice()
+            } else {
+                crate::highlight_defs::HLF_NAMES
+                    .get(entry.id1 as usize)
+                    .and_then(|name| *name)
+                    .unwrap_or_default()
+            };
+            put(b"ui_name", Object::String(name.to_vec()));
+            put(
+                b"hi_name",
+                Object::String(unsafe { crate::highlight_group::syn_id2name(entry.id2) }),
+            );
+        }
+        crate::highlight_defs::HlKind::Terminal => {
+            put(b"kind", Object::String(b"term".to_vec()));
+        }
+        crate::highlight_defs::HlKind::Combine
+        | crate::highlight_defs::HlKind::Blend
+        | crate::highlight_defs::HlKind::BlendThrough => {
+            hl_inspect_impl(result, entry.id1);
+            hl_inspect_impl(result, entry.id2);
+            return;
+        }
+        crate::highlight_defs::HlKind::Unknown | crate::highlight_defs::HlKind::Invalid => {
+            return;
+        }
+    }
+    put(b"id", Object::Integer(i64::from(attr)));
+    result.push(Object::Dict(dict));
+}
+
+/// Inspect the semantic provenance of one highlight attribute
+/// (`hl_inspect`).
+///
+/// Combination/blend entries are flattened recursively into their
+/// syntax/UI/terminal leaves. Before semantic highlight state is
+/// enabled, the result is empty.
+///
+/// # Safety
+/// Reads the shared attribute and highlight-group tables.
+#[must_use]
+pub unsafe fn hl_inspect(attr: i32) -> crate::api::private::defs::Array {
+    if !unsafe { *HLSTATE_ACTIVE.get_mut() } {
+        return Vec::new();
+    }
+    let mut result = Vec::with_capacity(hl_inspect_size(attr));
+    hl_inspect_impl(&mut result, attr);
+    result
+}
+
 /// Global highlight namespace (`ns_hl_global`).
 pub static NS_HL_GLOBAL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 /// Highlight namespace for the current window (`ns_hl_win`).
@@ -3441,6 +3537,114 @@ mod tests {
         assert!(matches!(
             api_dict_value(&cterm, b"foreground"),
             Some(crate::api::private::defs::Object::Integer(3))
+        ));
+    }
+
+    #[test]
+    fn hl_inspect_is_empty_before_semantic_highlight_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let attr = unsafe { hl_get_underline() };
+        assert!(unsafe { hl_inspect(attr) }.is_empty());
+    }
+
+    #[test]
+    fn hl_inspect_flattens_combined_syntax_and_terminal_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup {
+                sg_name: b"Comment".to_vec(),
+                sg_name_u: b"COMMENT".to_vec(),
+                ..Default::default()
+            },
+        ]);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let syntax = unsafe {
+            hl_get_syn_attr(
+                0,
+                1,
+                crate::highlight_defs::HlAttrs {
+                    rgb_fg_color: 0x12_34_56,
+                    ..Default::default()
+                },
+            )
+        };
+        let terminal = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                cterm_fg_color: 4,
+                ..Default::default()
+            })
+        };
+        let combined = unsafe { hl_combine_attr(syntax, terminal) };
+
+        let inspect = unsafe { hl_inspect(combined) };
+
+        assert_eq!(inspect.len(), 2);
+        let crate::api::private::defs::Object::Dict(syntax_info) = &inspect[0] else {
+            panic!("syntax provenance dictionary");
+        };
+        assert!(matches!(
+            api_dict_value(syntax_info, b"kind"),
+            Some(crate::api::private::defs::Object::String(kind)) if kind == b"syntax"
+        ));
+        assert!(matches!(
+            api_dict_value(syntax_info, b"hi_name"),
+            Some(crate::api::private::defs::Object::String(name)) if name == b"Comment"
+        ));
+        let crate::api::private::defs::Object::Dict(term_info) = &inspect[1] else {
+            panic!("terminal provenance dictionary");
+        };
+        assert!(matches!(
+            api_dict_value(term_info, b"kind"),
+            Some(crate::api::private::defs::Object::String(kind)) if kind == b"term"
+        ));
+    }
+
+    #[test]
+    fn hl_inspect_reports_ui_names_and_group_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup::default(),
+        ]);
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let group_attr = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_bg_color: 0x65_43_21,
+                ..Default::default()
+            })
+        };
+        {
+            let group = &mut unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0];
+            group.sg_name = b"ErrorMsg".to_vec();
+            group.sg_attr = group_attr;
+        }
+        let ui_attr = unsafe {
+            hl_get_ui_attr(
+                0,
+                crate::highlight_defs::HlfT::E as i32,
+                1,
+                false,
+            )
+        };
+
+        let inspect = unsafe { hl_inspect(ui_attr) };
+        let crate::api::private::defs::Object::Dict(info) = &inspect[0] else {
+            panic!("UI provenance dictionary");
+        };
+        assert!(matches!(
+            api_dict_value(info, b"kind"),
+            Some(crate::api::private::defs::Object::String(kind)) if kind == b"ui"
+        ));
+        assert!(matches!(
+            api_dict_value(info, b"ui_name"),
+            Some(crate::api::private::defs::Object::String(name)) if name == b"ErrorMsg"
+        ));
+        assert!(matches!(
+            api_dict_value(info, b"hi_name"),
+            Some(crate::api::private::defs::Object::String(name)) if name == b"ErrorMsg"
         ));
     }
 
