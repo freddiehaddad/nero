@@ -4,7 +4,8 @@
 //! `rename_buffer`/`do_buffer`, none of which are wired into this API
 //! layer yet).
 //!
-//! Translated: [`nvim_buf_get_lines`], [`nvim_buf_line_count`], [`nvim_buf_get_changedtick`],
+//! Translated: [`nvim_buf_get_lines`], [`nvim_buf_get_text`], [`nvim_buf_line_count`],
+//! [`nvim_buf_get_changedtick`],
 //! [`nvim_buf_get_mark`], [`nvim_buf_get_name`], [`nvim_buf_is_loaded`],
 //! [`nvim_buf_is_valid`] - every one of these is a thin, real
 //! `find_buffer_by_handle` + one-field read, with no other
@@ -81,6 +82,99 @@ pub unsafe fn nvim_buf_get_lines(
         lines.push(line);
     }
     lines
+}
+
+/// Return a byte-column-bounded, row-inclusive text range
+/// (`nvim_buf_get_text`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and the memline API.
+pub unsafe fn nvim_buf_get_text(
+    channel_id: u64,
+    buf: Buffer,
+    start_row: Integer,
+    start_col: Integer,
+    end_row: Integer,
+    end_col: Integer,
+    err: &mut Error,
+) -> StringArray {
+    let b = unsafe { find_buffer_by_handle(buf, err) };
+    if b.is_null() || unsafe { (*b).b_ml.ml_mfp }.is_null() {
+        return Vec::new();
+    }
+
+    let mut oob = false;
+    let start_row = crate::api::private::helpers::normalize_index(
+        unsafe { &*b },
+        start_row,
+        false,
+        &mut oob,
+    );
+    let end_row = crate::api::private::helpers::normalize_index(
+        unsafe { &*b },
+        end_row,
+        false,
+        &mut oob,
+    );
+    if oob {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Index out of bounds".to_string());
+        return Vec::new();
+    }
+    if start_row > end_row {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("'start' is higher than 'end'".to_string());
+        return Vec::new();
+    }
+
+    let replace_nl = channel_id != crate::api::private::defs::VIML_INTERNAL_CALL;
+    let push = |mut line: Vec<u8>| {
+        if replace_nl {
+            for byte in &mut line {
+                if *byte == b'\n' {
+                    *byte = 0;
+                }
+            }
+        }
+        line
+    };
+    if start_row == end_row {
+        let line = unsafe {
+            crate::api::private::helpers::buf_get_text(
+                b, start_row, start_col, end_col, err,
+            )
+        };
+        return if err.is_set() { Vec::new() } else { vec![push(line)] };
+    }
+
+    let mut result = Vec::with_capacity((end_row - start_row + 1) as usize);
+    let first = unsafe {
+        crate::api::private::helpers::buf_get_text(
+            b,
+            start_row,
+            start_col,
+            i64::from(crate::pos_defs::MAXCOL) - 1,
+            err,
+        )
+    };
+    if err.is_set() {
+        return Vec::new();
+    }
+    result.push(push(first));
+    for lnum in start_row + 1..end_row {
+        let line = unsafe { crate::memline::ml_get_buf(&mut *b, lnum as crate::pos_defs::LinenrT) };
+        let len =
+            unsafe { crate::memline::ml_get_buf_len(&mut *b, lnum as crate::pos_defs::LinenrT) }
+                as usize;
+        result.push(push(line[..len].to_vec()));
+    }
+    let last =
+        unsafe { crate::api::private::helpers::buf_get_text(b, end_row, 0, end_col, err) };
+    if err.is_set() {
+        return Vec::new();
+    }
+    result.push(push(last));
+    result
 }
 
 /// Get the number of lines in buffer `buf` (`0` for the current
@@ -373,6 +467,56 @@ mod tests {
             unsafe { nvim_buf_get_lines(0, fx.handle(), 0, -1, true, &mut err) }.is_empty()
         );
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_buf_get_text_returns_partial_first_and_last_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(47);
+        assert_eq!(unsafe { crate::memline::ml_open(fx.buf_mut()) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(fx.buf_mut(), 1, b"alpha\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(fx.buf_mut(), 1, b"beta\0", 5, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(fx.buf_mut(), 2, b"gamma\0", 6, false) },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+
+        let text =
+            unsafe { nvim_buf_get_text(0, fx.handle(), 0, 2, 2, 3, &mut err) };
+
+        assert!(!err.is_set());
+        assert_eq!(
+            text,
+            vec![b"pha".to_vec(), b"beta".to_vec(), b"gam".to_vec()]
+        );
+        unsafe { close_memline(&mut fx) };
+    }
+
+    #[test]
+    fn nvim_buf_get_text_rejects_reversed_columns() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(48);
+        assert_eq!(unsafe { crate::memline::ml_open(fx.buf_mut()) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(fx.buf_mut(), 1, b"alpha\0") },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+        assert!(
+            unsafe { nvim_buf_get_text(0, fx.handle(), 0, 4, 0, 2, &mut err) }.is_empty()
+        );
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("start_col must be less than or equal to end_col")
+        );
+        unsafe { close_memline(&mut fx) };
     }
 
     #[test]

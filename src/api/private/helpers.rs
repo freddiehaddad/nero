@@ -16,6 +16,7 @@
 //! against the current group count.
 //! [`normalize_index`] converts API line indexes to 1-based buffer
 //! line numbers.
+//! [`buf_get_text`] returns a bounded byte range from one buffer line.
 //!
 //! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
 //! generic, variadic/printf-style message formatters; this crate uses
@@ -119,6 +120,47 @@ pub fn normalize_index(buf: &BufT, index: i64, end_exclusive: bool, oob: &mut bo
         index = 0;
     }
     index + 1
+}
+
+/// Return bytes from one buffer line between `start_col` and
+/// `end_col` (`buf_get_text`).
+///
+/// # Safety
+/// `buf` must point to a live, loaded buffer. Forwarded to the memline
+/// accessors.
+pub unsafe fn buf_get_text(
+    buf: *mut BufT,
+    lnum: i64,
+    start_col: i64,
+    end_col: i64,
+    err: &mut Error,
+) -> crate::api::private::defs::NvimString {
+    if lnum >= i64::from(crate::pos_defs::MAXLNUM) {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Invalid line index: out of range".to_string());
+        return Vec::new();
+    }
+    let line = unsafe { crate::memline::ml_get_buf(&mut *buf, lnum as crate::pos_defs::LinenrT) };
+    let line_len =
+        i64::from(unsafe { crate::memline::ml_get_buf_len(&mut *buf, lnum as crate::pos_defs::LinenrT) });
+    let start_col = if start_col < 0 {
+        line_len + start_col + 1
+    } else {
+        start_col
+    }
+    .clamp(0, line_len);
+    let end_col = if end_col < 0 {
+        line_len + end_col + 1
+    } else {
+        end_col
+    }
+    .clamp(0, line_len);
+    if start_col > end_col {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("start_col must be less than or equal to end_col".to_string());
+        return Vec::new();
+    }
+    line[start_col as usize..end_col as usize].to_vec()
 }
 
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
