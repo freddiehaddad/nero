@@ -46,6 +46,26 @@ pub fn nvim__id_float(value: f64) -> f64 {
     value
 }
 
+/// Return the current editor mode and input-blocking state
+/// (`nvim_get_mode`).
+///
+/// # Safety
+/// Forwarded from [`crate::state::get_mode`] and
+/// [`crate::os::input::input_blocking`].
+#[must_use]
+pub unsafe fn nvim_get_mode() -> Dict {
+    vec![
+        crate::api::private::defs::KeyValuePair {
+            key: b"mode".to_vec(),
+            value: Object::String(unsafe { crate::state::get_mode() }),
+        },
+        crate::api::private::defs::KeyValuePair {
+            key: b"blocking".to_vec(),
+            value: Object::Boolean(unsafe { crate::os::input::input_blocking() }),
+        },
+    ]
+}
+
 /// List every current buffer, including unlisted and unloaded buffers
 /// (`nvim_list_bufs`).
 ///
@@ -484,6 +504,33 @@ mod tests {
         assert_eq!(nvim__id_float(3.25), 3.25);
         assert!(nvim__id_float(f64::NAN).is_nan());
         assert_eq!(nvim__id_float(f64::INFINITY), f64::INFINITY);
+    }
+
+    #[test]
+    fn nvim_get_mode_returns_normal_and_unblocked_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf_ptr = Box::into_raw(Box::new(BufT::default()));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr) };
+        let _state = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.State,
+                crate::state_defs::mode::NORMAL as i32,
+            )
+        };
+
+        let mode = unsafe { nvim_get_mode() };
+
+        assert!(mode.iter().any(|pair| {
+            pair.key == b"mode" && matches!(&pair.value, Object::String(value) if value == b"n")
+        }));
+        assert!(mode.iter().any(|pair| {
+            pair.key == b"blocking"
+                && matches!(pair.value, Object::Boolean(false))
+        }));
+        drop(_state);
+        drop(_curbuf);
+        unsafe { drop(Box::from_raw(buf_ptr)) };
     }
 
     struct HighlightNamespaceGuard {
