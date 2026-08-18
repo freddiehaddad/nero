@@ -18,6 +18,7 @@
 //! line numbers.
 //! [`buf_get_text`] returns a bounded byte range from one buffer line.
 //! [`dict_get_value`] bridges a scope dictionary item to an API object.
+//! [`dict_set_var`] performs the matching checked write/delete.
 //!
 //! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
 //! generic, variadic/printf-style message formatters; this crate uses
@@ -184,6 +185,99 @@ pub unsafe fn dict_get_value(
     crate::api::private::converter::vim_to_object(unsafe { &(*item).di_tv })
 }
 
+unsafe fn dict_check_writable(
+    dict: *mut crate::eval::typval_defs::DictT,
+    key: &[u8],
+    delete: bool,
+    err: &mut Error,
+) -> Option<*mut crate::eval::typval_defs::DictitemT> {
+    use crate::eval::typval_defs::{VarLockStatus, dict_item_flags};
+    let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) };
+    if let Some(item) = item {
+        let flags = unsafe { (*item).di_flags };
+        let message = if flags & dict_item_flags::RO != 0 {
+            Some("Key is read-only")
+        } else if flags & dict_item_flags::LOCK != 0 {
+            Some("Key is locked")
+        } else if delete && flags & dict_item_flags::FIX != 0 {
+            Some("Key is fixed")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            err.r#type = ErrorType::Exception;
+            err.msg = Some(format!("{message}: {}", String::from_utf8_lossy(key)));
+        }
+    } else if unsafe { (*dict).dv_lock } != VarLockStatus::Unlocked {
+        err.r#type = ErrorType::Exception;
+        err.msg = Some("Dict is locked".to_string());
+    } else if key.is_empty() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Key name is empty".to_string());
+    } else if key.len() > i32::MAX as usize {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Key name is too long".to_string());
+    }
+    item
+}
+
+/// Set or delete one scope-dictionary value (`dict_set_var`).
+///
+/// When `retval` is true, returns a recursively-converted copy of the
+/// old value.
+///
+/// # Safety
+/// `dict` must point to a live `DictT`; mutates its item/index/
+/// hashtable state and may release nested eval containers.
+pub unsafe fn dict_set_var(
+    dict: *mut crate::eval::typval_defs::DictT,
+    key: &[u8],
+    value: &Object,
+    delete: bool,
+    retval: bool,
+    err: &mut Error,
+) -> Object {
+    let item = unsafe { dict_check_writable(dict, key, delete, err) };
+    if err.is_set() {
+        return Object::Nil;
+    }
+    if delete {
+        let Some(item) = item else {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some(format!("Key not found: {}", String::from_utf8_lossy(key)));
+            return Object::Nil;
+        };
+        let old = if retval {
+            crate::api::private::converter::vim_to_object(unsafe { &(*item).di_tv })
+        } else {
+            Object::Nil
+        };
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        return old;
+    }
+
+    let mut converted =
+        unsafe { crate::api::private::converter::object_to_vim(value, err) };
+    if err.is_set() {
+        return Object::Nil;
+    }
+    if let Some(item) = item {
+        let old = if retval {
+            crate::api::private::converter::vim_to_object(unsafe { &(*item).di_tv })
+        } else {
+            Object::Nil
+        };
+        unsafe { crate::eval::typval::tv_clear_simple(&(*item).di_tv) };
+        unsafe { (*item).di_tv = std::mem::take(&mut converted) };
+        old
+    } else {
+        let item = crate::eval::typval::tv_dict_item_alloc(key);
+        unsafe { (*item).di_tv = std::mem::take(&mut converted) };
+        let _ = unsafe { crate::eval::typval::tv_dict_add(&mut *dict, item) };
+        Object::Nil
+    }
+}
+
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
 ///
 /// String names create the group when it does not exist, matching
@@ -273,6 +367,63 @@ mod tests {
             unsafe { dict_get_value(dict, b"missing", &mut missing) },
             Object::Nil
         ));
+        assert_eq!(missing.msg.as_deref(), Some("Key not found: missing"));
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn dict_set_var_inserts_updates_returns_and_deletes_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let mut err = Error::default();
+        assert!(matches!(
+            unsafe {
+                dict_set_var(dict, b"value", &Object::Integer(3), false, true, &mut err)
+            },
+            Object::Nil
+        ));
+        assert!(matches!(
+            unsafe {
+                dict_set_var(dict, b"value", &Object::Integer(7), false, true, &mut err)
+            },
+            Object::Integer(3)
+        ));
+        assert!(matches!(
+            unsafe {
+                dict_set_var(dict, b"value", &Object::Nil, true, true, &mut err)
+            },
+            Object::Integer(7)
+        ));
+        assert!(unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }.is_none());
+        assert!(!err.is_set());
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn dict_set_var_rejects_readonly_and_missing_deletes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"fixed", 1) },
+            crate::vim_defs::OK
+        );
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"fixed") }
+            .expect("fixed item");
+        unsafe { (*item).di_flags |= crate::eval::typval_defs::dict_item_flags::RO };
+        let mut readonly = Error::default();
+        let _ = unsafe {
+            dict_set_var(
+                dict,
+                b"fixed",
+                &Object::Integer(2),
+                false,
+                false,
+                &mut readonly,
+            )
+        };
+        assert_eq!(readonly.msg.as_deref(), Some("Key is read-only: fixed"));
+        let mut missing = Error::default();
+        let _ = unsafe { dict_set_var(dict, b"missing", &Object::Nil, true, false, &mut missing) };
         assert_eq!(missing.msg.as_deref(), Some("Key not found: missing"));
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
