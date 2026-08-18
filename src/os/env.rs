@@ -464,6 +464,58 @@ pub unsafe fn os_homedir() -> Option<Vec<u8>> {
     unsafe { HOMEDIR.get_mut() }.clone()
 }
 
+/// Replace a leading home-directory prefix with `~`
+/// (`home_replace_save`, single-file form).
+///
+/// # Safety
+/// Reads shared resolved-home state and option-dependent filename
+/// comparison state.
+#[must_use]
+pub unsafe fn home_replace_save(
+    buf: Option<&crate::buffer_defs::BufT>,
+    src: Option<&[u8]>,
+) -> Vec<u8> {
+    let Some(src) = src else {
+        return Vec::new();
+    };
+    if buf.is_some_and(|buf| buf.b_help) {
+        return src[crate::path::path_tail(src)..].to_vec();
+    }
+
+    let resolved_home = unsafe { os_homedir() };
+    let mut env_home = os_getenv(b"HOME");
+    #[cfg(windows)]
+    if env_home.is_none() {
+        env_home = os_getenv(b"USERPROFILE");
+    }
+    if let Some(home) = &mut env_home {
+        crate::path::path_to_slash(home);
+        if home.first() == Some(&b'~') {
+            unimplemented!(
+                "home_replace_save: a HOME value beginning with '~' needs modify_fname(:p)"
+            );
+        }
+    }
+
+    for home in [resolved_home.as_deref(), env_home.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let len = home.len();
+        if len <= src.len()
+            && len > 0
+            && unsafe { crate::path::path_fnamencmp(src, home, len) } == 0
+            && (len == src.len() || crate::path::vim_ispathsep(i32::from(src[len])))
+        {
+            let mut result = Vec::with_capacity(src.len() - len + 1);
+            result.push(b'~');
+            result.extend_from_slice(&src[len..]);
+            return result;
+        }
+    }
+    src.to_vec()
+}
+
 /// Queries the OS for the current user's home directory
 /// (`os_uv_homedir`, `static` in the original).
 ///
@@ -1004,6 +1056,34 @@ pub(crate) mod tests {
             init_homedir();
             assert_eq!(os_homedir(), Some(b"C:/some/home".to_vec()));
         }
+
+    }
+
+    #[test]
+    fn home_replace_save_replaces_only_complete_home_prefixes() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/nero"))]);
+        let old_home = unsafe { os_homedir() };
+        unsafe { *HOMEDIR.get_mut() = Some(b"/home/nero".to_vec()) };
+        let replaced =
+            unsafe { home_replace_save(None, Some(b"/home/nero/project/file")) };
+        let boundary = unsafe { home_replace_save(None, Some(b"/home/nerox/file")) };
+        unsafe { *HOMEDIR.get_mut() = old_home };
+        assert_eq!(replaced, b"~/project/file");
+        assert_eq!(boundary, b"/home/nerox/file");
+    }
+
+    #[test]
+    fn home_replace_save_uses_only_the_tail_for_help_buffers() {
+        let buf = crate::buffer_defs::BufT {
+            b_help: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { home_replace_save(Some(&buf), Some(b"/runtime/doc/help.txt")) },
+            b"help.txt"
+        );
+        assert!(unsafe { home_replace_save(None, None) }.is_empty());
     }
 
     #[test]
