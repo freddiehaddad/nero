@@ -7985,6 +7985,24 @@ pub fn did_set_updatecount(
     None
 }
 
+/// Process an updated `'equalalways'` value (`did_set_equalalways`).
+///
+/// Only enabling it from a previously-disabled state requires
+/// equalizing the live window layout via `win_equal`.
+pub fn did_set_equalalways(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let old_value = matches!(
+        args.os_oldval,
+        crate::option_defs::OptVal::Boolean(crate::types_defs::TriState::True)
+    );
+    let enabled = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ea } != 0;
+    if enabled && !old_value {
+        unimplemented!("did_set_equalalways: enabling needs win_equal");
+    }
+    None
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///
@@ -8816,6 +8834,23 @@ mod did_set_title_tests {
         }
     }
 
+    struct EqualalwaysGuard(i32);
+
+    impl EqualalwaysGuard {
+        fn set(value: i32) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_ea };
+            unsafe { (*options).p_ea = value };
+            EqualalwaysGuard(previous)
+        }
+    }
+
+    impl Drop for EqualalwaysGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_ea = self.0 };
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9559,6 +9594,40 @@ mod did_set_title_tests {
             ..Default::default()
         };
         did_set_updatecount(&mut args);
+    }
+
+    #[test]
+    fn did_set_equalalways_needs_no_layout_work_when_disabled_or_already_enabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut args = crate::option_defs::OptsetT {
+            os_oldval: crate::option_defs::OptVal::Boolean(
+                crate::types_defs::TriState::False,
+            ),
+            ..Default::default()
+        };
+        {
+            let _equalalways = EqualalwaysGuard::set(0);
+            assert_eq!(did_set_equalalways(&mut args), None);
+        }
+
+        let _equalalways = EqualalwaysGuard::set(1);
+        args.os_oldval =
+            crate::option_defs::OptVal::Boolean(crate::types_defs::TriState::True);
+        assert_eq!(did_set_equalalways(&mut args), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "win_equal")]
+    fn did_set_equalalways_enabling_needs_window_equalization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _equalalways = EqualalwaysGuard::set(1);
+        let mut args = crate::option_defs::OptsetT {
+            os_oldval: crate::option_defs::OptVal::Boolean(
+                crate::types_defs::TriState::False,
+            ),
+            ..Default::default()
+        };
+        did_set_equalalways(&mut args);
     }
 
     #[test]
