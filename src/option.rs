@@ -4174,6 +4174,48 @@ pub unsafe fn get_option_default(opt_idx: OptIndex, opt_flags: u32) -> OptVal {
     option.def_val.clone()
 }
 
+/// Set one option to its default without ordinary side effects
+/// (`set_option_default`).
+///
+/// # Safety
+/// Forwarded from [`get_option_default`], [`set_option_direct`],
+/// [`insecure_flag`] and [`crate::window::win_comp_scroll`].
+pub unsafe fn set_option_default(opt_idx: OptIndex, opt_flags: u32) {
+    let both = opt_flags
+        & (crate::option_defs::opt_set_flags::OPT_LOCAL
+            | crate::option_defs::opt_set_flags::OPT_GLOBAL)
+        == 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let default = unsafe { get_option_default(opt_idx, opt_flags) };
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: process-lifetime global state.
+    let sid = unsafe { (*globals).current_sctx.sc_sid };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_option_direct(opt_idx, default, opt_flags, sid) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { (*globals).curwin };
+    if opt_idx == OptIndex::Scroll {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::window::win_comp_scroll(curwin) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let flags = unsafe { insecure_flag(curwin, opt_idx, opt_flags) };
+    unsafe { *flags &= !crate::option_defs::opt_flags::INSECURE };
+    if both {
+        // SAFETY: forwarded from this function's own safety doc.
+        let local = unsafe {
+            insecure_flag(
+                curwin,
+                opt_idx,
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+            )
+        };
+        unsafe { *local &= !crate::option_defs::opt_flags::INSECURE };
+    }
+}
+
 #[cfg(test)]
 mod option_default_tests {
     use super::*;
@@ -4214,6 +4256,46 @@ mod option_default_tests {
             unsafe { option_expand(OptIndex::Cdpath, Some(&oversized)) },
             None
         );
+    }
+
+    #[test]
+    fn set_option_default_restores_value_and_clears_insecure_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let previous_value = unsafe { (*options).p_ari };
+        unsafe { (*options).p_ari = 1 };
+        let flags = unsafe { insecure_flag(win_ptr, OptIndex::Allowrevins, 0) };
+        let previous_flags = unsafe { *flags };
+        unsafe { *flags |= crate::option_defs::opt_flags::INSECURE };
+        let previous_ctx =
+            unsafe { OPTION_SCRIPT_CTX.get_mut() }[OptIndex::Allowrevins as usize];
+
+        unsafe { set_option_default(OptIndex::Allowrevins, 0) };
+
+        assert_eq!(unsafe { (*options).p_ari }, 0);
+        assert_eq!(
+            unsafe { *flags } & crate::option_defs::opt_flags::INSECURE,
+            0
+        );
+        unsafe {
+            (*options).p_ari = previous_value;
+            *flags = previous_flags;
+            OPTION_SCRIPT_CTX.get_mut()[OptIndex::Allowrevins as usize] =
+                previous_ctx;
+        }
     }
 }
 
