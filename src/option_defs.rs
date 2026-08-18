@@ -8356,6 +8356,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::option::did_set_equalalways);
     options[OptIndex::Helplang as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_helplang);
+    options[OptIndex::Guicursor as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_guicursor);
     options[OptIndex::Helpheight as usize].opt_did_set_cb =
         Some(crate::option::did_set_helpheight);
     options[OptIndex::Messagesopt as usize].opt_did_set_cb =
@@ -8708,6 +8710,7 @@ mod options_table_tests {
             b"diff",
             b"equalalways",
             b"helplang",
+            b"guicursor",
             b"helpheight",
             b"messagesopt",
             b"packpath",

@@ -724,6 +724,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn did_set_guicursor_updates_the_shape_table_through_the_parser() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShapeParseGuard::set(b"v:block-blinkon0");
+        assert_eq!(
+            crate::optionstr::did_set_guicursor(&mut Default::default()),
+            None
+        );
+        assert!(cursor_is_block_during_visual(false));
+    }
+
+    #[test]
+    fn did_set_guicursor_propagates_parser_errors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShapeParseGuard::set(b"nblock");
+        assert_eq!(
+            crate::optionstr::did_set_guicursor(&mut Default::default()),
+            Some(E_MISSING_COLON)
+        );
+    }
+
+    #[test]
     fn cursor_is_block_during_visual_is_false_by_default() {
         let _lock = crate::globals::global_state_test_lock();
         // Real static initializer: blinkon == 400 for both V and VE, so

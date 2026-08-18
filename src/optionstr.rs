@@ -2358,6 +2358,16 @@ pub unsafe fn did_set_formatoptions(args: &mut crate::option_defs::OptsetT) -> O
     did_set_option_listflag(val, crate::option_vars::FO_ALL.as_bytes())
 }
 
+/// The `'guicursor'` option is changed (`did_set_guicursor`).
+///
+/// Visual-mode line redraw scheduling is omitted; parsing and shape
+/// table updates are handled by the real cursor-shape parser.
+pub fn did_set_guicursor(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    crate::cursor_shape::parse_shape_opt(crate::cursor_shape::SHAPE_CURSOR)
+}
+
 /// The `'commentstring'` option is changed (`did_set_commentstring`).
 ///
 /// The value must be empty, or contain a literal `%s` placeholder
