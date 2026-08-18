@@ -18,10 +18,9 @@
 //! consumer (`mark_forget_file`) rather than waiting for the rest of
 //! this file - see that module's own doc comment.
 //!
-//! Also translated: [`set_ref_in_tagfunc`]/[`free_tagfunc_option`] -
-//! mark or release the global `'tagfunc'` callback (`TFU_CB`).
-//! `TFU_CB` stays `Callback::None` forever today (see its own doc
-//! comment) - matches every real, unconfigured session.
+//! Also translated: [`did_set_tagfunc`]/[`set_buflocal_tfu_callback`]/
+//! [`set_ref_in_tagfunc`]/[`free_tagfunc_option`] - parse, copy, mark,
+//! or release global and buffer-local `'tagfunc'` callbacks.
 //!
 //! Also translated: the tag-stack WRITE side - [`set_tagstack`] (the
 //! `settagstack()` builtin's real dispatcher) plus its own private
@@ -252,11 +251,66 @@ pub fn tag_strnicmp(s1: &[u8], s2: &[u8], len: usize) -> i32 {
 }
 
 /// The `'tagfunc'` callback (`tfu_cb`, a file-static `Callback`).
-/// Nothing in this crate can currently set a real value here - see
-/// `ops.rs`'s `OPFUNC_CB` for the identical reasoning (needs
-/// `option_set_callback_func`, not translated).
 static TFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Process the `'tagfunc'` option (`did_set_tagfunc`).
+///
+/// # Safety
+/// `args.os_buf` must point to a live buffer. Touches global/local
+/// callback and function-reference state.
+pub unsafe fn did_set_tagfunc(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf.cast::<crate::buffer_defs::BufT>();
+    assert!(!buf.is_null(), "did_set_tagfunc: missing buffer");
+    let flags = args.os_flags as u32;
+    let retval = if flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        let value = unsafe { (*buf).b_p_tfu.clone() };
+        crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { &mut (*buf).b_tfu_cb },
+        )
+    } else {
+        let value =
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tfu.clone();
+        let retval = crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { TFU_CB.get_mut() },
+        );
+        if retval == crate::vim_defs::OK
+            && flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0
+        {
+            unsafe { set_buflocal_tfu_callback(buf) };
+        }
+        retval
+    };
+    if retval == crate::vim_defs::FAIL {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
+
+/// Copy the global `'tagfunc'` callback to a buffer-local cache
+/// (`set_buflocal_tfu_callback`).
+///
+/// # Safety
+/// `buf` and all callback referents must remain valid.
+pub unsafe fn set_buflocal_tfu_callback(
+    buf: *mut crate::buffer_defs::BufT,
+) {
+    crate::eval::typval::callback_free(unsafe { &mut (*buf).b_tfu_cb });
+    let global = unsafe { &*TFU_CB.as_ptr() };
+    if global.kind() != crate::eval::typval_defs::CallbackType::None {
+        unsafe {
+            crate::eval::typval::callback_copy(
+                &mut (*buf).b_tfu_cb,
+                global,
+            )
+        };
+    }
+}
 
 /// Release the global `'tagfunc'` callback (`free_tagfunc_option`).
 ///
@@ -264,7 +318,7 @@ static TFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
 /// Must not run concurrently with another access to `TFU_CB`.
 pub unsafe fn free_tagfunc_option() {
     // SAFETY: forwarded from this function's own safety doc.
-    crate::eval::typval::callback_free(unsafe { &mut *TFU_CB.as_ptr() });
+    crate::eval::typval::callback_free(unsafe { TFU_CB.get_mut() });
 }
 
 /// Mark the global `'tagfunc'` callback with `copy_id` so that it is
@@ -517,6 +571,7 @@ mod tests {
     struct TfuGuard {
         saved: Option<crate::eval::typval_defs::Callback>,
     }
+    struct TfuOptionGuard(Option<Vec<u8>>);
 
     impl TfuGuard {
         fn install(value: crate::eval::typval_defs::Callback) -> Self {
@@ -530,6 +585,23 @@ mod tests {
             let slot = unsafe { &mut *TFU_CB.as_ptr() };
             crate::eval::typval::callback_free(slot);
             *slot = self.saved.take().expect("saved callback");
+        }
+    }
+
+    impl TfuOptionGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self(std::mem::replace(
+                &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                    .p_tfu,
+                value.map(<[u8]>::to_vec),
+            ))
+        }
+    }
+
+    impl Drop for TfuOptionGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tfu =
+                self.0.take();
         }
     }
 
@@ -833,24 +905,113 @@ mod tests {
     }
 
     #[test]
-    fn set_ref_in_tagfunc_is_always_false_since_tfu_cb_stays_none() {
+    fn did_set_tagfunc_plain_set_updates_global_and_buffer_callbacks() {
         let _lock = crate::globals::global_state_test_lock();
-        // Nothing in this crate can populate TFU_CB with a real
-        // callback yet (needs option_set_callback_func) - it always
-        // stays Callback::None, matching a real, unconfigured session.
+        let _callback =
+            TfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = TfuOptionGuard::install(Some(b"GlobalTag"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_tagfunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { TFU_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalTag"
+        ));
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_tfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalTag"
+        ));
         assert!(!unsafe { set_ref_in_tagfunc(1) });
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_tfu_cb
+        });
     }
 
     #[test]
-    fn free_tagfunc_option_releases_and_clears_the_callback() {
+    fn did_set_tagfunc_local_set_updates_only_buffer_callback() {
         let _lock = crate::globals::global_state_test_lock();
-        let _guard = TfuGuard::install(crate::eval::typval_defs::Callback::Funcref(
-            b"TagResolver".to_vec(),
+        let _callback =
+            TfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = TfuOptionGuard::install(Some(b"GlobalTag"));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_tfu: Some(b"LocalTag".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_tagfunc(&mut args) }, None);
+        assert_eq!(
+            unsafe { TFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_tfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"LocalTag"
         ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_tfu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_tagfunc_global_only_preserves_buffer_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback =
+            TfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = TfuOptionGuard::install(Some(b"NewGlobalTag"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalTag"),
+            unsafe { &mut (*buf_ptr).b_tfu_cb },
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_tagfunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_tfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldLocalTag"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_tfu_cb
+        });
+    }
+
+    #[test]
+    fn free_tagfunc_option_releases_and_clears_configured_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback =
+            TfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = TfuOptionGuard::install(Some(b"TagResolver"));
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: std::ptr::from_mut(&mut buf).cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+        unsafe { did_set_tagfunc(&mut args) };
         unsafe { free_tagfunc_option() };
         assert_eq!(
-            unsafe { &*TFU_CB.as_ptr() },
-            &crate::eval::typval_defs::Callback::None
+            unsafe { TFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
         );
     }
 
