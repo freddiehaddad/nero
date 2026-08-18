@@ -1204,6 +1204,34 @@ pub fn expand_set_diffopt(
     expand_set_opt_string(args, crate::option_vars::OPT_DIP_VALUES)
 }
 
+/// Expand `'winhighlight'` highlight-group names
+/// (`expand_set_winhighlight`).
+///
+/// Regex filtering remains deferred with the regexp engine.
+pub fn expand_set_winhighlight(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!("expand_set_winhighlight: regex filtering needs the regexp engine");
+    }
+
+    let mut matches = Vec::new();
+    if args.oe_include_orig_val
+        && let Some(value) = args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
+    {
+        matches.push(value.to_vec());
+    }
+
+    let mut idx = 0;
+    while let Some(name) = unsafe { crate::highlight_group::get_highlight_name(idx) } {
+        if !name.is_empty() {
+            matches.push(name);
+        }
+        idx += 1;
+    }
+    (!matches.is_empty()).then_some(matches)
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5682,6 +5710,95 @@ mod tests {
         let (mut xp, mut args) = diffopt_expand_args(b"context:", b"");
         args.oe_xp = std::ptr::from_mut(&mut xp);
         assert_eq!(expand_set_diffopt(&mut args), None);
+    }
+
+    struct HighlightCompletionGuard {
+        items: Vec<crate::highlight_group::HlGroup>,
+        include_none: i32,
+        include_default: i32,
+        include_link: i32,
+    }
+
+    impl HighlightCompletionGuard {
+        fn set(names: &[&[u8]], include_keywords: bool) -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            let items = std::mem::take(&mut table.items);
+            table.items = names
+                .iter()
+                .map(|name| crate::highlight_group::HlGroup {
+                    sg_name: name.to_vec(),
+                    ..Default::default()
+                })
+                .collect();
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = Self {
+                items,
+                include_none: g.include_none,
+                include_default: g.include_default,
+                include_link: g.include_link,
+            };
+            let include = i32::from(include_keywords);
+            g.include_none = include;
+            g.include_default = include;
+            g.include_link = include;
+            guard
+        }
+    }
+
+    impl Drop for HighlightCompletionGuard {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.items);
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.include_none = self.include_none;
+            g.include_default = self.include_default;
+            g.include_link = self.include_link;
+        }
+    }
+
+    #[test]
+    fn expand_set_winhighlight_returns_groups_and_completion_keywords() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = HighlightCompletionGuard::set(&[b"Normal", b"NormalNC"], true);
+        let mut args = crate::option_defs::OptexpandT::default();
+        assert_eq!(
+            expand_set_winhighlight(&mut args),
+            Some(vec![
+                b"Normal".to_vec(),
+                b"NormalNC".to_vec(),
+                b"none".to_vec(),
+                b"default".to_vec(),
+                b"link".to_vec(),
+                b"clear".to_vec(),
+            ])
+        );
+    }
+
+    #[test]
+    fn expand_set_winhighlight_skips_cleared_groups_and_includes_the_original() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = HighlightCompletionGuard::set(&[b"Old", b"Current"], false);
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0].sg_cleared = true;
+        let mut args = crate::option_defs::OptexpandT {
+            oe_opt_value: Some(b"Normal:Current".to_vec()),
+            oe_include_orig_val: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_set_winhighlight(&mut args),
+            Some(vec![b"Normal:Current".to_vec(), b"Current".to_vec()])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "regexp engine")]
+    fn expand_set_winhighlight_filtered_completion_needs_the_regexp_engine() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_regmatch: std::ptr::NonNull::dangling().as_ptr(),
+            ..Default::default()
+        };
+        let _ = expand_set_winhighlight(&mut args);
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);

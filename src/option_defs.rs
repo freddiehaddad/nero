@@ -8430,6 +8430,8 @@ fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::expand_set_shortmess);
     options[OptIndex::Whichwrap as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_whichwrap);
+    options[OptIndex::Winhighlight as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_winhighlight);
     options[OptIndex::Fileformats as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_str_generic);
     options[OptIndex::Formatoptions as usize].opt_expand_cb =
@@ -8801,6 +8803,7 @@ mod options_table_tests {
             b"shortmess",
             b"viewoptions",
             b"whichwrap",
+            b"winhighlight",
         ];
         for name in expanded {
             assert!(opts
