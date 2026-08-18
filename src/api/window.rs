@@ -89,6 +89,23 @@ pub unsafe fn nvim_win_get_width(win: Window, err: &mut Error) -> Integer {
     unsafe { i64::from((*w).w_width) }
 }
 
+/// Get the window's zero-based `(row, col)` screen position
+/// (`nvim_win_get_position`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`].
+#[must_use]
+pub unsafe fn nvim_win_get_position(win: Window, err: &mut Error) -> Array {
+    let window = unsafe { find_window_by_handle(win, err) };
+    if window.is_null() {
+        return Vec::new();
+    }
+    vec![
+        Object::Integer(i64::from(unsafe { (*window).w_winrow })),
+        Object::Integer(i64::from(unsafe { (*window).w_wincol })),
+    ]
+}
+
 /// Get the 1-based, current-tabpage-relative window number of window
 /// `win` (`0` for the current window), or `0` on failure/if `win` is
 /// not counted per [`crate::window::win_has_winnr`]
@@ -344,6 +361,32 @@ mod tests {
         assert_eq!(height, 24);
         assert_eq!(width, 80);
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_win_get_position_returns_zero_based_screen_coordinates() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(15);
+        unsafe {
+            (*fx.win).w_winrow = 4;
+            (*fx.win).w_wincol = 12;
+        }
+        let mut err = Error::default();
+
+        let position =
+            unsafe { nvim_win_get_position((*fx.win).handle, &mut err) };
+
+        assert!(!err.is_set());
+        assert!(matches!(position.as_slice(), [Object::Integer(4), Object::Integer(12)]));
+    }
+
+    #[test]
+    fn nvim_win_get_position_returns_empty_for_an_unknown_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = WinFixture::new(16);
+        let mut err = Error::default();
+        assert!(unsafe { nvim_win_get_position(99, &mut err) }.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
     }
 
     #[test]
