@@ -14,6 +14,8 @@
 //! Also [`object_to_hl_id`] - String names resolve through the real
 //! highlight-group registry, while Integer IDs are range-checked
 //! against the current group count.
+//! [`normalize_index`] converts API line indexes to 1-based buffer
+//! line numbers.
 //!
 //! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
 //! generic, variadic/printf-style message formatters; this crate uses
@@ -95,6 +97,30 @@ pub unsafe fn find_tab_by_handle(tabpage: Tabpage, err: &mut Error) -> *mut Tabp
     rv
 }
 
+/// Normalize a 0-based API line index to a 1-based buffer line number
+/// (`normalize_index`).
+///
+/// Negative indexes count from the end. Out-of-range indexes are
+/// clamped and set `oob`.
+#[must_use]
+pub fn normalize_index(buf: &BufT, index: i64, end_exclusive: bool, oob: &mut bool) -> i64 {
+    assert!(buf.b_ml.ml_line_count > 0);
+    let max_index = i64::from(buf.b_ml.ml_line_count) + i64::from(end_exclusive) - 1;
+    let mut index = if index < 0 {
+        max_index + index + 1
+    } else {
+        index
+    };
+    if index > max_index {
+        *oob = true;
+        index = max_index;
+    } else if index < 0 {
+        *oob = true;
+        index = 0;
+    }
+    index + 1
+}
+
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
 ///
 /// String names create the group when it does not exist, matching
@@ -132,6 +158,38 @@ pub unsafe fn object_to_hl_id(obj: &Object, what: &str, err: &mut Error) -> i32 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_index_converts_positive_and_negative_indexes() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 5;
+        let mut oob = false;
+        assert_eq!(normalize_index(&buf, 0, true, &mut oob), 1);
+        assert_eq!(normalize_index(&buf, -1, true, &mut oob), 6);
+        assert_eq!(normalize_index(&buf, -2, true, &mut oob), 5);
+        assert!(!oob);
+    }
+
+    #[test]
+    fn normalize_index_clamps_and_reports_out_of_bounds_indexes() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 5;
+        let mut low_oob = false;
+        let mut high_oob = false;
+        assert_eq!(normalize_index(&buf, -99, false, &mut low_oob), 1);
+        assert_eq!(normalize_index(&buf, 99, false, &mut high_oob), 5);
+        assert!(low_oob);
+        assert!(high_oob);
+    }
+
+    #[test]
+    fn normalize_index_end_exclusive_allows_the_index_after_the_last_line() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let mut oob = false;
+        assert_eq!(normalize_index(&buf, 3, true, &mut oob), 4);
+        assert!(!oob);
+    }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
         WinT {
