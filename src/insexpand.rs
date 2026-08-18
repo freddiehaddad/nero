@@ -2216,13 +2216,39 @@ pub unsafe fn did_set_thesaurusfunc(
 }
 
 /// Free an array of `'complete'` callbacks (`clear_cpt_callbacks`).
-#[allow(dead_code)]
 fn clear_cpt_callbacks(callbacks: &mut Vec<crate::eval::typval_defs::Callback>) {
     for callback in callbacks.iter_mut() {
         crate::eval::typval::callback_free(callback);
     }
     callbacks.clear();
     callbacks.shrink_to_fit();
+}
+
+/// Copy an array of completion callbacks with reference increments
+/// (`copy_cpt_callbacks`).
+///
+/// An empty source deliberately leaves the destination untouched,
+/// matching the original's early return.
+///
+/// # Safety
+/// Every callback referent in `src` must remain valid.
+#[allow(dead_code)]
+unsafe fn copy_cpt_callbacks(
+    dest: &mut Vec<crate::eval::typval_defs::Callback>,
+    src: &[crate::eval::typval_defs::Callback],
+) {
+    if src.is_empty() {
+        return;
+    }
+    clear_cpt_callbacks(dest);
+    dest.reserve(src.len());
+    for callback in src {
+        let mut copied = crate::eval::typval_defs::Callback::None;
+        if callback.kind() != crate::eval::typval_defs::CallbackType::None {
+            unsafe { crate::eval::typval::callback_copy(&mut copied, callback) };
+        }
+        dest.push(copied);
+    }
 }
 
 /// Mark `copy_id` on every callback in `callbacks` so none of them are
@@ -4985,5 +5011,47 @@ mod tests {
         assert!(callbacks.is_empty());
         assert_eq!(unsafe { (*partial).pt_refcount }, 1);
         unsafe { crate::eval::typval::partial_unref(partial) };
+    }
+
+    #[test]
+    fn copy_cpt_callbacks_empty_source_leaves_destination_untouched() {
+        let mut dest = vec![crate::eval::typval_defs::Callback::None];
+        unsafe { copy_cpt_callbacks(&mut dest, &[]) };
+        assert_eq!(dest.len(), 1);
+        assert_eq!(
+            dest[0].kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+    }
+
+    #[test]
+    fn copy_cpt_callbacks_releases_old_and_refs_new_callbacks() {
+        let old_partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let new_partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut dest = vec![
+            crate::eval::typval_defs::Callback::Partial(old_partial),
+        ];
+        let mut src = vec![
+            crate::eval::typval_defs::Callback::Partial(new_partial),
+            crate::eval::typval_defs::Callback::None,
+        ];
+
+        unsafe { copy_cpt_callbacks(&mut dest, &src) };
+
+        assert_eq!(dest.len(), 2);
+        assert_eq!(unsafe { (*new_partial).pt_refcount }, 2);
+        clear_cpt_callbacks(&mut dest);
+        assert_eq!(unsafe { (*new_partial).pt_refcount }, 1);
+        clear_cpt_callbacks(&mut src);
     }
 }
