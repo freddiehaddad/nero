@@ -287,13 +287,41 @@ pub unsafe fn nvim_list_tabpages() -> Array {
 /// Reads the shared global-variable dictionary and recursively
 /// converts the selected value.
 pub unsafe fn nvim_get_var(name: &NvimString, err: &mut Error) -> Object {
+    let dict = crate::eval::vars::get_globvar_dict();
+    if unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), name) }.is_none() {
+        let found = crate::runtime::script_autoload(name, false)
+            && !crate::ex_eval::aborting();
+        if !found {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some(format!("Key not found: {}", String::from_utf8_lossy(name)));
+            return Object::Nil;
+        }
+    }
     unsafe {
         crate::api::private::helpers::dict_get_value(
-            crate::eval::vars::get_globvar_dict(),
+            dict,
             name,
             err,
         )
     }
+}
+
+/// Set a global variable (`nvim_set_var`).
+///
+/// # Safety
+/// Mutates the shared global-variable dictionary and may allocate
+/// nested eval containers.
+pub unsafe fn nvim_set_var(name: &NvimString, value: &Object, err: &mut Error) {
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            crate::eval::vars::get_globvar_dict(),
+            name,
+            value,
+            false,
+            false,
+            err,
+        )
+    };
 }
 
 /// Get the current window's handle (`nvim_get_current_win`).
@@ -592,6 +620,22 @@ mod tests {
             .expect("global variable");
         unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
         assert!(matches!(value, Object::Integer(42)));
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_set_var_inserts_and_updates_a_global_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let key = b"nero_api_set_global";
+        let mut err = Error::default();
+        unsafe { nvim_set_var(&key.to_vec(), &Object::Integer(3), &mut err) };
+        unsafe { nvim_set_var(&key.to_vec(), &Object::Integer(7), &mut err) };
+        let dict = crate::eval::vars::get_globvar_dict();
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) }
+            .expect("global variable");
+        let stored = unsafe { (*item).di_tv.clone() };
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
+        assert!(matches!(stored.value, crate::eval::typval_defs::TypvalValue::Number(7)));
         assert!(!err.is_set());
     }
 
