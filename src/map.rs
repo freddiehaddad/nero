@@ -333,6 +333,13 @@ impl<K: Hash + Eq + Clone, V> Map<K, V> {
         self.set.get_index(key).map(|i| &self.values[i])
     }
 
+    /// Mutable `map_get(T, U)` access for callers updating an existing
+    /// parallel value in place.
+    #[inline]
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.set.get_index(key).map(|i| &mut self.values[i])
+    }
+
     #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.set.contains(key)

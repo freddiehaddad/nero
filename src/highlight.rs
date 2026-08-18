@@ -800,6 +800,132 @@ pub unsafe fn update_ns_hl(ns_id: i32) {
     unsafe { (*provider).hl_cached = true };
 }
 
+/// Get one builtin highlight attribute in a window's drawing context
+/// (`win_hl_attr`).
+///
+/// # Safety
+/// `wp` must point at a live window. Its namespace-attribute pointer,
+/// when non-null, must still name a live cached array.
+#[must_use]
+pub unsafe fn win_hl_attr(wp: *const crate::buffer_defs::WinT, hlf: i32) -> i32 {
+    let local = unsafe { (*wp).w_ns_hl_attr };
+    if !local.is_null() && unsafe { *NS_HL_FAST.get_mut() } < 0 {
+        unsafe { *local.add(hlf as usize) }
+    } else {
+        unsafe { HL_ATTR_ACTIVE.get_mut()[hlf as usize] }
+    }
+}
+
+/// Refresh all window-local highlight attributes (`update_window_hl`).
+///
+/// This selects the namespace cache, computes Normal/NormalNC,
+/// applies `'winblend'` to floating windows and borders, detects
+/// shadows, and updates grid blending.
+///
+/// # Safety
+/// `wp` must point at a live window. Reads and mutates shared
+/// highlight, namespace/provider, option, popup-menu, and global state.
+pub unsafe fn update_window_hl(wp: *mut crate::buffer_defs::WinT, invalid: bool) {
+    let ns_id = unsafe { (*wp).w_ns_hl };
+    unsafe { update_ns_hl(ns_id) };
+    if ns_id != unsafe { (*wp).w_ns_hl_active }
+        || unsafe { (*wp).w_ns_hl_attr }.is_null()
+    {
+        unsafe { (*wp).w_ns_hl_active = ns_id };
+        let attrs = if let Some(attrs) = unsafe { NS_HL_ATTR.get_mut() }.get_mut(&ns_id) {
+            attrs.as_mut_ptr()
+        } else {
+            HIGHLIGHT_ATTR.as_ptr().cast::<i32>()
+        };
+        unsafe { (*wp).w_ns_hl_attr = attrs };
+    }
+
+    if unsafe { (*wp).w_hl_needs_update == 0 } && !invalid {
+        return;
+    }
+    unsafe { (*wp).w_hl_needs_update = 0 };
+
+    let hl_def = unsafe { (*wp).w_ns_hl_attr };
+    let float_win = unsafe { (*wp).w_floating && !(*wp).w_config.external };
+    unsafe {
+        if float_win
+            && *hl_def.add(crate::highlight_defs::HlfT::Nfloat as usize) != 0
+            && ns_id > 0
+        {
+            (*wp).w_hl_attr_normal =
+                *hl_def.add(crate::highlight_defs::HlfT::Nfloat as usize);
+        } else if *hl_def.add(crate::highlight_defs::HlfT::None as usize) > 0 {
+            (*wp).w_hl_attr_normal =
+                *hl_def.add(crate::highlight_defs::HlfT::None as usize);
+        } else if float_win {
+            let active = HL_ATTR_ACTIVE.get_mut()
+                [crate::highlight_defs::HlfT::Nfloat as usize];
+            (*wp).w_hl_attr_normal = if active > 0 {
+                active
+            } else {
+                HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::Nfloat as usize]
+            };
+        } else {
+            (*wp).w_hl_attr_normal = 0;
+        }
+    }
+
+    if unsafe { (*wp).w_floating } {
+        let winblend = unsafe { (*wp).w_onebuf_opt.wo_winbl as i32 };
+        unsafe {
+            (*wp).w_hl_attr_normal =
+                hl_apply_winblend(winblend, (*wp).w_hl_attr_normal)
+        };
+    }
+
+    unsafe { (*wp).w_config.shadow = false };
+    if unsafe { (*wp).w_floating && (*wp).w_config.border } {
+        for index in 0..8 {
+            let mut attr =
+                unsafe { *hl_def.add(crate::highlight_defs::HlfT::Border as usize) };
+            let border_hl_id = unsafe { (*wp).w_config.border_hl_ids[index] };
+            if border_hl_id != 0 {
+                attr = unsafe {
+                    hl_get_ui_attr(
+                        ns_id,
+                        crate::highlight_defs::HlfT::Border as i32,
+                        border_hl_id,
+                        false,
+                    )
+                };
+            }
+            attr = unsafe {
+                hl_apply_winblend((*wp).w_onebuf_opt.wo_winbl as i32, attr)
+            };
+            if unsafe { syn_attr2entry(attr) }.hl_blend > 0 {
+                unsafe { (*wp).w_config.shadow = true };
+            }
+            unsafe { (*wp).w_config.border_attr[index] = attr };
+        }
+    }
+
+    unsafe { crate::option::check_blending(&mut *wp) };
+
+    let inactive = unsafe { *hl_def.add(crate::highlight_defs::HlfT::Inactive as usize) };
+    unsafe {
+        (*wp).w_hl_attr_normalnc = if inactive == 0 {
+            hl_combine_attr(
+                HL_ATTR_ACTIVE.get_mut()[crate::highlight_defs::HlfT::Inactive as usize],
+                (*wp).w_hl_attr_normal,
+            )
+        } else {
+            inactive
+        };
+    }
+    if unsafe { (*wp).w_floating } {
+        let winblend = unsafe { (*wp).w_onebuf_opt.wo_winbl as i32 };
+        unsafe {
+            (*wp).w_hl_attr_normalnc =
+                hl_apply_winblend(winblend, (*wp).w_hl_attr_normalnc)
+        };
+    }
+}
+
 /// Global UI highlight attributes (`highlight_attr`).
 pub static HIGHLIGHT_ATTR: crate::globals::GlobalCell<
     [i32; crate::highlight_defs::HlfT::Count as usize],
@@ -2371,6 +2497,134 @@ mod tests {
         assert!(unsafe { win_check_ns_hl(std::ptr::null()) });
         assert_eq!(unsafe { *NS_HL_WIN.get_mut() }, -1);
         assert_eq!(unsafe { *NS_HL_ACTIVE.get_mut() }, 0);
+    }
+
+    #[test]
+    fn update_window_hl_uses_global_normal_and_inactive_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, -1);
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let normal = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_bg_color: 0x12_34_56,
+                ..Default::default()
+            })
+        };
+        let inactive = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_bg_color: 0x65_43_21,
+                ..Default::default()
+            })
+        };
+        unsafe {
+            HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::None as usize] = normal;
+            HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::Inactive as usize] = inactive;
+        }
+        let mut win = crate::buffer_defs::WinT {
+            w_ns_hl: 0,
+            w_hl_needs_update: 1,
+            ..Default::default()
+        };
+
+        unsafe { update_window_hl(std::ptr::addr_of_mut!(win), false) };
+
+        assert_eq!(win.w_hl_attr_normal, normal);
+        assert_eq!(win.w_hl_attr_normalnc, inactive);
+        assert_eq!(win.w_hl_needs_update, 0);
+        assert_eq!(
+            win.w_ns_hl_attr,
+            HIGHLIGHT_ATTR.as_ptr().cast::<i32>()
+        );
+    }
+
+    #[test]
+    fn update_window_hl_keeps_namespace_array_pointers_stable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, -1);
+        let provider = unsafe { crate::decoration_provider::get_decor_provider(7, true) };
+        unsafe { (*provider).hl_cached = true };
+        let mut attrs = [0; crate::highlight_defs::HlfT::Count as usize];
+        attrs[crate::highlight_defs::HlfT::None as usize] = 17;
+        attrs[crate::highlight_defs::HlfT::Inactive as usize] = 18;
+        unsafe { NS_HL_ATTR.get_mut() }.insert(7, Box::new(attrs));
+        let mut win = crate::buffer_defs::WinT {
+            w_ns_hl: 7,
+            w_hl_needs_update: 1,
+            ..Default::default()
+        };
+
+        unsafe { update_window_hl(std::ptr::addr_of_mut!(win), false) };
+        let namespace_attrs = win.w_ns_hl_attr;
+        for ns in 8..40 {
+            unsafe { NS_HL_ATTR.get_mut() }.insert(
+                ns,
+                Box::new([ns; crate::highlight_defs::HlfT::Count as usize]),
+            );
+        }
+
+        assert_eq!(win.w_ns_hl_attr, namespace_attrs);
+        assert_eq!(
+            unsafe { *namespace_attrs.add(crate::highlight_defs::HlfT::None as usize) },
+            17
+        );
+        assert_eq!(
+            unsafe {
+                win_hl_attr(
+                    std::ptr::addr_of!(win),
+                    crate::highlight_defs::HlfT::Inactive as i32,
+                )
+            },
+            18
+        );
+    }
+
+    #[test]
+    fn update_window_hl_applies_winblend_to_float_and_border() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _selection = HighlightNamespaceSelectionGuard::set(0, -1, -1, -1);
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let normal = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_bg_color: 0x12_34_56,
+                ..Default::default()
+            })
+        };
+        let border = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_fg_color: 0x65_43_21,
+                ..Default::default()
+            })
+        };
+        unsafe {
+            HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::Nfloat as usize] = normal;
+            HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::Inactive as usize] = normal;
+            HIGHLIGHT_ATTR.get_mut()[crate::highlight_defs::HlfT::Border as usize] = border;
+        }
+        let mut win = crate::buffer_defs::WinT {
+            w_ns_hl: 0,
+            w_hl_needs_update: 1,
+            w_floating: true,
+            ..Default::default()
+        };
+        win.w_config.border = true;
+        win.w_onebuf_opt.wo_winbl = 25;
+
+        unsafe { update_window_hl(std::ptr::addr_of_mut!(win), false) };
+
+        assert_eq!(unsafe { syn_attr2entry(win.w_hl_attr_normal) }.hl_blend, 25);
+        assert_eq!(unsafe { syn_attr2entry(win.w_hl_attr_normalnc) }.hl_blend, 25);
+        assert!(win
+            .w_config
+            .border_attr
+            .iter()
+            .all(|&attr| unsafe { syn_attr2entry(attr) }.hl_blend == 25));
+        assert!(win.w_config.shadow);
+        assert!(win.w_grid_alloc.blending);
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);
