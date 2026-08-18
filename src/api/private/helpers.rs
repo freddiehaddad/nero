@@ -352,6 +352,35 @@ pub unsafe fn set_mark(
     result
 }
 
+/// Return the default statusline/winbar highlight name
+/// (`get_default_stl_hl`).
+///
+/// # Safety
+/// `win`, when non-null, must point to a live window. Reads
+/// `GLOBALS.curwin` and the shared highlight-group table.
+#[must_use]
+pub unsafe fn get_default_stl_hl(
+    win: *mut WinT,
+    use_winbar: bool,
+    stc_hl_id: i32,
+) -> Vec<u8> {
+    if win.is_null() {
+        b"TabLineFill".to_vec()
+    } else if use_winbar {
+        if win == unsafe { crate::globals::GLOBALS.get_mut() }.curwin {
+            b"WinBar".to_vec()
+        } else {
+            b"WinBarNC".to_vec()
+        }
+    } else if stc_hl_id > 0 {
+        unsafe { crate::highlight_group::syn_id2name(stc_hl_id) }
+    } else if win == unsafe { crate::globals::GLOBALS.get_mut() }.curwin {
+        b"StatusLine".to_vec()
+    } else {
+        b"StatusLineNC".to_vec()
+    }
+}
+
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
 ///
 /// String names create the group when it does not exist, matching
@@ -578,6 +607,38 @@ mod tests {
             )
         });
         assert_eq!(col_err.msg.as_deref(), Some("Invalid 'column': out of range"));
+    }
+
+    #[test]
+    fn get_default_stl_hl_selects_tabline_statusline_and_winbar_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut current = WinT::default();
+        let current_ptr = std::ptr::addr_of_mut!(current);
+        let mut other = WinT::default();
+        let other_ptr = std::ptr::addr_of_mut!(other);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, current_ptr)
+        };
+        assert_eq!(
+            unsafe { get_default_stl_hl(std::ptr::null_mut(), false, 0) },
+            b"TabLineFill"
+        );
+        assert_eq!(
+            unsafe { get_default_stl_hl(current_ptr, false, 0) },
+            b"StatusLine"
+        );
+        assert_eq!(
+            unsafe { get_default_stl_hl(other_ptr, false, 0) },
+            b"StatusLineNC"
+        );
+        assert_eq!(
+            unsafe { get_default_stl_hl(current_ptr, true, 0) },
+            b"WinBar"
+        );
+        assert_eq!(
+            unsafe { get_default_stl_hl(other_ptr, true, 0) },
+            b"WinBarNC"
+        );
     }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
