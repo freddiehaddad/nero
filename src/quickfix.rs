@@ -1541,6 +1541,50 @@ pub unsafe fn qf_add_entries(
     retval
 }
 
+/// Copy every entry from one location list to another
+/// (`copy_loclist_entries`).
+///
+/// # Safety
+/// Source and destination must be distinct, and all user-data pointers
+/// must remain valid while copied. Forwarded from [`qf_add_entry`].
+pub unsafe fn copy_loclist_entries(
+    from: &QfListT,
+    to: &mut QfListT,
+) -> i32 {
+    for entry in &from.qf_entries {
+        if unsafe {
+            qf_add_entry(
+                to,
+                None,
+                None,
+                entry.qf_module.as_deref(),
+                0,
+                entry.qf_text.as_deref().unwrap_or(&[]),
+                entry.qf_lnum,
+                entry.qf_end_lnum,
+                entry.qf_col,
+                entry.qf_end_col,
+                entry.qf_viscol,
+                entry.qf_pattern.as_deref(),
+                entry.qf_nr,
+                0,
+                Some(&entry.qf_user_data),
+                entry.qf_valid,
+            )
+        } == qf_status::QF_FAIL
+        {
+            return crate::vim_defs::FAIL;
+        }
+        let copied = to
+            .qf_entries
+            .last_mut()
+            .expect("inserted location entry must exist");
+        copied.qf_fnum = entry.qf_fnum;
+        copied.qf_type = entry.qf_type;
+    }
+    crate::vim_defs::OK
+}
+
 /// Whether an entry is still present in a quickfix list
 /// (`is_qf_entry_present`).
 #[allow(dead_code)]
@@ -12427,6 +12471,92 @@ mod tests {
 
         qf_free(&mut qi.qf_lists[0]);
         unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn copy_loclist_entries_preserves_fields_and_user_data_ownership() {
+        let _lock = crate::globals::global_state_test_lock();
+        let user_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(user_list) };
+        let mut source = QfListT {
+            qfl_type: QfltypeT::Location,
+            qf_entries: vec![
+                QflineT {
+                    qf_lnum: 10,
+                    qf_end_lnum: 12,
+                    qf_fnum: 7,
+                    qf_col: 3,
+                    qf_end_col: 8,
+                    qf_nr: 42,
+                    qf_module: Some(b"compiler".to_vec()),
+                    qf_fname: Some(b"alternate.c".to_vec()),
+                    qf_pattern: Some(b"needle".to_vec()),
+                    qf_text: Some(b"message".to_vec()),
+                    qf_viscol: true,
+                    qf_type: b'E',
+                    qf_user_data: crate::eval::typval_defs::TypvalT {
+                        value: crate::eval::typval_defs::TypvalValue::List(
+                            user_list,
+                        ),
+                        ..Default::default()
+                    },
+                    qf_valid: true,
+                    ..Default::default()
+                },
+                QflineT {
+                    qf_fnum: 8,
+                    qf_type: 1,
+                    qf_text: Some(b"second".to_vec()),
+                    qf_valid: false,
+                    ..Default::default()
+                },
+            ],
+            qf_index: 2,
+            qf_has_user_data: true,
+            ..Default::default()
+        };
+        let mut dest = QfListT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { copy_loclist_entries(&source, &mut dest) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(dest.qf_count(), 2);
+        let copied = &dest.qf_entries[0];
+        assert_eq!(copied.qf_fnum, 7);
+        assert_eq!(copied.qf_lnum, 10);
+        assert_eq!(copied.qf_end_lnum, 12);
+        assert_eq!(copied.qf_col, 3);
+        assert_eq!(copied.qf_end_col, 8);
+        assert_eq!(copied.qf_nr, 42);
+        assert_eq!(copied.qf_module.as_deref(), Some(&b"compiler"[..]));
+        assert_eq!(copied.qf_pattern.as_deref(), Some(&b"needle"[..]));
+        assert_eq!(copied.qf_text.as_deref(), Some(&b"message"[..]));
+        assert!(copied.qf_fname.is_none());
+        assert_eq!(copied.qf_type, b'E');
+        assert!(copied.qf_viscol);
+        assert!(copied.qf_valid);
+        assert_eq!(dest.qf_entries[1].qf_fnum, 8);
+        assert_eq!(dest.qf_entries[1].qf_type, 1);
+        assert!(!dest.qf_entries[1].qf_valid);
+        assert_eq!(unsafe { (*user_list).lv_refcount }, 2);
+
+        qf_free(&mut dest);
+        assert_eq!(unsafe { (*user_list).lv_refcount }, 1);
+        qf_free(&mut source);
+    }
+
+    #[test]
+    fn copy_loclist_entries_accepts_an_empty_source() {
+        let mut dest = QfListT::default();
+        assert_eq!(
+            unsafe { copy_loclist_entries(&QfListT::default(), &mut dest) },
+            crate::vim_defs::OK
+        );
+        assert!(dest.qf_entries.is_empty());
     }
 
     fn items_property(
