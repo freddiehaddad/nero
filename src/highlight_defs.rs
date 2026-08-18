@@ -236,6 +236,89 @@ pub enum HlfT {
     Count,
 }
 
+/// Builtin highlight-group names indexed by [`HlfT`] (`hlf_names`).
+///
+/// `HlfT::None` is handled specially as `Normal` by callers and has no
+/// table entry in the original designated initializer.
+pub const HLF_NAMES: [Option<&'static [u8]>; HlfT::Count as usize] = [
+    None,
+    Some(b"SpecialKey"),
+    Some(b"EndOfBuffer"),
+    Some(b"TermCursor"),
+    Some(b"NonText"),
+    Some(b"Directory"),
+    Some(b"ErrorMsg"),
+    Some(b"IncSearch"),
+    Some(b"Search"),
+    Some(b"CurSearch"),
+    Some(b"MoreMsg"),
+    Some(b"ModeMsg"),
+    Some(b"LineNr"),
+    Some(b"LineNrAbove"),
+    Some(b"LineNrBelow"),
+    Some(b"CursorLineNr"),
+    Some(b"CursorLineSign"),
+    Some(b"CursorLineFold"),
+    Some(b"Question"),
+    Some(b"StatusLine"),
+    Some(b"StatusLineNC"),
+    Some(b"WinSeparator"),
+    Some(b"VertSplit"),
+    Some(b"Title"),
+    Some(b"Visual"),
+    Some(b"VisualNC"),
+    Some(b"WarningMsg"),
+    Some(b"WildMenu"),
+    Some(b"Folded"),
+    Some(b"FoldColumn"),
+    Some(b"DiffAdd"),
+    Some(b"DiffChange"),
+    Some(b"DiffDelete"),
+    Some(b"DiffText"),
+    Some(b"DiffTextAdd"),
+    Some(b"SignColumn"),
+    Some(b"Conceal"),
+    Some(b"SpellBad"),
+    Some(b"SpellCap"),
+    Some(b"SpellRare"),
+    Some(b"SpellLocal"),
+    Some(b"Pmenu"),
+    Some(b"PmenuSel"),
+    Some(b"PmenuMatch"),
+    Some(b"PmenuMatchSel"),
+    Some(b"PmenuKind"),
+    Some(b"PmenuKindSel"),
+    Some(b"PmenuExtra"),
+    Some(b"PmenuExtraSel"),
+    Some(b"PmenuSbar"),
+    Some(b"PmenuThumb"),
+    Some(b"PmenuBorder"),
+    Some(b"TabLine"),
+    Some(b"TabLineSel"),
+    Some(b"TabLineFill"),
+    Some(b"CursorColumn"),
+    Some(b"CursorLine"),
+    Some(b"ColorColumn"),
+    Some(b"QuickFixLine"),
+    Some(b"Whitespace"),
+    Some(b"NormalNC"),
+    Some(b"MsgSeparator"),
+    Some(b"NormalFloat"),
+    Some(b"MsgArea"),
+    Some(b"FloatBorder"),
+    Some(b"WinBar"),
+    Some(b"WinBarNC"),
+    Some(b"Cursor"),
+    Some(b"FloatTitle"),
+    Some(b"FloatFooter"),
+    Some(b"StatusLineTerm"),
+    Some(b"StatusLineTermNC"),
+    Some(b"StderrMsg"),
+    Some(b"StdoutMsg"),
+    Some(b"OkMsg"),
+    Some(b"PreInsert"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HlKind {
     Unknown,
@@ -340,5 +423,16 @@ mod tests {
         // Spot check the enum is sequential and Count is indeed last by
         // construction (auto-incremented, matching the C enum exactly).
         assert!(HlfT::Count as u8 > HlfT::Pre as u8);
+    }
+
+    #[test]
+    fn hlf_names_match_the_designated_header_table() {
+        assert_eq!(HLF_NAMES.len(), HlfT::Count as usize);
+        assert_eq!(HLF_NAMES[HlfT::None as usize], None);
+        assert_eq!(HLF_NAMES[HlfT::F8 as usize], Some(b"SpecialKey".as_slice()));
+        assert_eq!(HLF_NAMES[HlfT::Pbr as usize], Some(b"PmenuBorder".as_slice()));
+        assert_eq!(HLF_NAMES[HlfT::Se as usize], Some(b"StderrMsg".as_slice()));
+        assert_eq!(HLF_NAMES[HlfT::Ok as usize], Some(b"OkMsg".as_slice()));
+        assert!(HLF_NAMES.iter().skip(1).all(Option::is_some));
     }
 }
