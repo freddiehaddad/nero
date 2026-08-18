@@ -17,6 +17,7 @@
 //! [`normalize_index`] converts API line indexes to 1-based buffer
 //! line numbers.
 //! [`buf_get_text`] returns a bounded byte range from one buffer line.
+//! [`dict_get_value`] bridges a scope dictionary item to an API object.
 //!
 //! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
 //! generic, variadic/printf-style message formatters; this crate uses
@@ -163,6 +164,26 @@ pub unsafe fn buf_get_text(
     line[start_col as usize..end_col as usize].to_vec()
 }
 
+/// Get and recursively convert one scope-dictionary value
+/// (`dict_get_value`).
+///
+/// # Safety
+/// `dict` must point to a live `DictT`; forwarded to
+/// [`crate::api::private::converter::vim_to_object`].
+pub unsafe fn dict_get_value(
+    dict: *mut crate::eval::typval_defs::DictT,
+    key: &[u8],
+    err: &mut Error,
+) -> Object {
+    let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), key) };
+    let Some(item) = item else {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Key not found: {}", String::from_utf8_lossy(key)));
+        return Object::Nil;
+    };
+    crate::api::private::converter::vim_to_object(unsafe { &(*item).di_tv })
+}
+
 /// Convert an API object to a highlight-group ID (`object_to_hl_id`).
 ///
 /// String names create the group when it does not exist, matching
@@ -231,6 +252,29 @@ mod tests {
         let mut oob = false;
         assert_eq!(normalize_index(&buf, 3, true, &mut oob), 4);
         assert!(!oob);
+    }
+
+    #[test]
+    fn dict_get_value_returns_converted_values_and_reports_missing_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"answer", 42) },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+        assert!(matches!(
+            unsafe { dict_get_value(dict, b"answer", &mut err) },
+            Object::Integer(42)
+        ));
+        assert!(!err.is_set());
+        let mut missing = Error::default();
+        assert!(matches!(
+            unsafe { dict_get_value(dict, b"missing", &mut missing) },
+            Object::Nil
+        ));
+        assert_eq!(missing.msg.as_deref(), Some("Key not found: missing"));
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
