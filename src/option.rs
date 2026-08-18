@@ -3800,6 +3800,55 @@ pub unsafe fn set_option_direct(
     debug_assert!(error.is_none());
 }
 
+/// Set an option directly for an explicit buffer or window
+/// (`set_option_direct_for`).
+///
+/// This intentionally changes only `GLOBALS.curbuf`/`curwin`, rather
+/// than calling the side-effecting context-switch machinery.
+///
+/// # Safety
+/// `from` must point to a live value matching `scope`; the previously
+/// installed current buffer/window pointers must remain live for the
+/// whole call. Forwarded from [`set_option_direct`].
+pub unsafe fn set_option_direct_for(
+    opt_idx: OptIndex,
+    value: OptVal,
+    opt_flags: u32,
+    set_sid: crate::eval::typval_defs::ScidT,
+    scope: OptScope,
+    from: *mut c_void,
+) {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (saved_curbuf, saved_curwin) =
+        unsafe { ((*globals).curbuf, (*globals).curwin) };
+
+    match scope {
+        OptScope::Global => {}
+        OptScope::Win => {
+            let win = from.cast::<WinT>();
+            unsafe {
+                (*globals).curwin = win;
+                (*globals).curbuf = (*win).w_buffer;
+            }
+        }
+        OptScope::Buf => unsafe {
+            (*globals).curbuf = from.cast::<BufT>();
+        },
+        OptScope::Tab => {
+            panic!("set_option_direct_for: tab-scoped direct writes are not used")
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_option_direct(opt_idx, value, opt_flags, set_sid) };
+    // SAFETY: restore the process-lifetime global fields.
+    unsafe {
+        (*globals).curbuf = saved_curbuf;
+        (*globals).curwin = saved_curwin;
+    }
+}
+
 /// Unset the local value of a global-local option
 /// (`unset_option_local_value`).
 ///
@@ -7848,6 +7897,69 @@ mod did_set_option_tests {
             None
         );
         assert_eq!(unsafe { (*win).w_onebuf_opt.wo_so }, -1);
+    }
+
+    #[test]
+    fn set_option_direct_for_targets_explicit_window_and_buffer_storage() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, current_buf, current_win) = setup_curbuf_curwin();
+
+        let mut target_buf = BufT {
+            b_p_ts: 8,
+            ..Default::default()
+        };
+        let target_buf_ptr = std::ptr::from_mut(&mut target_buf);
+        let mut target_win = WinT {
+            w_buffer: target_buf_ptr,
+            ..Default::default()
+        };
+        let target_win_ptr = std::ptr::from_mut(&mut target_win);
+
+        unsafe {
+            set_option_direct_for(
+                OptIndex::Arabic,
+                OptVal::Boolean(TriState::True),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                crate::globals::SID_NONE,
+                OptScope::Win,
+                target_win_ptr.cast(),
+            )
+        };
+        assert_eq!(unsafe { (*target_win_ptr).w_onebuf_opt.wo_arab }, 1);
+
+        unsafe {
+            set_option_direct_for(
+                OptIndex::Tabstop,
+                OptVal::Number(3),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                crate::globals::SID_NONE,
+                OptScope::Buf,
+                target_buf_ptr.cast(),
+            )
+        };
+        assert_eq!(unsafe { (*target_buf_ptr).b_p_ts }, 3);
+        let globals = crate::globals::GLOBALS.as_ptr();
+        assert_eq!(unsafe { (*globals).curbuf }, current_buf);
+        assert_eq!(unsafe { (*globals).curwin }, current_win);
+    }
+
+    #[test]
+    #[should_panic(expected = "tab-scoped direct writes are not used")]
+    fn set_option_direct_for_rejects_tab_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        unsafe {
+            set_option_direct_for(
+                OptIndex::Tabstop,
+                OptVal::Number(3),
+                0,
+                crate::globals::SID_NONE,
+                OptScope::Tab,
+                std::ptr::null_mut(),
+            )
+        };
     }
 }
 
