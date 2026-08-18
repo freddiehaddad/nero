@@ -1,9 +1,8 @@
 //! Translated from `src/nvim/cursor_shape.c` (tractable core only).
 //!
 //! `cursor_shape.c` handles cursor/mouse-pointer shape configuration via
-//! the `'guicursor'`/`'mouseshape'` options. The option-string parser
-//! is translated for shape/blink/mode syntax; highlight-group names
-//! remain deferred on `syn_check_group`.
+//! the `'guicursor'`/`'mouseshape'` options, including highlight-group
+//! names resolved through the real highlight registry.
 //!
 //! Translated: `SHAPE_TABLE` (`shape_table`, with its own real static
 //! initializer values - `parse_shape_opt`, the only thing that would
@@ -368,13 +367,18 @@ const E_ILLEGAL_MODE: &[u8] = b"E546: Illegal mode";
 const E_ILLEGAL_PERCENTAGE: &[u8] = b"E549: Illegal percentage";
 
 #[derive(Clone, Copy)]
-enum ShapeAttribute {
+enum ShapeAttribute<'a> {
     Block,
     Vertical(i32),
     Horizontal(i32),
     BlinkWait(i32),
     BlinkOn(i32),
     BlinkOff(i32),
+    Highlight {
+        group: &'a [u8],
+        langmap: Option<&'a [u8]>,
+        group_id: Option<i32>,
+    },
 }
 
 fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
@@ -385,9 +389,8 @@ fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
 
 /// Parse `'guicursor'` shape/blink/mode syntax (`parse_shape_opt`).
 ///
-/// Highlight-group tokens still need `syn_check_group` and stop at
-/// that exact dependency. Successful parses replace `SHAPE_TABLE`
-/// atomically, matching the original's validate-then-apply two rounds.
+/// Successful parses replace `SHAPE_TABLE` atomically, matching the
+/// original's validate-then-apply two rounds.
 #[must_use]
 pub fn parse_shape_opt(what: u8) -> Option<&'static [u8]> {
     let value = unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_guicursor.clone() }
@@ -428,51 +431,81 @@ pub fn parse_shape_opt(what: u8) -> Option<&'static [u8]> {
 
         let mut attributes = Vec::new();
         let tail = &part[colon + 1..];
-        if !tail.is_empty() {
-            for attribute in tail.split(|&byte| byte == b'-') {
-                let parsed = if attribute.eq_ignore_ascii_case(b"block") {
-                    ShapeAttribute::Block
-                } else {
-                    let (kind, prefix_len) = if starts_with_ignore_ascii_case(attribute, b"ver") {
-                        (0, 3)
-                    } else if starts_with_ignore_ascii_case(attribute, b"hor") {
-                        (1, 3)
-                    } else if starts_with_ignore_ascii_case(attribute, b"blinkwait") {
-                        (2, 9)
-                    } else if starts_with_ignore_ascii_case(attribute, b"blinkon") {
-                        (3, 7)
-                    } else if starts_with_ignore_ascii_case(attribute, b"blinkoff") {
-                        (4, 8)
-                    } else {
-                        unimplemented!(
-                            "parse_shape_opt: highlight-group names need syn_check_group"
-                        );
+        let mut pos = 0usize;
+        while pos < tail.len() {
+            let attribute = &tail[pos..];
+            let parsed = if let Some((kind, prefix_len)) = if starts_with_ignore_ascii_case(
+                attribute,
+                b"ver",
+            ) {
+                Some((0, 3))
+            } else if starts_with_ignore_ascii_case(attribute, b"hor") {
+                Some((1, 3))
+            } else if starts_with_ignore_ascii_case(attribute, b"blinkwait") {
+                Some((2, 9))
+            } else if starts_with_ignore_ascii_case(attribute, b"blinkon") {
+                Some((3, 7))
+            } else if starts_with_ignore_ascii_case(attribute, b"blinkoff") {
+                Some((4, 8))
+            } else {
+                None
+            } {
+                pos += prefix_len;
+                if !tail.get(pos).is_some_and(u8::is_ascii_digit) {
+                    return Some(crate::gettext_defs::gettext_noop(
+                        "E5080: Digit expected",
+                    )
+                    .as_bytes());
+                }
+                let mut number = 0i32;
+                while let Some(digit) = tail.get(pos).filter(|digit| digit.is_ascii_digit()) {
+                    number = number
+                        .saturating_mul(10)
+                        .saturating_add(i32::from(*digit - b'0'));
+                    pos += 1;
+                }
+                match kind {
+                    0 if number == 0 => return Some(E_ILLEGAL_PERCENTAGE),
+                    1 if number == 0 => return Some(E_ILLEGAL_PERCENTAGE),
+                    0 => ShapeAttribute::Vertical(number),
+                    1 => ShapeAttribute::Horizontal(number),
+                    2 => ShapeAttribute::BlinkWait(number),
+                    3 => ShapeAttribute::BlinkOn(number),
+                    _ => ShapeAttribute::BlinkOff(number),
+                }
+            } else if starts_with_ignore_ascii_case(attribute, b"block") {
+                pos += 5;
+                ShapeAttribute::Block
+            } else {
+                let len = attribute
+                    .iter()
+                    .position(|&byte| byte == b'-')
+                    .unwrap_or(attribute.len());
+                let name = &attribute[..len];
+                pos += len;
+                if let Some(slash) = name.iter().position(|&byte| byte == b'/') {
+                    let group = &name[..slash];
+                    // The original resolves the first group during its
+                    // validation round, before committing the table.
+                    let group_id = unsafe {
+                        crate::highlight_group::syn_check_group(group)
                     };
-                    let digits = &attribute[prefix_len..];
-                    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-                        return Some(crate::gettext_defs::gettext_noop(
-                            "E5080: Digit expected",
-                        )
-                        .as_bytes());
+                    ShapeAttribute::Highlight {
+                        group,
+                        langmap: Some(&name[slash + 1..]),
+                        group_id: Some(group_id),
                     }
-                    let number = digits
-                        .iter()
-                        .fold(0i32, |value, &digit| {
-                            value
-                                .saturating_mul(10)
-                                .saturating_add(i32::from(digit - b'0'))
-                        });
-                    match kind {
-                        0 if number == 0 => return Some(E_ILLEGAL_PERCENTAGE),
-                        1 if number == 0 => return Some(E_ILLEGAL_PERCENTAGE),
-                        0 => ShapeAttribute::Vertical(number),
-                        1 => ShapeAttribute::Horizontal(number),
-                        2 => ShapeAttribute::BlinkWait(number),
-                        3 => ShapeAttribute::BlinkOn(number),
-                        _ => ShapeAttribute::BlinkOff(number),
+                } else {
+                    ShapeAttribute::Highlight {
+                        group: name,
+                        langmap: None,
+                        group_id: None,
                     }
-                };
-                attributes.push(parsed);
+                }
+            };
+            attributes.push(parsed);
+            if tail.get(pos) == Some(&b'-') {
+                pos += 1;
             }
         }
 
@@ -491,6 +524,19 @@ pub fn parse_shape_opt(what: u8) -> Option<&'static [u8]> {
                     ShapeAttribute::BlinkWait(value) => table[index].blinkwait = value,
                     ShapeAttribute::BlinkOn(value) => table[index].blinkon = value,
                     ShapeAttribute::BlinkOff(value) => table[index].blinkoff = value,
+                    ShapeAttribute::Highlight {
+                        group,
+                        langmap,
+                        group_id,
+                    } => {
+                        let id_lm = unsafe {
+                            crate::highlight_group::syn_check_group(
+                                langmap.unwrap_or(group),
+                            )
+                        };
+                        table[index].id_lm = id_lm;
+                        table[index].id = group_id.unwrap_or(id_lm);
+                    }
                 }
             }
         }
@@ -661,6 +707,32 @@ pub(crate) mod tests {
         }
     }
 
+    struct HighlightShapeGuard {
+        items: Vec<crate::highlight_group::HlGroup>,
+        names: crate::map::Map<Vec<u8>, i32>,
+    }
+
+    impl HighlightShapeGuard {
+        fn empty() -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            let items = std::mem::take(&mut table.items);
+            let names = std::mem::replace(
+                unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() },
+                crate::map::Map::new(),
+            );
+            Self { items, names }
+        }
+    }
+
+    impl Drop for HighlightShapeGuard {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.items);
+            *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } =
+                std::mem::replace(&mut self.names, crate::map::Map::new());
+        }
+    }
+
     #[test]
     fn parse_shape_opt_applies_shape_blink_and_mode_lists() {
         let _lock = crate::globals::global_state_test_lock();
@@ -716,11 +788,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "syn_check_group")]
-    fn parse_shape_opt_highlight_names_need_the_highlight_registry() {
+    fn parse_shape_opt_resolves_normal_and_langmap_highlight_groups() {
         let _lock = crate::globals::global_state_test_lock();
-        let _guard = ShapeParseGuard::set(b"n:TermCursor");
-        let _ = parse_shape_opt(SHAPE_CURSOR);
+        let _highlights = HighlightShapeGuard::empty();
+        let _guard = ShapeParseGuard::set(b"n:TermCursor/TermCursorIM");
+
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), None);
+        let entry = unsafe { SHAPE_TABLE.get_mut() }[SHAPE_IDX_N];
+        assert_eq!(
+            unsafe { crate::highlight_group::syn_id2name(entry.id) },
+            b"TermCursor"
+        );
+        assert_eq!(
+            unsafe { crate::highlight_group::syn_id2name(entry.id_lm) },
+            b"TermCursorIM"
+        );
+    }
+
+    #[test]
+    fn parse_shape_opt_accepts_adjacent_block_and_highlight_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _highlights = HighlightShapeGuard::empty();
+        let _guard = ShapeParseGuard::set(b"n:blockTermCursor");
+
+        assert_eq!(parse_shape_opt(SHAPE_CURSOR), None);
+        let entry = unsafe { SHAPE_TABLE.get_mut() }[SHAPE_IDX_N];
+        assert_eq!(entry.shape, CursorShape::Block);
+        assert_eq!(
+            unsafe { crate::highlight_group::syn_id2name(entry.id) },
+            b"TermCursor"
+        );
     }
 
     #[test]
