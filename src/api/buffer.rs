@@ -274,6 +274,33 @@ pub unsafe fn nvim_buf_get_var(buf: Buffer, name: &NvimString, err: &mut Error) 
     unsafe { crate::api::private::helpers::dict_get_value((*buf).b_vars, name, err) }
 }
 
+/// Set a buffer-scoped variable (`nvim_buf_set_var`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and the checked
+/// scope-dictionary writer.
+pub unsafe fn nvim_buf_set_var(
+    buf: Buffer,
+    name: &NvimString,
+    value: &Object,
+    err: &mut Error,
+) {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return;
+    }
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*buf).b_vars,
+            name,
+            value,
+            false,
+            false,
+            err,
+        )
+    };
+}
+
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
 /// current buffer), or an empty string on failure/if the buffer has
 /// no file name (`nvim_buf_get_name`).
@@ -658,6 +685,36 @@ mod tests {
             Object::Nil
         ));
         assert_eq!(err.msg.as_deref(), Some("Key not found: missing"));
+        fx.buf_mut().b_vars = std::ptr::null_mut();
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn nvim_buf_set_var_stores_nested_api_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(51);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        fx.buf_mut().b_vars = dict;
+        let mut err = Error::default();
+        unsafe {
+            nvim_buf_set_var(
+                fx.handle(),
+                &b"items".to_vec(),
+                &Object::Array(vec![Object::Integer(3), Object::Integer(7)]),
+                &mut err,
+            )
+        };
+        let stored =
+            unsafe { nvim_buf_get_var(fx.handle(), &b"items".to_vec(), &mut err) };
+        assert!(matches!(
+            stored,
+            Object::Array(ref values)
+                if matches!(values.as_slice(), [Object::Integer(3), Object::Integer(7)])
+        ));
+        assert!(!err.is_set());
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"items") }
+            .expect("buffer variable");
+        unsafe { crate::eval::typval::tv_dict_item_remove(&mut *dict, item) };
         fx.buf_mut().b_vars = std::ptr::null_mut();
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
