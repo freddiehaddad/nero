@@ -8233,6 +8233,18 @@ pub fn did_set_equalalways(
     None
 }
 
+/// Process an updated `'autochdir'` value (`did_set_autochdir`).
+///
+/// # Safety
+/// Forwarded from [`crate::buffer::do_autochdir`].
+pub unsafe fn did_set_autochdir(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::buffer::do_autochdir() };
+    None
+}
+
 /// Process an updated `'undofile'` value (`did_set_undofile`).
 ///
 /// When both the buffer-local and global values are disabled, the

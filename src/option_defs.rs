@@ -8339,6 +8339,8 @@ fn wire_callback_option_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
 fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
     options[OptIndex::Arabic as usize].opt_did_set_cb =
         Some(crate::option::did_set_arabic);
+    options[OptIndex::Autochdir as usize].opt_did_set_cb =
+        Some(crate::option::did_set_autochdir);
     options[OptIndex::Backupext as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_backupext_or_patchmode);
     options[OptIndex::Background as usize].opt_did_set_cb =
@@ -8570,6 +8572,7 @@ mod options_table_tests {
         let opts = unsafe { OPTIONS.get_mut() };
         let mut expected: Vec<&[u8]> = vec![
             b"arabic",
+            b"autochdir",
             b"ambiwidth",
             b"backspace",
             b"backupcopy",

@@ -42,7 +42,9 @@
 //! anymore), keeping the underlying `b:changedtick` value itself fully
 //! correct for every other C-level accessor in this crate. `set_buflisted`
 //! (now tractable now that `autocmd.c`'s `apply_autocmds` is real - see
-//! `crate::autocmd`'s own module doc). `buf_clear_file` (now tractable
+//! `crate::autocmd`'s own module doc). [`do_autochdir`] changes to the
+//! current buffer's directory through the real `vim_chdirfile`/
+//! `shorten_fnames` chain. `buf_clear_file` (now tractable
 //! now that `change.c`'s `unchanged` is real - see `crate::change`'s
 //! own module doc); translated ahead of its own real callers
 //! (`close_buffer`/`ex_cmds.c`'s `:enew`, neither translated), matching
@@ -77,6 +79,46 @@ use crate::buffer_defs::{BufT, BufrefT};
 use crate::ex_cmds_defs::cmod;
 use crate::globals::{GlobalCell, GLOBALS};
 use crate::option_vars::OPTION_VARS;
+
+/// Change to the directory of the current buffer when `'autochdir'`
+/// is enabled (`do_autochdir`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` and the global buffer list must consist of live
+/// values; forwarded from [`crate::file_search::vim_chdirfile`] and
+/// [`crate::fileio::shorten_fnames`].
+pub unsafe fn do_autochdir() {
+    // SAFETY: a plain read from process-lifetime option storage.
+    if unsafe { (*OPTION_VARS.as_ptr()).p_acd } == 0 {
+        return;
+    }
+    let globals = GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*globals).starting } != 0 {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { (*globals).curbuf };
+    // Clone before changing cwd/shortening names, both of which may
+    // mutate this buffer's filename storage.
+    let fname = unsafe { (*curbuf).b_ffname.clone() };
+    let Some(fname) = fname else {
+        return;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe {
+        crate::file_search::vim_chdirfile(
+            &fname,
+            crate::vim_defs::CdCause::Auto,
+        )
+    } == crate::vim_defs::OK
+    {
+        // SAFETY: same process-lifetime global pointer.
+        unsafe { (*globals).last_chdir_reason = Some(b"autochdir".to_vec()) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fileio::shorten_fnames(true) };
+    }
+}
 
 /// Highest-ever-assigned buffer number counter (`buffer.c`'s own
 /// file-static `top_file_num`), starting at 1 like the original.
@@ -865,6 +907,139 @@ pub unsafe fn buf_spname(buf: &BufT) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AutochdirOptionGuard(i32);
+
+    impl AutochdirOptionGuard {
+        fn set(value: i32) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = unsafe { (*options).p_acd };
+            unsafe { (*options).p_acd = value };
+            AutochdirOptionGuard(previous)
+        }
+    }
+
+    impl Drop for AutochdirOptionGuard {
+        fn drop(&mut self) {
+            unsafe { (*crate::option_vars::OPTION_VARS.as_ptr()).p_acd = self.0 };
+        }
+    }
+
+    struct LastChdirReasonGuard(Option<Vec<u8>>);
+
+    impl LastChdirReasonGuard {
+        fn clear() -> Self {
+            LastChdirReasonGuard(unsafe {
+                (*crate::globals::GLOBALS.as_ptr())
+                    .last_chdir_reason
+                    .take()
+            })
+        }
+    }
+
+    impl Drop for LastChdirReasonGuard {
+        fn drop(&mut self) {
+            unsafe {
+                (*crate::globals::GLOBALS.as_ptr()).last_chdir_reason =
+                    self.0.take()
+            };
+        }
+    }
+
+    struct CwdGuard(std::path::PathBuf);
+
+    impl CwdGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().expect("current directory");
+            std::env::set_current_dir(path).expect("set test directory");
+            CwdGuard(previous)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "nero_buffer_autochdir_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch directory");
+            ScratchDir(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn did_set_autochdir_is_inert_when_the_option_is_disabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _autochdir = AutochdirOptionGuard::set(0);
+        assert_eq!(
+            unsafe { crate::option::did_set_autochdir(&mut Default::default()) },
+            None
+        );
+    }
+
+    #[test]
+    fn did_set_autochdir_changes_directory_and_shortens_buffer_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let scratch = ScratchDir::new();
+        let child = scratch.0.join("child");
+        std::fs::create_dir(&child).expect("create child");
+        let _cwd = CwdGuard::set(&scratch.0);
+        let _autochdir = AutochdirOptionGuard::set(1);
+
+        let mut full_name = child
+            .join("file.txt")
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes();
+        crate::path::path_to_slash(&mut full_name);
+        let mut buf = BufT {
+            b_ffname: Some(full_name.clone()),
+            b_sfname: Some(full_name.clone()),
+            b_fname: Some(full_name),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let _firstbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstbuf, buf_ptr)
+        };
+        let _starting = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.starting, 0)
+        };
+        let _reason = LastChdirReasonGuard::clear();
+
+        assert_eq!(
+            unsafe { crate::option::did_set_autochdir(&mut Default::default()) },
+            None
+        );
+
+        let mut expected_dir = child.to_string_lossy().into_owned().into_bytes();
+        crate::path::path_to_slash(&mut expected_dir);
+        assert_eq!(crate::os::fs::os_dirname(), Some(expected_dir));
+        assert_eq!(unsafe { (*buf_ptr).b_fname.as_deref() }, Some(b"file.txt".as_slice()));
+        assert_eq!(
+            unsafe { (*crate::globals::GLOBALS.as_ptr()).last_chdir_reason.as_deref() },
+            Some(b"autochdir".as_slice())
+        );
+    }
 
     #[test]
     fn buf_spname_reports_scratch_prompt_and_normal_names() {
