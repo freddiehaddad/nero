@@ -4137,9 +4137,8 @@ pub unsafe fn set_option_value_for(
 /// Get an option value for an explicit scope target
 /// (`get_option_value_for`).
 ///
-/// Global/current-context reads and non-current tabpage reads are
-/// complete. Switching to a different buffer/window still needs
-/// `ctx_switch`.
+/// Global/current-context, cross-buffer/window, and non-current
+/// tabpage reads are complete.
 ///
 /// # Safety
 /// `from` must point to a live value matching `scope`; tabpage state
@@ -4170,10 +4169,16 @@ pub unsafe fn get_option_value_for(
             // SAFETY: forwarded from this function's own safety doc.
             return unsafe { get_option_value(opt_idx, opt_flags) };
         }
-        OptScope::Win | OptScope::Buf => {
-            unimplemented!(
-                "get_option_value_for: cross-window/buffer reads need switch_option_context"
-            )
+        OptScope::Win => {
+            let win = from.cast::<WinT>();
+            let varp =
+                unsafe { get_varp_scope_from(opt_idx, opt_flags, (*win).w_buffer, win) };
+            return unsafe { optval_from_varp(opt_idx, varp) };
+        }
+        OptScope::Buf => {
+            let buf = from.cast::<BufT>();
+            let varp = unsafe { get_varp_scope_from(opt_idx, opt_flags, buf, curwin) };
+            return unsafe { optval_from_varp(opt_idx, varp) };
         }
         OptScope::Tab => {}
     }
@@ -8869,21 +8874,29 @@ mod did_set_option_tests {
     }
 
     #[test]
-    #[should_panic(expected = "switch_option_context")]
-    fn get_option_value_for_cross_window_needs_context_switching() {
+    fn get_option_value_for_reads_cross_window_storage_directly() {
         let _lock = crate::globals::global_state_test_lock();
         reset_shared_state();
         let (_guard, _buf, _win) = setup_curbuf_curwin();
-        let mut target = WinT::default();
+        let mut target = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_so: 23,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let target_ptr = std::ptr::from_mut(&mut target);
-        unsafe {
-            let _ = get_option_value_for(
+        assert_eq!(
+            unsafe {
+                get_option_value_for(
                 OptIndex::Scrolloff,
                 crate::option_defs::opt_set_flags::OPT_LOCAL,
                 OptScope::Win,
                 target_ptr.cast(),
-            );
-        }
+                )
+            },
+            OptVal::Number(23)
+        );
     }
 
     #[test]
