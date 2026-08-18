@@ -6,9 +6,9 @@
 //!
 //! Translated: [`nvim_win_get_buf`], [`nvim_win_get_height`],
 //! [`nvim_win_get_width`], [`nvim_win_get_number`],
-//! [`nvim_win_is_valid`] - every one of these is a thin, real
-//! `find_window_by_handle` + one-field read, with no other
-//! dependency.
+//! [`nvim_win_is_valid`], [`nvim_win_set_hl_ns`] - thin, real
+//! `find_window_by_handle` plus direct field access, with no other
+//! subsystem dependency.
 //!
 //! Deferred (each needs a real, not-yet-translated subsystem beyond
 //! `find_window_by_handle` itself): `nvim_win_set_buf` (needs
@@ -107,6 +107,31 @@ pub unsafe fn nvim_win_is_valid(win: Window) -> Boolean {
     !unsafe { find_window_by_handle(win, &mut stub) }.is_null()
 }
 
+/// Set the highlight namespace for window `win`
+/// (`nvim_win_set_hl_ns`).
+///
+/// Namespace `-1` inherits the global namespace.
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`] and
+/// [`crate::drawscreen::redraw_later`].
+pub unsafe fn nvim_win_set_hl_ns(win: Window, ns_id: Integer, err: &mut Error) {
+    let window = unsafe { find_window_by_handle(win, err) };
+    if window.is_null() {
+        return;
+    }
+    if ns_id < -1 {
+        err.r#type = crate::api::private::defs::ErrorType::Validation;
+        err.msg = Some("Invalid 'namespace'".to_string());
+        return;
+    }
+    unsafe {
+        (*window).w_ns_hl = ns_id as i32;
+        (*window).w_hl_needs_update = 1;
+        crate::drawscreen::redraw_later(window, crate::drawscreen::UPD_NOT_VALID);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +198,65 @@ mod tests {
                 g.curwin = self.prev_curwin;
                 g.curtab = self.prev_curtab;
                 g.first_tabpage = self.prev_first_tabpage;
+            }
+        }
+    }
+
+    struct RawWinFixture {
+        buf: *mut BufT,
+        win: *mut WinT,
+        tab: *mut TabpageT,
+        prev_firstwin: *mut WinT,
+        prev_curwin: *mut WinT,
+        prev_curtab: *mut TabpageT,
+        prev_first_tabpage: *mut TabpageT,
+    }
+
+    impl RawWinFixture {
+        fn new(handle: crate::types_defs::HandleT) -> Self {
+            let mut buf = Box::new(BufT::default());
+            buf.handle = handle * 100;
+            let buf = Box::into_raw(buf);
+
+            let mut win = Box::new(WinT::default());
+            win.handle = handle;
+            win.w_buffer = buf;
+            win.w_config.focusable = true;
+            let win = Box::into_raw(win);
+
+            let mut tab = Box::new(TabpageT::default());
+            tab.tp_firstwin = win;
+            let tab = Box::into_raw(tab);
+
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let fixture = Self {
+                buf,
+                win,
+                tab,
+                prev_firstwin: globals.firstwin,
+                prev_curwin: globals.curwin,
+                prev_curtab: globals.curtab,
+                prev_first_tabpage: globals.first_tabpage,
+            };
+            globals.firstwin = win;
+            globals.curwin = win;
+            globals.curtab = tab;
+            globals.first_tabpage = tab;
+            fixture
+        }
+    }
+
+    impl Drop for RawWinFixture {
+        fn drop(&mut self) {
+            unsafe {
+                let globals = crate::globals::GLOBALS.get_mut();
+                globals.firstwin = self.prev_firstwin;
+                globals.curwin = self.prev_curwin;
+                globals.curtab = self.prev_curtab;
+                globals.first_tabpage = self.prev_first_tabpage;
+                drop(Box::from_raw(self.tab));
+                drop(Box::from_raw(self.win));
+                drop(Box::from_raw(self.buf));
             }
         }
     }
@@ -248,5 +332,48 @@ mod tests {
         let buf = unsafe { nvim_win_get_buf(9999, &mut err) };
         assert_eq!(buf, 0);
         assert!(err.is_set());
+    }
+
+    #[test]
+    fn nvim_win_set_hl_ns_sets_namespace_marks_update_and_redraw() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(11);
+        let handle = unsafe { (*fx.win).handle };
+        let win_ptr = fx.win;
+        let mut err = Error::default();
+
+        unsafe { nvim_win_set_hl_ns(handle, 7, &mut err) };
+
+        assert!(!err.is_set());
+        assert_eq!(unsafe { (*win_ptr).w_ns_hl }, 7);
+        assert_eq!(unsafe { (*win_ptr).w_hl_needs_update }, 1);
+        assert_eq!(
+            unsafe { (*win_ptr).w_redr_type },
+            crate::drawscreen::UPD_NOT_VALID
+        );
+
+        unsafe { nvim_win_set_hl_ns(handle, -1, &mut err) };
+        assert_eq!(unsafe { (*win_ptr).w_ns_hl }, -1);
+    }
+
+    #[test]
+    fn nvim_win_set_hl_ns_rejects_too_negative_or_unknown_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(12);
+        let handle = unsafe { (*fx.win).handle };
+        let win_ptr = fx.win;
+        let mut err = Error::default();
+
+        unsafe { nvim_win_set_hl_ns(handle, -2, &mut err) };
+        assert_eq!(
+            err.r#type,
+            crate::api::private::defs::ErrorType::Validation
+        );
+        assert_eq!(err.msg.as_deref(), Some("Invalid 'namespace'"));
+        assert_eq!(unsafe { (*win_ptr).w_ns_hl }, 0);
+
+        err = Error::default();
+        unsafe { nvim_win_set_hl_ns(99, 1, &mut err) };
+        assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
     }
 }
