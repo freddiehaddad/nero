@@ -1027,6 +1027,13 @@ pub fn expand_set_concealcursor(
     expand_set_opt_listflag(args, crate::option_vars::COCU_ALL.as_bytes())
 }
 
+/// Expand `'cpoptions'` flag values (`expand_set_cpoptions`).
+pub fn expand_set_cpoptions(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    expand_set_opt_listflag(args, crate::option_vars::CPO_VI.as_bytes())
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5220,6 +5227,16 @@ mod tests {
                 b"c".to_vec(),
             ])
         );
+    }
+
+    #[test]
+    fn expand_set_cpoptions_returns_each_vi_flag() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        let matches = expand_set_cpoptions(&mut args).expect("cpoptions matches");
+        assert_eq!(matches.len(), crate::option_vars::CPO_VI.len());
+        assert_eq!(matches.first().map(Vec::as_slice), Some(b"a".as_slice()));
+        assert_eq!(matches.last().map(Vec::as_slice), Some(b"_".as_slice()));
+        assert!(matches.iter().all(|value| value.len() == 1));
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);
