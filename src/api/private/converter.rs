@@ -1,8 +1,8 @@
 //! Translated from `src/nvim/api/private/converter.c`.
 //!
-//! The `typval_T` to API [`Object`] direction is complete. The reverse
-//! direction is translated separately below once its allocation/
-//! ownership tests are in place.
+//! Both recursive conversion directions are complete except actual
+//! LuaRef registration, which remains at the untranslated Lua-host
+//! boundary.
 
 use std::collections::HashSet;
 
@@ -77,6 +77,63 @@ fn vim_to_object_inner(
 #[must_use]
 pub fn vim_to_object(value: &TypvalT) -> Object {
     vim_to_object_inner(value, &mut HashSet::new())
+}
+
+/// Convert an API object to a Vimscript value (`object_to_vim`).
+///
+/// # Safety
+/// Allocates and links real eval Lists/Dicts and mutates their shared
+/// GC registries.
+#[must_use]
+pub unsafe fn object_to_vim(
+    object: &Object,
+    _err: &mut crate::api::private::defs::Error,
+) -> TypvalT {
+    use crate::eval::typval::{
+        tv_dict_add, tv_dict_alloc, tv_dict_item_alloc, tv_list_alloc,
+        tv_list_append_owned_tv, tv_list_ref,
+    };
+    use crate::eval::typval_defs::{SpecialVarValue, VarLockStatus};
+
+    let value = match object {
+        Object::Nil => TypvalValue::Special(SpecialVarValue::Null),
+        Object::Boolean(false) => TypvalValue::Bool(BoolVarValue::False),
+        Object::Boolean(true) => TypvalValue::Bool(BoolVarValue::True),
+        Object::Integer(value) => TypvalValue::Number(*value),
+        Object::Buffer(value) | Object::Window(value) | Object::Tabpage(value) => {
+            TypvalValue::Number(i64::from(*value))
+        }
+        Object::Float(value) => TypvalValue::Float(*value),
+        Object::String(value) => {
+            return crate::eval::decode::decode_string(value.clone(), false);
+        }
+        Object::Array(items) => {
+            let list = tv_list_alloc(items.len() as isize);
+            for item in items {
+                let item_tv = unsafe { object_to_vim(item, _err) };
+                unsafe { tv_list_append_owned_tv(list, item_tv) };
+            }
+            unsafe { tv_list_ref(list) };
+            TypvalValue::List(list)
+        }
+        Object::Dict(items) => {
+            let dict = tv_dict_alloc();
+            for item in items {
+                let dict_item = tv_dict_item_alloc(&item.key);
+                unsafe { (*dict_item).di_tv = object_to_vim(&item.value, _err) };
+                let _ = unsafe { tv_dict_add(&mut *dict, dict_item) };
+            }
+            unsafe { (*dict).dv_refcount += 1 };
+            TypvalValue::Dict(dict)
+        }
+        Object::LuaRef(_) => {
+            unimplemented!("object_to_vim: LuaRef registration needs the Lua host")
+        }
+    };
+    TypvalT {
+        v_lock: VarLockStatus::Unlocked,
+        value,
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +236,73 @@ mod tests {
         // Break the cycle before normal recursive cleanup.
         unsafe { (*(*list).lv_first).li_tv = TypvalT::default() };
         unsafe { tv_list_unref(list) };
+    }
+
+    #[test]
+    fn object_to_vim_converts_scalars_and_handles() {
+        let mut err = crate::api::private::defs::Error::default();
+        assert!(matches!(
+            unsafe { object_to_vim(&Object::Boolean(true), &mut err) }.value,
+            TypvalValue::Bool(BoolVarValue::True)
+        ));
+        assert!(matches!(
+            unsafe { object_to_vim(&Object::Buffer(17), &mut err) }.value,
+            TypvalValue::Number(17)
+        ));
+        assert!(matches!(
+            unsafe { object_to_vim(&Object::String(b"text".to_vec()), &mut err) }.value,
+            TypvalValue::String(Some(value)) if value == b"text"
+        ));
+    }
+
+    #[test]
+    fn object_to_vim_converts_array_and_dict_containers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut err = crate::api::private::defs::Error::default();
+        let list = unsafe {
+            object_to_vim(
+                &Object::Array(vec![Object::Integer(3), Object::String(b"x".to_vec())]),
+                &mut err,
+            )
+        };
+        let dict = unsafe {
+            object_to_vim(
+                &Object::Dict(vec![KeyValuePair {
+                    key: b"value".to_vec(),
+                    value: Object::Integer(9),
+                }]),
+                &mut err,
+            )
+        };
+
+        let TypvalValue::List(list_ptr) = list.value else {
+            panic!("list result")
+        };
+        assert_eq!(unsafe { (*list_ptr).lv_len }, 2);
+        assert!(matches!(
+            unsafe { &(*(*list_ptr).lv_first).li_tv.value },
+            TypvalValue::Number(3)
+        ));
+        let TypvalValue::Dict(dict_ptr) = dict.value else {
+            panic!("dict result")
+        };
+        let item = unsafe {
+            crate::eval::typval::tv_dict_find(Some(&mut *dict_ptr), b"value")
+        }
+        .expect("dict item");
+        assert!(matches!(unsafe { &(*item).di_tv.value }, TypvalValue::Number(9)));
+        unsafe {
+            tv_list_unref(list_ptr);
+            tv_dict_unref(dict_ptr);
+        }
+    }
+
+    #[test]
+    fn object_to_vim_luaref_needs_the_lua_host() {
+        let mut err = crate::api::private::defs::Error::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            object_to_vim(&Object::LuaRef(3), &mut err)
+        }));
+        assert!(result.is_err());
     }
 }
