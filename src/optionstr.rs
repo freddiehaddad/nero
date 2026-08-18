@@ -1034,6 +1034,13 @@ pub fn expand_set_cpoptions(
     expand_set_opt_listflag(args, crate::option_vars::CPO_VI.as_bytes())
 }
 
+/// Expand `'formatoptions'` flag values (`expand_set_formatoptions`).
+pub fn expand_set_formatoptions(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    expand_set_opt_listflag(args, crate::option_vars::FO_ALL.as_bytes())
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5236,6 +5243,17 @@ mod tests {
         assert_eq!(matches.len(), crate::option_vars::CPO_VI.len());
         assert_eq!(matches.first().map(Vec::as_slice), Some(b"a".as_slice()));
         assert_eq!(matches.last().map(Vec::as_slice), Some(b"_".as_slice()));
+        assert!(matches.iter().all(|value| value.len() == 1));
+    }
+
+    #[test]
+    fn expand_set_formatoptions_returns_each_valid_flag_including_comma() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        let matches = expand_set_formatoptions(&mut args).expect("formatoptions matches");
+        assert_eq!(matches.len(), crate::option_vars::FO_ALL.len());
+        assert!(matches.iter().any(|value| value == b"t"));
+        assert!(matches.iter().any(|value| value == b","));
+        assert!(matches.iter().any(|value| value == b"p"));
         assert!(matches.iter().all(|value| value.len() == 1));
     }
 
