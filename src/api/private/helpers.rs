@@ -267,6 +267,24 @@ pub unsafe fn dict_set_var(
         } else {
             Object::Nil
         };
+        if dict == crate::eval::vars::get_vimvar_dict() {
+            match unsafe { crate::eval::vars::before_set_vvar(key, item, &converted) } {
+                crate::eval::vars::BeforeSetVvar::Handled => {
+                    unsafe { crate::eval::typval::tv_clear_simple(&converted) };
+                    return old;
+                }
+                crate::eval::vars::BeforeSetVvar::TypeError => {
+                    unsafe { crate::eval::typval::tv_clear_simple(&converted) };
+                    err.r#type = ErrorType::Validation;
+                    err.msg = Some(format!(
+                        "Setting v:{} to value with wrong type",
+                        String::from_utf8_lossy(key)
+                    ));
+                    return old;
+                }
+                crate::eval::vars::BeforeSetVvar::SetNormally => {}
+            }
+        }
         unsafe { crate::eval::typval::tv_clear_simple(&(*item).di_tv) };
         unsafe { (*item).di_tv = std::mem::take(&mut converted) };
         old
@@ -426,6 +444,36 @@ mod tests {
         let _ = unsafe { dict_set_var(dict, b"missing", &Object::Nil, true, false, &mut missing) };
         assert_eq!(missing.msg.as_deref(), Some("Key not found: missing"));
         unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn dict_set_var_uses_special_variable_type_coercion() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::vars::get_vimvar_dict();
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"errmsg") }
+            .expect("v:errmsg");
+        let old = unsafe { (*item).di_tv.clone() };
+        let mut err = Error::default();
+        let _ = unsafe {
+            dict_set_var(
+                dict,
+                b"errmsg",
+                &Object::Integer(42),
+                false,
+                false,
+                &mut err,
+            )
+        };
+        let converted = unsafe { (*item).di_tv.clone() };
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&(*item).di_tv);
+            (*item).di_tv = old;
+        }
+        assert!(matches!(
+            converted.value,
+            crate::eval::typval_defs::TypvalValue::String(Some(value)) if value == b"42"
+        ));
+        assert!(!err.is_set());
     }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {

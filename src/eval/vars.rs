@@ -197,6 +197,56 @@ use crate::eval::typval_defs::{
     ScopeType, SpecialVarValue, TypvalT, TypvalValue, VarLockStatus, VarType, VarnumberT,
     DO_NOT_FREE_CNT,
 };
+
+/// Outcome of [`before_set_vvar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeforeSetVvar {
+    /// The special variable was updated directly.
+    Handled,
+    /// The generic assignment path should replace the value.
+    SetNormally,
+    /// The new value has the wrong type.
+    TypeError,
+}
+
+/// Additional handling before assigning a `v:` variable
+/// (`before_set_vvar`).
+///
+/// Dictionary watchers are omitted because `DictT` has no watcher
+/// registry yet and therefore no current dictionary can be watched.
+///
+/// # Safety
+/// `item` must point to a live `DictitemT`; may mutate shared search
+/// and redraw state for `v:searchforward`/`v:hlsearch`.
+pub(crate) unsafe fn before_set_vvar(
+    name: &[u8],
+    item: *mut crate::eval::typval_defs::DictitemT,
+    value: &TypvalT,
+) -> BeforeSetVvar {
+    use crate::eval::typval_defs::TypvalValue;
+    match unsafe { &(*item).di_tv.value } {
+        TypvalValue::String(_) => {
+            let string = crate::eval::typval::tv_get_string(value);
+            unsafe { (*item).di_tv.value = TypvalValue::String(Some(string)) };
+            BeforeSetVvar::Handled
+        }
+        TypvalValue::Number(_) => {
+            let number = crate::eval::typval::tv_get_number(value);
+            unsafe { (*item).di_tv.value = TypvalValue::Number(number) };
+            if name == b"searchforward" {
+                unsafe { crate::search::set_search_direction(if number != 0 { b'/' } else { b'?' }) };
+            } else if name == b"hlsearch" {
+                unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = number == 0;
+                unsafe { crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_SOME_VALID) };
+            }
+            BeforeSetVvar::Handled
+        }
+        _ if unsafe { (*item).di_tv.var_type() } != value.var_type() => {
+            BeforeSetVvar::TypeError
+        }
+        _ => BeforeSetVvar::SetNormally,
+    }
+}
 use crate::eval::userfunc::{get_funccal_args_dict, get_funccal_local_dict};
 use crate::hashtab::hashitem_empty;
 use crate::hashtab_defs::HashtabT;
@@ -3033,6 +3083,68 @@ mod unref_var_dict_and_vars_clear_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn before_set_vvar_coerces_existing_string_and_number_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let string_item = crate::eval::typval::tv_dict_item_alloc(b"errmsg");
+        unsafe {
+            (*string_item).di_tv.value =
+                crate::eval::typval_defs::TypvalValue::String(None);
+        }
+        let number = TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(42),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { before_set_vvar(b"errmsg", string_item, &number) },
+            BeforeSetVvar::Handled
+        );
+        assert!(matches!(
+            unsafe { &(*string_item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::String(Some(value)) if value == b"42"
+        ));
+
+        let number_item = crate::eval::typval::tv_dict_item_alloc(b"count");
+        unsafe {
+            (*number_item).di_tv.value =
+                crate::eval::typval_defs::TypvalValue::Number(0);
+        }
+        let string = TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::String(Some(b"7".to_vec())),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { before_set_vvar(b"count", number_item, &string) },
+            BeforeSetVvar::Handled
+        );
+        assert!(matches!(
+            unsafe { &(*number_item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::Number(7)
+        ));
+        unsafe {
+            crate::eval::typval::tv_dict_item_free(string_item);
+            crate::eval::typval::tv_dict_item_free(number_item);
+        }
+    }
+
+    #[test]
+    fn before_set_vvar_rejects_other_type_changes() {
+        let item = crate::eval::typval::tv_dict_item_alloc(b"event");
+        unsafe {
+            (*item).di_tv.value =
+                crate::eval::typval_defs::TypvalValue::Dict(std::ptr::null_mut());
+        }
+        let number = TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { before_set_vvar(b"event", item, &number) },
+            BeforeSetVvar::TypeError
+        );
+        unsafe { crate::eval::typval::tv_dict_item_free(item) };
+    }
 
     #[test]
     fn vimvars_table_has_exactly_108_entries() {
