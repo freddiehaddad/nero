@@ -143,6 +143,33 @@ pub unsafe fn nvim_win_get_var(win: Window, name: &NvimString, err: &mut Error) 
     unsafe { crate::api::private::helpers::dict_get_value((*win).w_vars, name, err) }
 }
 
+/// Set a window-scoped variable (`nvim_win_set_var`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`] and the checked
+/// scope-dictionary writer.
+pub unsafe fn nvim_win_set_var(
+    win: Window,
+    name: &NvimString,
+    value: &Object,
+    err: &mut Error,
+) {
+    let win = unsafe { find_window_by_handle(win, err) };
+    if win.is_null() {
+        return;
+    }
+    let _ = unsafe {
+        crate::api::private::helpers::dict_set_var(
+            (*win).w_vars,
+            name,
+            value,
+            false,
+            false,
+            err,
+        )
+    };
+}
+
 /// Optional range controls for [`nvim_win_text_height`].
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct WinTextHeightOpts {
@@ -603,6 +630,34 @@ mod tests {
         assert!(matches!(value, Object::Integer(42)));
         assert!(!err.is_set());
         unsafe {
+            (*fx.win).w_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn nvim_win_set_var_stores_a_window_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(22);
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*fx.win).w_vars = dict };
+        let mut err = Error::default();
+        unsafe {
+            nvim_win_set_var(
+                (*fx.win).handle,
+                &b"value".to_vec(),
+                &Object::String(b"text".to_vec()),
+                &mut err,
+            )
+        };
+        let value =
+            unsafe { nvim_win_get_var((*fx.win).handle, &b"value".to_vec(), &mut err) };
+        assert!(matches!(value, Object::String(ref text) if text == b"text"));
+        assert!(!err.is_set());
+        let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), b"value") }
+            .expect("window variable");
+        unsafe {
+            crate::eval::typval::tv_dict_item_remove(&mut *dict, item);
             (*fx.win).w_vars = std::ptr::null_mut();
             crate::eval::typval::tv_dict_unref(dict);
         }
