@@ -53,6 +53,9 @@
 //! flags into the SAME slot; a `,`-joined group starts a new one)
 //! before translating. `optionstr.rs`'s `did_set_wildmode` is its
 //! real caller.
+//!
+//! Also translated: [`did_set_cedit`] - validates `'cedit'` and stores
+//! its parsed key in the real file-local `cedit_key` state.
 
 /// Trigger one command-line autocmd (`trigger_cmd_autocmd`).
 ///
@@ -373,6 +376,9 @@ static CCLINE: crate::globals::GlobalCell<crate::ex_getln_defs::CmdlineInfo> =
 
 /// The ID of the most recent command-line prompt (`last_prompt_id`).
 static LAST_PROMPT_ID: crate::globals::GlobalCell<u32> = crate::globals::GlobalCell::new(0);
+
+/// Key value of the `'cedit'` option (`cedit_key`).
+static CEDIT_KEY: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
 
 /// The current command-line info (`get_cmdline_info`).
 ///
@@ -1008,6 +1014,36 @@ pub unsafe fn is_in_cmdwin() -> bool {
     unsafe { crate::buffer::bt_cmdwin(Some(curbuf)) }
 }
 
+/// Check `'cedit'` and store its parsed key (`did_set_cedit`).
+///
+/// # Safety
+/// Touches `OPTION_VARS` and the `CEDIT_KEY` file-static.
+pub unsafe fn did_set_cedit(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_cedit
+        .clone()
+        .unwrap_or_default();
+
+    if value.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *CEDIT_KEY.get_mut() = -1 };
+        return None;
+    }
+
+    let key = crate::option::string_to_key(&value);
+    // SAFETY: forwarded from this function's own safety doc.
+    if key == 0 || unsafe { crate::charset::vim_isprintc(key) } {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CEDIT_KEY.get_mut() = key };
+    None
+}
+
 /// Read the `'wildmode'` option, filling
 /// `crate::globals::Globals::wim_flags` (`check_opt_wim`).
 ///
@@ -1139,6 +1175,78 @@ pub fn empty_pattern_magic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CeditGuard {
+        previous_option: Option<Vec<u8>>,
+        previous_key: i32,
+    }
+
+    impl CeditGuard {
+        fn set(value: Option<&[u8]>) -> Self {
+            let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let previous_option = std::mem::replace(
+                &mut options.p_cedit,
+                value.map(<[u8]>::to_vec),
+            );
+            let previous_key = unsafe { *CEDIT_KEY.get_mut() };
+            CeditGuard { previous_option, previous_key }
+        }
+    }
+
+    impl Drop for CeditGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cedit =
+                self.previous_option.take();
+            unsafe { *CEDIT_KEY.get_mut() = self.previous_key };
+        }
+    }
+
+    #[test]
+    fn did_set_cedit_empty_value_disables_the_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CeditGuard::set(Some(b""));
+        unsafe { *CEDIT_KEY.get_mut() = 7 };
+        assert_eq!(
+            unsafe { did_set_cedit(&mut Default::default()) },
+            None
+        );
+        assert_eq!(unsafe { *CEDIT_KEY.get_mut() }, -1);
+    }
+
+    #[test]
+    fn did_set_cedit_accepts_a_non_printable_control_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CeditGuard::set(Some(b"^A"));
+        assert_eq!(
+            unsafe { did_set_cedit(&mut Default::default()) },
+            None
+        );
+        assert_eq!(unsafe { *CEDIT_KEY.get_mut() }, 1);
+    }
+
+    #[test]
+    fn did_set_cedit_rejects_a_printable_key_without_changing_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CeditGuard::set(Some(b"x"));
+        unsafe { *CEDIT_KEY.get_mut() = 9 };
+        assert_eq!(
+            unsafe { did_set_cedit(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(unsafe { *CEDIT_KEY.get_mut() }, 9);
+    }
+
+    #[test]
+    fn did_set_cedit_rejects_an_unrecognized_key_without_changing_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CeditGuard::set(Some(b"<NotARealKey>"));
+        unsafe { *CEDIT_KEY.get_mut() = 11 };
+        assert_eq!(
+            unsafe { did_set_cedit(&mut Default::default()) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(unsafe { *CEDIT_KEY.get_mut() }, 11);
+    }
 
     #[test]
     fn get_text_locked_msg_returns_the_canonical_e565_diagnostic() {

@@ -8337,6 +8337,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::did_set_backupext_or_patchmode);
     options[OptIndex::Breakat as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_breakat);
+    options[OptIndex::Cedit as usize].opt_did_set_cb =
+        Some(crate::ex_getln::did_set_cedit);
     options[OptIndex::Completeitemalign as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_completeitemalign);
     options[OptIndex::Diffopt as usize].opt_did_set_cb =
@@ -8661,6 +8663,7 @@ mod options_table_tests {
             b"wrap",
             b"backupext",
             b"breakat",
+            b"cedit",
             b"completeitemalign",
             b"diffopt",
             b"helplang",
