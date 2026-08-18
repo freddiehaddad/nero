@@ -66,6 +66,16 @@ pub unsafe fn nvim_get_mode() -> Dict {
     ]
 }
 
+/// Resolve a named or hexadecimal RGB color
+/// (`nvim_get_color_by_name`).
+///
+/// # Safety
+/// Forwarded from [`crate::highlight_group::name_to_color`].
+#[must_use]
+pub unsafe fn nvim_get_color_by_name(name: &NvimString) -> Integer {
+    i64::from(unsafe { crate::highlight_group::name_to_color(name) }.0)
+}
+
 /// List every current buffer, including unlisted and unloaded buffers
 /// (`nvim_list_bufs`).
 ///
@@ -531,6 +541,22 @@ mod tests {
         drop(_state);
         drop(_curbuf);
         unsafe { drop(Box::from_raw(buf_ptr)) };
+    }
+
+    #[test]
+    fn nvim_get_color_by_name_resolves_named_hex_and_invalid_colors() {
+        assert_eq!(
+            unsafe { nvim_get_color_by_name(&b"RebeccaPurple".to_vec()) },
+            0x663399
+        );
+        assert_eq!(
+            unsafe { nvim_get_color_by_name(&b"#12abEF".to_vec()) },
+            0x12abef
+        );
+        assert_eq!(
+            unsafe { nvim_get_color_by_name(&b"not-a-color".to_vec()) },
+            -1
+        );
     }
 
     struct HighlightNamespaceGuard {
