@@ -3,7 +3,7 @@
 //! machinery, the msgpack-rpc dispatch layer, command execution, and
 //! the Lua host, none of which are wired into this API layer yet).
 //!
-//! Translated: [`nvim_list_bufs`], [`nvim_get_current_win`]/
+//! Translated: [`nvim_list_bufs`], [`nvim_list_wins`], [`nvim_get_current_win`]/
 //! [`nvim_get_current_buf`]/[`nvim_get_current_tabpage`] (harvested ahead of the rest of this
 //! file, matching the established "one tractable function ahead of a
 //! huge file" precedent used elsewhere in this crate, e.g.
@@ -29,6 +29,33 @@ pub unsafe fn nvim_list_bufs() -> Array {
     while !buf.is_null() {
         result.push(Object::Buffer(unsafe { (*buf).handle }));
         buf = unsafe { (*buf).b_next };
+    }
+    result
+}
+
+/// List every current window in every tabpage (`nvim_list_wins`).
+///
+/// # Safety
+/// The tabpage list and every tabpage's window list must consist of
+/// live pointers.
+#[must_use]
+pub unsafe fn nvim_list_wins() -> Array {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let current_tab = globals.curtab;
+    let current_firstwin = globals.firstwin;
+    let mut tab = globals.first_tabpage;
+    let mut result = Vec::new();
+    while !tab.is_null() {
+        let mut win = if std::ptr::eq(tab, current_tab) {
+            current_firstwin
+        } else {
+            unsafe { (*tab).tp_firstwin }
+        };
+        while !win.is_null() {
+            result.push(Object::Window(unsafe { (*win).handle }));
+            win = unsafe { (*win).w_next };
+        }
+        tab = unsafe { (*tab).tp_next };
     }
     result
 }
@@ -192,6 +219,73 @@ mod tests {
             )
         };
         assert!(unsafe { nvim_list_bufs() }.is_empty());
+    }
+
+    #[test]
+    fn nvim_list_wins_returns_windows_from_every_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other_win = WinT {
+            handle: 83,
+            ..Default::default()
+        };
+        let other_win_ptr = std::ptr::addr_of_mut!(other_win);
+        let mut current_second = WinT {
+            handle: 82,
+            ..Default::default()
+        };
+        let current_second_ptr = std::ptr::addr_of_mut!(current_second);
+        let mut current_first = WinT {
+            handle: 81,
+            w_next: current_second_ptr,
+            ..Default::default()
+        };
+        let current_first_ptr = std::ptr::addr_of_mut!(current_first);
+        let mut other_tab = TabpageT {
+            handle: 92,
+            tp_firstwin: other_win_ptr,
+            ..Default::default()
+        };
+        let other_tab_ptr = std::ptr::addr_of_mut!(other_tab);
+        let mut current_tab = TabpageT {
+            handle: 91,
+            tp_next: other_tab_ptr,
+            ..Default::default()
+        };
+        let current_tab_ptr = std::ptr::addr_of_mut!(current_tab);
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.first_tabpage,
+                current_tab_ptr,
+            )
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, current_tab_ptr)
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                current_first_ptr,
+            )
+        };
+
+        let windows = unsafe { nvim_list_wins() };
+
+        assert!(matches!(
+            windows.as_slice(),
+            [Object::Window(81), Object::Window(82), Object::Window(83)]
+        ));
+    }
+
+    #[test]
+    fn nvim_list_wins_returns_empty_without_tabpages() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.first_tabpage,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(unsafe { nvim_list_wins() }.is_empty());
     }
 
     struct HighlightNamespaceGuard {
