@@ -9,6 +9,9 @@
 //! [`ff_path_in_stoplist`] - small, pure string/path helpers needing
 //! only already-translated pieces (`mbyte.rs`, `path.rs`,
 //! `option_vars.rs`).
+//! Also translated: [`vim_chdirfile`] - changes to the directory
+//! containing a file. DirChanged autocmd dispatch is inert today
+//! because no autocmd can be registered yet.
 //!
 //! Deferred: everything else - `vim_findfile_init`/`vim_findfile`/
 //! `find_file_in_path`/`find_directory_in_path`/`grab_file_name`/
@@ -19,6 +22,37 @@
 
 use crate::mbyte::utf_ptr2char;
 use crate::path::{path_fnamencmp, vim_ispathsep};
+
+/// Change to the directory containing `fname` (`vim_chdirfile`).
+///
+/// The original fires pre/post `DirChanged` autocmds unless `cause`
+/// is `Other`. No autocmd can be registered in this crate yet, so
+/// those calls have no lasting effect and are omitted. Paths must be
+/// valid UTF-8, matching the existing `std::path::Path`-based OS layer.
+///
+/// # Safety
+/// Forwarded from [`crate::path::pathcmp`]'s option/global-state
+/// requirements.
+pub unsafe fn vim_chdirfile(fname: &[u8], _cause: crate::vim_defs::CdCause) -> i32 {
+    let tail = crate::path::path_tail_with_sep(fname);
+    let dir = &fname[..tail];
+    let Some(current) = crate::os::fs::os_dirname() else {
+        return crate::vim_defs::FAIL;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::path::pathcmp(dir, &current, None) } == 0 {
+        return crate::vim_defs::OK;
+    }
+
+    let Ok(dir) = std::str::from_utf8(dir) else {
+        return crate::vim_defs::FAIL;
+    };
+    if crate::os::fs::os_chdir(std::path::Path::new(dir)) == 0 {
+        crate::vim_defs::OK
+    } else {
+        crate::vim_defs::FAIL
+    }
+}
 
 /// Shared filename-expansion buffer (`ff_expand_buffer`).
 static FF_EXPAND_BUFFER: crate::globals::GlobalCell<Option<Vec<u8>>> =
@@ -420,6 +454,92 @@ pub unsafe fn ff_free_stack_element(stack_ptr: *mut FfStackT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CwdGuard(std::path::PathBuf);
+
+    impl CwdGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().expect("current directory");
+            std::env::set_current_dir(path).expect("set test directory");
+            CwdGuard(previous)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "nero_file_search_{name}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch directory");
+            ScratchDir(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn vim_chdirfile_returns_ok_when_the_file_is_already_in_cwd() {
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let current = crate::os::fs::os_dirname().expect("current directory");
+        let fname = crate::path::concat_fnames(&current, b"file.txt", true);
+        assert_eq!(
+            unsafe { vim_chdirfile(&fname, crate::vim_defs::CdCause::Auto) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(crate::os::fs::os_dirname(), Some(current));
+    }
+
+    #[test]
+    fn vim_chdirfile_changes_to_the_files_directory() {
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let scratch = ScratchDir::new("chdirfile");
+        let child = scratch.0.join("child");
+        std::fs::create_dir(&child).expect("create child");
+        let _cwd = CwdGuard::set(&scratch.0);
+
+        assert_eq!(
+            unsafe {
+                vim_chdirfile(b"child/file.txt", crate::vim_defs::CdCause::Auto)
+            },
+            crate::vim_defs::OK
+        );
+        let mut expected = child.to_string_lossy().into_owned().into_bytes();
+        crate::path::path_to_slash(&mut expected);
+        assert_eq!(crate::os::fs::os_dirname(), Some(expected));
+    }
+
+    #[test]
+    fn vim_chdirfile_fails_when_the_directory_does_not_exist() {
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let scratch = ScratchDir::new("chdirfile_missing");
+        let _cwd = CwdGuard::set(&scratch.0);
+        let before = crate::os::fs::os_dirname();
+
+        assert_eq!(
+            unsafe {
+                vim_chdirfile(
+                    b"missing/file.txt",
+                    crate::vim_defs::CdCause::Manual,
+                )
+            },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(crate::os::fs::os_dirname(), before);
+    }
 
     struct ExpandBufferGuard(Option<Vec<u8>>);
 
