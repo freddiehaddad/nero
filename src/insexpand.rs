@@ -2232,7 +2232,6 @@ fn clear_cpt_callbacks(callbacks: &mut Vec<crate::eval::typval_defs::Callback>) 
 ///
 /// # Safety
 /// Every callback referent in `src` must remain valid.
-#[allow(dead_code)]
 unsafe fn copy_cpt_callbacks(
     dest: &mut Vec<crate::eval::typval_defs::Callback>,
     src: &[crate::eval::typval_defs::Callback],
@@ -2249,6 +2248,25 @@ unsafe fn copy_cpt_callbacks(
         }
         dest.push(copied);
     }
+}
+
+/// Copy cached global `'complete'` callbacks into a buffer
+/// (`set_buflocal_cpt_callbacks`).
+///
+/// # Safety
+/// `buf` and every callback referent must remain valid.
+pub unsafe fn set_buflocal_cpt_callbacks(
+    buf: *mut crate::buffer_defs::BufT,
+) {
+    if buf.is_null() || unsafe { CPT_CB.get_mut() }.is_empty() {
+        return;
+    }
+    unsafe {
+        copy_cpt_callbacks(
+            &mut (*buf).b_p_cpt_cb,
+            &*CPT_CB.as_ptr(),
+        )
+    };
 }
 
 /// Mark `copy_id` on every callback in `callbacks` so none of them are
@@ -2346,6 +2364,7 @@ mod tests {
         callback: crate::eval::typval_defs::Callback,
         option: Option<Vec<u8>>,
     }
+    struct CptGuard(Vec<crate::eval::typval_defs::Callback>);
 
     impl CfuGuard {
         fn install(value: Option<&[u8]>) -> Self {
@@ -2434,6 +2453,19 @@ mod tests {
             );
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tsrfu =
                 self.option.take();
+        }
+    }
+
+    impl CptGuard {
+        fn install(value: Vec<crate::eval::typval_defs::Callback>) -> Self {
+            Self(std::mem::replace(unsafe { CPT_CB.get_mut() }, value))
+        }
+    }
+
+    impl Drop for CptGuard {
+        fn drop(&mut self) {
+            clear_cpt_callbacks(unsafe { CPT_CB.get_mut() });
+            *unsafe { CPT_CB.get_mut() } = std::mem::take(&mut self.0);
         }
     }
 
@@ -5053,5 +5085,65 @@ mod tests {
         clear_cpt_callbacks(&mut dest);
         assert_eq!(unsafe { (*new_partial).pt_refcount }, 1);
         clear_cpt_callbacks(&mut src);
+    }
+
+    #[test]
+    fn set_buflocal_cpt_callbacks_copies_global_callbacks() {
+        let _lock = global_state_test_lock();
+        let global_partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let _global = CptGuard::install(vec![
+            crate::eval::typval_defs::Callback::Partial(global_partial),
+            crate::eval::typval_defs::Callback::None,
+        ]);
+        let old_local = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt_cb: vec![
+                crate::eval::typval_defs::Callback::Partial(old_local),
+            ],
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+
+        unsafe { set_buflocal_cpt_callbacks(buf_ptr) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_p_cpt_cb.len() }, 2);
+        assert_eq!(unsafe { (*global_partial).pt_refcount }, 2);
+        clear_cpt_callbacks(unsafe { &mut (*buf_ptr).b_p_cpt_cb });
+        assert_eq!(unsafe { (*global_partial).pt_refcount }, 1);
+    }
+
+    #[test]
+    fn set_buflocal_cpt_callbacks_empty_global_leaves_local_untouched() {
+        let _lock = global_state_test_lock();
+        let _global = CptGuard::install(Vec::new());
+        let local_partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt_cb: vec![
+                crate::eval::typval_defs::Callback::Partial(local_partial),
+            ],
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+
+        unsafe { set_buflocal_cpt_callbacks(buf_ptr) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_p_cpt_cb.len() }, 1);
+        assert_eq!(unsafe { (*local_partial).pt_refcount }, 1);
+        clear_cpt_callbacks(unsafe { &mut (*buf_ptr).b_p_cpt_cb });
     }
 }
