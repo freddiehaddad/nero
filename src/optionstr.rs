@@ -2497,7 +2497,13 @@ pub unsafe fn did_set_complete(args: &mut crate::option_defs::OptsetT) -> Option
         }
     }
 
-    None
+    if unsafe { crate::insexpand::set_cpt_callbacks(args) }
+        != crate::vim_defs::OK
+    {
+        Some(e_illegal_character_after_chr.as_bytes())
+    } else {
+        None
+    }
 }
 
 /// Check `scl` as a `'signcolumn'` value and update `wp`'s own
@@ -8034,14 +8040,31 @@ mod tests {
     /// the `char_before` path reports its error rather than taking
     /// the original's own errbuf-absent success shortcut.
     fn complete_result(value: &[u8]) -> Option<&'static [u8]> {
+        let _lock = crate::globals::global_state_test_lock();
         let mut val: Option<Vec<u8>> = Some(value.to_vec());
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt: Some(value.to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
         let mut args = crate::option_defs::OptsetT {
             os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
             os_errbuf: Some(vec![0; 80]),
             os_errbuflen: 80,
             ..Default::default()
         };
-        unsafe { did_set_complete(&mut args) }
+        let result = unsafe { did_set_complete(&mut args) };
+        for callback in unsafe { &mut (*buf_ptr).b_p_cpt_cb } {
+            crate::eval::typval::callback_free(callback);
+        }
+        result
     }
 
     fn illegal_after() -> Option<&'static [u8]> {
@@ -8069,6 +8092,42 @@ mod tests {
     fn did_set_complete_argument_taking_flags_accept_trailing_text() {
         assert_eq!(complete_result(b"k/some/path"), None);
         assert_eq!(complete_result(b"Fmyfunc"), None);
+    }
+
+    #[test]
+    fn did_set_complete_builds_function_callback_slots() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut val: Option<Vec<u8>> = Some(b".,FMyComplete,w".to_vec());
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cpt: val.clone(),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: (&mut val as *mut Option<Vec<u8>>).cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            os_errbuf: Some(vec![0; 80]),
+            os_errbuflen: 80,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_complete(&mut args) }, None);
+        let callbacks = unsafe { &mut (*buf_ptr).b_p_cpt_cb };
+        assert_eq!(callbacks.len(), 3);
+        assert!(matches!(
+            &callbacks[1],
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"MyComplete"
+        ));
+        for callback in callbacks {
+            crate::eval::typval::callback_free(callback);
+        }
     }
 
     #[test]
