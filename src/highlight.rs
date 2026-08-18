@@ -670,6 +670,35 @@ pub unsafe fn ns_get_hl(
     }
 }
 
+/// Resolve a highlight group's complete attributes in one namespace
+/// (`hl_ns_get_attrs`).
+///
+/// `optional` is updated when namespace link resolution explicitly
+/// defines the group to be empty.
+///
+/// # Safety
+/// Reads the shared group, namespace/provider, and attribute tables.
+#[must_use]
+pub unsafe fn hl_ns_get_attrs(
+    ns_id: i32,
+    hl_id: i32,
+    optional: Option<&mut bool>,
+    attrs: &mut crate::highlight_defs::HlAttrs,
+) -> bool {
+    let mut is_optional = optional.as_ref().map(|value| **value).unwrap_or(true);
+    let attr_id = unsafe {
+        crate::highlight_group::syn_ns_id2attr(ns_id, hl_id, &mut is_optional)
+    };
+    if let Some(out) = optional {
+        *out = is_optional;
+    }
+    if attr_id <= 0 {
+        return false;
+    }
+    *attrs = unsafe { syn_attr2entry(attr_id) };
+    true
+}
+
 /// The currently active UI highlight attribute for each `HlfT`
 /// (`hl_attr_active`).
 pub static HL_ATTR_ACTIVE: crate::globals::GlobalCell<
@@ -1792,6 +1821,77 @@ mod tests {
         assert_eq!(unsafe { ns_get_hl(&mut inactive, 2, false, false) }, -1);
         let mut missing = 6;
         assert_eq!(unsafe { ns_get_hl(&mut missing, 2, false, false) }, -1);
+    }
+
+    #[test]
+    fn hl_ns_get_attrs_returns_global_group_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup {
+                sg_attr: 1,
+                ..Default::default()
+            },
+        ]);
+        unsafe { highlight_init() };
+        let expected = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x12_34_56,
+            ..Default::default()
+        };
+        let attr_id = unsafe { hl_get_term_attr(&expected) };
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items[0].sg_attr = attr_id;
+        let mut attrs = Default::default();
+
+        assert!(unsafe { hl_ns_get_attrs(0, 1, None, &mut attrs) });
+        assert_eq!(attrs, expected);
+    }
+
+    #[test]
+    fn hl_ns_get_attrs_updates_optional_for_an_explicit_namespace_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup::default(),
+        ]);
+        unsafe { highlight_init() };
+        let expected = crate::highlight_defs::HlAttrs {
+            rgb_bg_color: 0x65_43_21,
+            ..Default::default()
+        };
+        let attr_id = unsafe { hl_get_term_attr(&expected) };
+        let _ = unsafe { crate::decoration_provider::get_decor_provider(3, true) };
+        unsafe { NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(3, 1),
+            crate::highlight_defs::ColorItem {
+                attr_id,
+                version: -1,
+                ..Default::default()
+            },
+        );
+        let mut optional = true;
+        let mut attrs = Default::default();
+
+        assert!(unsafe { hl_ns_get_attrs(3, 1, Some(&mut optional), &mut attrs) });
+        assert!(!optional);
+        assert_eq!(attrs, expected);
+    }
+
+    #[test]
+    fn hl_ns_get_attrs_returns_false_for_a_missing_attribute() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(vec![
+            crate::highlight_group::HlGroup::default(),
+        ]);
+        let mut attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 7,
+            ..Default::default()
+        };
+
+        assert!(!unsafe { hl_ns_get_attrs(0, 1, None, &mut attrs) });
+        assert_eq!(attrs.rgb_fg_color, 7);
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);
