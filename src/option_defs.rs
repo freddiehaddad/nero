@@ -8412,6 +8412,10 @@ fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::expand_set_encoding);
     options[OptIndex::Makeencoding as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_encoding);
+    options[OptIndex::Fileformats as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_str_generic);
+    options[OptIndex::Viewoptions as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_str_generic);
 }
 
 #[cfg(test)]
@@ -8758,8 +8762,13 @@ mod options_table_tests {
             expected.contains(&option.fullname)
                 || option.opt_did_set_cb.is_none()
         }));
-        let expanded: &[&[u8]] =
-            &[b"fileencoding", b"fileencodings", b"makeencoding"];
+        let expanded: &[&[u8]] = &[
+            b"fileencoding",
+            b"fileencodings",
+            b"fileformats",
+            b"makeencoding",
+            b"viewoptions",
+        ];
         for name in expanded {
             assert!(opts
                 .iter()

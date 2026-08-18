@@ -962,6 +962,34 @@ pub fn expand_set_encoding(
     )
 }
 
+/// Expand an option's fixed string-value list
+/// (`expand_set_str_generic`).
+///
+/// Regex filtering remains deferred with the regexp engine.
+pub fn expand_set_str_generic(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!("expand_set_str_generic: regex filtering needs the regexp engine");
+    }
+    let values_idx = match args.oe_idx {
+        crate::option_defs::OptIndex::Viewoptions => {
+            crate::option_defs::OptIndex::Sessionoptions
+        }
+        crate::option_defs::OptIndex::Fileformats => {
+            crate::option_defs::OptIndex::Fileformat
+        }
+        idx => idx,
+    };
+    Some(
+        crate::option::get_option(values_idx)
+            .values
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect(),
+    )
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5064,6 +5092,42 @@ mod tests {
             ..Default::default()
         };
         let _ = expand_set_encoding(&mut args);
+    }
+
+    #[test]
+    fn expand_set_str_generic_uses_the_fileformat_and_sessionoption_value_lists() {
+        let mut fileformats = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Fileformats,
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_set_str_generic(&mut fileformats),
+            Some(vec![
+                b"unix".to_vec(),
+                b"dos".to_vec(),
+                b"mac".to_vec(),
+            ])
+        );
+
+        let mut viewoptions = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Viewoptions,
+            ..Default::default()
+        };
+        let values = expand_set_str_generic(&mut viewoptions).expect("viewoption values");
+        assert!(values.iter().any(|value| value == b"folds"));
+        assert!(values.iter().any(|value| value == b"cursor"));
+        assert!(values.iter().any(|value| value == b"curdir"));
+    }
+
+    #[test]
+    #[should_panic(expected = "regexp engine")]
+    fn expand_set_str_generic_filtered_completion_needs_the_regexp_engine() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Fileformats,
+            oe_regmatch: std::ptr::NonNull::dangling().as_ptr(),
+            ..Default::default()
+        };
+        let _ = expand_set_str_generic(&mut args);
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);
