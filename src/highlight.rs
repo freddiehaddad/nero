@@ -551,6 +551,10 @@ pub static NS_HL_WIN: crate::globals::GlobalCell<i32> = crate::globals::GlobalCe
 /// Negative means no fast-callback namespace is in effect, which is
 /// what lets per-window highlight overrides apply.
 pub static NS_HL_FAST: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
+/// Namespace currently active for global/window drawing
+/// (`ns_hl_active`).
+pub static NS_HL_ACTIVE: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
 
 /// Namespace highlight definitions (`ns_hls`).
 pub static NS_HLS: std::sync::LazyLock<
@@ -605,6 +609,64 @@ pub unsafe fn ns_hl_def(
     };
     unsafe { NS_HLS.get_mut() }.insert(key, item);
     unsafe { (*provider).hl_cached = false };
+}
+
+/// Resolve one highlight definition from a namespace (`ns_get_hl`).
+///
+/// A negative namespace selects [`NS_HL_ACTIVE`]. Link lookups return
+/// the linked group ID, while direct-attribute lookups return the
+/// interned attribute ID. A real Lua `hl_def` callback remains at an
+/// explicit boundary because the Lua host is not translated and no
+/// current code can install such a callback.
+///
+/// # Safety
+/// Mutates `ns_hl` and reads/mutates shared namespace/provider state.
+#[must_use]
+pub unsafe fn ns_get_hl(
+    ns_hl: &mut i32,
+    hl_id: i32,
+    link: bool,
+    nodefault: bool,
+) -> i32 {
+    if *ns_hl == 0 {
+        return -1;
+    }
+    if *ns_hl < 0 {
+        let active = unsafe { *NS_HL_ACTIVE.get_mut() };
+        if active <= 0 {
+            return -1;
+        }
+        *ns_hl = active;
+    }
+
+    let ns_id = *ns_hl;
+    let provider = unsafe {
+        crate::decoration_provider::get_decor_provider(ns_id, true)
+    };
+    let item = unsafe { NS_HLS.get_mut() }
+        .get(&crate::highlight_defs::ColorKey::new(ns_id, hl_id))
+        .copied()
+        .unwrap_or_default();
+    let valid_item = item.version >= unsafe { (*provider).hl_valid };
+
+    if !valid_item && unsafe { (*provider).hl_def } != -1 {
+        unimplemented!("ns_get_hl: Lua highlight callbacks need the Lua host");
+    }
+    if (item.is_default && nodefault) || !valid_item {
+        return -1;
+    }
+
+    if link {
+        if item.attr_id >= 0 {
+            return 0;
+        }
+        if item.link_global {
+            *ns_hl = 0;
+        }
+        item.link_id
+    } else {
+        item.attr_id
+    }
 }
 
 /// The currently active UI highlight attribute for each `HlfT`
@@ -1518,6 +1580,7 @@ mod tests {
             crate::highlight_defs::ColorItem,
         >,
         providers: Vec<crate::decoration_defs::DecorProvider>,
+        active: i32,
     }
 
     impl NamespaceHighlightsGuard {
@@ -1528,9 +1591,12 @@ mod tests {
             );
             let providers =
                 std::mem::take(unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() });
+            let active = unsafe { *NS_HL_ACTIVE.get_mut() };
+            unsafe { *NS_HL_ACTIVE.get_mut() = 0 };
             Self {
                 definitions,
                 providers,
+                active,
             }
         }
     }
@@ -1541,6 +1607,7 @@ mod tests {
                 std::mem::replace(&mut self.definitions, crate::map::Map::new());
             *unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() } =
                 std::mem::take(&mut self.providers);
+            unsafe { *NS_HL_ACTIVE.get_mut() = self.active };
         }
     }
 
@@ -1614,6 +1681,72 @@ mod tests {
         assert!(item.attr_id > 0);
         assert_eq!(item.link_id, -1);
         assert!(item.link_global);
+    }
+
+    #[test]
+    fn ns_get_hl_resolves_direct_attributes_and_active_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x12_34_56,
+            ..Default::default()
+        };
+        unsafe { ns_hl_def(7, 3, attrs, -1) };
+        unsafe { *NS_HL_ACTIVE.get_mut() = 7 };
+        let mut ns_id = -1;
+
+        let attr_id = unsafe { ns_get_hl(&mut ns_id, 3, false, false) };
+
+        assert_eq!(ns_id, 7);
+        assert!(attr_id > 0);
+        assert_eq!(unsafe { syn_attr2entry(attr_id) }, attrs);
+        assert_eq!(unsafe { ns_get_hl(&mut ns_id, 3, true, false) }, 0);
+    }
+
+    #[test]
+    fn ns_get_hl_resolves_links_and_global_link_fallback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_GLOBAL as i32,
+            ..Default::default()
+        };
+        unsafe { ns_hl_def(4, 2, attrs, 9) };
+        let mut ns_id = 4;
+
+        assert_eq!(unsafe { ns_get_hl(&mut ns_id, 2, true, false) }, 9);
+        assert_eq!(ns_id, 0);
+    }
+
+    #[test]
+    fn ns_get_hl_rejects_default_and_stale_definitions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_DEFAULT as i32,
+            ..Default::default()
+        };
+        unsafe { ns_hl_def(4, 2, attrs, 8) };
+        let mut ns_id = 4;
+        assert_eq!(unsafe { ns_get_hl(&mut ns_id, 2, true, true) }, -1);
+
+        let provider = unsafe { crate::decoration_provider::get_decor_provider(4, false) };
+        unsafe { (*provider).hl_valid += 1 };
+        assert_eq!(unsafe { ns_get_hl(&mut ns_id, 2, true, false) }, -1);
+    }
+
+    #[test]
+    fn ns_get_hl_returns_minus_one_without_a_namespace_or_definition() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let mut global = 0;
+        assert_eq!(unsafe { ns_get_hl(&mut global, 2, false, false) }, -1);
+        let mut inactive = -1;
+        assert_eq!(unsafe { ns_get_hl(&mut inactive, 2, false, false) }, -1);
+        let mut missing = 6;
+        assert_eq!(unsafe { ns_get_hl(&mut missing, 2, false, false) }, -1);
     }
 
     struct UrlsGuard(Vec<Vec<u8>>);
