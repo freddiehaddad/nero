@@ -19,10 +19,9 @@
 //! bitmasks, e.g. for spelling combined with syntax highlighting - the
 //! underline-kind bits in `prim_ae` overrule `char_ae`'s, every other
 //! bit is a plain bitwise OR), via already-real
-//! `crate::highlight_defs::HL_UNDERLINE_MASK`. Translated ahead of its
-//! real caller (`hl_combine_attr`, needing the `combine_attr_entries`
-//! hashmap and `syn_attr2entry`'s own `attr_entries` table, neither
-//! translated), matching the same precedent.
+//! `crate::highlight_defs::HL_UNDERLINE_MASK`, and
+//! [`hl_combine_attr`] (the cached, full attribute combination built
+//! on it).
 //!
 //! Deferred: everything else in the file.
 
@@ -46,6 +45,11 @@ pub(crate) static ATTR_ENTRIES: std::sync::LazyLock<
     crate::globals::GlobalCell<crate::map::Set<crate::highlight_defs::HlEntry>>,
 > = std::sync::LazyLock::new(|| {
     crate::globals::GlobalCell::new(crate::map::Set::new())
+});
+static COMBINE_ATTR_ENTRIES: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::map::Map<u64, i32>>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::map::Map::new())
 });
 
 /// Initialize the highlight attribute table (`highlight_init`).
@@ -171,6 +175,93 @@ pub unsafe fn syn_attr2entry(attr: i32) -> crate::highlight_defs::HlAttrs {
         .get_at(attr as usize)
         .map(|entry| entry.attr)
         .unwrap_or_default()
+}
+
+/// Combine low-priority `char_attr` with overriding `prim_attr`
+/// (`hl_combine_attr`).
+///
+/// Attribute flags are merged, while every explicitly set primary
+/// color overrides its character counterpart. Results are interned and
+/// cached by the ordered pair of source attribute IDs.
+///
+/// # Safety
+/// Reads and mutates the shared attribute and combination tables.
+#[must_use]
+pub unsafe fn hl_combine_attr(char_attr: i32, prim_attr: i32) -> i32 {
+    if char_attr == 0 {
+        return prim_attr;
+    } else if prim_attr == 0 {
+        return char_attr;
+    }
+
+    let combine_tag = crate::highlight_defs::hl_attr_key(char_attr, prim_attr);
+    if let Some(id) = unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.get(&combine_tag)
+        && *id > 0
+    {
+        return *id;
+    }
+
+    let char_attrs = unsafe { syn_attr2entry(char_attr) };
+    let prim_attrs = unsafe { syn_attr2entry(prim_attr) };
+    let mut combined = char_attrs;
+
+    if prim_attrs.cterm_ae_attr & crate::highlight_defs::HL_NOCOMBINE as i32 != 0 {
+        combined.cterm_ae_attr = prim_attrs.cterm_ae_attr;
+    } else {
+        combined.cterm_ae_attr =
+            hl_combine_ae(combined.cterm_ae_attr, prim_attrs.cterm_ae_attr);
+    }
+    if prim_attrs.rgb_ae_attr & crate::highlight_defs::HL_NOCOMBINE as i32 != 0 {
+        combined.rgb_ae_attr = prim_attrs.rgb_ae_attr;
+    } else {
+        combined.rgb_ae_attr =
+            hl_combine_ae(combined.rgb_ae_attr, prim_attrs.rgb_ae_attr);
+    }
+
+    if prim_attrs.cterm_fg_color > 0 {
+        combined.cterm_fg_color = prim_attrs.cterm_fg_color;
+        combined.rgb_ae_attr &= !(crate::highlight_defs::HL_FG_INDEXED as i32)
+            | (prim_attrs.rgb_ae_attr & crate::highlight_defs::HL_FG_INDEXED as i32);
+    }
+    if prim_attrs.cterm_bg_color > 0 {
+        combined.cterm_bg_color = prim_attrs.cterm_bg_color;
+        combined.rgb_ae_attr &= !(crate::highlight_defs::HL_BG_INDEXED as i32)
+            | (prim_attrs.rgb_ae_attr & crate::highlight_defs::HL_BG_INDEXED as i32);
+    }
+    if prim_attrs.rgb_fg_color >= 0 {
+        combined.rgb_fg_color = prim_attrs.rgb_fg_color;
+        combined.rgb_ae_attr &= !(crate::highlight_defs::HL_FG_INDEXED as i32)
+            | (prim_attrs.rgb_ae_attr & crate::highlight_defs::HL_FG_INDEXED as i32);
+    }
+    if prim_attrs.rgb_bg_color >= 0 {
+        combined.rgb_bg_color = prim_attrs.rgb_bg_color;
+        combined.rgb_ae_attr &= !(crate::highlight_defs::HL_BG_INDEXED as i32)
+            | (prim_attrs.rgb_ae_attr & crate::highlight_defs::HL_BG_INDEXED as i32);
+    }
+    if prim_attrs.rgb_sp_color >= 0 {
+        combined.rgb_sp_color = prim_attrs.rgb_sp_color;
+    }
+    if prim_attrs.hl_blend >= 0 {
+        combined.hl_blend = prim_attrs.hl_blend;
+    }
+    if combined.url == -1 && prim_attrs.url >= 0 {
+        combined.url = prim_attrs.url;
+    }
+    if prim_attrs.font >= 0 {
+        combined.font = prim_attrs.font;
+    }
+
+    let id = get_attr_entry(crate::highlight_defs::HlEntry {
+        attr: combined,
+        kind: crate::highlight_defs::HlKind::Combine,
+        id1: char_attr,
+        id2: prim_attr,
+        winid: 0,
+    });
+    if id > 0 {
+        unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.insert(combine_tag, id);
+    }
+    id
 }
 
 /// Get an interned URL by index (`hl_get_url`).
@@ -557,6 +648,7 @@ mod tests {
 
     struct AttributeEntriesGuard {
         entries: crate::map::Set<crate::highlight_defs::HlEntry>,
+        combine_entries: crate::map::Map<u64, i32>,
         active: bool,
     }
 
@@ -566,9 +658,17 @@ mod tests {
                 unsafe { ATTR_ENTRIES.get_mut() },
                 crate::map::Set::new(),
             );
+            let combine_entries = std::mem::replace(
+                unsafe { COMBINE_ATTR_ENTRIES.get_mut() },
+                crate::map::Map::new(),
+            );
             let active = unsafe { *HLSTATE_ACTIVE.get_mut() };
             unsafe { *HLSTATE_ACTIVE.get_mut() = false };
-            Self { entries, active }
+            Self {
+                entries,
+                combine_entries,
+                active,
+            }
         }
     }
 
@@ -576,6 +676,8 @@ mod tests {
         fn drop(&mut self) {
             *unsafe { ATTR_ENTRIES.get_mut() } =
                 std::mem::replace(&mut self.entries, crate::map::Set::new());
+            *unsafe { COMBINE_ATTR_ENTRIES.get_mut() } =
+                std::mem::replace(&mut self.combine_entries, crate::map::Map::new());
             unsafe { *HLSTATE_ACTIVE.get_mut() = self.active };
         }
     }
@@ -681,6 +783,96 @@ mod tests {
             unsafe { syn_attr2entry(999) },
             crate::highlight_defs::HlAttrs::default()
         );
+    }
+
+    #[test]
+    fn hl_combine_attr_applies_primary_precedence_and_caches_the_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let char_attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: (crate::highlight_defs::HL_BOLD
+                | crate::highlight_defs::HL_UNDERLINE
+                | crate::highlight_defs::HL_FG_INDEXED) as i32,
+            cterm_ae_attr: crate::highlight_defs::HL_BOLD as i32,
+            rgb_fg_color: 0x11_22_33,
+            rgb_bg_color: 0x44_55_66,
+            rgb_sp_color: 0x77_88_99,
+            cterm_fg_color: 2,
+            cterm_bg_color: 3,
+            hl_blend: 10,
+            url: 4,
+            font: 5,
+        };
+        let prim_attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: (crate::highlight_defs::HL_ITALIC
+                | crate::highlight_defs::HL_UNDERCURL) as i32,
+            cterm_ae_attr: crate::highlight_defs::HL_ITALIC as i32,
+            rgb_fg_color: 0xAA_BB_CC,
+            cterm_bg_color: 9,
+            hl_blend: 40,
+            url: 8,
+            font: 7,
+            ..Default::default()
+        };
+        let char_id = unsafe { hl_get_term_attr(&char_attrs) };
+        let prim_id = unsafe { hl_get_term_attr(&prim_attrs) };
+
+        let combined_id = unsafe { hl_combine_attr(char_id, prim_id) };
+        let again = unsafe { hl_combine_attr(char_id, prim_id) };
+        let combined = unsafe { syn_attr2entry(combined_id) };
+
+        assert_eq!(combined_id, again);
+        assert_eq!(unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert_eq!(
+            combined.rgb_ae_attr,
+            (crate::highlight_defs::HL_BOLD
+                | crate::highlight_defs::HL_ITALIC
+                | crate::highlight_defs::HL_UNDERCURL) as i32
+        );
+        assert_eq!(
+            combined.cterm_ae_attr,
+            (crate::highlight_defs::HL_BOLD | crate::highlight_defs::HL_ITALIC) as i32
+        );
+        assert_eq!(combined.rgb_fg_color, 0xAA_BB_CC);
+        assert_eq!(combined.rgb_bg_color, 0x44_55_66);
+        assert_eq!(combined.rgb_sp_color, 0x77_88_99);
+        assert_eq!(combined.cterm_fg_color, 2);
+        assert_eq!(combined.cterm_bg_color, 9);
+        assert_eq!(combined.hl_blend, 40);
+        assert_eq!(combined.url, 4);
+        assert_eq!(combined.font, 7);
+    }
+
+    #[test]
+    fn hl_combine_attr_nocombine_replaces_attribute_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let char_attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_BOLD as i32,
+            cterm_ae_attr: crate::highlight_defs::HL_BOLD as i32,
+            ..Default::default()
+        };
+        let prim_attrs = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: (crate::highlight_defs::HL_NOCOMBINE
+                | crate::highlight_defs::HL_ITALIC) as i32,
+            cterm_ae_attr: (crate::highlight_defs::HL_NOCOMBINE
+                | crate::highlight_defs::HL_ITALIC) as i32,
+            ..Default::default()
+        };
+        let char_id = unsafe { hl_get_term_attr(&char_attrs) };
+        let prim_id = unsafe { hl_get_term_attr(&prim_attrs) };
+
+        let combined = unsafe { syn_attr2entry(hl_combine_attr(char_id, prim_id)) };
+        assert_eq!(combined.rgb_ae_attr, prim_attrs.rgb_ae_attr);
+        assert_eq!(combined.cterm_ae_attr, prim_attrs.cterm_ae_attr);
+    }
+
+    #[test]
+    fn hl_combine_attr_shortcuts_zero_ids() {
+        assert_eq!(unsafe { hl_combine_attr(0, 7) }, 7);
+        assert_eq!(unsafe { hl_combine_attr(9, 0) }, 9);
     }
 
     struct NamespaceHighlightsGuard {
