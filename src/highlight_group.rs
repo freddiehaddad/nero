@@ -690,6 +690,82 @@ pub unsafe fn syn_get_final_id(mut hl_id: i32) -> i32 {
     hl_id
 }
 
+/// Recompute the interned attribute code for one highlight group
+/// (`set_hl_attr`).
+///
+/// `idx` is the group's zero-based table index.
+///
+/// # Safety
+/// Reads and mutates the shared highlight-group/attribute/font tables,
+/// and may queue a cursor-mode-info UI update.
+pub unsafe fn set_hl_attr(idx: i32) {
+    let (
+        cterm,
+        cterm_fg,
+        cterm_bg,
+        gui,
+        rgb_fg,
+        rgb_bg,
+        rgb_sp,
+        rgb_fg_idx,
+        rgb_bg_idx,
+        rgb_sp_idx,
+        blend,
+        font,
+    ) = {
+        let table = unsafe { HL_TABLE.get_mut() };
+        let group = &table.items[idx as usize];
+        (
+            group.sg_cterm,
+            group.sg_cterm_fg,
+            group.sg_cterm_bg,
+            group.sg_gui,
+            group.sg_rgb_fg,
+            group.sg_rgb_bg,
+            group.sg_rgb_sp,
+            group.sg_rgb_fg_idx,
+            group.sg_rgb_bg_idx,
+            group.sg_rgb_sp_idx,
+            group.sg_blend,
+            group.sg_font.clone(),
+        )
+    };
+
+    let mut attrs = crate::highlight_defs::HlAttrs {
+        cterm_ae_attr: cterm,
+        cterm_fg_color: cterm_fg as i16,
+        cterm_bg_color: cterm_bg as i16,
+        rgb_ae_attr: gui,
+        rgb_fg_color: if rgb_fg_idx != COLOR_IDX_NONE {
+            rgb_fg
+        } else {
+            -1
+        },
+        rgb_bg_color: if rgb_bg_idx != COLOR_IDX_NONE {
+            rgb_bg
+        } else {
+            -1
+        },
+        rgb_sp_color: if rgb_sp_idx != COLOR_IDX_NONE {
+            rgb_sp
+        } else {
+            -1
+        },
+        hl_blend: blend,
+        ..Default::default()
+    };
+    if let Some(font) = font {
+        attrs.font = unsafe { crate::highlight::hl_add_font_idx(&font) };
+    }
+
+    let attr = unsafe { crate::highlight::hl_get_syn_attr(0, idx + 1, attrs) };
+    unsafe { HL_TABLE.get_mut() }.items[idx as usize].sg_attr = attr;
+
+    if crate::cursor_shape::cursor_mode_uses_syn_id(idx + 1) {
+        unsafe { crate::ui::ui_mode_info_set() };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +860,24 @@ mod tests {
     impl Drop for CurwinGuard {
         fn drop(&mut self) {
             unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.0;
+        }
+    }
+
+    struct AttributeTableGuard(crate::map::Set<crate::highlight_defs::HlEntry>);
+
+    impl AttributeTableGuard {
+        fn empty() -> Self {
+            Self(std::mem::replace(
+                unsafe { crate::highlight::ATTR_ENTRIES.get_mut() },
+                crate::map::Set::new(),
+            ))
+        }
+    }
+
+    impl Drop for AttributeTableGuard {
+        fn drop(&mut self) {
+            *unsafe { crate::highlight::ATTR_ENTRIES.get_mut() } =
+                std::mem::replace(&mut self.0, crate::map::Set::new());
         }
     }
 
@@ -897,6 +991,61 @@ mod tests {
         let result = unsafe { syn_get_final_id(1) };
 
         assert_eq!(result, 2);
+    }
+
+    #[test]
+    fn set_hl_attr_interns_all_explicit_group_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"Comment"]);
+        let _attrs = AttributeTableGuard::empty();
+        {
+            let group = &mut unsafe { HL_TABLE.get_mut() }.items[0];
+            group.sg_cterm = crate::highlight_defs::HL_BOLD as i32;
+            group.sg_cterm_fg = 4;
+            group.sg_cterm_bg = 5;
+            group.sg_gui = crate::highlight_defs::HL_ITALIC as i32;
+            group.sg_rgb_fg = 0x11_22_33;
+            group.sg_rgb_bg = 0x44_55_66;
+            group.sg_rgb_sp = 0x77_88_99;
+            group.sg_rgb_fg_idx = 1;
+            group.sg_rgb_bg_idx = 2;
+            group.sg_rgb_sp_idx = 3;
+            group.sg_blend = 30;
+        }
+
+        unsafe { set_hl_attr(0) };
+
+        let attr_id = unsafe { HL_TABLE.get_mut() }.items[0].sg_attr;
+        assert!(attr_id > 0);
+        let attrs = unsafe { crate::highlight::syn_attr2entry(attr_id) };
+        assert_eq!(attrs.cterm_ae_attr, crate::highlight_defs::HL_BOLD as i32);
+        assert_eq!((attrs.cterm_fg_color, attrs.cterm_bg_color), (4, 5));
+        assert_eq!(attrs.rgb_ae_attr, crate::highlight_defs::HL_ITALIC as i32);
+        assert_eq!(
+            (attrs.rgb_fg_color, attrs.rgb_bg_color, attrs.rgb_sp_color),
+            (0x11_22_33, 0x44_55_66, 0x77_88_99)
+        );
+        assert_eq!(attrs.hl_blend, 30);
+    }
+
+    #[test]
+    fn set_hl_attr_leaves_unset_rgb_colors_at_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _table = HlTableGuard::with_names(&[b"Empty"]);
+        let _attrs = AttributeTableGuard::empty();
+        {
+            let group = &mut unsafe { HL_TABLE.get_mut() }.items[0];
+            group.sg_rgb_fg = 0;
+            group.sg_rgb_bg = 0;
+            group.sg_rgb_sp = 0;
+            group.sg_rgb_fg_idx = COLOR_IDX_NONE;
+            group.sg_rgb_bg_idx = COLOR_IDX_NONE;
+            group.sg_rgb_sp_idx = COLOR_IDX_NONE;
+        }
+
+        unsafe { set_hl_attr(0) };
+
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.items[0].sg_attr, 0);
     }
 
     /// IDs are 1-based, so the first group is id 1 and id 0 is "no
