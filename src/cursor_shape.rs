@@ -30,9 +30,10 @@
 //! constants, `crate::option_vars::OPTION_VARS.p_sel`, and
 //! `crate::ex_getln`'s newly-real `cmdline_at_end`/`cmdline_overstrike`.
 //!
-//! Deferred: `mode_style_array` (needs `Arena`/`Dict`/`Array`, the API
-//! layer), highlight-group resolution in [`parse_shape_opt`],
-//! `update_mouseshape`/`ui_cursor_shape_*`
+//! Also translated: [`mode_style_array`], using the owned Rust API
+//! `Array`/`Dict` representation instead of C's arena allocation.
+//!
+//! Deferred: `update_mouseshape`/`ui_cursor_shape_*`
 //! (UI dispatch), `get_default_cursor_shape` and friends.
 
 use crate::globals::GlobalCell;
@@ -556,6 +557,78 @@ pub fn parse_shape_opt(what: u8) -> Option<&'static [u8]> {
     None
 }
 
+/// Convert every cursor/mouse shape entry to API dictionaries
+/// (`mode_style_array`).
+///
+/// The original allocates the returned objects from an `Arena`; Rust's
+/// existing API `Array`/`Dict` types own their values directly, so no
+/// arena parameter is needed.
+///
+/// # Safety
+/// Reads the shared shape and highlight-group/namespace tables.
+#[must_use]
+pub unsafe fn mode_style_array() -> crate::api::private::defs::Array {
+    use crate::api::private::defs::{KeyValuePair, Object};
+
+    let table = unsafe { SHAPE_TABLE.get_mut() };
+    let mut all = Vec::with_capacity(SHAPE_IDX_COUNT);
+    for entry in table {
+        let mut dict = Vec::with_capacity(
+            3 + if entry.used_for & SHAPE_CURSOR != 0 {
+                9
+            } else {
+                0
+            },
+        );
+        let mut put = |key: &[u8], value: Object| {
+            dict.push(KeyValuePair {
+                key: key.to_vec(),
+                value,
+            });
+        };
+        put(b"name", Object::String(entry.full_name.as_bytes().to_vec()));
+        put(b"short_name", Object::String(entry.name.as_bytes().to_vec()));
+        if entry.used_for & SHAPE_MOUSE != 0 {
+            put(b"mouse_shape", Object::Integer(i64::from(entry.mshape)));
+        }
+        if entry.used_for & SHAPE_CURSOR != 0 {
+            let shape = match entry.shape {
+                CursorShape::Block => b"block".as_slice(),
+                CursorShape::Ver => b"vertical".as_slice(),
+                CursorShape::Hor => b"horizontal".as_slice(),
+            };
+            put(b"cursor_shape", Object::String(shape.to_vec()));
+            put(
+                b"cell_percentage",
+                Object::Integer(i64::from(entry.percentage)),
+            );
+            put(b"blinkwait", Object::Integer(i64::from(entry.blinkwait)));
+            put(b"blinkon", Object::Integer(i64::from(entry.blinkon)));
+            put(b"blinkoff", Object::Integer(i64::from(entry.blinkoff)));
+            put(b"hl_id", Object::Integer(i64::from(entry.id)));
+            put(b"id_lm", Object::Integer(i64::from(entry.id_lm)));
+            put(
+                b"attr_id",
+                Object::Integer(i64::from(if entry.id != 0 {
+                    unsafe { crate::highlight_group::syn_id2attr(entry.id) }
+                } else {
+                    0
+                })),
+            );
+            put(
+                b"attr_id_lm",
+                Object::Integer(i64::from(if entry.id_lm != 0 {
+                    unsafe { crate::highlight_group::syn_id2attr(entry.id_lm) }
+                } else {
+                    0
+                })),
+            );
+        }
+        all.push(Object::Dict(dict));
+    }
+    all
+}
+
 /// Return the index into `SHAPE_TABLE` for the current mode
 /// (`cursor_get_mode_idx`).
 ///
@@ -722,6 +795,119 @@ pub(crate) mod tests {
             );
             Self { items, names }
         }
+    }
+
+    struct ActiveNamespaceGuard(i32);
+
+    impl ActiveNamespaceGuard {
+        fn zero() -> Self {
+            let active = unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() };
+            unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() = 0 };
+            Self(active)
+        }
+    }
+
+    impl Drop for ActiveNamespaceGuard {
+        fn drop(&mut self) {
+            unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() = self.0 };
+        }
+    }
+
+    fn dict_value<'a>(
+        dict: &'a crate::api::private::defs::Dict,
+        key: &[u8],
+    ) -> &'a crate::api::private::defs::Object {
+        &dict
+            .iter()
+            .find(|item| item.key == key)
+            .expect("dictionary key")
+            .value
+    }
+
+    #[test]
+    fn mode_style_array_reports_cursor_and_mouse_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _active = ActiveNamespaceGuard::zero();
+        let all = unsafe { mode_style_array() };
+
+        assert_eq!(all.len(), SHAPE_IDX_COUNT);
+        let crate::api::private::defs::Object::Dict(normal) = &all[SHAPE_IDX_N] else {
+            panic!("normal mode dictionary");
+        };
+        assert!(matches!(
+            dict_value(normal, b"name"),
+            crate::api::private::defs::Object::String(name) if name == b"normal"
+        ));
+        assert!(matches!(
+            dict_value(normal, b"short_name"),
+            crate::api::private::defs::Object::String(name) if name == b"n"
+        ));
+        assert!(matches!(
+            dict_value(normal, b"mouse_shape"),
+            crate::api::private::defs::Object::Integer(0)
+        ));
+        assert!(matches!(
+            dict_value(normal, b"cursor_shape"),
+            crate::api::private::defs::Object::String(shape) if shape == b"block"
+        ));
+        assert!(matches!(
+            dict_value(normal, b"blinkwait"),
+            crate::api::private::defs::Object::Integer(700)
+        ));
+    }
+
+    #[test]
+    fn mode_style_array_omits_cursor_fields_for_mouse_only_modes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _active = ActiveNamespaceGuard::zero();
+        let all = unsafe { mode_style_array() };
+        let crate::api::private::defs::Object::Dict(cmdline_hover) =
+            &all[SHAPE_IDX_CLINE]
+        else {
+            panic!("cmdline-hover dictionary");
+        };
+
+        assert!(cmdline_hover.iter().any(|item| item.key == b"mouse_shape"));
+        assert!(!cmdline_hover.iter().any(|item| item.key == b"cursor_shape"));
+        assert!(!cmdline_hover.iter().any(|item| item.key == b"attr_id"));
+    }
+
+    #[test]
+    fn mode_style_array_resolves_cursor_highlight_attribute_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _active = ActiveNamespaceGuard::zero();
+        let _groups = HighlightShapeGuard::empty();
+        let _shape = ShapeParseGuard::set(b"");
+        unsafe { crate::highlight_group::HL_TABLE.get_mut() }
+            .items
+            .push(crate::highlight_group::HlGroup {
+                sg_name: b"Cursor".to_vec(),
+                sg_name_u: b"CURSOR".to_vec(),
+                sg_attr: 42,
+                ..Default::default()
+            });
+        let normal_entry = unsafe { SHAPE_TABLE.get_mut()[SHAPE_IDX_N] };
+        set_shape_table_entry(
+            SHAPE_IDX_N,
+            CursorentryT {
+                id: 1,
+                id_lm: 1,
+                ..normal_entry
+            },
+        );
+
+        let all = unsafe { mode_style_array() };
+        let crate::api::private::defs::Object::Dict(normal) = &all[SHAPE_IDX_N] else {
+            panic!("normal mode dictionary");
+        };
+        assert!(matches!(
+            dict_value(normal, b"attr_id"),
+            crate::api::private::defs::Object::Integer(42)
+        ));
+        assert!(matches!(
+            dict_value(normal, b"attr_id_lm"),
+            crate::api::private::defs::Object::Integer(42)
+        ));
     }
 
     impl Drop for HighlightShapeGuard {
