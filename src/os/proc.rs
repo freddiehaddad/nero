@@ -8,6 +8,99 @@
 //! `Toolhelp32Snapshot` on Windows) well beyond a single-PID liveness
 //! check, out of scope for this pass.
 
+/// Get immediate child process IDs (`os_proc_children`).
+///
+/// Returns `(status, children)`: status `0` is success, `1` means the
+/// process was not found, and `2` means another error.
+#[must_use]
+pub fn os_proc_children(ppid: i32) -> (i32, Vec<i32>) {
+    if ppid < 0 {
+        return (2, Vec::new());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{ppid}/task/{ppid}/children");
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return (2, Vec::new());
+        };
+        let children = contents
+            .split_ascii_whitespace()
+            .filter_map(|value| value.parse::<i32>().ok())
+            .collect();
+        (0, children)
+    }
+    #[cfg(windows)]
+    {
+        os_proc_children_windows(ppid)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        (2, Vec::new())
+    }
+}
+
+#[cfg(windows)]
+fn os_proc_children_windows(ppid: i32) -> (i32, Vec<i32>) {
+    type Handle = *mut std::ffi::c_void;
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const MAX_PATH: usize = 260;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+    #[repr(C)]
+    struct ProcessEntry32 {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32) -> i32;
+        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return (2, Vec::new());
+    }
+    let mut entry = ProcessEntry32 {
+        dw_size: std::mem::size_of::<ProcessEntry32>() as u32,
+        cnt_usage: 0,
+        th32_process_id: 0,
+        th32_default_heap_id: 0,
+        th32_module_id: 0,
+        cnt_threads: 0,
+        th32_parent_process_id: 0,
+        pc_pri_class_base: 0,
+        dw_flags: 0,
+        sz_exe_file: [0; MAX_PATH],
+    };
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        unsafe { CloseHandle(snapshot) };
+        return (2, Vec::new());
+    }
+    let mut children = Vec::new();
+    loop {
+        if entry.th32_parent_process_id == ppid as u32 {
+            children.push(entry.th32_process_id as i32);
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            break;
+        }
+    }
+    unsafe { CloseHandle(snapshot) };
+    (0, children)
+}
+
 /// Checks whether the process with the given `pid` is currently
 /// running (`os_proc_running`).
 ///
@@ -200,6 +293,17 @@ fn os_proc_running_windows(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_proc_children_rejects_negative_pid() {
+        assert_eq!(os_proc_children(-1), (2, Vec::new()));
+    }
+
+    #[test]
+    fn os_proc_children_accepts_the_current_process() {
+        let (status, _children) = os_proc_children(std::process::id() as i32);
+        assert_eq!(status, 0);
+    }
 
     #[test]
     fn os_proc_running_is_true_for_the_current_process() {
