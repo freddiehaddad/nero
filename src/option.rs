@@ -221,9 +221,9 @@
 //!   [`option_was_set`]'s own doc comment for why).
 //!
 //! Deferred:
-//! - `parse_winhl_opt` needs the decoration/highlight-group subsystem
-//!   (`nvim_create_namespace`/`get_decor_provider`/`syn_check_group`/
-//!   `ns_hl_def`).
+//! - [`parse_winhl_opt`]'s nonempty local-window application path
+//!   needs `get_decor_provider`/`ns_hl_def`. Global validation and the
+//!   empty-local reset path are real.
 //! - Cross-window/buffer paths in `get_option_value_for`/
 //!   `set_option_value_for` need the real `ctx_switch`.
 //! - Ten remaining did-set/expand callbacks still need their own
@@ -244,6 +244,72 @@ use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPT
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
 use crate::types_defs::{OptInt, TriState};
 use std::ffi::c_void;
+
+/// Parse a `'winhighlight'` value (`parse_winhl_opt`).
+///
+/// Global validation (`win == None`) and clearing a local value are
+/// complete. Applying a nonempty value to a window stops at the
+/// namespace highlight-definition machinery, which is not translated.
+///
+/// # Safety
+/// Touches the highlight-group registry, and `win`, when present, must
+/// be a live window.
+#[must_use]
+pub unsafe fn parse_winhl_opt(
+    winhl: Option<&[u8]>,
+    win: Option<&mut WinT>,
+) -> bool {
+    let win = win.map(std::ptr::from_mut).unwrap_or(std::ptr::null_mut());
+    let value = if let Some(value) = winhl {
+        value.to_vec()
+    } else if !win.is_null() {
+        unsafe { (*win).w_onebuf_opt.wo_winhl.clone() }.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if value.is_empty() {
+        if !win.is_null()
+            && unsafe { (*win).w_ns_hl_winhl } > 0
+            && unsafe { (*win).w_ns_hl == (*win).w_ns_hl_winhl }
+        {
+            unsafe {
+                (*win).w_ns_hl = 0;
+                (*win).w_hl_needs_update = 1;
+            }
+        }
+        return true;
+    }
+
+    if !win.is_null() {
+        unimplemented!("parse_winhl_opt: local highlight definitions need ns_hl_def");
+    }
+
+    for part in value.split(|byte| *byte == b',') {
+        let Some(colon) = part.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        let source = &part[..colon];
+        let target = &part[colon + 1..];
+        let target_id = if target.is_empty() {
+            -1
+        } else {
+            unsafe { crate::highlight_group::syn_check_group(target) }
+        };
+        if target_id == 0 {
+            return false;
+        }
+        let source_id = if source.is_empty() {
+            0
+        } else {
+            unsafe { crate::highlight_group::syn_check_group(source) }
+        };
+        if source_id == 0 {
+            return false;
+        }
+    }
+    true
+}
 
 /// Set a callback-valued option from its textual value
 /// (`option_set_callback_func`).
@@ -5233,6 +5299,79 @@ mod num_option_bounds_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WinhlGroupGuard {
+        items: Vec<crate::highlight_group::HlGroup>,
+        names: crate::map::Map<Vec<u8>, i32>,
+    }
+
+    impl WinhlGroupGuard {
+        fn empty() -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            let items = std::mem::take(&mut table.items);
+            let names = std::mem::replace(
+                unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() },
+                crate::map::Map::new(),
+            );
+            Self { items, names }
+        }
+    }
+
+    impl Drop for WinhlGroupGuard {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.items);
+            *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } =
+                std::mem::replace(&mut self.names, crate::map::Map::new());
+        }
+    }
+
+    #[test]
+    fn parse_winhl_opt_validates_global_group_pairs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = WinhlGroupGuard::empty();
+
+        assert!(unsafe {
+            parse_winhl_opt(
+                Some(b"Normal:MyNormal,NormalNC:MyNormalNC,EndOfBuffer:"),
+                None,
+            )
+        });
+        assert!(unsafe { crate::highlight_group::syn_name2id_len(b"Normal") } > 0);
+        assert!(unsafe { crate::highlight_group::syn_name2id_len(b"MyNormalNC") } > 0);
+    }
+
+    #[test]
+    fn parse_winhl_opt_rejects_malformed_global_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = WinhlGroupGuard::empty();
+
+        assert!(!unsafe { parse_winhl_opt(Some(b"Normal"), None) });
+        assert!(!unsafe { parse_winhl_opt(Some(b":Target"), None) });
+    }
+
+    #[test]
+    fn parse_winhl_opt_empty_local_value_detaches_its_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_ns_hl: 7,
+            w_ns_hl_winhl: 7,
+            w_hl_needs_update: 0,
+            ..Default::default()
+        };
+
+        assert!(unsafe { parse_winhl_opt(Some(b""), Some(&mut win)) });
+        assert_eq!(win.w_ns_hl, 0);
+        assert_eq!(win.w_ns_hl_winhl, 7);
+        assert_eq!(win.w_hl_needs_update, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ns_hl_def")]
+    fn parse_winhl_opt_nonempty_local_value_needs_namespace_definitions() {
+        let mut win = WinT::default();
+        let _ = unsafe { parse_winhl_opt(Some(b"Normal:MyNormal"), Some(&mut win)) };
+    }
 
     fn buf_with_ff(ff: &str, bin: bool) -> BufT {
         BufT {
