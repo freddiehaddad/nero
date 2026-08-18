@@ -568,6 +568,16 @@ pub static NS_HLS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| {
     crate::globals::GlobalCell::new(crate::map::Map::new())
 });
+static NS_HL_ATTR: std::sync::LazyLock<
+    crate::globals::GlobalCell<
+        crate::map::Map<
+            i32,
+            [i32; crate::highlight_defs::HlfT::Count as usize],
+        >,
+    >,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::map::Map::new())
+});
 
 /// Define one namespace highlight (`ns_hl_def`).
 ///
@@ -746,6 +756,48 @@ pub unsafe fn hl_get_ui_attr(
         id2: final_id,
         winid: 0,
     })
+}
+
+/// Refresh every builtin highlight attribute for namespace `ns_id`
+/// (`update_ns_hl`).
+///
+/// Results are cached as one complete `HlfT`-indexed array and the
+/// provider's `hl_cached` flag is set only after all group lookups are
+/// complete.
+///
+/// # Safety
+/// Mutates shared group, namespace/provider, attribute, option, and
+/// popup-menu state.
+pub unsafe fn update_ns_hl(ns_id: i32) {
+    if ns_id <= 0 {
+        return;
+    }
+    let provider = unsafe {
+        crate::decoration_provider::get_decor_provider(ns_id, true)
+    };
+    if unsafe { (*provider).hl_cached } {
+        return;
+    }
+
+    let mut attrs = [0; crate::highlight_defs::HlfT::Count as usize];
+    for (hlf, attr) in attrs.iter_mut().enumerate().skip(1) {
+        let name = crate::highlight_defs::HLF_NAMES[hlf]
+            .expect("every non-Normal HlfT has a name");
+        let id = unsafe { crate::highlight_group::syn_check_group(name) };
+        let optional = hlf == crate::highlight_defs::HlfT::Inactive as usize
+            || hlf == crate::highlight_defs::HlfT::Nfloat as usize;
+        *attr = unsafe { hl_get_ui_attr(ns_id, hlf as i32, id, optional) };
+    }
+
+    let normal = unsafe { crate::highlight_group::syn_check_group(b"Normal") };
+    attrs[crate::highlight_defs::HlfT::None as usize] =
+        unsafe { hl_get_ui_attr(ns_id, -1, normal, true) };
+    unsafe { NS_HL_ATTR.get_mut() }.insert(ns_id, attrs);
+
+    let provider = unsafe {
+        crate::decoration_provider::get_decor_provider(ns_id, true)
+    };
+    unsafe { (*provider).hl_cached = true };
 }
 
 /// The currently active UI highlight attribute for each `HlfT`
@@ -1105,19 +1157,29 @@ mod tests {
         }
     }
 
-    struct HighlightGroupTableGuard(Vec<crate::highlight_group::HlGroup>);
+    struct HighlightGroupTableGuard {
+        groups: Vec<crate::highlight_group::HlGroup>,
+        names: crate::map::Map<Vec<u8>, i32>,
+    }
 
     impl HighlightGroupTableGuard {
         fn install(groups: Vec<crate::highlight_group::HlGroup>) -> Self {
             let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
-            Self(std::mem::replace(&mut table.items, groups))
+            let groups = std::mem::replace(&mut table.items, groups);
+            let names = std::mem::replace(
+                unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() },
+                crate::map::Map::new(),
+            );
+            Self { groups, names }
         }
     }
 
     impl Drop for HighlightGroupTableGuard {
         fn drop(&mut self) {
             unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
-                std::mem::take(&mut self.0);
+                std::mem::take(&mut self.groups);
+            *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } =
+                std::mem::replace(&mut self.names, crate::map::Map::new());
         }
     }
 
@@ -1702,6 +1764,10 @@ mod tests {
             crate::highlight_defs::ColorKey,
             crate::highlight_defs::ColorItem,
         >,
+        attributes: crate::map::Map<
+            i32,
+            [i32; crate::highlight_defs::HlfT::Count as usize],
+        >,
         providers: Vec<crate::decoration_defs::DecorProvider>,
         active: i32,
     }
@@ -1712,12 +1778,17 @@ mod tests {
                 unsafe { NS_HLS.get_mut() },
                 crate::map::Map::new(),
             );
+            let attributes = std::mem::replace(
+                unsafe { NS_HL_ATTR.get_mut() },
+                crate::map::Map::new(),
+            );
             let providers =
                 std::mem::take(unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() });
             let active = unsafe { *NS_HL_ACTIVE.get_mut() };
             unsafe { *NS_HL_ACTIVE.get_mut() = 0 };
             Self {
                 definitions,
+                attributes,
                 providers,
                 active,
             }
@@ -1728,6 +1799,8 @@ mod tests {
         fn drop(&mut self) {
             *unsafe { NS_HLS.get_mut() } =
                 std::mem::replace(&mut self.definitions, crate::map::Map::new());
+            *unsafe { NS_HL_ATTR.get_mut() } =
+                std::mem::replace(&mut self.attributes, crate::map::Map::new());
             *unsafe { crate::decoration_provider::DECOR_PROVIDERS.get_mut() } =
                 std::mem::take(&mut self.providers);
             unsafe { *NS_HL_ACTIVE.get_mut() = self.active };
@@ -2056,6 +2129,59 @@ mod tests {
                 )
             },
             0
+        );
+    }
+
+    #[test]
+    fn update_ns_hl_builds_and_caches_the_complete_builtin_array() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+
+        unsafe { update_ns_hl(6) };
+
+        let attrs = unsafe { NS_HL_ATTR.get_mut() }
+            .get(&6)
+            .expect("namespace attribute array");
+        assert_eq!(attrs.len(), crate::highlight_defs::HlfT::Count as usize);
+        assert_eq!(
+            unsafe { crate::highlight_group::highlight_num_groups() },
+            crate::highlight_defs::HlfT::Count as i32,
+        );
+        let provider = unsafe { crate::decoration_provider::get_decor_provider(6, false) };
+        assert!(unsafe { (*provider).hl_cached });
+    }
+
+    #[test]
+    fn update_ns_hl_uses_namespace_definitions_and_skips_cached_providers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = NamespaceHighlightsGuard::empty();
+        let _entries = AttributeEntriesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let error_id = unsafe { crate::highlight_group::syn_check_group(b"ErrorMsg") };
+        let expected = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0xAB_CD_EF,
+            ..Default::default()
+        };
+        unsafe { ns_hl_def(3, error_id, expected, -1) };
+
+        unsafe { update_ns_hl(3) };
+
+        let error_attr = unsafe { NS_HL_ATTR.get_mut() }
+            .get(&3)
+            .expect("namespace attribute array")
+            [crate::highlight_defs::HlfT::E as usize];
+        assert_eq!(unsafe { syn_attr2entry(error_attr) }, expected);
+
+        unsafe { NS_HL_ATTR.get_mut() }
+            .insert(3, [77; crate::highlight_defs::HlfT::Count as usize]);
+        unsafe { update_ns_hl(3) };
+        assert_eq!(
+            unsafe { NS_HL_ATTR.get_mut() }.get(&3),
+            Some(&[77; crate::highlight_defs::HlfT::Count as usize])
         );
     }
 
