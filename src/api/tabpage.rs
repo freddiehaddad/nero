@@ -3,19 +3,42 @@
 //! scoped-variable access, and `win_goto`'s real window-switching
 //! machinery, none of which are wired into this API layer yet).
 //!
-//! Translated: [`nvim_tabpage_get_win`], [`nvim_tabpage_get_number`],
-//! [`nvim_tabpage_is_valid`].
+//! Translated: [`nvim_tabpage_list_wins`], [`nvim_tabpage_get_win`],
+//! [`nvim_tabpage_get_number`], [`nvim_tabpage_is_valid`].
 //!
 //! Deferred (each needs a real, not-yet-translated subsystem beyond
 //! `find_tab_by_handle` itself): `nvim_tabpage_get/set/del_var`
 //! (`dict_get_value`/`dict_set_var`, the API layer's `Object`-to-
 //! `typval_T` bridge), `nvim_tabpage_set_win` (needs `win_goto`'s
 //! real window-switching machinery for the "switching to the current
-//! tabpage" branch), `nvim_tabpage_list_wins` (needs `Array`
-//! conversion).
+//! tabpage" branch).
 
-use crate::api::private::defs::{Boolean, Error, Integer, Tabpage, Window};
+use crate::api::private::defs::{Array, Boolean, Error, Integer, Object, Tabpage, Window};
 use crate::api::private::helpers::find_tab_by_handle;
+
+/// List every window in `tabpage` (`nvim_tabpage_list_wins`).
+///
+/// # Safety
+/// Forwarded from [`find_tab_by_handle`]; the selected tabpage's
+/// window list must consist of live pointers.
+#[must_use]
+pub unsafe fn nvim_tabpage_list_wins(tabpage: Tabpage, err: &mut Error) -> Array {
+    let tab = unsafe { find_tab_by_handle(tabpage, err) };
+    if tab.is_null() || !unsafe { crate::window::valid_tabpage(tab) } {
+        return Vec::new();
+    }
+    let mut win = if std::ptr::eq(tab, unsafe { crate::globals::GLOBALS.get_mut() }.curtab) {
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+    } else {
+        unsafe { (*tab).tp_firstwin }
+    };
+    let mut result = Vec::new();
+    while !win.is_null() {
+        result.push(Object::Window(unsafe { (*win).handle }));
+        win = unsafe { (*win).w_next };
+    }
+    result
+}
 
 /// Get the handle of the current window in tab page `tabpage` (`0`
 /// for the current tabpage), or `0` on failure
@@ -178,6 +201,45 @@ mod tests {
 
         assert_eq!(win_handle, 77);
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_tabpage_list_wins_returns_every_current_tab_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = WinT {
+            handle: 12,
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = WinT {
+            handle: 11,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let fx = TabFixture::new(19);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = fx.tab_ptr;
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, first_ptr)
+        };
+        let mut err = Error::default();
+
+        let windows = unsafe { nvim_tabpage_list_wins(fx.handle(), &mut err) };
+
+        assert!(!err.is_set());
+        assert!(matches!(
+            windows.as_slice(),
+            [Object::Window(11), Object::Window(12)]
+        ));
+    }
+
+    #[test]
+    fn nvim_tabpage_list_wins_returns_empty_for_an_unknown_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = TabFixture::new(20);
+        let mut err = Error::default();
+        assert!(unsafe { nvim_tabpage_list_wins(99, &mut err) }.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid tabpage id: 99"));
     }
 
     /// For a NON-current tabpage, `nvim_tabpage_get_win` walks
