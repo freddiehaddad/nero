@@ -21,7 +21,9 @@
 //! hardcoded shortcut" pattern (e.g. `autocmd.rs`'s `AU_NEED_CLEAN`).
 //!
 //! Also [`get_decor_provider`] - lookup or create a provider by
-//! namespace ID. Deferred: everything else in the file.
+//! namespace ID, and [`decor_provider_invalidate_hl`] - invalidate
+//! every namespace highlight cache and reselect the active namespace.
+//! Deferred: everything else in the file.
 
 use crate::decoration_defs::{DecorProvider, DecorProviderState};
 use crate::globals::GlobalCell;
@@ -114,6 +116,27 @@ pub unsafe fn decor_free_all_mem() {
         decor_provider_clear(Some(p));
     }
     providers.clear();
+}
+
+/// Invalidate every decoration provider's namespace-highlight cache
+/// (`decor_provider_invalidate_hl`).
+///
+/// If a namespace is active, force the highlight selector to revalidate
+/// it immediately.
+///
+/// # Safety
+/// Mutates the shared provider registry and highlight namespace state.
+pub unsafe fn decor_provider_invalidate_hl() {
+    {
+        let providers = unsafe { DECOR_PROVIDERS.get_mut() };
+        for provider in providers {
+            provider.hl_cached = false;
+        }
+    }
+    if unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() } != 0 {
+        unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() = -1 };
+        let _ = unsafe { crate::highlight::hl_check_ns() };
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +248,81 @@ mod tests {
         unsafe { decor_free_all_mem() };
         let providers = unsafe { DECOR_PROVIDERS.get_mut() };
         assert!(providers.is_empty());
+    }
+
+    struct HighlightNamespaceGuard {
+        global: i32,
+        win: i32,
+        fast: i32,
+        active: i32,
+        need_changed: bool,
+    }
+
+    impl HighlightNamespaceGuard {
+        fn set(global: i32, win: i32, fast: i32, active: i32) -> Self {
+            let guard = Self {
+                global: unsafe { *crate::highlight::NS_HL_GLOBAL.get_mut() },
+                win: unsafe { *crate::highlight::NS_HL_WIN.get_mut() },
+                fast: unsafe { *crate::highlight::NS_HL_FAST.get_mut() },
+                active: unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() },
+                need_changed: unsafe { crate::globals::GLOBALS.get_mut() }
+                    .need_highlight_changed,
+            };
+            unsafe {
+                *crate::highlight::NS_HL_GLOBAL.get_mut() = global;
+                *crate::highlight::NS_HL_WIN.get_mut() = win;
+                *crate::highlight::NS_HL_FAST.get_mut() = fast;
+                *crate::highlight::NS_HL_ACTIVE.get_mut() = active;
+                crate::globals::GLOBALS.get_mut().need_highlight_changed = false;
+            }
+            guard
+        }
+    }
+
+    impl Drop for HighlightNamespaceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *crate::highlight::NS_HL_GLOBAL.get_mut() = self.global;
+                *crate::highlight::NS_HL_WIN.get_mut() = self.win;
+                *crate::highlight::NS_HL_FAST.get_mut() = self.fast;
+                *crate::highlight::NS_HL_ACTIVE.get_mut() = self.active;
+                crate::globals::GLOBALS.get_mut().need_highlight_changed = self.need_changed;
+            }
+        }
+    }
+
+    #[test]
+    fn decor_provider_invalidate_hl_clears_every_provider_cache() {
+        let _lock = global_state_test_lock();
+        let _providers = ProviderRegistryGuard::empty();
+        let _namespace = HighlightNamespaceGuard::set(0, -1, -1, 0);
+        let providers = unsafe { DECOR_PROVIDERS.get_mut() };
+        let mut first = DecorProvider::new(1);
+        first.hl_cached = true;
+        let mut second = DecorProvider::new(2);
+        second.hl_cached = true;
+        providers.extend([first, second]);
+
+        unsafe { decor_provider_invalidate_hl() };
+
+        assert!(unsafe { DECOR_PROVIDERS.get_mut() }
+            .iter()
+            .all(|provider| !provider.hl_cached));
+    }
+
+    #[test]
+    fn decor_provider_invalidate_hl_reselects_an_active_namespace() {
+        let _lock = global_state_test_lock();
+        let _providers = ProviderRegistryGuard::empty();
+        let _namespace = HighlightNamespaceGuard::set(0, -1, -1, 7);
+        let mut provider = DecorProvider::new(7);
+        provider.hl_cached = true;
+        unsafe { DECOR_PROVIDERS.get_mut() }.push(provider);
+
+        unsafe { decor_provider_invalidate_hl() };
+
+        assert_eq!(unsafe { *crate::highlight::NS_HL_ACTIVE.get_mut() }, 0);
+        assert!(!unsafe { DECOR_PROVIDERS.get_mut() }[0].hl_cached);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.need_highlight_changed);
     }
 }
