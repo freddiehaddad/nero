@@ -23,7 +23,9 @@
 //! (needs `win_find_tabpage`), `nvim_win_close`/`nvim_win_hide`
 //! (real window-closing machinery).
 
-use crate::api::private::defs::{Array, Boolean, Buffer, Error, Integer, Object, Window};
+use crate::api::private::defs::{
+    Array, Boolean, Buffer, Error, Integer, Object, Tabpage, Window,
+};
 use crate::api::private::helpers::find_window_by_handle;
 
 /// Get the buffer handle shown in window `win` (`0` for the current
@@ -104,6 +106,26 @@ pub unsafe fn nvim_win_get_position(win: Window, err: &mut Error) -> Array {
         Object::Integer(i64::from(unsafe { (*window).w_winrow })),
         Object::Integer(i64::from(unsafe { (*window).w_wincol })),
     ]
+}
+
+/// Get the tabpage containing window `win`
+/// (`nvim_win_get_tabpage`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`] and
+/// [`crate::window::win_find_tabpage`].
+#[must_use]
+pub unsafe fn nvim_win_get_tabpage(win: Window, err: &mut Error) -> Tabpage {
+    let window = unsafe { find_window_by_handle(win, err) };
+    if window.is_null() {
+        return 0;
+    }
+    let tab = unsafe { crate::window::win_find_tabpage(window) };
+    if tab.is_null() {
+        0
+    } else {
+        unsafe { (*tab).handle }
+    }
 }
 
 /// Get the 1-based, current-tabpage-relative window number of window
@@ -386,6 +408,29 @@ mod tests {
         let _fx = WinFixture::new(16);
         let mut err = Error::default();
         assert!(unsafe { nvim_win_get_position(99, &mut err) }.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
+    }
+
+    #[test]
+    fn nvim_win_get_tabpage_returns_the_containing_tab_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(17);
+        unsafe { (*fx.tab).handle = 70 };
+        let mut err = Error::default();
+
+        let tabpage =
+            unsafe { nvim_win_get_tabpage((*fx.win).handle, &mut err) };
+
+        assert_eq!(tabpage, 70);
+        assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_win_get_tabpage_returns_zero_for_an_unknown_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = WinFixture::new(18);
+        let mut err = Error::default();
+        assert_eq!(unsafe { nvim_win_get_tabpage(99, &mut err) }, 0);
         assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
     }
 
