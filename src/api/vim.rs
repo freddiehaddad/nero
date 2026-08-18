@@ -39,6 +39,13 @@ pub fn nvim__id_dict(dict: &Dict) -> Dict {
     dict.clone()
 }
 
+/// Return `value` unchanged (`nvim__id_float`).
+#[must_use]
+#[allow(non_snake_case)]
+pub fn nvim__id_float(value: f64) -> f64 {
+    value
+}
+
 /// List every current buffer, including unlisted and unloaded buffers
 /// (`nvim_list_bufs`).
 ///
@@ -470,6 +477,13 @@ mod tests {
         assert_eq!(output[0].key, b"game");
         assert!(matches!(&input[0].value, Object::String(text) if text == b"one"));
         assert!(matches!(&output[0].value, Object::String(text) if text == b"dne"));
+    }
+
+    #[test]
+    fn nvim_id_float_returns_its_argument() {
+        assert_eq!(nvim__id_float(3.25), 3.25);
+        assert!(nvim__id_float(f64::NAN).is_nan());
+        assert_eq!(nvim__id_float(f64::INFINITY), f64::INFINITY);
     }
 
     struct HighlightNamespaceGuard {
