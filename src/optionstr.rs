@@ -1062,6 +1062,48 @@ pub fn expand_set_whichwrap(
     expand_set_opt_listflag(args, crate::option_vars::WW_ALL.as_bytes())
 }
 
+/// Expand `'eventignore'` or `'eventignorewin'` event names
+/// (`expand_set_eventignore`).
+///
+/// Regex filtering remains deferred with the regexp engine.
+pub fn expand_set_eventignore(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!("expand_set_eventignore: regex filtering needs the regexp engine");
+    }
+
+    // SAFETY: the option-expansion callback contract requires
+    // `oe_xp`, when non-null, to point to a live expansion context.
+    let subtract = unsafe { args.oe_xp.as_ref() }
+        .and_then(|xp| xp.xp_pattern.as_deref())
+        .is_some_and(|pattern| pattern.first() == Some(&b'-'));
+    let win = args.oe_idx == crate::option_defs::OptIndex::Eventignorewin;
+    let mut matches = Vec::new();
+
+    if args.oe_include_orig_val
+        && let Some(value) = args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
+    {
+        matches.push(value.to_vec());
+    }
+    if !subtract {
+        matches.push(b"all".to_vec());
+    }
+
+    let mut idx = 0;
+    while let Some(name) = crate::autocmd::get_event_name_no_group(idx, win) {
+        let mut value = Vec::with_capacity(name.len() + usize::from(subtract));
+        if subtract {
+            value.push(b'-');
+        }
+        value.extend_from_slice(name);
+        matches.push(value);
+        idx += 1;
+    }
+
+    (!matches.is_empty()).then_some(matches)
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5315,6 +5357,85 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!matches.iter().any(|value| value == b","));
+    }
+
+    #[test]
+    fn expand_set_eventignore_includes_all_and_every_event_name() {
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_pattern: Some(Vec::new()),
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Eventignore,
+            oe_xp: std::ptr::from_mut(&mut xp),
+            ..Default::default()
+        };
+        let matches = expand_set_eventignore(&mut args).expect("eventignore matches");
+        assert_eq!(matches.first().map(Vec::as_slice), Some(b"all".as_slice()));
+        assert_eq!(matches.len(), crate::autocmd_defs::NUM_EVENTS + 1);
+        assert!(matches.iter().any(|value| value == b"BufEnter"));
+        assert!(matches.iter().any(|value| value == b"WinLeave"));
+    }
+
+    #[test]
+    fn expand_set_eventignore_prefixes_subtracted_events_and_omits_all() {
+        let mut xp = crate::cmdexpand_defs::ExpandT {
+            xp_pattern: Some(b"-Buf".to_vec()),
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Eventignore,
+            oe_xp: std::ptr::from_mut(&mut xp),
+            ..Default::default()
+        };
+        let matches = expand_set_eventignore(&mut args).expect("subtracted events");
+        assert_eq!(matches.len(), crate::autocmd_defs::NUM_EVENTS);
+        assert!(matches.iter().all(|value| value.first() == Some(&b'-')));
+        assert!(matches.iter().any(|value| value == b"-BufEnter"));
+        assert!(!matches.iter().any(|value| value == b"all"));
+    }
+
+    #[test]
+    fn expand_set_eventignorewin_returns_only_window_local_events() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Eventignorewin,
+            ..Default::default()
+        };
+        let matches = expand_set_eventignore(&mut args).expect("window-local events");
+        let expected = crate::autocmd_defs::EVENT_NAMES
+            .iter()
+            .filter(|event| event.win_local)
+            .count();
+        assert_eq!(matches.len(), expected + 1);
+        assert!(matches.iter().any(|value| value == b"WinEnter"));
+        assert!(!matches.iter().any(|value| value == b"ChanOpen"));
+    }
+
+    #[test]
+    fn expand_set_eventignore_can_include_the_original_value_first() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Eventignore,
+            oe_opt_value: Some(b"BufEnter,WinEnter".to_vec()),
+            oe_include_orig_val: true,
+            ..Default::default()
+        };
+        let matches = expand_set_eventignore(&mut args).expect("eventignore matches");
+        assert_eq!(
+            matches.first().map(Vec::as_slice),
+            Some(b"BufEnter,WinEnter".as_slice())
+        );
+        assert_eq!(matches.get(1).map(Vec::as_slice), Some(b"all".as_slice()));
+    }
+
+    #[test]
+    #[should_panic(expected = "regexp engine")]
+    fn expand_set_eventignore_filtered_completion_needs_the_regexp_engine() {
+        let mut args = crate::option_defs::OptexpandT {
+            oe_idx: crate::option_defs::OptIndex::Eventignore,
+            oe_regmatch: std::ptr::NonNull::dangling().as_ptr(),
+            ..Default::default()
+        };
+        let _ = expand_set_eventignore(&mut args);
     }
 
     struct MessagesoptValueGuard(Option<Vec<u8>>);

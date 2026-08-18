@@ -8410,6 +8410,10 @@ fn wire_translated_expand_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::expand_set_concealcursor);
     options[OptIndex::Cpoptions as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_cpoptions);
+    options[OptIndex::Eventignore as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_eventignore);
+    options[OptIndex::Eventignorewin as usize].opt_expand_cb =
+        Some(crate::optionstr::expand_set_eventignore);
     options[OptIndex::Fileencoding as usize].opt_expand_cb =
         Some(crate::optionstr::expand_set_encoding);
     options[OptIndex::Fileencodings as usize].opt_expand_cb =
@@ -8777,6 +8781,8 @@ mod options_table_tests {
         let expanded: &[&[u8]] = &[
             b"concealcursor",
             b"cpoptions",
+            b"eventignore",
+            b"eventignorewin",
             b"fileencoding",
             b"fileencodings",
             b"fileformats",
