@@ -4099,6 +4099,124 @@ pub unsafe fn get_option_value_for(
     value
 }
 
+/// Expand environment variables for one string option
+/// (`option_expand`).
+///
+/// Returns `None` when expansion is disabled, hidden, too long, or
+/// leaves the value unchanged.
+///
+/// # Safety
+/// Forwarded from [`optval_from_varp`] and
+/// [`crate::os::env::expand_env_esc`].
+unsafe fn option_expand(
+    opt_idx: OptIndex,
+    value: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let option = get_option(opt_idx);
+    if option.flags & crate::option_defs::opt_flags::EXPAND == 0
+        || is_option_hidden(opt_idx)
+    {
+        return None;
+    }
+
+    let value = if let Some(value) = value {
+        value.to_vec()
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        match unsafe { optval_from_varp(opt_idx, option.var) } {
+            OptVal::String(value) => value,
+            _ => return None,
+        }
+    };
+    if value.len() > crate::os::os_defs::MAXPATHL as usize {
+        return None;
+    }
+
+    let escape = matches!(opt_idx, OptIndex::Tags | OptIndex::Path)
+        .then_some(b" \t".as_slice());
+    let prefix =
+        (opt_idx == OptIndex::Spellsuggest).then_some(b"file:".as_slice());
+    // SAFETY: forwarded from this function's own safety doc.
+    let expanded = unsafe {
+        crate::os::env::expand_env_esc(&value, escape, false, prefix)
+    };
+    (expanded != value).then_some(expanded)
+}
+
+/// Get an option's default value for the requested scope
+/// (`get_option_default`).
+///
+/// # Safety
+/// Forwarded from [`get_option_unset_value`] and [`option_expand`].
+#[must_use]
+pub unsafe fn get_option_default(opt_idx: OptIndex, opt_flags: u32) -> OptVal {
+    #[cfg(unix)]
+    if opt_idx == OptIndex::Modeline && unsafe { libc::getuid() } == 0 {
+        return OptVal::Boolean(TriState::False);
+    }
+
+    if opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0
+        && option_is_global_local(opt_idx)
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { get_option_unset_value(opt_idx) };
+    }
+
+    let option = get_option(opt_idx);
+    if option.r#type == OptValType::String
+        && option.flags & crate::option_defs::opt_flags::NO_DEF_EXP == 0
+        && let OptVal::String(default) = &option.def_val
+        // SAFETY: forwarded from this function's own safety doc.
+        && let Some(expanded) = unsafe { option_expand(opt_idx, Some(default)) }
+    {
+        return OptVal::String(expanded);
+    }
+    option.def_val.clone()
+}
+
+#[cfg(test)]
+mod option_default_tests {
+    use super::*;
+
+    #[test]
+    fn get_option_default_returns_number_string_and_local_unset_values() {
+        assert_eq!(
+            unsafe { get_option_default(OptIndex::Tabstop, 0) },
+            OptVal::Number(8)
+        );
+        assert_eq!(
+            unsafe { get_option_default(OptIndex::Encoding, 0) },
+            OptVal::String(b"utf-8".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                get_option_default(
+                    OptIndex::Scrolloff,
+                    crate::option_defs::opt_set_flags::OPT_LOCAL,
+                )
+            },
+            OptVal::Number(-1)
+        );
+    }
+
+    #[test]
+    fn option_expand_skips_nonexpandable_unchanged_and_oversized_values() {
+        assert_eq!(
+            unsafe { option_expand(OptIndex::Encoding, Some(b"$NO_EXPANSION")) },
+            None
+        );
+        assert_eq!(
+            unsafe { option_expand(OptIndex::Cdpath, Some(b"plain")) },
+            None
+        );
+        let oversized = vec![b'a'; crate::os::os_defs::MAXPATHL as usize + 1];
+        assert_eq!(
+            unsafe { option_expand(OptIndex::Cdpath, Some(&oversized)) },
+            None
+        );
+    }
+}
+
 /// Set an option directly without validation or side effects
 /// (`set_option_direct`).
 ///
