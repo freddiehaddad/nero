@@ -30,10 +30,9 @@
 //! by `strings.c`'s `vim_strsave_shellescape()` (`shellescape()`).
 //!
 //! Also translated: `get_findfunc_callback`/
-//! `set_ref_in_findfunc`/`free_findfunc_option` - select, mark or
-//! release the local/global `'findfunc'` callback (`ffu_cb`).
-//! `ffu_cb` stays `Callback::None` forever today (see `FFU_CB`'s own
-//! doc comment) - matches every real, unconfigured session.
+//! [`did_set_findfunc`]/`set_ref_in_findfunc`/
+//! `free_findfunc_option` - parse, select, mark or release the
+//! local/global `'findfunc'` callback (`ffu_cb`).
 //!
 //! Also translated: `modifier_len` - the length of a command modifier
 //! (e.g. `silent`/`vertical`/`3tab`) at the start of a `:` command
@@ -932,11 +931,56 @@ pub fn checkforcmd(p: &[u8], cmd: &[u8], len: usize) -> Option<usize> {
 }
 
 /// The `'findfunc'` callback (`ffu_cb`, a file-static `Callback`).
-/// Nothing in this crate can currently set a real value here - see
-/// `ops.rs`'s `OPFUNC_CB` for the identical reasoning (needs
-/// `option_set_callback_func`, not translated).
 static FFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Process the `'findfunc'` option (`did_set_findfunc`).
+///
+/// # Safety
+/// `args.os_buf` and `args.os_varp` must identify live option storage.
+/// Touches global/local callbacks, script context, and function refs.
+pub unsafe fn did_set_findfunc(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf.cast::<crate::buffer_defs::BufT>();
+    assert!(!buf.is_null(), "did_set_findfunc: missing buffer");
+    let flags = args.os_flags as u32;
+    let retval = if flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        let value = unsafe { (*buf).b_p_ffu.clone() };
+        crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { &mut (*buf).b_ffu_cb },
+        )
+    } else {
+        let value =
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffu.clone();
+        let retval = crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { FFU_CB.get_mut() },
+        );
+        if flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0 {
+            crate::eval::typval::callback_free(unsafe {
+                &mut (*buf).b_ffu_cb
+            });
+        }
+        retval
+    };
+    if retval == crate::vim_defs::FAIL {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    if !args.os_varp.is_null() {
+        let option = args.os_varp.cast::<Option<Vec<u8>>>();
+        let value = unsafe { (*option).clone() };
+        if let Some(value) = value
+            && let Some(expanded) =
+                unsafe { crate::eval::userfunc::get_scriptlocal_funcname(&value) }
+        {
+            unsafe { *option = Some(expanded) };
+        }
+    }
+    None
+}
 
 /// Select the buffer-local or global `'findfunc'` callback
 /// (`get_findfunc_callback`).
@@ -963,7 +1007,7 @@ unsafe fn get_findfunc_callback() -> *mut crate::eval::typval_defs::Callback {
 /// Must not run concurrently with another access to `FFU_CB`.
 pub unsafe fn free_findfunc_option() {
     // SAFETY: forwarded from this function's own safety doc.
-    crate::eval::typval::callback_free(unsafe { &mut *FFU_CB.as_ptr() });
+    crate::eval::typval::callback_free(unsafe { FFU_CB.get_mut() });
 }
 
 /// Mark the global `'findfunc'` callback with `copy_id` so that it is
@@ -1539,6 +1583,7 @@ mod tests {
     struct FfuGuard {
         saved: Option<crate::eval::typval_defs::Callback>,
     }
+    struct FfuOptionGuard(Option<Vec<u8>>);
 
     impl FfuGuard {
         fn install(value: crate::eval::typval_defs::Callback) -> Self {
@@ -1552,6 +1597,23 @@ mod tests {
             let slot = unsafe { &mut *FFU_CB.as_ptr() };
             crate::eval::typval::callback_free(slot);
             *slot = self.saved.take().expect("saved callback");
+        }
+    }
+
+    impl FfuOptionGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self(std::mem::replace(
+                &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                    .p_ffu,
+                value.map(<[u8]>::to_vec),
+            ))
+        }
+    }
+
+    impl Drop for FfuOptionGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffu =
+                self.0.take();
         }
     }
 
@@ -2607,25 +2669,134 @@ mod tests {
     }
 
     #[test]
-    fn set_ref_in_findfunc_is_always_false_since_ffu_cb_stays_none() {
+    fn did_set_findfunc_plain_set_updates_global_and_clears_local_callback() {
         let _lock = crate::globals::global_state_test_lock();
-        // Nothing in this crate can populate FFU_CB with a real
-        // callback yet (needs option_set_callback_func) - it always
-        // stays Callback::None, matching a real, unconfigured session.
+        let _callback =
+            FfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = FfuOptionGuard::install(Some(b"GlobalFind"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalFind"),
+            unsafe { &mut (*buf_ptr).b_ffu_cb },
+        );
+        let global_varp = unsafe {
+            std::ptr::addr_of_mut!(
+                (*crate::option_vars::OPTION_VARS.as_ptr()).p_ffu
+            )
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: global_varp.cast(),
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_findfunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { FFU_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalFind"
+        ));
+        assert_eq!(
+            unsafe { &(*buf_ptr).b_ffu_cb }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
         assert!(!unsafe { set_ref_in_findfunc(1) });
     }
 
     #[test]
-    fn free_findfunc_option_releases_and_clears_the_callback() {
+    fn did_set_findfunc_local_set_updates_buffer_callback_only() {
         let _lock = crate::globals::global_state_test_lock();
-        let _guard = FfuGuard::install(crate::eval::typval_defs::Callback::Funcref(
-            b"OrdinaryName".to_vec(),
-        ));
+        let _callback =
+            FfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = FfuOptionGuard::install(Some(b"GlobalFind"));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_ffu: Some(b"LocalFind".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let local_varp =
+            unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_p_ffu) };
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: local_varp.cast(),
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
 
+        assert_eq!(unsafe { did_set_findfunc(&mut args) }, None);
+        assert_eq!(
+            unsafe { FFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_ffu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"LocalFind"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_ffu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_findfunc_global_only_preserves_local_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback =
+            FfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = FfuOptionGuard::install(Some(b"NewGlobalFind"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalFind"),
+            unsafe { &mut (*buf_ptr).b_ffu_cb },
+        );
+        let global_varp = unsafe {
+            std::ptr::addr_of_mut!(
+                (*crate::option_vars::OPTION_VARS.as_ptr()).p_ffu
+            )
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: global_varp.cast(),
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_findfunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_ffu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldLocalFind"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_ffu_cb
+        });
+    }
+
+    #[test]
+    fn free_findfunc_option_releases_and_clears_configured_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback =
+            FfuGuard::install(crate::eval::typval_defs::Callback::None);
+        let _option = FfuOptionGuard::install(Some(b"OrdinaryName"));
+        let mut buf = crate::buffer_defs::BufT::default();
+        let global_varp = unsafe {
+            std::ptr::addr_of_mut!(
+                (*crate::option_vars::OPTION_VARS.as_ptr()).p_ffu
+            )
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: global_varp.cast(),
+            os_buf: std::ptr::from_mut(&mut buf).cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+        unsafe { did_set_findfunc(&mut args) };
         unsafe { free_findfunc_option() };
         assert_eq!(
-            unsafe { &*FFU_CB.as_ptr() },
-            &crate::eval::typval_defs::Callback::None
+            unsafe { FFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
         );
     }
 
