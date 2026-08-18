@@ -24,10 +24,8 @@
 //! Also translated: [`set_ref_in_opfunc`] - marks the global
 //! `'operatorfunc'` callback (`OPFUNC_CB`) with a GC `copy_id` so it
 //! survives garbage collection, via `eval/eval.rs`'s
-//! `set_ref_in_callback`. `OPFUNC_CB` stays `Callback::None` forever
-//! today (see its own doc comment) - matches every real, unconfigured
-//! session, since nothing here can populate a real `'operatorfunc'`
-//! value yet.
+//! `set_ref_in_callback`, plus [`did_set_operatorfunc`], which keeps
+//! that cache synchronized with the option value.
 //!
 //! Also translated: `is_ex_cmdchar` (a `static` predicate - whether a
 //! `cmdarg_T`'s `cmdchar` started a `:`-command-line-shaped operator,
@@ -331,26 +329,36 @@ pub unsafe fn replace_character(c: i32) {
 }
 
 /// The `'operatorfunc'` callback (`opfunc_cb`, a file-static
-/// `Callback`). Nothing in this crate can currently set a real value
-/// here: doing so needs `option_set_callback_func`, itself needing
-/// `eval_expr`/the full `:set`-parsing `Callback` machinery, none
-/// translated - so this stays [`crate::eval::typval_defs::Callback::None`]
-/// forever today, matching every real, unconfigured session before
-/// `'operatorfunc'` is ever assigned.
+/// `Callback`).
 static OPFUNC_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Process the `'operatorfunc'` option (`did_set_operatorfunc`).
+///
+/// # Safety
+/// Touches `OPTION_VARS`, `OPFUNC_CB`, and function-reference state.
+pub unsafe fn did_set_operatorfunc(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_opfunc
+        .as_deref();
+    if crate::option::option_set_callback_func(
+        value,
+        unsafe { OPFUNC_CB.get_mut() },
+    ) == crate::vim_defs::FAIL
+    {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
 
 /// Release the global `'operatorfunc'` callback
 /// (`free_operatorfunc_option`).
 ///
 /// The original guards this in `#ifdef EXITFREE`, i.e. it exists only
 /// to hand memory back cleanly on exit so leak checkers stay quiet.
-/// `OPFUNC_CB` is `Callback::None` in every session this crate can
-/// currently build (see its own doc comment), so today this is a
-/// well-defined no-op - but it is translated in full rather than
-/// stubbed, so it already does the right thing the moment
-/// `'operatorfunc'` becomes settable.
-///
 /// # Safety
 /// Same as [`crate::eval::typval::callback_free`]: `OPFUNC_CB` must
 /// hold a callback whose referent is still live and not aliased.
@@ -1139,6 +1147,41 @@ mod tests {
     use super::*;
     use crate::buffer_defs::WinT;
 
+    struct OpfuncGuard {
+        callback: crate::eval::typval_defs::Callback,
+        option: Option<Vec<u8>>,
+    }
+
+    impl OpfuncGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self {
+                callback: std::mem::replace(
+                    unsafe { OPFUNC_CB.get_mut() },
+                    crate::eval::typval_defs::Callback::None,
+                ),
+                option: std::mem::replace(
+                    &mut unsafe {
+                        crate::option_vars::OPTION_VARS.get_mut()
+                    }
+                    .p_opfunc,
+                    value.map(<[u8]>::to_vec),
+                ),
+            }
+        }
+    }
+
+    impl Drop for OpfuncGuard {
+        fn drop(&mut self) {
+            crate::eval::typval::callback_free(unsafe { OPFUNC_CB.get_mut() });
+            *unsafe { OPFUNC_CB.get_mut() } = std::mem::replace(
+                &mut self.callback,
+                crate::eval::typval_defs::Callback::None,
+            );
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_opfunc =
+                self.option.take();
+        }
+    }
+
     #[test]
     fn get_op_type_single_char_operators() {
         assert_eq!(get_op_type(i32::from(b'd'), 0), OpType::Delete);
@@ -1368,23 +1411,66 @@ mod tests {
     }
 
     #[test]
-    fn set_ref_in_opfunc_is_always_false_since_opfunc_cb_stays_none() {
-        // Nothing in this crate can populate OPFUNC_CB with a real
-        // callback yet (needs option_set_callback_func) - it always
-        // stays Callback::None, matching a real, unconfigured session.
+    fn did_set_operatorfunc_installs_and_marks_a_function_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = OpfuncGuard::install(Some(b"MyOperator"));
+        assert_eq!(
+            unsafe {
+                did_set_operatorfunc(
+                    &mut crate::option_defs::OptsetT::default(),
+                )
+            },
+            None
+        );
+        assert!(matches!(
+            unsafe { OPFUNC_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"MyOperator"
+        ));
         assert!(!unsafe { set_ref_in_opfunc(1) });
     }
 
     #[test]
-    fn free_operatorfunc_option_is_a_noop_while_opfunc_cb_stays_none() {
+    fn did_set_operatorfunc_rejects_invalid_name_without_replacing_callback() {
         let _lock = crate::globals::global_state_test_lock();
-        // Same reasoning as the test above: OPFUNC_CB is Callback::None
-        // in every session this crate can build, so freeing it must be
-        // well defined and leave it None - including when called twice,
-        // as an exit path may well do.
+        let _guard = OpfuncGuard::install(Some(b"OldOperator"));
+        unsafe {
+            did_set_operatorfunc(
+                &mut crate::option_defs::OptsetT::default(),
+            )
+        };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_opfunc =
+            Some(b"123bad".to_vec());
+        assert_eq!(
+            unsafe {
+                did_set_operatorfunc(
+                    &mut crate::option_defs::OptsetT::default(),
+                )
+            },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert!(matches!(
+            unsafe { OPFUNC_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldOperator"
+        ));
+    }
+
+    #[test]
+    fn free_operatorfunc_option_releases_a_configured_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = OpfuncGuard::install(Some(b"MyOperator"));
+        unsafe {
+            did_set_operatorfunc(
+                &mut crate::option_defs::OptsetT::default(),
+            )
+        };
         unsafe { free_operatorfunc_option() };
         unsafe { free_operatorfunc_option() };
-        // Still None, so it still has nothing for the GC to mark.
+        assert_eq!(
+            unsafe { OPFUNC_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
         assert!(!unsafe { set_ref_in_opfunc(1) });
     }
 
