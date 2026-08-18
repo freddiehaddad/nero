@@ -445,6 +445,52 @@ pub unsafe fn hl_invalidate_blends() {
     unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.clear();
 }
 
+/// Clear every highlight table (`clear_hl_tables`).
+///
+/// Reinitialization retains namespace definitions and fonts, resets
+/// attribute/composition caches, and reinstalls the zero attribute.
+/// Destruction also clears namespace definitions and fonts. The
+/// original's redraw/UI notifications remain with the untranslated
+/// rendering pipeline.
+///
+/// # Safety
+/// Mutates all shared highlight tables.
+pub unsafe fn clear_hl_tables(reinit: bool) {
+    unsafe { URLS.get_mut() }.clear();
+    if reinit {
+        unsafe { ATTR_ENTRIES.get_mut() }.clear();
+        unsafe { highlight_init() };
+        unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.clear();
+        unsafe { BLEND_ATTR_ENTRIES.get_mut() }.clear();
+        unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.clear();
+    } else {
+        *unsafe { ATTR_ENTRIES.get_mut() } = crate::map::Set::new();
+        *unsafe { COMBINE_ATTR_ENTRIES.get_mut() } = crate::map::Map::new();
+        *unsafe { BLEND_ATTR_ENTRIES.get_mut() } = crate::map::Map::new();
+        *unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() } = crate::map::Map::new();
+        unsafe { NS_HLS.get_mut() }.clear();
+        unsafe { FONTS.get_mut() }.clear();
+    }
+}
+
+/// Enable semantic highlight-state descriptions once
+/// (`highlight_use_hlstate`).
+///
+/// The first call activates the state and rebuilds all attribute
+/// tables; later calls are no-ops.
+///
+/// # Safety
+/// Mutates all shared highlight tables and the highlight-state flag.
+#[must_use]
+pub unsafe fn highlight_use_hlstate() -> bool {
+    if unsafe { *HLSTATE_ACTIVE.get_mut() } {
+        return false;
+    }
+    unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+    unsafe { clear_hl_tables(true) };
+    true
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -876,6 +922,45 @@ mod tests {
             *unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() } =
                 std::mem::replace(&mut self.blendthrough_entries, crate::map::Map::new());
             unsafe { *HLSTATE_ACTIVE.get_mut() = self.active };
+        }
+    }
+
+    struct AllHighlightTablesGuard {
+        attributes: AttributeEntriesGuard,
+        urls: Vec<Vec<u8>>,
+        fonts: Vec<Vec<u8>>,
+        namespace_highlights: crate::map::Map<
+            crate::highlight_defs::ColorKey,
+            crate::highlight_defs::ColorItem,
+        >,
+    }
+
+    impl AllHighlightTablesGuard {
+        fn empty() -> Self {
+            let attributes = AttributeEntriesGuard::empty();
+            let urls = std::mem::take(unsafe { URLS.get_mut() });
+            let fonts = std::mem::take(unsafe { FONTS.get_mut() });
+            let namespace_highlights =
+                std::mem::replace(unsafe { NS_HLS.get_mut() }, crate::map::Map::new());
+            Self {
+                attributes,
+                urls,
+                fonts,
+                namespace_highlights,
+            }
+        }
+    }
+
+    impl Drop for AllHighlightTablesGuard {
+        fn drop(&mut self) {
+            *unsafe { URLS.get_mut() } = std::mem::take(&mut self.urls);
+            *unsafe { FONTS.get_mut() } = std::mem::take(&mut self.fonts);
+            *unsafe { NS_HLS.get_mut() } = std::mem::replace(
+                &mut self.namespace_highlights,
+                crate::map::Map::new(),
+            );
+            // `attributes` restores itself after this Drop body.
+            let _ = &self.attributes;
         }
     }
 
@@ -1348,6 +1433,83 @@ mod tests {
 
         assert!(unsafe { BLEND_ATTR_ENTRIES.get_mut() }.is_empty());
         assert!(unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.is_empty());
+    }
+
+    #[test]
+    fn clear_hl_tables_reinitializes_attributes_but_keeps_fonts_and_namespaces() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tables = AllHighlightTablesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        unsafe { FONTS.get_mut() }.push(b"Mono".to_vec());
+        unsafe { URLS.get_mut() }.push(b"https://example.test".to_vec());
+        unsafe { NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(2, 3),
+            crate::highlight_defs::ColorItem::default(),
+        );
+        let attr = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                hl_blend: 40,
+                ..Default::default()
+            })
+        };
+        let mut through = false;
+        let _ = unsafe { hl_blend_attrs(0, attr, &mut through) };
+
+        unsafe { clear_hl_tables(true) };
+
+        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert_eq!(
+            unsafe { ATTR_ENTRIES.get_mut() }.get_at(0).map(|entry| entry.kind),
+            Some(crate::highlight_defs::HlKind::Invalid)
+        );
+        assert!(unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { BLEND_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { URLS.get_mut() }.is_empty());
+        assert_eq!(unsafe { FONTS.get_mut() }.as_slice(), [b"Mono".as_slice()]);
+        assert_eq!(unsafe { NS_HLS.get_mut() }.len(), 1);
+    }
+
+    #[test]
+    fn clear_hl_tables_destroy_clears_every_highlight_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tables = AllHighlightTablesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        unsafe { FONTS.get_mut() }.push(b"Mono".to_vec());
+        unsafe { URLS.get_mut() }.push(b"https://example.test".to_vec());
+        unsafe { NS_HLS.get_mut() }.insert(
+            crate::highlight_defs::ColorKey::new(2, 3),
+            crate::highlight_defs::ColorItem::default(),
+        );
+        let _ = unsafe { hl_get_underline() };
+
+        unsafe { clear_hl_tables(false) };
+
+        assert!(unsafe { ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { BLEND_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { URLS.get_mut() }.is_empty());
+        assert!(unsafe { FONTS.get_mut() }.is_empty());
+        assert!(unsafe { NS_HLS.get_mut() }.is_empty());
+    }
+
+    #[test]
+    fn highlight_use_hlstate_rebuilds_tables_only_once() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _tables = AllHighlightTablesGuard::empty();
+        unsafe { URLS.get_mut() }.push(b"https://example.test".to_vec());
+        let _ = unsafe { hl_get_underline() };
+        assert!(unsafe { ATTR_ENTRIES.get_mut() }.len() > 1);
+
+        assert!(unsafe { highlight_use_hlstate() });
+        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert!(unsafe { URLS.get_mut() }.is_empty());
+
+        let attr = unsafe { hl_get_underline() };
+        assert!(attr > 0);
+        assert!(!unsafe { highlight_use_hlstate() });
+        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 2);
     }
 
     struct NamespaceHighlightsGuard {
