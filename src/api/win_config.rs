@@ -13,12 +13,10 @@
 //! `win_new_float`), the redraw pipeline, and the `Dict(win_config)`
 //! keyset-decoding machinery - none translated.
 //!
-//! `parse_border_style`'s own two-item `["char", "HlGroup"]` array form
-//! needs `object_to_hl_id` (`highlight_group.c`'s `syn_check_group`
-//! registry), and the `"shadow"` style's own `FloatShadow`/
-//! `FloatShadowThrough` highlight-group lookups need the same registry -
-//! see `parse_border_style`'s own doc comment for exactly how each is
-//! handled here.
+//! Border-style parsing includes two-item `["char", "HlGroup"]`
+//! entries and the built-in `"shadow"` style's
+//! `FloatShadow`/`FloatShadowThrough` groups through the real
+//! highlight registry.
 
 use crate::api::private::defs::{Error, ErrorType, Object};
 use crate::buffer_defs::WinConfig;
@@ -95,21 +93,6 @@ fn set_border_char(slot: &mut [u8; MAX_SCHAR_SIZE], s: &[u8]) {
 /// `else`), leaving `fconfig->border` set to `true` and everything else
 /// untouched.
 ///
-/// Two narrow, deliberate gaps, both needing `highlight_group.c`'s
-/// `syn_check_group` registry (not translated):
-///
-/// An array item may itself be a two-element `["char", "HlGroup"]`
-/// array in the original, whose second element goes through
-/// `object_to_hl_id`. That form panics via `unimplemented!()` here.
-/// It is unreachable from `parse_winborder` - the only translated
-/// caller - which only ever builds arrays of plain strings.
-///
-/// The `"shadow"` style also assigns `FloatShadow`/`FloatShadowThrough`
-/// highlight ids to five of its eight slots. Those ids stay `0` here.
-/// This affects only `border_hl_ids`, never the accepted/rejected
-/// outcome, and `parse_winborder`'s only translated caller
-/// (`optionstr.c`'s `parse_border_opt`) discards `fconfig` entirely -
-/// so no currently-translated behaviour can observe the difference.
 pub fn parse_border_style(style: &Object, fconfig: &mut WinConfig, err: &mut Error) {
     fconfig.border = true;
 
@@ -125,13 +108,38 @@ pub fn parse_border_style(style: &Object, fconfig: &mut WinConfig, err: &mut Err
                 return;
             }
             for (i, item) in arr.iter().enumerate() {
-                let string = match item {
-                    Object::String(s) => s,
-                    Object::Array(_) => unimplemented!(
-                        "parse_border_style: a [\"char\", \"HlGroup\"] border item needs \
-                         object_to_hl_id (highlight_group.c's syn_check_group registry), \
-                         not yet translated"
-                    ),
+                let (string, hl_id) = match item {
+                    Object::String(s) => (s, 0),
+                    Object::Array(item) => {
+                        if item.is_empty() || item.len() > 2 {
+                            err.r#type = ErrorType::Validation;
+                            err.msg =
+                                Some("Invalid 'border': expected 1 or 2-item Array".to_string());
+                            return;
+                        }
+                        let Object::String(string) = &item[0] else {
+                            err.r#type = ErrorType::Validation;
+                            err.msg =
+                                Some("Invalid 'border': expected Array of Strings".to_string());
+                            return;
+                        };
+                        let hl_id = if item.len() == 2 {
+                            let id = unsafe {
+                                crate::api::private::helpers::object_to_hl_id(
+                                    &item[1],
+                                    "border char highlight",
+                                    err,
+                                )
+                            };
+                            if err.is_set() {
+                                return;
+                            }
+                            id
+                        } else {
+                            0
+                        };
+                        (string, hl_id)
+                    }
                     other => {
                         err.r#type = ErrorType::Validation;
                         err.msg = Some(format!(
@@ -149,7 +157,7 @@ pub fn parse_border_style(style: &Object, fconfig: &mut WinConfig, err: &mut Err
                     return;
                 }
                 set_border_char(&mut fconfig.border_chars[i], string);
-                fconfig.border_hl_ids[i] = 0;
+                fconfig.border_hl_ids[i] = hl_id;
             }
             // Repeat the given chars until all eight slots are filled.
             while size < 8 {
@@ -183,9 +191,21 @@ pub fn parse_border_style(style: &Object, fconfig: &mut WinConfig, err: &mut Err
                         set_border_char(slot, ch.as_bytes());
                     }
                     fconfig.border_hl_ids = [0; 8];
-                    // The `shadow_color` highlight ids are the
-                    // documented gap - see this function's own doc.
-                    let _ = d.shadow_color;
+                    if d.shadow_color {
+                        let blend = unsafe {
+                            crate::highlight_group::syn_check_group(b"FloatShadow")
+                        };
+                        let through = unsafe {
+                            crate::highlight_group::syn_check_group(
+                                b"FloatShadowThrough",
+                            )
+                        };
+                        fconfig.border_hl_ids[2] = through;
+                        fconfig.border_hl_ids[3] = blend;
+                        fconfig.border_hl_ids[4] = blend;
+                        fconfig.border_hl_ids[5] = blend;
+                        fconfig.border_hl_ids[6] = through;
+                    }
                     return;
                 }
             }
@@ -231,6 +251,32 @@ pub fn parse_winborder(fconfig: &mut WinConfig, border_opt: &[u8], err: &mut Err
 mod tests {
     use super::*;
 
+    struct BorderHighlightGuard {
+        items: Vec<crate::highlight_group::HlGroup>,
+        names: crate::map::Map<Vec<u8>, i32>,
+    }
+
+    impl BorderHighlightGuard {
+        fn empty() -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            let items = std::mem::take(&mut table.items);
+            let names = std::mem::replace(
+                unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() },
+                crate::map::Map::new(),
+            );
+            Self { items, names }
+        }
+    }
+
+    impl Drop for BorderHighlightGuard {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.items);
+            *unsafe { crate::highlight_group::HIGHLIGHT_UNAMES.get_mut() } =
+                std::mem::replace(&mut self.names, crate::map::Map::new());
+        }
+    }
+
     /// Read one border slot back as a byte slice, stopping at its NUL.
     fn slot(fc: &WinConfig, i: usize) -> &[u8] {
         let s = &fc.border_chars[i];
@@ -257,6 +303,8 @@ mod tests {
 
     #[test]
     fn parse_border_style_expands_each_named_style() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = BorderHighlightGuard::empty();
         // Spot-check every name plus its own first and last character,
         // hand-read straight off the original's `defaults[]` table.
         let cases: [(&str, &str, &str); 6] = [
@@ -279,7 +327,65 @@ mod tests {
             assert!(fc.border);
             assert_eq!(slot(&fc, 0), first.as_bytes(), "{name} first char");
             assert_eq!(slot(&fc, 7), last.as_bytes(), "{name} last char");
-            assert_eq!(fc.border_hl_ids, [0; 8]);
+            if name == "shadow" {
+                assert!(fc.border_hl_ids[2] > 0);
+                assert_eq!(fc.border_hl_ids[2], fc.border_hl_ids[6]);
+                assert!(fc.border_hl_ids[3] > 0);
+                assert_eq!(fc.border_hl_ids[3], fc.border_hl_ids[4]);
+                assert_eq!(fc.border_hl_ids[4], fc.border_hl_ids[5]);
+                assert_ne!(fc.border_hl_ids[2], fc.border_hl_ids[3]);
+            } else {
+                assert_eq!(fc.border_hl_ids, [0; 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_border_style_accepts_char_and_highlight_pairs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = BorderHighlightGuard::empty();
+        let style = Object::Array(vec![Object::Array(vec![
+            Object::String(b"|".to_vec()),
+            Object::String(b"FloatBorder".to_vec()),
+        ])]);
+        let mut fc = WinConfig::default();
+        let mut err = Error::default();
+
+        parse_border_style(&style, &mut fc, &mut err);
+
+        assert!(!err.is_set());
+        assert!(fc.border_hl_ids[0] > 0);
+        assert!(fc
+            .border_hl_ids
+            .iter()
+            .all(|id| *id == fc.border_hl_ids[0]));
+        for i in 0..8 {
+            assert_eq!(slot(&fc, i), b"|");
+        }
+    }
+
+    #[test]
+    fn parse_border_style_rejects_bad_nested_array_shapes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _groups = BorderHighlightGuard::empty();
+        for item in [
+            Object::Array(Vec::new()),
+            Object::Array(vec![
+                Object::String(b"|".to_vec()),
+                Object::String(b"Border".to_vec()),
+                Object::String(b"Extra".to_vec()),
+            ]),
+            Object::Array(vec![Object::Integer(1)]),
+            Object::Array(vec![
+                Object::String(b"|".to_vec()),
+                Object::Boolean(true),
+            ]),
+        ] {
+            let mut fc = WinConfig::default();
+            let mut err = Error::default();
+            parse_border_style(&Object::Array(vec![item]), &mut fc, &mut err);
+            assert!(err.is_set());
+            assert_eq!(err.r#type, ErrorType::Validation);
         }
     }
 
