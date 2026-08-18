@@ -76,6 +76,52 @@ pub unsafe fn nvim_get_color_by_name(name: &NvimString) -> Integer {
     i64::from(unsafe { crate::highlight_group::name_to_color(name) }.0)
 }
 
+/// Define a highlight group in a namespace (`nvim_set_hl`).
+///
+/// # Safety
+/// Mutates shared highlight-group, namespace, provider, attribute,
+/// font, redraw, and script-context state.
+pub unsafe fn nvim_set_hl(
+    ns_id: Integer,
+    name: &NvimString,
+    value: &crate::highlight::HighlightDict,
+    err: &mut Error,
+) {
+    let hl_id = unsafe { crate::highlight_group::syn_check_group(name) };
+    if hl_id == 0 {
+        return;
+    }
+    if value.url.is_some() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Invalid key: 'url'".to_string());
+        return;
+    }
+    let mut link_id = -1;
+    let mut base_attrs = crate::highlight_defs::HlAttrs::default();
+    let base = if value.update.unwrap_or(false)
+        && unsafe {
+            crate::highlight::hl_ns_get_attrs(ns_id as i32, hl_id, None, &mut base_attrs)
+        }
+    {
+        Some(&base_attrs)
+    } else {
+        None
+    };
+    let attrs =
+        unsafe { crate::highlight::dict2hlattrs(value, true, Some(&mut link_id), base, err) };
+    if !err.is_set() {
+        unsafe {
+            crate::highlight::ns_hl_def(
+                ns_id as i32,
+                hl_id,
+                attrs,
+                link_id,
+                Some(value),
+            )
+        };
+    }
+}
+
 /// Return the complete named RGB color map (`nvim_get_color_map`).
 #[must_use]
 pub fn nvim_get_color_map() -> Dict {
@@ -583,6 +629,56 @@ mod tests {
             pair.key == b"YellowGreen"
                 && matches!(pair.value, Object::Integer(0x9acd32))
         }));
+    }
+
+    #[test]
+    fn nvim_set_hl_defines_a_namespaced_highlight() {
+        let _lock = crate::globals::global_state_test_lock();
+        let namespace = 4001;
+        let name = b"NeroApiNamespacedHighlight".to_vec();
+        let mut err = Error::default();
+        unsafe {
+            nvim_set_hl(
+                namespace,
+                &name,
+                &crate::highlight::HighlightDict {
+                    bold: Some(true),
+                    fg: Some(Object::Integer(0x123456)),
+                    ..Default::default()
+                },
+                &mut err,
+            )
+        };
+        assert!(!err.is_set());
+        let hl_id = unsafe { crate::highlight_group::syn_name2id(&name) };
+        let item = *unsafe { crate::highlight::NS_HLS.get_mut() }
+            .get(&crate::highlight_defs::ColorKey::new(namespace as i32, hl_id))
+            .expect("namespace definition");
+        assert!(item.attr_id > 0);
+        let attrs = unsafe { crate::highlight::syn_attr2entry(item.attr_id) };
+        assert_eq!(attrs.rgb_fg_color, 0x123456);
+        assert_eq!(
+            attrs.rgb_ae_attr,
+            crate::highlight_defs::HL_BOLD as i32
+        );
+    }
+
+    #[test]
+    fn nvim_set_hl_rejects_url_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut err = Error::default();
+        unsafe {
+            nvim_set_hl(
+                4002,
+                &b"NeroApiUrlHighlight".to_vec(),
+                &crate::highlight::HighlightDict {
+                    url: Some(b"https://example.test".to_vec()),
+                    ..Default::default()
+                },
+                &mut err,
+            )
+        };
+        assert_eq!(err.msg.as_deref(), Some("Invalid key: 'url'"));
     }
 
     struct HighlightNamespaceGuard {
