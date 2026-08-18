@@ -120,6 +120,26 @@ pub unsafe fn hl_get_syn_attr(
     }
 }
 
+/// Get the underline highlight attribute (`hl_get_underline`).
+///
+/// # Safety
+/// Mutates the shared attribute table when first called.
+#[must_use]
+pub unsafe fn hl_get_underline() -> i32 {
+    let attrs = crate::highlight_defs::HlAttrs {
+        cterm_ae_attr: crate::highlight_defs::HL_UNDERLINE as i32,
+        rgb_ae_attr: crate::highlight_defs::HL_UNDERLINE as i32,
+        ..Default::default()
+    };
+    get_attr_entry(crate::highlight_defs::HlEntry {
+        attr: attrs,
+        kind: crate::highlight_defs::HlKind::Ui,
+        id1: 0,
+        id2: 0,
+        winid: 0,
+    })
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -565,6 +585,19 @@ mod tests {
             unsafe { hl_get_syn_attr(0, 3, Default::default()) },
             0
         );
+    }
+
+    #[test]
+    fn hl_get_underline_returns_a_stable_nonzero_attribute() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+
+        let first = unsafe { hl_get_underline() };
+        let second = unsafe { hl_get_underline() };
+
+        assert!(first > 0);
+        assert_eq!(second, first);
+        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 2);
     }
 
     struct NamespaceHighlightsGuard {
