@@ -431,6 +431,20 @@ pub unsafe fn hl_apply_winblend(winbl: i32, attr: i32) -> i32 {
     }
 }
 
+/// Invalidate cached blend combinations (`hl_invalidate_blends`).
+///
+/// The original also schedules highlight redraw and refreshes the
+/// current window. Those rendering-side effects remain with the
+/// untranslated redraw/window-highlight pipeline; the complete cache
+/// invalidation is performed here.
+///
+/// # Safety
+/// Mutates the two shared blend caches.
+pub unsafe fn hl_invalidate_blends() {
+    unsafe { BLEND_ATTR_ENTRIES.get_mut() }.clear();
+    unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.clear();
+}
+
 /// Get an interned URL by index (`hl_get_url`).
 ///
 /// # Safety
@@ -1302,6 +1316,38 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let _entries = AttributeEntriesGuard::empty();
         let _ = unsafe { hl_apply_winblend(20, 99) };
+    }
+
+    #[test]
+    fn hl_invalidate_blends_clears_both_blend_caches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let back = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_fg_color: 0x10_20_30,
+                rgb_bg_color: 0x20_30_40,
+                ..Default::default()
+            })
+        };
+        let front = unsafe {
+            hl_get_term_attr(&crate::highlight_defs::HlAttrs {
+                rgb_bg_color: 0x80_90_A0,
+                hl_blend: 30,
+                ..Default::default()
+            })
+        };
+        let mut normal = false;
+        let mut through = true;
+        let _ = unsafe { hl_blend_attrs(back, front, &mut normal) };
+        let _ = unsafe { hl_blend_attrs(back, front, &mut through) };
+        assert_eq!(unsafe { BLEND_ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert_eq!(unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.len(), 1);
+
+        unsafe { hl_invalidate_blends() };
+
+        assert!(unsafe { BLEND_ATTR_ENTRIES.get_mut() }.is_empty());
+        assert!(unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.is_empty());
     }
 
     struct NamespaceHighlightsGuard {

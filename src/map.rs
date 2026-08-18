@@ -362,6 +362,13 @@ impl<K: Hash + Eq + Clone, V> Map<K, V> {
         self.values.pop()
     }
 
+    /// `map_clear(T, U)`: remove every key/value pair while retaining
+    /// allocated storage for reuse.
+    pub fn clear(&mut self) {
+        self.set.clear();
+        self.values.clear();
+    }
+
     /// Iterates `(key, value)` pairs (`map_foreach`).
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.set.keys.iter().zip(self.values.iter())
@@ -411,6 +418,21 @@ mod tests {
         assert_eq!(set.get_at(0), Some(&10));
         assert_eq!(set.get_at(1), Some(&20));
         assert_eq!(set.get_at(2), None);
+    }
+
+    #[test]
+    fn map_clear_removes_all_parallel_keys_and_values() {
+        let mut map = Map::new();
+        map.insert(1, "one");
+        map.insert(2, "two");
+
+        map.clear();
+
+        assert!(map.is_empty());
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&2), None);
+        map.insert(3, "three");
+        assert_eq!(map.get(&3), Some(&"three"));
     }
 
     #[test]
