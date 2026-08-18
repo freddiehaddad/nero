@@ -3600,6 +3600,44 @@ fn stropt_concat_with_comma(
     }
 }
 
+/// Validate a new typed option value (`validate_option_value`).
+///
+/// The original formats a dynamic type-mismatch diagnostic naming the
+/// option and both types. This crate returns `E474` while preserving
+/// the same rejection and all value mutation semantics.
+///
+/// # Safety
+/// Forwarded from [`get_option_unset_value`] and
+/// [`validate_num_option`].
+#[must_use]
+pub unsafe fn validate_option_value(
+    opt_idx: OptIndex,
+    newval: &mut OptVal,
+    opt_flags: u32,
+) -> Option<&'static str> {
+    if option_is_global_local(opt_idx)
+        && opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && *newval == unsafe { get_option_unset_value(opt_idx) }
+    {
+        return None;
+    }
+
+    if *newval == OptVal::Nil {
+        if opt_flags == crate::option_defs::opt_set_flags::OPT_GLOBAL {
+            return Some("Cannot unset global option value");
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        *newval = unsafe { get_option_unset_value(opt_idx) };
+    } else if !option_has_type(opt_idx, newval.value_type()) {
+        return Some(crate::errors::e_invarg);
+    } else if let OptVal::Number(number) = newval {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { validate_num_option(opt_idx, number) };
+    }
+    None
+}
+
 /// Skip to next part of an option argument: skip a leading comma and
 /// any following spaces (`skip_to_option_part`).
 ///
@@ -4363,6 +4401,78 @@ mod num_option_bounds_tests {
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         globals.firstwin = prev_firstwin;
         globals.full_screen = prev_full_screen;
+    }
+
+    #[test]
+    fn validate_option_value_accepts_an_explicit_local_unset_sentinel() {
+        let mut value = OptVal::Number(-1);
+        assert_eq!(
+            unsafe {
+                validate_option_value(
+                    OptIndex::Scrolloff,
+                    &mut value,
+                    crate::option_defs::opt_set_flags::OPT_LOCAL,
+                )
+            },
+            None
+        );
+        assert_eq!(value, OptVal::Number(-1));
+    }
+
+    #[test]
+    fn validate_option_value_rejects_unsetting_global_scope() {
+        let mut value = OptVal::Nil;
+        assert_eq!(
+            unsafe {
+                validate_option_value(
+                    OptIndex::Scrolloff,
+                    &mut value,
+                    crate::option_defs::opt_set_flags::OPT_GLOBAL,
+                )
+            },
+            Some("Cannot unset global option value")
+        );
+        assert_eq!(value, OptVal::Nil);
+    }
+
+    #[test]
+    fn validate_option_value_converts_nil_local_value_to_the_unset_sentinel() {
+        let mut value = OptVal::Nil;
+        assert_eq!(
+            unsafe {
+                validate_option_value(
+                    OptIndex::Scrolloff,
+                    &mut value,
+                    crate::option_defs::opt_set_flags::OPT_LOCAL,
+                )
+            },
+            None
+        );
+        assert_eq!(value, OptVal::Number(-1));
+    }
+
+    #[test]
+    fn validate_option_value_rejects_a_mismatched_type() {
+        let mut value = OptVal::String(b"eight".to_vec());
+        assert_eq!(
+            unsafe { validate_option_value(OptIndex::Tabstop, &mut value, 0) },
+            Some(crate::errors::e_invarg)
+        );
+    }
+
+    #[test]
+    fn validate_option_value_delegates_numeric_bounds_and_accepts_valid_strings() {
+        let mut number = OptVal::Number(0);
+        assert_eq!(
+            unsafe { validate_option_value(OptIndex::Tabstop, &mut number, 0) },
+            Some(crate::errors::e_positive)
+        );
+
+        let mut string = OptVal::String(b"dark".to_vec());
+        assert_eq!(
+            unsafe { validate_option_value(OptIndex::Background, &mut string, 0) },
+            None
+        );
     }
 }
 
