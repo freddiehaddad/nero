@@ -8353,6 +8353,8 @@ fn wire_other_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::did_set_backupext_or_patchmode);
     options[OptIndex::Runtimepath as usize].opt_did_set_cb =
         Some(crate::runtime::did_set_runtimepackpath);
+    options[OptIndex::Scrollbind as usize].opt_did_set_cb =
+        Some(crate::option::did_set_scrollbind);
     options[OptIndex::Shada as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_shada);
     options[OptIndex::Shellpipe as usize].opt_did_set_cb =
@@ -8671,6 +8673,7 @@ mod options_table_tests {
             b"packpath",
             b"patchmode",
             b"runtimepath",
+            b"scrollbind",
             b"shada",
             b"shellpipe",
             b"shellredir",

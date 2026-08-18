@@ -462,6 +462,58 @@ pub unsafe fn get_vtopline(wp: &crate::buffer_defs::WinT) -> i32 {
     unsafe { crate::plines::plines_m_win_fill(wp, 1, wp.w_topline) - wp.w_topfill }
 }
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct ScrollbindState {
+    old_curwin: *mut crate::buffer_defs::WinT,
+    old_vtopline: i32,
+    old_buf: *mut crate::buffer_defs::BufT,
+    old_leftcol: i32,
+}
+
+/// Function-local static state used by [`do_check_scrollbind`].
+static SCROLLBIND_STATE: crate::globals::GlobalCell<ScrollbindState> =
+    crate::globals::GlobalCell::new(ScrollbindState {
+        old_curwin: std::ptr::null_mut(),
+        old_vtopline: 0,
+        old_buf: std::ptr::null_mut(),
+        old_leftcol: 0,
+    });
+
+/// Snapshot or synchronize scroll-bound windows (`do_check_scrollbind`).
+///
+/// The `check == false` snapshot path is translated in full and is
+/// the path used when `'scrollbind'` is enabled. Active synchronization
+/// still needs `check_scrollbind` and the real `'scrollopt'` behavior.
+///
+/// # Safety
+/// `GLOBALS.curwin` must point to a live `WinT`; forwarded from
+/// [`get_vtopline`].
+pub unsafe fn do_check_scrollbind(check: bool) {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { (*globals).curwin };
+    // SAFETY: forwarded from this function's own safety doc.
+    let vtopline = unsafe { get_vtopline(&*curwin) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if check && unsafe { (*curwin).w_onebuf_opt.wo_scb != 0 } {
+        unimplemented!(
+            "do_check_scrollbind(check=true): needs check_scrollbind and real scrollopt behavior"
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (buffer, leftcol) = unsafe { ((*curwin).w_buffer, (*curwin).w_leftcol) };
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { SCROLLBIND_STATE.get_mut() } = ScrollbindState {
+        old_curwin: curwin,
+        old_vtopline: vtopline,
+        old_buf: buffer,
+        old_leftcol: leftcol,
+    };
+}
+
 /// Command character that doesn't do anything, and does NOT start
 /// `edit()` afterwards (`nv_ignore`).
 pub fn nv_ignore(cap: &mut crate::normal_defs::CmdargT) {
@@ -898,6 +950,20 @@ mod tests {
     struct SafeStateReset;
 
     struct OperatorVarGuard(crate::eval::typval_defs::TypvalValue);
+
+    struct ScrollbindStateGuard(ScrollbindState);
+
+    impl ScrollbindStateGuard {
+        fn capture() -> Self {
+            ScrollbindStateGuard(unsafe { *SCROLLBIND_STATE.get_mut() })
+        }
+    }
+
+    impl Drop for ScrollbindStateGuard {
+        fn drop(&mut self) {
+            unsafe { *SCROLLBIND_STATE.get_mut() = self.0 };
+        }
+    }
 
     impl OperatorVarGuard {
         fn save() -> Self {
@@ -1721,6 +1787,118 @@ mod tests {
         assert_eq!(unsafe { get_vtopline(&win_filled) }, without_fill - 3);
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_tab;
+    }
+
+    #[test]
+    fn do_check_scrollbind_false_snapshots_the_current_window_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ScrollbindStateGuard::capture();
+
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_line_count = 20;
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_topline: 3,
+            w_topfill: 1,
+            w_leftcol: 7,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+
+        let expected = unsafe { get_vtopline(&*win_ptr) };
+        unsafe { do_check_scrollbind(false) };
+
+        let state = unsafe { *SCROLLBIND_STATE.get_mut() };
+        assert_eq!(state.old_curwin, win_ptr);
+        assert_eq!(state.old_vtopline, expected);
+        assert_eq!(state.old_buf, buf_ptr);
+        assert_eq!(state.old_leftcol, 7);
+    }
+
+    #[test]
+    fn did_set_scrollbind_snapshots_and_records_the_virtual_topline_when_enabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ScrollbindStateGuard::capture();
+
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_line_count = 20;
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_topline: 4,
+            w_topfill: 1,
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_scb = 1;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+        let expected = unsafe { get_vtopline(&*win_ptr) };
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { crate::option::did_set_scrollbind(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_scbind_pos }, expected);
+    }
+
+    #[test]
+    fn did_set_scrollbind_leaves_the_snapshot_unchanged_when_disabled() {
+        let mut win = crate::buffer_defs::WinT {
+            w_scbind_pos: 17,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { crate::option::did_set_scrollbind(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_scbind_pos }, 17);
+    }
+
+    #[test]
+    #[should_panic(expected = "check_scrollbind")]
+    fn do_check_scrollbind_true_with_scrollbind_enabled_needs_synchronization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ScrollbindStateGuard::capture();
+
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let tab_ptr = std::ptr::from_mut(&mut tab);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr)
+        };
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_line_count = 1;
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_scb = 1;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
+
+        unsafe { do_check_scrollbind(true) };
     }
 
     #[test]

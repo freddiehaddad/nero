@@ -7845,6 +7845,34 @@ pub unsafe fn did_set_smoothscroll(
     None
 }
 
+/// Process an updated `'scrollbind'` value (`did_set_scrollbind`).
+///
+/// Enabling scroll binding snapshots the current scroll state and
+/// records this window's virtual top line, avoiding a jump on the next
+/// normal-mode command.
+///
+/// # Safety
+/// `args.os_win` and `GLOBALS.curwin` must point to live windows;
+/// forwarded from [`crate::normal::do_check_scrollbind`] and
+/// [`crate::normal::get_vtopline`].
+pub unsafe fn did_set_scrollbind(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*win).w_onebuf_opt.wo_scb == 0 } {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::normal::do_check_scrollbind(false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let vtopline = unsafe { crate::normal::get_vtopline(&*win) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*win).w_scbind_pos = vtopline };
+    None
+}
+
 /// Process an updated terminal `'scrollback'` value
 /// (`did_set_scrollback`).
 ///
