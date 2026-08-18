@@ -7825,6 +7825,71 @@ pub fn did_set_showtabline(
     unimplemented!("did_set_showtabline: initialized layouts need win_new_screen_rows");
 }
 
+/// Process an updated `'arabic'` value (`did_set_arabic`).
+///
+/// The complete disable path resets right-to-left mode and the
+/// buffer's input modes. Enabling applies every prerequisite setting
+/// in source order, then stops at the still-missing keymap option
+/// write.
+///
+/// # Safety
+/// `args.os_win` must point to a live `WinT` whose `w_buffer` points
+/// to a live `BufT`; forwarded from
+/// [`crate::r#move::changed_window_setting`].
+pub unsafe fn did_set_arabic(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win as *mut crate::buffer_defs::WinT;
+    let options = crate::option_vars::OPTION_VARS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc.
+    let enabled = unsafe { (*win).w_onebuf_opt.wo_arab != 0 };
+    // SAFETY: `options` points at the process-lifetime option store.
+    let termbidi = unsafe { (*options).p_tbidi != 0 };
+
+    if enabled {
+        if !termbidi {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { (*win).w_onebuf_opt.wo_rl == 0 } {
+                // SAFETY: same live window pointer.
+                unsafe { (*win).w_onebuf_opt.wo_rl = 1 };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::r#move::changed_window_setting(win) };
+            }
+            // SAFETY: same process-lifetime option pointer.
+            if unsafe { (*options).p_arshape == 0 } {
+                unsafe { (*options).p_arshape = 1 };
+            }
+        }
+
+        // The original warns when encoding is not UTF-8. Message
+        // display is deferred, but v:warningmsg remains observable.
+        let utf8 = unsafe { (*options).p_enc.as_deref() } == Some(b"utf-8".as_slice());
+        if !utf8 {
+            unsafe {
+                crate::eval::vars::set_vim_var_string(
+                    crate::eval::vars::VimVarIndex::Warningmsg,
+                    Some(b"W17: Arabic requires UTF-8, do ':set encoding=utf-8'"),
+                )
+            };
+        }
+        unsafe { (*options).p_deco = 1 };
+        unimplemented!("did_set_arabic: enabling needs set_option_value for the arabic keymap");
+    }
+
+    if !termbidi && unsafe { (*win).w_onebuf_opt.wo_rl != 0 } {
+        unsafe { (*win).w_onebuf_opt.wo_rl = 0 };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::changed_window_setting(win) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { (*win).w_buffer };
+    unsafe {
+        (*buf).b_p_iminsert = crate::buffer_defs::B_IMODE_NONE;
+        (*buf).b_p_imsearch = crate::buffer_defs::B_IMODE_USE_INSERT;
+    }
+    None
+}
+
 /// Process the updated global or buffer-local `'undolevels'` value
 /// (`did_set_undolevels`).
 ///
@@ -9064,6 +9129,44 @@ mod did_set_title_tests {
         }
     }
 
+    struct ArabicOptionsGuard {
+        termbidi: i32,
+        arabicshape: i32,
+        delcombine: i32,
+        encoding: Option<Vec<u8>>,
+    }
+
+    impl ArabicOptionsGuard {
+        fn set(termbidi: i32, arabicshape: i32, delcombine: i32) -> Self {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            let previous = ArabicOptionsGuard {
+                termbidi: unsafe { (*options).p_tbidi },
+                arabicshape: unsafe { (*options).p_arshape },
+                delcombine: unsafe { (*options).p_deco },
+                encoding: unsafe { (*options).p_enc.clone() },
+            };
+            unsafe {
+                (*options).p_tbidi = termbidi;
+                (*options).p_arshape = arabicshape;
+                (*options).p_deco = delcombine;
+                (*options).p_enc = Some(b"utf-8".to_vec());
+            }
+            previous
+        }
+    }
+
+    impl Drop for ArabicOptionsGuard {
+        fn drop(&mut self) {
+            let options = crate::option_vars::OPTION_VARS.as_ptr();
+            unsafe {
+                (*options).p_tbidi = self.termbidi;
+                (*options).p_arshape = self.arabicshape;
+                (*options).p_deco = self.delcombine;
+                (*options).p_enc = self.encoding.take();
+            }
+        }
+    }
+
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -9556,6 +9659,64 @@ mod did_set_title_tests {
             crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
         };
         did_set_showtabline(&mut Default::default());
+    }
+
+    #[test]
+    fn did_set_arabic_disabling_resets_window_and_buffer_input_modes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = ArabicOptionsGuard::set(0, 1, 1);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_iminsert: crate::buffer_defs::B_IMODE_LMAP,
+            b_p_imsearch: crate::buffer_defs::B_IMODE_LMAP,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_arab = 0;
+        win.w_onebuf_opt.wo_rl = 1;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_arabic(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_rl }, 0);
+        assert_eq!(unsafe { (*buf_ptr).b_p_iminsert }, crate::buffer_defs::B_IMODE_NONE);
+        assert_eq!(
+            unsafe { (*buf_ptr).b_p_imsearch },
+            crate::buffer_defs::B_IMODE_USE_INSERT
+        );
+    }
+
+    #[test]
+    fn did_set_arabic_enabling_applies_prerequisites_before_keymap_assignment() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = ArabicOptionsGuard::set(0, 0, 0);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_arab = 1;
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            did_set_arabic(&mut args)
+        }));
+        assert!(result.is_err());
+        assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_rl }, 1);
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        assert_eq!(unsafe { (*options).p_arshape }, 1);
+        assert_eq!(unsafe { (*options).p_deco }, 1);
     }
 
     #[test]
