@@ -3779,6 +3779,50 @@ pub unsafe fn set_option_value(
     unsafe { set_option(opt_idx, value, opt_flags, 0, false, true) }
 }
 
+/// Set an option directly without validation or side effects
+/// (`set_option_direct`).
+///
+/// # Safety
+/// Forwarded from [`set_option`].
+pub unsafe fn set_option_direct(
+    opt_idx: OptIndex,
+    value: OptVal,
+    opt_flags: u32,
+    set_sid: crate::eval::typval_defs::ScidT,
+) {
+    if is_option_hidden(opt_idx) {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let error = unsafe {
+        set_option(opt_idx, value, opt_flags, set_sid, true, true)
+    };
+    debug_assert!(error.is_none());
+}
+
+/// Unset the local value of a global-local option
+/// (`unset_option_local_value`).
+///
+/// # Safety
+/// Forwarded from [`get_option_unset_value`] and
+/// [`set_option_value`].
+#[must_use]
+pub unsafe fn unset_option_local_value(
+    opt_idx: OptIndex,
+) -> Option<&'static str> {
+    debug_assert!(option_is_global_local(opt_idx));
+    // SAFETY: forwarded from this function's own safety doc.
+    let value = unsafe { get_option_unset_value(opt_idx) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        set_option_value(
+            opt_idx,
+            value,
+            crate::option_defs::opt_set_flags::OPT_LOCAL,
+        )
+    }
+}
+
 /// Skip to next part of an option argument: skip a leading comma and
 /// any following spaces (`skip_to_option_part`).
 ///
@@ -7764,6 +7808,46 @@ mod did_set_option_tests {
             },
             Some(crate::errors::e_sandbox)
         );
+    }
+
+    #[test]
+    fn set_option_direct_skips_hidden_options_and_accepts_invalid_numeric_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        unsafe {
+            set_option_direct(
+                OptIndex::Aleph,
+                OptVal::Number(99),
+                0,
+                crate::globals::SID_NONE,
+            )
+        };
+
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+        unsafe { (*buf).b_p_ts = 8 };
+        unsafe {
+            set_option_direct(
+                OptIndex::Tabstop,
+                OptVal::Number(0),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                crate::globals::SID_NONE,
+            )
+        };
+        assert_eq!(unsafe { (*buf).b_p_ts }, 0);
+    }
+
+    #[test]
+    fn unset_option_local_value_installs_the_global_local_sentinel() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, win) = setup_curbuf_curwin();
+        unsafe { (*win).w_onebuf_opt.wo_so = 5 };
+
+        assert_eq!(
+            unsafe { unset_option_local_value(OptIndex::Scrolloff) },
+            None
+        );
+        assert_eq!(unsafe { (*win).w_onebuf_opt.wo_so }, -1);
     }
 }
 
