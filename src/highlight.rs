@@ -51,6 +51,16 @@ static COMBINE_ATTR_ENTRIES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| {
     crate::globals::GlobalCell::new(crate::map::Map::new())
 });
+static BLEND_ATTR_ENTRIES: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::map::Map<u64, i32>>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::map::Map::new())
+});
+static BLENDTHROUGH_ATTR_ENTRIES: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::map::Map<u64, i32>>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::map::Map::new())
+});
 
 /// Initialize the highlight attribute table (`highlight_init`).
 ///
@@ -260,6 +270,109 @@ pub unsafe fn hl_combine_attr(char_attr: i32, prim_attr: i32) -> i32 {
     });
     if id > 0 {
         unsafe { COMBINE_ATTR_ENTRIES.get_mut() }.insert(combine_tag, id);
+    }
+    id
+}
+
+/// Blend foreground `front_attr` over background `back_attr`
+/// (`hl_blend_attrs`).
+///
+/// `through` selects the variant used when a transparent virtual-text
+/// cell should preserve the underlying cell's attributes. The blend
+/// property is consumed by this operation and cleared in the result.
+///
+/// # Safety
+/// Reads and mutates the shared attribute and blend-cache tables, plus
+/// the shared default-color state.
+#[must_use]
+pub unsafe fn hl_blend_attrs(
+    back_attr: i32,
+    front_attr: i32,
+    through: &mut bool,
+) -> i32 {
+    if front_attr < 0 || back_attr < 0 {
+        return front_attr;
+    }
+
+    let front_raw = unsafe { syn_attr2entry(front_attr) };
+    let front = unsafe { get_colors_force(front_raw) };
+    let ratio = front.hl_blend;
+    if ratio <= 0 {
+        *through = false;
+        return front_attr;
+    }
+
+    let combine_tag = crate::highlight_defs::hl_attr_key(back_attr, front_attr);
+    let cache = if *through {
+        unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }
+    } else {
+        unsafe { BLEND_ATTR_ENTRIES.get_mut() }
+    };
+    if let Some(id) = cache.get(&combine_tag)
+        && *id > 0
+    {
+        return *id;
+    }
+
+    let back_raw = unsafe { syn_attr2entry(back_attr) };
+    let back = unsafe { get_colors_force(back_raw) };
+    let mut combined;
+    if *through {
+        combined = back;
+        combined.rgb_fg_color =
+            rgb_blend(ratio, back.rgb_fg_color, front.rgb_bg_color);
+        if combined.rgb_ae_attr & crate::highlight_defs::HL_UNDERLINE_MASK as i32 != 0
+            && back_raw.rgb_sp_color != -1
+        {
+            combined.rgb_sp_color =
+                rgb_blend(ratio, back.rgb_sp_color, front.rgb_bg_color);
+        } else {
+            combined.rgb_sp_color = -1;
+        }
+        combined.cterm_bg_color = front.cterm_bg_color;
+        combined.cterm_fg_color =
+            cterm_blend(ratio, back.cterm_fg_color, front.cterm_bg_color) as i16;
+        combined.rgb_ae_attr &= !((crate::highlight_defs::HL_FG_INDEXED
+            | crate::highlight_defs::HL_BG_INDEXED) as i32);
+    } else {
+        combined = front;
+        combined.rgb_fg_color =
+            rgb_blend(ratio / 2, back.rgb_fg_color, front.rgb_fg_color);
+        if combined.rgb_ae_attr & crate::highlight_defs::HL_UNDERLINE_MASK as i32 != 0 {
+            combined.rgb_sp_color =
+                rgb_blend(ratio / 2, back.rgb_bg_color, front.rgb_sp_color);
+        } else {
+            combined.rgb_sp_color = -1;
+        }
+        combined.rgb_ae_attr &= !((crate::highlight_defs::HL_FG_INDEXED
+            | crate::highlight_defs::HL_BG_INDEXED) as i32);
+    }
+
+    if ratio == 100 && back_raw.rgb_bg_color == -1 {
+        combined.rgb_bg_color = -1;
+    } else {
+        combined.rgb_bg_color =
+            if back_raw.rgb_bg_color == -1 && front_raw.rgb_bg_color == -1 {
+                -1
+            } else {
+                rgb_blend(ratio, back.rgb_bg_color, front.rgb_bg_color)
+            };
+    }
+    combined.hl_blend = -1;
+    let kind = if *through {
+        crate::highlight_defs::HlKind::BlendThrough
+    } else {
+        crate::highlight_defs::HlKind::Blend
+    };
+    let id = get_attr_entry(crate::highlight_defs::HlEntry {
+        attr: combined,
+        kind,
+        id1: back_attr,
+        id2: front_attr,
+        winid: 0,
+    });
+    if id > 0 {
+        cache.insert(combine_tag, id);
     }
     id
 }
@@ -649,6 +762,8 @@ mod tests {
     struct AttributeEntriesGuard {
         entries: crate::map::Set<crate::highlight_defs::HlEntry>,
         combine_entries: crate::map::Map<u64, i32>,
+        blend_entries: crate::map::Map<u64, i32>,
+        blendthrough_entries: crate::map::Map<u64, i32>,
         active: bool,
     }
 
@@ -662,11 +777,21 @@ mod tests {
                 unsafe { COMBINE_ATTR_ENTRIES.get_mut() },
                 crate::map::Map::new(),
             );
+            let blend_entries = std::mem::replace(
+                unsafe { BLEND_ATTR_ENTRIES.get_mut() },
+                crate::map::Map::new(),
+            );
+            let blendthrough_entries = std::mem::replace(
+                unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() },
+                crate::map::Map::new(),
+            );
             let active = unsafe { *HLSTATE_ACTIVE.get_mut() };
             unsafe { *HLSTATE_ACTIVE.get_mut() = false };
             Self {
                 entries,
                 combine_entries,
+                blend_entries,
+                blendthrough_entries,
                 active,
             }
         }
@@ -678,6 +803,10 @@ mod tests {
                 std::mem::replace(&mut self.entries, crate::map::Set::new());
             *unsafe { COMBINE_ATTR_ENTRIES.get_mut() } =
                 std::mem::replace(&mut self.combine_entries, crate::map::Map::new());
+            *unsafe { BLEND_ATTR_ENTRIES.get_mut() } =
+                std::mem::replace(&mut self.blend_entries, crate::map::Map::new());
+            *unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() } =
+                std::mem::replace(&mut self.blendthrough_entries, crate::map::Map::new());
             unsafe { *HLSTATE_ACTIVE.get_mut() = self.active };
         }
     }
@@ -873,6 +1002,148 @@ mod tests {
     fn hl_combine_attr_shortcuts_zero_ids() {
         assert_eq!(unsafe { hl_combine_attr(0, 7) }, 7);
         assert_eq!(unsafe { hl_combine_attr(9, 0) }, 9);
+    }
+
+    #[test]
+    fn hl_blend_attrs_blends_colors_and_caches_normal_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let back = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x00_00_00,
+            rgb_bg_color: 0x20_40_60,
+            rgb_sp_color: 0x10_20_30,
+            ..Default::default()
+        };
+        let front = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: (crate::highlight_defs::HL_UNDERLINE
+                | crate::highlight_defs::HL_FG_INDEXED
+                | crate::highlight_defs::HL_BG_INDEXED) as i32,
+            rgb_fg_color: 0x80_A0_C0,
+            rgb_bg_color: 0x60_80_A0,
+            rgb_sp_color: 0x40_60_80,
+            hl_blend: 40,
+            ..Default::default()
+        };
+        let back_id = unsafe { hl_get_term_attr(&back) };
+        let front_id = unsafe { hl_get_term_attr(&front) };
+        let mut through = false;
+
+        let blended_id = unsafe { hl_blend_attrs(back_id, front_id, &mut through) };
+        let again = unsafe { hl_blend_attrs(back_id, front_id, &mut through) };
+        let blended = unsafe { syn_attr2entry(blended_id) };
+
+        assert_eq!(blended_id, again);
+        assert_eq!(unsafe { BLEND_ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert_eq!(
+            blended.rgb_fg_color,
+            rgb_blend(20, back.rgb_fg_color, front.rgb_fg_color)
+        );
+        assert_eq!(
+            blended.rgb_bg_color,
+            rgb_blend(40, back.rgb_bg_color, front.rgb_bg_color)
+        );
+        assert_eq!(
+            blended.rgb_sp_color,
+            rgb_blend(20, back.rgb_bg_color, front.rgb_sp_color)
+        );
+        assert_eq!(
+            blended.rgb_ae_attr
+                & (crate::highlight_defs::HL_FG_INDEXED
+                    | crate::highlight_defs::HL_BG_INDEXED) as i32,
+            0
+        );
+        assert_eq!(blended.hl_blend, -1);
+    }
+
+    #[test]
+    fn hl_blend_attrs_through_mode_preserves_back_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let back = crate::highlight_defs::HlAttrs {
+            rgb_ae_attr: crate::highlight_defs::HL_UNDERCURL as i32,
+            rgb_fg_color: 0x20_40_60,
+            rgb_bg_color: 0x40_60_80,
+            rgb_sp_color: 0x60_80_A0,
+            cterm_fg_color: 8,
+            cterm_bg_color: 9,
+            ..Default::default()
+        };
+        let front = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x80_A0_C0,
+            rgb_bg_color: 0xA0_C0_E0,
+            cterm_bg_color: 12,
+            hl_blend: 25,
+            ..Default::default()
+        };
+        let back_id = unsafe { hl_get_term_attr(&back) };
+        let front_id = unsafe { hl_get_term_attr(&front) };
+        let mut through = true;
+
+        let blended_id = unsafe { hl_blend_attrs(back_id, front_id, &mut through) };
+        let blended = unsafe { syn_attr2entry(blended_id) };
+
+        assert!(through);
+        assert_eq!(unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert_eq!(blended.rgb_ae_attr, back.rgb_ae_attr);
+        assert_eq!(
+            blended.rgb_fg_color,
+            rgb_blend(25, back.rgb_fg_color, front.rgb_bg_color)
+        );
+        assert_eq!(
+            blended.rgb_sp_color,
+            rgb_blend(25, back.rgb_sp_color, front.rgb_bg_color)
+        );
+        assert_eq!(blended.cterm_bg_color, front.cterm_bg_color);
+        assert_eq!(blended.hl_blend, -1);
+    }
+
+    #[test]
+    fn hl_blend_attrs_nonpositive_ratio_disables_through() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        let front = crate::highlight_defs::HlAttrs {
+            hl_blend: 0,
+            ..Default::default()
+        };
+        let front_id = unsafe { hl_get_term_attr(&front) };
+        let mut through = true;
+
+        assert_eq!(unsafe { hl_blend_attrs(0, front_id, &mut through) }, front_id);
+        assert!(!through);
+    }
+
+    #[test]
+    fn hl_blend_attrs_preserves_transparency_at_full_blend() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _entries = AttributeEntriesGuard::empty();
+        unsafe { *HLSTATE_ACTIVE.get_mut() = true };
+        let back = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x10_20_30,
+            rgb_bg_color: -1,
+            ..Default::default()
+        };
+        let front = crate::highlight_defs::HlAttrs {
+            rgb_bg_color: 0x40_50_60,
+            hl_blend: 100,
+            ..Default::default()
+        };
+        let back_id = unsafe { hl_get_term_attr(&back) };
+        let front_id = unsafe { hl_get_term_attr(&front) };
+        let mut through = false;
+
+        let blended_id = unsafe { hl_blend_attrs(back_id, front_id, &mut through) };
+        assert_eq!(unsafe { syn_attr2entry(blended_id) }.rgb_bg_color, -1);
+    }
+
+    #[test]
+    fn hl_blend_attrs_returns_front_for_uninitialized_cells() {
+        let mut through = true;
+        assert_eq!(unsafe { hl_blend_attrs(-1, 7, &mut through) }, 7);
+        assert!(through);
+        assert_eq!(unsafe { hl_blend_attrs(3, -1, &mut through) }, -1);
+        assert!(through);
     }
 
     struct NamespaceHighlightsGuard {
