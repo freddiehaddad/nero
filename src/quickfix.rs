@@ -123,6 +123,13 @@ static QF_DELETE_QUEUE: std::sync::LazyLock<
 static SET_QF_LL_RECURSIVE: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 
+/// Parsed global `'quickfixtextfunc'` callback (`qftf_cb`).
+static QFTF_CB: crate::globals::GlobalCell<
+    crate::eval::typval_defs::Callback,
+> = crate::globals::GlobalCell::new(
+    crate::eval::typval_defs::Callback::None,
+);
+
 /// Delay location-list destruction while quickfix code holds references
 /// (`incr_quickfix_busy`).
 ///
@@ -2199,7 +2206,6 @@ pub unsafe fn set_errorlist(
 /// # Safety
 /// Every typval pointer reachable from live quickfix entries must be
 /// valid. Forwarded from [`crate::eval::eval::set_ref_in_item`].
-#[allow(dead_code)]
 unsafe fn mark_quickfix_user_data(
     qi: &mut crate::types_defs::QfInfoT,
     copy_id: i32,
@@ -2241,7 +2247,6 @@ unsafe fn mark_quickfix_user_data(
 /// # Safety
 /// Every pointer reachable from context typvals and callbacks must be
 /// valid. Forwarded from `set_ref_in_item`/`set_ref_in_callback`.
-#[allow(dead_code)]
 unsafe fn mark_quickfix_ctx(
     qi: &mut crate::types_defs::QfInfoT,
     copy_id: i32,
@@ -2278,6 +2283,71 @@ unsafe fn mark_quickfix_ctx(
         } {
             return true;
         }
+    }
+    false
+}
+
+/// Mark all quickfix/location-list references as reachable
+/// (`set_ref_in_quickfix`).
+///
+/// # Safety
+/// The global quickfix stack, tab/window chains, location-list
+/// pointers, buffers, context typvals, user data, and callbacks must
+/// all remain valid for the traversal.
+pub unsafe fn set_ref_in_quickfix(copy_id: i32) -> bool {
+    let ql_info = unsafe { QL_INFO.get_mut() }
+        .as_mut()
+        .expect("set_ref_in_quickfix: quickfix stack is not initialized");
+    if unsafe { mark_quickfix_ctx(ql_info, copy_id) }
+        || unsafe { mark_quickfix_user_data(ql_info, copy_id) }
+        || unsafe {
+            crate::eval::eval::set_ref_in_callback(
+                QFTF_CB.get_mut(),
+                copy_id,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+    {
+        return true;
+    }
+
+    let mut tab = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tab.is_null() {
+        let mut win = if std::ptr::eq(
+            tab,
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab,
+        ) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            unsafe { (*tab).tp_firstwin }
+        };
+        while !win.is_null() {
+            let location = unsafe { (*win).w_llist };
+            if !location.is_null()
+                && (unsafe { mark_quickfix_ctx(&mut *location, copy_id) }
+                    || unsafe {
+                        mark_quickfix_user_data(&mut *location, copy_id)
+                    })
+            {
+                return true;
+            }
+
+            if unsafe { is_ll_window(&*win) } {
+                let reference = unsafe { (*win).w_llist_ref };
+                if unsafe { (*reference).qf_refcount } == 1
+                    && (unsafe {
+                        mark_quickfix_ctx(&mut *reference, copy_id)
+                    } || unsafe {
+                        mark_quickfix_user_data(&mut *reference, copy_id)
+                    })
+                {
+                    return true;
+                }
+            }
+            win = unsafe { (*win).w_next };
+        }
+        tab = unsafe { (*tab).tp_next };
     }
     false
 }
@@ -7158,6 +7228,7 @@ mod tests {
     /// Restores `QL_INFO` on drop, even through a panic, so a failing
     /// test cannot leave a half-built global stack behind.
     struct QlInfoGuard(Option<crate::types_defs::QfInfoT>);
+    struct QftfCallbackGuard(crate::eval::typval_defs::Callback);
 
     impl QlInfoGuard {
         fn save() -> Self {
@@ -7168,6 +7239,25 @@ mod tests {
     impl Drop for QlInfoGuard {
         fn drop(&mut self) {
             *unsafe { QL_INFO.get_mut() } = self.0.take();
+        }
+    }
+
+    impl QftfCallbackGuard {
+        fn save() -> Self {
+            Self(std::mem::replace(
+                unsafe { QFTF_CB.get_mut() },
+                crate::eval::typval_defs::Callback::None,
+            ))
+        }
+    }
+
+    impl Drop for QftfCallbackGuard {
+        fn drop(&mut self) {
+            crate::eval::typval::callback_free(unsafe { QFTF_CB.get_mut() });
+            *unsafe { QFTF_CB.get_mut() } = std::mem::replace(
+                &mut self.0,
+                crate::eval::typval_defs::Callback::None,
+            );
         }
     }
 
@@ -11234,6 +11324,182 @@ mod tests {
 
         qf_free(&mut qi.qf_lists[0]);
         qf_free(&mut qi.qf_lists[1]);
+    }
+
+    #[test]
+    fn set_ref_in_quickfix_marks_global_stack_and_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _qftf = QftfCallbackGuard::save();
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                std::ptr::null_mut(),
+            )
+        };
+        let context = crate::eval::typval::tv_list_alloc(0);
+        let user_data = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(context);
+            crate::eval::typval::tv_list_ref(user_data);
+        }
+        let global_callback = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        *unsafe { QFTF_CB.get_mut() } =
+            crate::eval::typval_defs::Callback::Partial(global_callback);
+        *unsafe { QL_INFO.get_mut() } = Some(crate::types_defs::QfInfoT {
+            qf_maxcount: 1,
+            qf_lists: vec![QfListT {
+                qf_entries: vec![QflineT {
+                    qf_user_data: crate::eval::typval_defs::TypvalT {
+                        value: crate::eval::typval_defs::TypvalValue::List(
+                            user_data,
+                        ),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                qf_has_user_data: true,
+                qf_ctx: Some(Box::new(
+                    crate::eval::typval_defs::TypvalT {
+                        value: crate::eval::typval_defs::TypvalValue::List(
+                            context,
+                        ),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(!unsafe { set_ref_in_quickfix(61) });
+        assert_eq!(unsafe { (*context).lv_copy_id }, 61);
+        assert_eq!(unsafe { (*user_data).lv_copy_id }, 61);
+        assert_eq!(unsafe { (*global_callback).pt_copy_id }, 61);
+
+        qf_free(&mut unsafe { QL_INFO.get_mut() }
+            .as_mut()
+            .unwrap()
+            .qf_lists[0]);
+    }
+
+    #[test]
+    fn set_ref_in_quickfix_marks_window_and_orphan_location_stacks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ql_info = QlInfoGuard::save();
+        let _qftf = QftfCallbackGuard::save();
+        *unsafe { QL_INFO.get_mut() } =
+            Some(qf_alloc_stack(QfltypeT::Quickfix, 1));
+
+        let file_context = crate::eval::typval::tv_list_alloc(0);
+        let orphan_context = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(file_context);
+            crate::eval::typval::tv_list_ref(orphan_context);
+        }
+        let file_stack = Box::into_raw(Box::new(
+            crate::types_defs::QfInfoT {
+                qf_refcount: 1,
+                qf_maxcount: 1,
+                qf_lists: vec![QfListT {
+                    qf_ctx: Some(Box::new(
+                        crate::eval::typval_defs::TypvalT {
+                            value:
+                                crate::eval::typval_defs::TypvalValue::List(
+                                    file_context,
+                                ),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                qfl_type: QfltypeT::Location,
+                ..Default::default()
+            },
+        ));
+        let orphan_stack = Box::into_raw(Box::new(
+            crate::types_defs::QfInfoT {
+                qf_refcount: 1,
+                qf_maxcount: 1,
+                qf_lists: vec![QfListT {
+                    qf_ctx: Some(Box::new(
+                        crate::eval::typval_defs::TypvalT {
+                            value:
+                                crate::eval::typval_defs::TypvalValue::List(
+                                    orphan_context,
+                                ),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                qfl_type: QfltypeT::Location,
+                ..Default::default()
+            },
+        ));
+
+        let mut plain_buf = Box::new(crate::buffer_defs::BufT::default());
+        let plain_buf_ptr = std::ptr::addr_of_mut!(*plain_buf);
+        let mut qf_buf = Box::new(crate::buffer_defs::BufT {
+            handle: 7,
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        });
+        let qf_buf_ptr = std::ptr::addr_of_mut!(*qf_buf);
+        let mut file_win = Box::new(crate::buffer_defs::WinT {
+            w_buffer: plain_buf_ptr,
+            w_llist: file_stack,
+            ..Default::default()
+        });
+        let file_win_ptr = std::ptr::addr_of_mut!(*file_win);
+        let mut list_win = Box::new(crate::buffer_defs::WinT {
+            w_buffer: qf_buf_ptr,
+            w_llist_ref: orphan_stack,
+            ..Default::default()
+        });
+        let list_win_ptr = std::ptr::addr_of_mut!(*list_win);
+        unsafe { (*file_win_ptr).w_next = list_win_ptr };
+
+        let mut tab = Box::new(crate::buffer_defs::TabpageT::default());
+        let tab_ptr = std::ptr::addr_of_mut!(*tab);
+        let _first_tabpage = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                tab_ptr,
+            )
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                tab_ptr,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                file_win_ptr,
+            )
+        };
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                qf_buf_ptr,
+            )
+        };
+
+        assert!(!unsafe { set_ref_in_quickfix(73) });
+        assert_eq!(unsafe { (*file_context).lv_copy_id }, 73);
+        assert_eq!(unsafe { (*orphan_context).lv_copy_id }, 73);
+
+        unsafe {
+            qf_free_all(Some(file_win_ptr));
+            qf_free_all(Some(list_win_ptr));
+        }
     }
 
     #[test]
