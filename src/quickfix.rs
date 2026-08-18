@@ -130,6 +130,28 @@ static QFTF_CB: crate::globals::GlobalCell<
     crate::eval::typval_defs::Callback::None,
 );
 
+/// Process the global `'quickfixtextfunc'` option
+/// (`did_set_quickfixtextfunc`).
+///
+/// # Safety
+/// Touches `OPTION_VARS`, `QFTF_CB`, and function-reference state.
+pub unsafe fn did_set_quickfixtextfunc(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_qftf
+        .as_deref();
+    if crate::option::option_set_callback_func(
+        value,
+        unsafe { QFTF_CB.get_mut() },
+    ) == crate::vim_defs::FAIL
+    {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
+
 /// Delay location-list destruction while quickfix code holds references
 /// (`incr_quickfix_busy`).
 ///
@@ -5076,6 +5098,82 @@ mod tests {
     }
 
     #[test]
+    fn did_set_quickfixtextfunc_installs_an_ordinary_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback = QftfCallbackGuard::save();
+        let _option = QftfOptionGuard::install(Some(b"MyQfText"));
+
+        assert_eq!(
+            unsafe {
+                did_set_quickfixtextfunc(
+                    &mut crate::option_defs::OptsetT::default(),
+                )
+            },
+            None
+        );
+        assert!(matches!(
+            unsafe { QFTF_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"MyQfText"
+        ));
+    }
+
+    #[test]
+    fn did_set_quickfixtextfunc_rejects_invalid_name_without_replacing_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback = QftfCallbackGuard::save();
+        let _option = QftfOptionGuard::install(Some(b"OldQfText"));
+        unsafe {
+            did_set_quickfixtextfunc(
+                &mut crate::option_defs::OptsetT::default(),
+            )
+        };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_qftf =
+            Some(b"123bad".to_vec());
+
+        assert_eq!(
+            unsafe {
+                did_set_quickfixtextfunc(
+                    &mut crate::option_defs::OptsetT::default(),
+                )
+            },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert!(matches!(
+            unsafe { QFTF_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldQfText"
+        ));
+    }
+
+    #[test]
+    fn did_set_quickfixtextfunc_empty_value_clears_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _callback = QftfCallbackGuard::save();
+        let _option = QftfOptionGuard::install(Some(b"OldQfText"));
+        unsafe {
+            did_set_quickfixtextfunc(
+                &mut crate::option_defs::OptsetT::default(),
+            )
+        };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_qftf =
+            Some(Vec::new());
+
+        assert_eq!(
+            unsafe {
+                did_set_quickfixtextfunc(
+                    &mut crate::option_defs::OptsetT::default(),
+                )
+            },
+            None
+        );
+        assert_eq!(
+            unsafe { QFTF_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+    }
+
+    #[test]
     fn qf_update_win_titlevar_updates_matching_windows_in_all_tabs_and_restores_curwin() {
         let _lock = crate::globals::global_state_test_lock();
         let qi = Box::new(crate::types_defs::QfInfoT {
@@ -7229,6 +7327,7 @@ mod tests {
     /// test cannot leave a half-built global stack behind.
     struct QlInfoGuard(Option<crate::types_defs::QfInfoT>);
     struct QftfCallbackGuard(crate::eval::typval_defs::Callback);
+    struct QftfOptionGuard(Option<Vec<u8>>);
 
     impl QlInfoGuard {
         fn save() -> Self {
@@ -7258,6 +7357,22 @@ mod tests {
                 &mut self.0,
                 crate::eval::typval_defs::Callback::None,
             );
+        }
+    }
+
+    impl QftfOptionGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self(std::mem::replace(
+                &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_qftf,
+                value.map(<[u8]>::to_vec),
+            ))
+        }
+    }
+
+    impl Drop for QftfOptionGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_qftf =
+                self.0.take();
         }
     }
 
