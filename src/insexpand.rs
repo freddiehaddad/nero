@@ -2033,9 +2033,6 @@ pub unsafe fn ctrl_x_mode_not_defined_yet() -> bool {
 }
 
 /// The `'completefunc'` callback (`cfu_cb`, a file-static `Callback`).
-/// Nothing in this crate can currently set a real value here - see
-/// `ops.rs`'s `OPFUNC_CB` for the identical reasoning (needs
-/// `option_set_callback_func`, not translated).
 static CFU_CB: GlobalCell<crate::eval::typval_defs::Callback> =
     GlobalCell::new(crate::eval::typval_defs::Callback::None);
 
@@ -2055,6 +2052,75 @@ static TSRFU_CB: GlobalCell<crate::eval::typval_defs::Callback> =
 /// `runtime.rs`'s own `SCRIPT_ITEMS`). Always empty today: nothing in
 /// this crate can currently populate it.
 static CPT_CB: GlobalCell<Vec<crate::eval::typval_defs::Callback>> = GlobalCell::new(Vec::new());
+
+/// Copy a global completion callback into its buffer-local cache
+/// (`copy_global_to_buflocal_cb`).
+///
+/// # Safety
+/// Every callback referent must remain valid.
+unsafe fn copy_global_to_buflocal_cb(
+    global: &crate::eval::typval_defs::Callback,
+    local: &mut crate::eval::typval_defs::Callback,
+) {
+    crate::eval::typval::callback_free(local);
+    if global.kind() != crate::eval::typval_defs::CallbackType::None {
+        unsafe { crate::eval::typval::callback_copy(local, global) };
+    }
+}
+
+/// Copy global `'completefunc'` callback state to a buffer
+/// (`set_buflocal_cfu_callback`).
+///
+/// # Safety
+/// `buf` and every callback referent must remain valid.
+pub unsafe fn set_buflocal_cfu_callback(
+    buf: *mut crate::buffer_defs::BufT,
+) {
+    unsafe {
+        copy_global_to_buflocal_cb(
+            &*CFU_CB.as_ptr(),
+            &mut (*buf).b_cfu_cb,
+        )
+    };
+}
+
+/// Process the `'completefunc'` option (`did_set_completefunc`).
+///
+/// # Safety
+/// `args.os_buf` must point to a live buffer. Touches callback and
+/// function-reference state.
+pub unsafe fn did_set_completefunc(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf.cast::<crate::buffer_defs::BufT>();
+    assert!(!buf.is_null(), "did_set_completefunc: missing buffer");
+    let flags = args.os_flags as u32;
+    let retval = if flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        let value = unsafe { (*buf).b_p_cfu.clone() };
+        crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { &mut (*buf).b_cfu_cb },
+        )
+    } else {
+        let value =
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cfu.clone();
+        let retval = crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { CFU_CB.get_mut() },
+        );
+        if retval == crate::vim_defs::OK
+            && flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0
+        {
+            unsafe { set_buflocal_cfu_callback(buf) };
+        }
+        retval
+    };
+    if retval == crate::vim_defs::FAIL {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
 
 /// Free an array of `'complete'` callbacks (`clear_cpt_callbacks`).
 #[allow(dead_code)]
@@ -2149,6 +2215,40 @@ mod tests {
     struct FirstMatchGuard(*mut ComplT);
 
     struct CurrMatchGuard(*mut ComplT);
+    struct CfuGuard {
+        callback: crate::eval::typval_defs::Callback,
+        option: Option<Vec<u8>>,
+    }
+
+    impl CfuGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self {
+                callback: std::mem::replace(
+                    unsafe { CFU_CB.get_mut() },
+                    crate::eval::typval_defs::Callback::None,
+                ),
+                option: std::mem::replace(
+                    &mut unsafe {
+                        crate::option_vars::OPTION_VARS.get_mut()
+                    }
+                    .p_cfu,
+                    value.map(<[u8]>::to_vec),
+                ),
+            }
+        }
+    }
+
+    impl Drop for CfuGuard {
+        fn drop(&mut self) {
+            crate::eval::typval::callback_free(unsafe { CFU_CB.get_mut() });
+            *unsafe { CFU_CB.get_mut() } = std::mem::replace(
+                &mut self.callback,
+                crate::eval::typval_defs::Callback::None,
+            );
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cfu =
+                self.option.take();
+        }
+    }
 
     impl CurrMatchGuard {
         fn install(value: *mut ComplT) -> Self {
@@ -4440,13 +4540,88 @@ mod tests {
     }
 
     #[test]
-    fn set_ref_in_insexpand_funcs_is_always_false_since_every_callback_stays_empty() {
-        // Nothing in this crate can populate CFU_CB/OFU_CB/TSRFU_CB/
-        // CPT_CB with a real callback yet (needs
-        // option_set_callback_func) - they always stay at their own
-        // empty defaults, matching a real, unconfigured session.
+    fn did_set_completefunc_plain_set_updates_global_and_local_callbacks() {
         let _lock = global_state_test_lock();
+        let _guard = CfuGuard::install(Some(b"GlobalComplete"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_completefunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { CFU_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalComplete"
+        ));
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_cfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalComplete"
+        ));
         assert!(!unsafe { set_ref_in_insexpand_funcs(1) });
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_cfu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_completefunc_local_set_updates_only_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = CfuGuard::install(Some(b"GlobalComplete"));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_cfu: Some(b"LocalComplete".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_completefunc(&mut args) }, None);
+        assert_eq!(
+            unsafe { CFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_cfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"LocalComplete"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_cfu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_completefunc_global_only_preserves_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = CfuGuard::install(Some(b"NewGlobalComplete"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalComplete"),
+            unsafe { &mut (*buf_ptr).b_cfu_cb },
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_completefunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_cfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldLocalComplete"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_cfu_cb
+        });
     }
 
     #[test]
