@@ -8239,6 +8239,8 @@ fn wire_optionstr_callbacks(options: &mut [VimoptionT; OPT_COUNT]) {
         Some(crate::optionstr::did_set_iskeyword);
     options[OptIndex::Isprint as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_isopt);
+    options[OptIndex::Keymap as usize].opt_did_set_cb =
+        Some(crate::optionstr::did_set_keymap);
     options[OptIndex::Keymodel as usize].opt_did_set_cb =
         Some(crate::optionstr::did_set_keymodel);
     options[OptIndex::Langmap as usize].opt_did_set_cb =
@@ -8680,6 +8682,7 @@ mod options_table_tests {
             b"isident",
             b"iskeyword",
             b"isprint",
+            b"keymap",
             b"keymodel",
             b"langmap",
             b"langnoremap",

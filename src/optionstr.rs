@@ -69,7 +69,10 @@
 //! (delegates entirely to `did_set_str_generic`, its own pure
 //! redraw-scheduling call omitted) and [`did_set_sessionoptions`]
 //! (rejects `"sesdir"`+`"curdir"` together, restoring the OLD
-//! `ssop_flags` on that specific failure). Also [`did_set_keymodel`]
+//! `ssop_flags` on that specific failure). Also [`did_set_keymap`]
+//! (validates the name, delegates to `digraph.rs`'s real empty-keymap
+//! initialization path, updates insert/search input modes and
+//! synchronizes their global values) and [`did_set_keymodel`]
 //! (sets `GLOBALS.km_stopsel`/`km_startsel` from `'keymodel'`'s own
 //! character content), [`did_set_showcmdloc`] (delegates then calls
 //! the already-real `comp_col`), [`did_set_splitkeep`] (snapshots
@@ -1541,6 +1544,60 @@ pub unsafe fn did_set_sessionoptions(args: &mut crate::option_defs::OptsetT) -> 
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags = restored_flags;
         }
         return Some(crate::errors::e_invarg.as_bytes());
+    }
+    None
+}
+
+/// The `'keymap'` option changed (`did_set_keymap`).
+///
+/// Empty keymaps are unloaded completely. Loading a nonempty keymap
+/// stops in [`crate::digraph::keymap_init`] at runtime-file sourcing.
+/// The status-line redraw request is omitted as redraw scheduling.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`, and
+/// `args.os_buf` to a live `BufT`.
+pub unsafe fn did_set_keymap(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let value = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    if !valid_filetype(value.as_deref().unwrap_or(&[])) {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+    let buf = unsafe { &mut *(args.os_buf as *mut crate::buffer_defs::BufT) };
+
+    struct SecureRestore(i32);
+    impl Drop for SecureRestore {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.secure = self.0;
+        }
+    }
+    let secure = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+    unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    let _secure = SecureRestore(secure);
+
+    let error = unsafe { crate::digraph::keymap_init(buf) };
+    args.os_value_checked = true;
+    if error.is_some() {
+        return error;
+    }
+
+    if buf.b_p_keymap.as_deref().is_some_and(|value| !value.is_empty()) {
+        buf.b_p_iminsert = crate::buffer_defs::B_IMODE_LMAP;
+        if buf.b_p_imsearch != crate::buffer_defs::B_IMODE_USE_INSERT {
+            buf.b_p_imsearch = crate::buffer_defs::B_IMODE_LMAP;
+        }
+    } else {
+        if buf.b_p_iminsert == crate::buffer_defs::B_IMODE_LMAP {
+            buf.b_p_iminsert = crate::buffer_defs::B_IMODE_NONE;
+        }
+        if buf.b_p_imsearch == crate::buffer_defs::B_IMODE_LMAP {
+            buf.b_p_imsearch = crate::buffer_defs::B_IMODE_USE_INSERT;
+        }
+    }
+    if args.os_flags as u32 & crate::option_defs::opt_set_flags::OPT_LOCAL == 0 {
+        crate::option::set_iminsert_global(buf);
+        crate::option::set_imsearch_global(buf);
     }
     None
 }
@@ -6495,7 +6552,134 @@ mod tests {
         assert_eq!(unsafe { did_set_sessionoptions(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
     }
 
-    // ---- did_set_keymodel ----
+    // ---- did_set_keymap / did_set_keymodel ----
+
+    #[test]
+    fn did_set_keymap_rejects_an_invalid_name_before_touching_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous_secure = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 7;
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_keymap: Some(b"bad/name".to_vec()),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_p_keymap) };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Keymap,
+            os_varp: varp.cast(),
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { did_set_keymap(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert!(!args.os_value_checked);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 7);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = previous_secure;
+    }
+
+    #[test]
+    fn did_set_keymap_empty_local_value_resets_the_buffer_input_modes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous_secure = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 5;
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_keymap: Some(Vec::new()),
+            b_p_iminsert: crate::buffer_defs::B_IMODE_LMAP,
+            b_p_imsearch: crate::buffer_defs::B_IMODE_LMAP,
+            b_kmap_state: crate::buffer_defs::KEYMAP_INIT,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_p_keymap) };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Keymap,
+            os_varp: varp.cast(),
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_keymap(&mut args) }, None);
+        assert!(args.os_value_checked);
+        assert_eq!(
+            unsafe { (*buf_ptr).b_p_iminsert },
+            crate::buffer_defs::B_IMODE_NONE
+        );
+        assert_eq!(
+            unsafe { (*buf_ptr).b_p_imsearch },
+            crate::buffer_defs::B_IMODE_USE_INSERT
+        );
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 5);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = previous_secure;
+    }
+
+    #[test]
+    fn did_set_keymap_nonlocal_value_synchronizes_global_input_modes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (previous_iminsert, previous_imsearch) = (options.p_iminsert, options.p_imsearch);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_keymap: Some(Vec::new()),
+            b_p_iminsert: crate::buffer_defs::B_IMODE_LMAP,
+            b_p_imsearch: crate::buffer_defs::B_IMODE_LMAP,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_p_keymap) };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Keymap,
+            os_varp: varp.cast(),
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_keymap(&mut args) }, None);
+        assert_eq!(
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_iminsert,
+            crate::buffer_defs::B_IMODE_NONE
+        );
+        assert_eq!(
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_imsearch,
+            crate::buffer_defs::B_IMODE_USE_INSERT
+        );
+
+        let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        options.p_iminsert = previous_iminsert;
+        options.p_imsearch = previous_imsearch;
+    }
+
+    #[test]
+    fn did_set_keymap_restores_secure_when_runtime_loading_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous_secure = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 9;
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_keymap: Some(b"russian-jcukenwin".to_vec()),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf_ptr).b_p_keymap) };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Keymap,
+            os_varp: varp.cast(),
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _ = did_set_keymap(&mut args);
+        }));
+        assert!(panic.is_err());
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 9);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = previous_secure;
+    }
 
     #[test]
     fn did_set_keymodel_sets_stopsel_and_startsel_from_o_and_a() {
