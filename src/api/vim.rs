@@ -269,6 +269,26 @@ pub unsafe fn nvim_get_mark(name: &NvimString, err: &mut Error) -> Array {
     ]
 }
 
+/// Get immediate child process IDs (`nvim_get_proc_children`).
+#[must_use]
+pub fn nvim_get_proc_children(pid: Integer, err: &mut Error) -> Array {
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Invalid 'pid': {pid}"));
+        return Vec::new();
+    }
+    let (status, children) = crate::os::proc::os_proc_children(pid as i32);
+    if status == 2 && crate::os::proc::os_proc_running(pid as i32) {
+        unimplemented!(
+            "nvim_get_proc_children: unsupported-kernel fallback needs vim._os_proc_children"
+        );
+    }
+    children
+        .into_iter()
+        .map(|child| Object::Integer(i64::from(child)))
+        .collect()
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1195,6 +1215,24 @@ mod tests {
             err.msg.as_deref(),
             Some("Invalid mark name (must be file/uppercase): 'a'")
         );
+    }
+
+    #[test]
+    fn nvim_get_proc_children_validates_pid() {
+        let mut invalid = Error::default();
+        assert!(nvim_get_proc_children(0, &mut invalid).is_empty());
+        assert_eq!(invalid.msg.as_deref(), Some("Invalid 'pid': 0"));
+    }
+
+    #[test]
+    fn nvim_get_proc_children_accepts_current_process() {
+        let mut err = Error::default();
+        let children =
+            nvim_get_proc_children(i64::from(std::process::id()), &mut err);
+        assert!(!err.is_set());
+        assert!(children
+            .iter()
+            .all(|child| matches!(child, Object::Integer(pid) if *pid > 0)));
     }
 
     #[test]
