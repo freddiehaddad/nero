@@ -2176,6 +2176,45 @@ pub unsafe fn did_set_omnifunc(
     }
 }
 
+/// Process the `'thesaurusfunc'` option (`did_set_thesaurusfunc`).
+///
+/// # Safety
+/// `args.os_buf` must point to a live buffer. Touches callback and
+/// function-reference state.
+pub unsafe fn did_set_thesaurusfunc(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let buf = args.os_buf.cast::<crate::buffer_defs::BufT>();
+    assert!(!buf.is_null(), "did_set_thesaurusfunc: missing buffer");
+    let flags = args.os_flags as u32;
+    let retval = if flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        let value = unsafe { (*buf).b_p_tsrfu.clone() };
+        crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { &mut (*buf).b_tsrfu_cb },
+        )
+    } else {
+        let value = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_tsrfu
+            .clone();
+        let retval = crate::option::option_set_callback_func(
+            value.as_deref(),
+            unsafe { TSRFU_CB.get_mut() },
+        );
+        if flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0 {
+            crate::eval::typval::callback_free(unsafe {
+                &mut (*buf).b_tsrfu_cb
+            });
+        }
+        retval
+    };
+    if retval == crate::vim_defs::FAIL {
+        Some(crate::errors::e_invarg.as_bytes())
+    } else {
+        None
+    }
+}
+
 /// Free an array of `'complete'` callbacks (`clear_cpt_callbacks`).
 #[allow(dead_code)]
 fn clear_cpt_callbacks(callbacks: &mut Vec<crate::eval::typval_defs::Callback>) {
@@ -2277,6 +2316,10 @@ mod tests {
         callback: crate::eval::typval_defs::Callback,
         option: Option<Vec<u8>>,
     }
+    struct TsrfuGuard {
+        callback: crate::eval::typval_defs::Callback,
+        option: Option<Vec<u8>>,
+    }
 
     impl CfuGuard {
         fn install(value: Option<&[u8]>) -> Self {
@@ -2334,6 +2377,36 @@ mod tests {
                 crate::eval::typval_defs::Callback::None,
             );
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ofu =
+                self.option.take();
+        }
+    }
+
+    impl TsrfuGuard {
+        fn install(value: Option<&[u8]>) -> Self {
+            Self {
+                callback: std::mem::replace(
+                    unsafe { TSRFU_CB.get_mut() },
+                    crate::eval::typval_defs::Callback::None,
+                ),
+                option: std::mem::replace(
+                    &mut unsafe {
+                        crate::option_vars::OPTION_VARS.get_mut()
+                    }
+                    .p_tsrfu,
+                    value.map(<[u8]>::to_vec),
+                ),
+            }
+        }
+    }
+
+    impl Drop for TsrfuGuard {
+        fn drop(&mut self) {
+            crate::eval::typval::callback_free(unsafe { TSRFU_CB.get_mut() });
+            *unsafe { TSRFU_CB.get_mut() } = std::mem::replace(
+                &mut self.callback,
+                crate::eval::typval_defs::Callback::None,
+            );
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tsrfu =
                 self.option.take();
         }
     }
@@ -4793,6 +4866,90 @@ mod tests {
         ));
         crate::eval::typval::callback_free(unsafe {
             &mut (*buf_ptr).b_ofu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_thesaurusfunc_plain_set_updates_global_and_clears_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = TsrfuGuard::install(Some(b"GlobalThesaurus"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalThesaurus"),
+            unsafe { &mut (*buf_ptr).b_tsrfu_cb },
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_thesaurusfunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { TSRFU_CB.get_mut() },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"GlobalThesaurus"
+        ));
+        assert_eq!(
+            unsafe { &(*buf_ptr).b_tsrfu_cb }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+    }
+
+    #[test]
+    fn did_set_thesaurusfunc_local_set_updates_only_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = TsrfuGuard::install(Some(b"GlobalThesaurus"));
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_tsrfu: Some(b"LocalThesaurus".to_vec()),
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_thesaurusfunc(&mut args) }, None);
+        assert_eq!(
+            unsafe { TSRFU_CB.get_mut() }.kind(),
+            crate::eval::typval_defs::CallbackType::None
+        );
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_tsrfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"LocalThesaurus"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_tsrfu_cb
+        });
+    }
+
+    #[test]
+    fn did_set_thesaurusfunc_global_only_preserves_local_callback() {
+        let _lock = global_state_test_lock();
+        let _guard = TsrfuGuard::install(Some(b"NewGlobalThesaurus"));
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        crate::option::option_set_callback_func(
+            Some(b"OldLocalThesaurus"),
+            unsafe { &mut (*buf_ptr).b_tsrfu_cb },
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: buf_ptr.cast(),
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_thesaurusfunc(&mut args) }, None);
+        assert!(matches!(
+            unsafe { &(*buf_ptr).b_tsrfu_cb },
+            crate::eval::typval_defs::Callback::Funcref(name)
+                if name == b"OldLocalThesaurus"
+        ));
+        crate::eval::typval::callback_free(unsafe {
+            &mut (*buf_ptr).b_tsrfu_cb
         });
     }
 
