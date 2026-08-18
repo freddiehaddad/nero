@@ -3805,6 +3805,24 @@ pub unsafe fn set_option_value_handle_tty(
     unsafe { set_option_value(opt_idx, value, opt_flags) }
 }
 
+/// Set an option and display any returned error
+/// (`set_option_value_give_err`).
+///
+/// Message display is omitted with the rest of the message pipeline;
+/// storage and error-triggered rollback are still performed by the
+/// real write core.
+///
+/// # Safety
+/// Forwarded from [`set_option_value`].
+pub unsafe fn set_option_value_give_err(
+    opt_idx: OptIndex,
+    value: OptVal,
+    opt_flags: u32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { set_option_value(opt_idx, value, opt_flags) };
+}
+
 /// Set an option value for an explicit scope target
 /// (`set_option_value_for`).
 ///
@@ -8070,6 +8088,37 @@ mod did_set_option_tests {
             None
         );
         assert_eq!(unsafe { (*options).p_ari }, 1);
+        unsafe { (*options).p_ari = previous };
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_option_value_give_err_applies_valid_values_and_rolls_back_invalid_ones() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+        let options = crate::option_vars::OPTION_VARS.as_ptr();
+        let previous = unsafe { (*options).p_ari };
+        unsafe { (*options).p_ari = 0 };
+        unsafe {
+            set_option_value_give_err(
+                OptIndex::Allowrevins,
+                OptVal::Boolean(TriState::True),
+                0,
+            )
+        };
+        assert_eq!(unsafe { (*options).p_ari }, 1);
+
+        unsafe { (*buf).b_p_ts = 8 };
+        unsafe {
+            set_option_value_give_err(
+                OptIndex::Tabstop,
+                OptVal::Number(0),
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+            )
+        };
+        assert_eq!(unsafe { (*buf).b_p_ts }, 8);
+
         unsafe { (*options).p_ari = previous };
         reset_shared_state();
     }
