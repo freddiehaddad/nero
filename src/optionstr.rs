@@ -1048,6 +1048,13 @@ pub fn expand_set_mouse(
     expand_set_opt_listflag(args, crate::option_vars::MOUSE_ALL.as_bytes())
 }
 
+/// Expand `'shortmess'` flag values (`expand_set_shortmess`).
+pub fn expand_set_shortmess(
+    args: &mut crate::option_defs::OptexpandT,
+) -> Option<Vec<Vec<u8>>> {
+    expand_set_opt_listflag(args, SHM_ALL)
+}
+
 /// Process an updated `'messagesopt'` value
 /// (`did_set_messagesopt`).
 pub fn did_set_messagesopt(
@@ -5275,6 +5282,17 @@ mod tests {
                     .map(|flag| vec![flag])
                     .collect()
             )
+        );
+    }
+
+    #[test]
+    fn expand_set_shortmess_returns_every_flag_from_shm_all() {
+        let mut args = crate::option_defs::OptexpandT::default();
+        let matches = expand_set_shortmess(&mut args).expect("shortmess matches");
+        assert_eq!(matches.len(), SHM_ALL.len());
+        assert_eq!(
+            matches,
+            SHM_ALL.iter().map(|flag| vec![*flag]).collect::<Vec<_>>()
         );
     }
 
