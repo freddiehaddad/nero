@@ -464,6 +464,8 @@ pub unsafe fn clear_hl_tables(reinit: bool) {
         unsafe { BLEND_ATTR_ENTRIES.get_mut() }.clear();
         unsafe { BLENDTHROUGH_ATTR_ENTRIES.get_mut() }.clear();
         unsafe { crate::highlight_group::highlight_attr_set_all() };
+        unsafe { highlight_changed() };
+        unsafe { crate::drawscreen::screen_invalidate_highlights() };
     } else {
         *unsafe { ATTR_ENTRIES.get_mut() } = crate::map::Set::new();
         *unsafe { COMBINE_ATTR_ENTRIES.get_mut() } = crate::map::Map::new();
@@ -1475,6 +1477,11 @@ mod tests {
         attributes: AttributeEntriesGuard,
         urls: Vec<Vec<u8>>,
         fonts: Vec<Vec<u8>>,
+        global_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        last_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        active_attrs: [i32; crate::highlight_defs::HlfT::Count as usize],
+        user_attrs: [i32; 9],
+        stlnc_attrs: [i32; 9],
         namespace_highlights: crate::map::Map<
             crate::highlight_defs::ColorKey,
             crate::highlight_defs::ColorItem,
@@ -1486,12 +1493,31 @@ mod tests {
             let attributes = AttributeEntriesGuard::empty();
             let urls = std::mem::take(unsafe { URLS.get_mut() });
             let fonts = std::mem::take(unsafe { FONTS.get_mut() });
+            let global_attrs = std::mem::replace(
+                unsafe { HIGHLIGHT_ATTR.get_mut() },
+                [0; crate::highlight_defs::HlfT::Count as usize],
+            );
+            let last_attrs = std::mem::replace(
+                unsafe { HIGHLIGHT_ATTR_LAST.get_mut() },
+                [0; crate::highlight_defs::HlfT::Count as usize],
+            );
+            let active_attrs = std::mem::replace(
+                unsafe { HL_ATTR_ACTIVE.get_mut() },
+                [0; crate::highlight_defs::HlfT::Count as usize],
+            );
+            let user_attrs = std::mem::take(unsafe { HIGHLIGHT_USER.get_mut() });
+            let stlnc_attrs = std::mem::take(unsafe { HIGHLIGHT_STLNC.get_mut() });
             let namespace_highlights =
                 std::mem::replace(unsafe { NS_HLS.get_mut() }, crate::map::Map::new());
             Self {
                 attributes,
                 urls,
                 fonts,
+                global_attrs,
+                last_attrs,
+                active_attrs,
+                user_attrs,
+                stlnc_attrs,
                 namespace_highlights,
             }
         }
@@ -1501,6 +1527,11 @@ mod tests {
         fn drop(&mut self) {
             *unsafe { URLS.get_mut() } = std::mem::take(&mut self.urls);
             *unsafe { FONTS.get_mut() } = std::mem::take(&mut self.fonts);
+            *unsafe { HIGHLIGHT_ATTR.get_mut() } = self.global_attrs;
+            *unsafe { HIGHLIGHT_ATTR_LAST.get_mut() } = self.last_attrs;
+            *unsafe { HL_ATTR_ACTIVE.get_mut() } = self.active_attrs;
+            *unsafe { HIGHLIGHT_USER.get_mut() } = self.user_attrs;
+            *unsafe { HIGHLIGHT_STLNC.get_mut() } = self.stlnc_attrs;
             *unsafe { NS_HLS.get_mut() } = std::mem::replace(
                 &mut self.namespace_highlights,
                 crate::map::Map::new(),
@@ -2017,6 +2048,7 @@ mod tests {
     fn clear_hl_tables_reinitializes_attributes_but_keeps_fonts_and_namespaces() {
         let _lock = crate::globals::global_state_test_lock();
         let _tables = AllHighlightTablesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
         unsafe { *HLSTATE_ACTIVE.get_mut() = true };
         unsafe { FONTS.get_mut() }.push(b"Mono".to_vec());
         unsafe { URLS.get_mut() }.push(b"https://example.test".to_vec());
@@ -2035,7 +2067,7 @@ mod tests {
 
         unsafe { clear_hl_tables(true) };
 
-        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 1);
+        assert!(unsafe { ATTR_ENTRIES.get_mut() }.len() > 1);
         assert_eq!(
             unsafe { ATTR_ENTRIES.get_mut() }.get_at(0).map(|entry| entry.kind),
             Some(crate::highlight_defs::HlKind::Invalid)
@@ -2076,18 +2108,20 @@ mod tests {
     fn highlight_use_hlstate_rebuilds_tables_only_once() {
         let _lock = crate::globals::global_state_test_lock();
         let _tables = AllHighlightTablesGuard::empty();
+        let _groups = HighlightGroupTableGuard::install(Vec::new());
         unsafe { URLS.get_mut() }.push(b"https://example.test".to_vec());
         let _ = unsafe { hl_get_underline() };
         assert!(unsafe { ATTR_ENTRIES.get_mut() }.len() > 1);
 
         assert!(unsafe { highlight_use_hlstate() });
-        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 1);
+        let rebuilt_len = unsafe { ATTR_ENTRIES.get_mut() }.len();
+        assert!(rebuilt_len > 1);
         assert!(unsafe { URLS.get_mut() }.is_empty());
 
         let attr = unsafe { hl_get_underline() };
         assert!(attr > 0);
         assert!(!unsafe { highlight_use_hlstate() });
-        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), 2);
+        assert_eq!(unsafe { ATTR_ENTRIES.get_mut() }.len(), rebuilt_len + 1);
     }
 
     #[test]
@@ -2428,6 +2462,14 @@ mod tests {
                 *NS_HL_WIN.get_mut() = win;
                 *NS_HL_FAST.get_mut() = fast;
                 *NS_HL_ACTIVE.get_mut() = active;
+                *HIGHLIGHT_ATTR.get_mut() =
+                    [0; crate::highlight_defs::HlfT::Count as usize];
+                *HIGHLIGHT_ATTR_LAST.get_mut() =
+                    [0; crate::highlight_defs::HlfT::Count as usize];
+                *HL_ATTR_ACTIVE.get_mut() =
+                    [0; crate::highlight_defs::HlfT::Count as usize];
+                *HIGHLIGHT_USER.get_mut() = [0; 9];
+                *HIGHLIGHT_STLNC.get_mut() = [0; 9];
                 crate::globals::GLOBALS.get_mut().need_highlight_changed = false;
                 crate::globals::GLOBALS.get_mut().clear_cmdline = false;
             }
