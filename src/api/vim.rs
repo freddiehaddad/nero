@@ -316,6 +316,15 @@ pub fn nvim_get_proc(pid: Integer, err: &mut Error) -> Object {
     ])
 }
 
+/// Select an item in the completion popup menu
+/// (`nvim_select_popupmenu_item`).
+pub fn nvim_select_popupmenu_item(item: Integer, mut insert: Boolean, finish: Boolean) {
+    if finish {
+        insert = true;
+    }
+    crate::popupmenu::pum_ext_select_item(item as i32, insert, finish);
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1283,6 +1292,14 @@ mod tests {
         assert!(info
             .iter()
             .any(|item| item.key == b"name" && matches!(&item.value, Object::String(name) if !name.is_empty())));
+    }
+
+    #[test]
+    fn nvim_select_popupmenu_item_is_ignored_when_no_menu_is_visible() {
+        let _lock = crate::globals::global_state_test_lock();
+        nvim_select_popupmenu_item(0, false, false);
+        nvim_select_popupmenu_item(-1, false, true);
+        assert!(!crate::popupmenu::pum_visible());
     }
 
     #[test]
