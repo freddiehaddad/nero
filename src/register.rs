@@ -1688,6 +1688,29 @@ pub fn format_reg_type(reg_type: Option<crate::normal_defs::MotionType>, reg_wid
     }
 }
 
+/// Add a register's type string to a dictionary
+/// (`add_regtype_to_dict`).
+///
+/// A missing register represents a special characterwise register,
+/// matching the original's `reg == NULL` branch.
+///
+/// # Safety
+/// `dict` must be a valid, exclusively accessible dictionary.
+pub unsafe fn add_regtype_to_dict(
+    reg: Option<&YankregT>,
+    dict: &mut crate::eval::typval_defs::DictT,
+) {
+    let (reg_type, width) = reg.map_or(
+        (crate::normal_defs::MotionType::CharWise, 0),
+        |reg| (reg.y_type, reg.y_width),
+    );
+    crate::eval::typval::tv_dict_add_str(
+        dict,
+        b"regtype",
+        Some(&format_reg_type(Some(reg_type), width)),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4275,5 +4298,41 @@ mod tests {
     #[test]
     fn format_reg_type_unknown_is_empty() {
         assert_eq!(format_reg_type(None, 0), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn add_regtype_to_dict_formats_register_and_special_types() {
+        let _lock = crate::globals::global_state_test_lock();
+        for (register, expected) in [
+            (
+                Some(YankregT {
+                    y_type: crate::normal_defs::MotionType::LineWise,
+                    ..Default::default()
+                }),
+                b"V".as_slice(),
+            ),
+            (
+                Some(YankregT {
+                    y_type: crate::normal_defs::MotionType::BlockWise,
+                    y_width: 4,
+                    ..Default::default()
+                }),
+                b"\x165".as_slice(),
+            ),
+            (None, b"v".as_slice()),
+        ] {
+            let dict = crate::eval::typval::tv_dict_alloc();
+            unsafe {
+                add_regtype_to_dict(register.as_ref(), &mut *dict);
+                assert_eq!(
+                    crate::eval::typval::tv_dict_get_string(
+                        dict.as_mut(),
+                        b"regtype",
+                    ),
+                    Some(expected.to_vec())
+                );
+                crate::eval::typval::tv_dict_unref(dict);
+            }
+        }
     }
 }
