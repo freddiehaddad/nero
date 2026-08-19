@@ -29,6 +29,9 @@
 //! core" pattern, even without a real caller yet among currently-
 //! translated code (matching the established precedent, e.g.
 //! `cursor.c`'s batch last session).
+//! [`may_trigger_modechanged`] preserves the real no-handler/interrupt
+//! fast path; its event-dictionary body remains with real autocmd
+//! registration.
 //!
 //! Everything else - `state_enter`, `check_pending`, `may_sync_undo`,
 //! `restart_edit`-related helpers, `os_breakcheck`/`line_breakcheck`
@@ -203,6 +206,26 @@ pub unsafe fn get_mode() -> Vec<u8> {
     buf
 }
 
+/// Fire `ModeChanged` when the effective mode changed
+/// (`may_trigger_modechanged`).
+///
+/// The original returns before constructing `v:event` whenever no
+/// handler exists or an interrupt is pending. No translated code can
+/// register a real autocmd yet, so this is the complete reachable path.
+///
+/// # Safety
+/// Reads shared editor/autocmd state.
+pub unsafe fn may_trigger_modechanged() {
+    if !crate::autocmd::has_event(crate::autocmd_defs::EventT::ModeChanged)
+        || unsafe { crate::globals::GLOBALS.get_mut() }.got_int
+    {
+        return;
+    }
+    unimplemented!(
+        "may_trigger_modechanged: real handlers need v:event save/restore"
+    );
+}
+
 /// When true in a safe state when starting to wait for a character
 /// (`was_safe`, `static` in the original).
 static WAS_SAFE: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
@@ -278,6 +301,17 @@ mod tests {
 
     fn default_win() -> WinT {
         WinT::default()
+    }
+
+    #[test]
+    fn may_trigger_modechanged_returns_without_registered_handlers() {
+        let _lock = global_state_test_lock();
+        let previous = unsafe { GLOBALS.get_mut() }.got_int;
+        unsafe { GLOBALS.get_mut() }.got_int = false;
+        unsafe { may_trigger_modechanged() };
+        unsafe { GLOBALS.get_mut() }.got_int = true;
+        unsafe { may_trigger_modechanged() };
+        unsafe { GLOBALS.get_mut() }.got_int = previous;
     }
 
     #[test]
