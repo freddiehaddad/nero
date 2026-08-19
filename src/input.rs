@@ -753,6 +753,18 @@ pub const RM_ABBR: i32 = 4;
 /// `tb_noremap`: allow normal remapping (`RM_YES`).
 pub const RM_YES: i32 = 0;
 
+/// How much queued input [`flush_buffers`] removes
+/// (`flush_buffers_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushBuffers {
+    /// Remove stuffed input and the mapped prefix.
+    Minimal = 0,
+    /// Remove stuffed input and all typeahead.
+    Typeahead = 1,
+    /// Also drain pending OS input before clearing typeahead.
+    Input = 2,
+}
+
 /// Character put back by `vungetc()` (`old_char`), file-static in the
 /// original. Starts at `-1` ("none put back"), matching the original's
 /// own `static int old_char = -1;`.
@@ -1151,6 +1163,55 @@ pub fn del_typebuf(len: i32, offset: i32) {
     }
 
     unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = false;
+    tb.tb_change_cnt = tb.tb_change_cnt.wrapping_add(1);
+    if tb.tb_change_cnt == 0 {
+        tb.tb_change_cnt = 1;
+    }
+}
+
+/// Remove stuffed input and some or all typeahead (`flush_buffers`).
+///
+/// `FlushBuffers::Input` stops where the original first calls
+/// `inchar()` to drain live OS input; the other two modes are complete.
+pub fn flush_buffers(flush: FlushBuffers) {
+    init_typebuf();
+    unsafe { start_stuff() };
+    while read_readbuffers(true) != crate::ascii_defs::NUL {}
+
+    let tb = unsafe { TYPEBUF.get_mut() };
+    match flush {
+        FlushBuffers::Minimal => {
+            let mapped = tb.tb_maplen.min(tb.tb_len).max(0);
+            tb.tb_off += mapped;
+            tb.tb_len -= mapped;
+            if tb.tb_len == 0 {
+                unsafe { crate::globals::GLOBALS.get_mut() }
+                    .typebuf_was_filled = false;
+            }
+        }
+        FlushBuffers::Typeahead => {
+            tb.tb_off = MAXMAPLEN;
+            tb.tb_len = 0;
+            if tb.tb_buf.len() <= MAXMAPLEN as usize {
+                tb.tb_buf.resize(MAXMAPLEN as usize + 1, 0);
+            }
+            if tb.tb_noremap.len() < MAXMAPLEN as usize {
+                tb.tb_noremap.resize(MAXMAPLEN as usize, 0);
+            }
+            unsafe { crate::globals::GLOBALS.get_mut() }
+                .typebuf_was_filled = false;
+        }
+        FlushBuffers::Input => {
+            unimplemented!(
+                "flush_buffers(Input): draining pending OS input needs inchar"
+            );
+        }
+    }
+
+    tb.tb_maplen = 0;
+    tb.tb_silent = 0;
+    unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent = false;
+    tb.tb_no_abbr_cnt = 0;
     tb.tb_change_cnt = tb.tb_change_cnt.wrapping_add(1);
     if tb.tb_change_cnt == 0 {
         tb.tb_change_cnt = 1;
@@ -3168,6 +3229,87 @@ mod tests {
         assert!(current_typebuf().0.is_empty());
         assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled);
         assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_change_cnt, 1);
+    }
+
+    #[test]
+    fn flush_buffers_minimal_removes_stuff_and_the_mapped_prefix() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _cmd_silent = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmd_silent,
+                true,
+            )
+        };
+        stuff_readbuff(b"stuffed");
+        assert_eq!(
+            ins_typebuf(
+                b"map",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                true,
+                true,
+            ),
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            ins_typebuf(
+                b"typed",
+                crate::input_defs::RemapValues::Yes as i32,
+                3,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+        unsafe { TYPEBUF.get_mut() }.tb_no_abbr_cnt = 2;
+
+        flush_buffers(FlushBuffers::Minimal);
+
+        assert!(stuff_empty());
+        assert_eq!(current_typebuf().0, b"typed");
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert_eq!(tb.tb_maplen, 0);
+        assert_eq!(tb.tb_silent, 0);
+        assert_eq!(tb.tb_no_abbr_cnt, 0);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent);
+    }
+
+    #[test]
+    fn flush_buffers_typeahead_removes_every_queued_byte() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _filled = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.typebuf_was_filled,
+                true,
+            )
+        };
+        assert_eq!(
+            ins_typebuf(
+                b"queued",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+
+        flush_buffers(FlushBuffers::Typeahead);
+
+        assert_eq!(crate::input::typebuf_len(), 0);
+        assert!(current_typebuf().0.is_empty());
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled);
+    }
+
+    #[test]
+    #[should_panic(expected = "inchar")]
+    fn flush_buffers_input_needs_the_live_os_input_drain() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        flush_buffers(FlushBuffers::Input);
     }
 
     #[test]
