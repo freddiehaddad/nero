@@ -526,21 +526,35 @@ pub unsafe fn aubuflocal_remove(buf: &BufT) {
     au_cleanup();
 }
 
+unsafe fn aucmd_del(command: &mut crate::autocmd_defs::AutoCmd) {
+    if !command.pat.is_null() {
+        let pattern = unsafe { &mut *command.pat };
+        pattern.refcount -= 1;
+        if pattern.refcount == 0 {
+            if !pattern.reg_prog.is_null() {
+                unimplemented!("aucmd_del: freeing compiled regex needs vim_regfree");
+            }
+            unsafe { drop(Box::from_raw(command.pat)) };
+        }
+    }
+    command.pat = std::ptr::null_mut();
+    if command.handler_cmd.take().is_none() {
+        crate::eval::typval::callback_free(&mut command.handler_fn);
+    }
+    command.desc = None;
+    unsafe { *AU_NEED_CLEAN.get_mut() = true };
+}
+
 /// Cleanup autocommands that have been deleted. This is only done
 /// when not executing autocommands (`au_cleanup`).
-///
-/// Always a real no-op today: [`AUTOCMD_BUSY`] and `AU_NEED_CLEAN`
-/// both start `false`, and `AU_NEED_CLEAN` is only ever set by code
-/// inside [`aubuflocal_remove`]'s own always-zero-iteration loop - see
-/// this module's own doc comment.
 fn au_cleanup() {
     if unsafe { *AUTOCMD_BUSY.get_mut() } || !unsafe { *AU_NEED_CLEAN.get_mut() } {
         return;
     }
-    unimplemented!(
-        "au_cleanup: real cleanup needs at least one AUTOCMDS[event] entry to exist, \
-         unreachable in practice today - see this module's own doc comment"
-    );
+    for commands in unsafe { AUTOCMDS.get_mut() } {
+        commands.retain(|command| !command.pat.is_null());
+    }
+    unsafe { *AU_NEED_CLEAN.get_mut() = false };
 }
 
 /// `map_augroup_name_to_id` - augroup name -> ID registry. Always
@@ -598,16 +612,14 @@ pub unsafe fn augroup_name(mut group: i32) -> Option<Vec<u8>> {
 /// # Safety
 /// Mutates the shared autocmd registry.
 pub unsafe fn augroup_clear(group: i32) {
-    let has_entries = unsafe { AUTOCMDS.get_mut() }.iter().any(|commands| {
-        commands
-            .iter()
-            .any(|command| !command.pat.is_null() && unsafe { (*command.pat).group } == group)
-    });
-    if has_entries {
-        unimplemented!(
-            "augroup_clear: deleting populated groups needs aucmd_del and callback cleanup"
-        );
+    for commands in unsafe { AUTOCMDS.get_mut() } {
+        for command in commands {
+            if !command.pat.is_null() && unsafe { (*command.pat).group } == group {
+                unsafe { aucmd_del(command) };
+            }
+        }
     }
+    au_cleanup();
 }
 
 /// Delete an augroup and its commands (`augroup_del`, non-legacy
@@ -1410,7 +1422,30 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         reset_augroup_map();
         let id = unsafe { augroup_add(b"Disposable") };
+        let pattern = Box::into_raw(Box::new(crate::autocmd_defs::AutoPat {
+            refcount: 1,
+            pat: Some(b"*".to_vec()),
+            reg_prog: std::ptr::null_mut(),
+            group: id,
+            patlen: 1,
+            buflocal_nr: 0,
+            allow_dirs: false,
+        }));
+        let autocmds = unsafe { AUTOCMDS.get_mut() };
+        autocmds[EventT::BufEnter as usize].push(
+            crate::autocmd_defs::AutoCmd {
+                pat: pattern,
+                id: 1,
+                desc: Some(b"test".to_vec()),
+                handler_cmd: Some(b"echo".to_vec()),
+                handler_fn: Default::default(),
+                script_ctx: Default::default(),
+                once: false,
+                nested: false,
+            },
+        );
         assert_eq!(unsafe { augroup_del(b"Disposable") }, Ok(()));
+        assert!(unsafe { AUTOCMDS.get_mut() }[EventT::BufEnter as usize].is_empty());
         assert_eq!(augroup_find(b"Disposable"), augroup::ERROR);
         assert_eq!(unsafe { augroup_name(id) }, None);
         assert_eq!(unsafe { augroup_del(b"Missing") }, Err("No such group"));
