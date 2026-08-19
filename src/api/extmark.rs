@@ -114,6 +114,35 @@ pub unsafe fn ns_initialized(namespace: u32) -> bool {
     namespace >= 1 && namespace < unsafe { *NEXT_NAMESPACE_ID.get_mut() } as u32
 }
 
+/// Get namespace properties (`nvim__ns_get`).
+///
+/// # Safety
+/// Reads shared namespace and global tab/window-list state.
+#[must_use]
+#[allow(non_snake_case)]
+pub unsafe fn nvim__ns_get(ns_id: Integer, err: &mut crate::api::private::defs::Error) -> Dict {
+    use crate::api::private::defs::{ErrorType, KeyValuePair, Object};
+    let mut windows = Vec::new();
+    if ns_id < 0 || !unsafe { ns_initialized(ns_id as u32) } {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Invalid 'ns_id': {ns_id}"));
+    } else if unsafe { NAMESPACE_LOCALSCOPE.get_mut() }.contains(&(ns_id as u32)) {
+        for window in unsafe { crate::api::vim::nvim_list_wins() } {
+            let Object::Window(handle) = window else {
+                continue;
+            };
+            let win = unsafe { crate::window::handle_get_window(handle) };
+            if !win.is_null() && unsafe { (*win).w_ns_set.contains(&(ns_id as u32)) } {
+                windows.push(Object::Integer(i64::from(handle)));
+            }
+        }
+    }
+    vec![KeyValuePair {
+        key: b"wins".to_vec(),
+        value: Object::Array(windows),
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +233,48 @@ mod tests {
         assert!(unsafe { ns_initialized(named as u32) });
         assert!(unsafe { ns_initialized(anonymous as u32) });
         assert!(!unsafe { ns_initialized(u32::MAX) });
+    }
+
+    #[test]
+    fn nvim_ns_get_returns_scoped_window_handles() {
+        let _lock = crate::globals::global_state_test_lock();
+        let namespace = unsafe { nvim_create_namespace(&Vec::new()) } as u32;
+        unsafe { NAMESPACE_LOCALSCOPE.get_mut() }.put(namespace);
+        let mut win = crate::buffer_defs::WinT {
+            handle: 77,
+            ..Default::default()
+        };
+        win.w_ns_set.put(namespace);
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let mut tab = crate::buffer_defs::TabpageT {
+            tp_firstwin: win_ptr,
+            ..Default::default()
+        };
+        let tab_ptr = std::ptr::addr_of_mut!(tab);
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        let _curtab =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tab_ptr) };
+        let _firsttab = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.first_tabpage, tab_ptr)
+        };
+        let mut err = crate::api::private::defs::Error::default();
+        let properties = unsafe { nvim__ns_get(i64::from(namespace), &mut err) };
+        unsafe { NAMESPACE_LOCALSCOPE.get_mut() }.delete(&namespace);
+        assert!(!err.is_set());
+        assert!(matches!(
+            &properties[0].value,
+            Object::Array(wins) if matches!(wins.as_slice(), [Object::Integer(77)])
+        ));
+    }
+
+    #[test]
+    fn nvim_ns_get_rejects_unallocated_namespace() {
+        let mut err = crate::api::private::defs::Error::default();
+        let properties = unsafe { nvim__ns_get(-1, &mut err) };
+        assert_eq!(err.msg.as_deref(), Some("Invalid 'ns_id': -1"));
+        assert!(matches!(&properties[0].value, Object::Array(wins) if wins.is_empty()));
     }
 
     #[test]
