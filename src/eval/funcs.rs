@@ -557,6 +557,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getcursorcharpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcursorcharpos });
         m.insert(&b"setcharsearch"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_setcharsearch });
         m.insert(&b"setpos"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 2, func: f_setpos });
+        m.insert(&b"setcharpos"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 2, func: f_setcharpos });
         m.insert(&b"cursor"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_cursor });
         m.insert(&b"setcursorcharpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_setcursorcharpos });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
@@ -5425,15 +5426,8 @@ pub unsafe fn f_setcharsearch(argvars: &[TypvalT], _rettv: &mut TypvalT) {
 /// `setpos({expr}, {list})`/`setcharpos({expr}, {list})` shared engine
 /// (`set_position`).
 ///
-/// Only `charpos == false` (i.e. `setpos()`) is currently reachable
-/// without panicking: `list2fpos`'s own `charcol == true` branch
-/// (needed for EVERY `setcharpos()` call, regardless of `{expr}`)
-/// needs `buflist_findnr`/`buf_charidx_to_byteidx`, neither
-/// translated - `f_setcharpos` is therefore not registered as a
-/// builtin at all yet (it would panic on every invocation, not just a
-/// narrow one), matching the established policy of not registering a
-/// builtin whose entire reachable path is blocked (e.g. `settabvar()`
-/// was similarly left out).
+/// Both byte-column (`setpos`) and character-column (`setcharpos`)
+/// forms use the real `list2fpos` conversion.
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::eval::list2fpos`]'s/
@@ -5496,6 +5490,14 @@ unsafe fn set_position(argvars: &[TypvalT], rettv: &mut TypvalT, charpos: bool) 
 pub unsafe fn f_setpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { set_position(argvars, rettv, false) };
+}
+
+/// `"setcharpos({expr}, {list})"` function.
+///
+/// # Safety
+/// Forwarded from `set_position`.
+pub unsafe fn f_setcharpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    unsafe { set_position(argvars, rettv, true) };
 }
 
 /// `cursor({lnum}, {col} [, {off}])`/`cursor({list})`/
@@ -15042,6 +15044,55 @@ mod tests {
         assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 });
 
         unsafe { crate::eval::typval::tv_list_unref(l) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "ml_open transitively calls GetComputerNameW, unavailable under Miri"
+    )]
+    fn setcharpos_converts_an_explicit_buffer_character_column() {
+        let mut buf = buf_with_lines(&[b"\xE4\xB8\xADhello"]);
+        buf.handle = 42;
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            ..focusable_win(1)
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastbuf,
+                buf_ptr,
+            )
+        };
+        let (position, list) = num_list(&[0, 1, 2, 0]);
+        let args = [
+            TypvalT {
+                value: TypvalValue::String(Some(b".".to_vec())),
+                ..Default::default()
+            },
+            position,
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_setcharpos(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(
+            unsafe { (*win_ptr).w_cursor },
+            crate::pos_defs::PosT {
+                lnum: 1,
+                col: 3,
+                coladd: 0,
+            }
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        drop(_lastbuf);
+        drop(_guard);
+        let _lock = crate::globals::global_state_test_lock();
         close_test_buf(buf);
     }
 

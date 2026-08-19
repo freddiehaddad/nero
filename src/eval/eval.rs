@@ -5178,22 +5178,9 @@ pub unsafe fn var2fpos(
 /// `arg` must be `[fnum, lnum, col, coladd, curswant]` (`fnum` present
 /// only when `fnump` is `Some`; `coladd`/`curswant` optional).
 ///
-/// The `charcol=true` (character-position, used by `setcharpos()`/
-/// `setcursorcharpos()`) path is tractable ONLY when `fnump` is
-/// `None`: the original resolves the target buffer via
-/// `buflist_findnr(fnump == NULL ? curbuf->b_fnum : *fnump)`, and
-/// looking up your OWN buffer number always finds `curbuf` itself, so
-/// this case substitutes `GLOBALS.curbuf` directly, skipping the
-/// not-yet-translated `buflist_findnr` lookup entirely (provably
-/// equivalent for this specific sub-case, via
-/// [`buf_charidx_to_byteidx`]). When `fnump` is `Some` (an EXPLICIT
-/// buffer number, possibly a DIFFERENT buffer than `curbuf`), this
-/// same shortcut does not apply - `unimplemented!()`s if reached
-/// (`set_position`'s own call for `setpos()`/`setcharpos()` always
-/// passes `fnump = Some`, so `setcharpos()` itself is still not
-/// registered as a builtin for this reason; `set_cursorpos`'s own
-/// List-argument call for `cursor()`/`setcursorcharpos()` always
-/// passes `fnump = None`, so THAT call site works for both).
+/// Character-position input is converted through the target buffer's
+/// real loaded text, using `buflist_findnr` when an explicit buffer
+/// number is present.
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::typval::tv_list_find_nr`]'s own
@@ -5215,6 +5202,7 @@ pub unsafe fn list2fpos(
     // SAFETY: forwarded from this function's own safety doc.
     let list_len = i64::from(unsafe { crate::eval::typval::tv_list_len(l) });
     let fnump_was_some = fnump.is_some();
+    let mut resolved_fnum = None;
     let min_len = if fnump_was_some { 3 } else { 2 };
     let max_len = if fnump_was_some { 5 } else { 4 };
     if list_len < min_len || list_len > max_len {
@@ -5236,6 +5224,7 @@ pub unsafe fn list2fpos(
             n
         };
         *fnump = n as i32;
+        resolved_fnum = Some(*fnump);
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -5251,27 +5240,23 @@ pub unsafe fn list2fpos(
     i += 1;
     if n < 0 {
         return FAIL;
-    }
+    };
     let n = if charcol {
-        if fnump_was_some {
-            unimplemented!(
-                "list2fpos: character-position conversion for an explicit fnum needs \
-                 buflist_findnr, not yet translated"
-            );
+        let buf_ptr = if let Some(fnum) = resolved_fnum {
+            unsafe { crate::buffer::buflist_findnr(fnum) }
+        } else {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf
+        };
+        if buf_ptr.is_null() || unsafe { (*buf_ptr).b_ml.ml_mfp }.is_null() {
+            return FAIL;
         }
-        // fnump == NULL means the original resolves via
-        // `buflist_findnr(curbuf->b_fnum)`, which always finds curbuf
-        // itself (looking up your own buffer number always succeeds) -
-        // substitute GLOBALS.curbuf directly, skipping the not-yet-
-        // translated buflist_findnr lookup entirely (provably
-        // equivalent for this specific, fnump-absent case).
         // SAFETY: forwarded from this function's own safety doc.
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        // SAFETY: forwarded from this function's own safety doc.
-        let buf = unsafe { &mut *globals.curbuf };
+        let buf = unsafe { &mut *buf_ptr };
         let lnum = if posp.lnum == 0 {
             // SAFETY: forwarded from this function's own safety doc.
-            unsafe { &*globals.curwin }.w_cursor.lnum
+            unsafe { &*crate::globals::GLOBALS.get_mut().curwin }
+                .w_cursor
+                .lnum
         } else {
             posp.lnum
         };
@@ -11346,27 +11331,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "buflist_findnr")]
-    fn list2fpos_charcol_true_panics_needs_buflist_findnr() {
-        // fnum=1 (nonzero) so GLOBALS.curbuf is never touched - this
-        // test intentionally exercises ONLY the charcol=true panic,
-        // not fnum-zero resolution (which needs a real buffer set up).
+    fn list2fpos_charcol_fails_for_an_unknown_buffer() {
         let _lock = crate::globals::global_state_test_lock();
         let l = crate::eval::typval::tv_list_alloc(3);
-        for n in [1, 5, 3] {
+        for n in [i64::from(i32::MAX), 5, 3] {
             unsafe { crate::eval::typval::tv_list_append_number(l, n) };
         }
         let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
         let mut pos = crate::pos_defs::PosT::default();
         let mut fnum = 0;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let result = unsafe {
             list2fpos(&tv, &mut pos, Some(&mut fnum), None, true)
-        }));
+        };
         unsafe { crate::eval::typval::tv_list_unref(l) };
-        match result {
-            Ok(_) => panic!("expected a panic, but list2fpos returned normally"),
-            Err(e) => std::panic::resume_unwind(e),
-        }
+        assert_eq!(result, FAIL);
     }
 
     // --- setmark_pos ---
