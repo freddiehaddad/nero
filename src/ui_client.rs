@@ -12,6 +12,10 @@ pub static UI_CLIENT_FORWARD_STDIN: GlobalCell<bool> = GlobalCell::new(false);
 static TUI_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
 static TUI_HEIGHT: GlobalCell<i32> = GlobalCell::new(0);
 pub static UI_CLIENT_ERROR_EXIT: GlobalCell<i32> = GlobalCell::new(0);
+static RESTART_ARGS: std::sync::LazyLock<
+    GlobalCell<crate::api::private::defs::Array>,
+> = std::sync::LazyLock::new(|| GlobalCell::new(Vec::new()));
+static RESTART_PENDING: GlobalCell<bool> = GlobalCell::new(false);
 
 /// Update the UI client's known dimensions (`ui_client_set_size`).
 ///
@@ -60,6 +64,16 @@ pub unsafe fn ui_client_event_error_exit(args: &crate::api::private::defs::Array
     unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() = *status as i32 };
 }
 
+/// Save arguments from a UI `restart` event
+/// (`ui_client_event_restart`).
+///
+/// # Safety
+/// Replaces shared restart state.
+pub unsafe fn ui_client_event_restart(args: &crate::api::private::defs::Array) {
+    *unsafe { RESTART_ARGS.get_mut() } = args.clone();
+    unsafe { *RESTART_PENDING.get_mut() = true };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +120,24 @@ mod tests {
         }
         assert_eq!(unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() }, 7);
         unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() = old };
+    }
+
+    #[test]
+    fn ui_client_event_restart_copies_arguments_and_marks_pending() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_args = std::mem::take(unsafe { RESTART_ARGS.get_mut() });
+        let old_pending = unsafe { *RESTART_PENDING.get_mut() };
+        let mut args = vec![crate::api::private::defs::Object::String(
+            b"server".to_vec(),
+        )];
+        unsafe { ui_client_event_restart(&args) };
+        args.clear();
+        assert!(unsafe { *RESTART_PENDING.get_mut() });
+        assert!(matches!(
+            unsafe { RESTART_ARGS.get_mut() }.as_slice(),
+            [crate::api::private::defs::Object::String(value)] if value == b"server"
+        ));
+        *unsafe { RESTART_ARGS.get_mut() } = old_args;
+        unsafe { *RESTART_PENDING.get_mut() = old_pending };
     }
 }
