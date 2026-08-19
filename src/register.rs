@@ -79,6 +79,13 @@ pub fn is_literal_register(regname: i32) -> bool {
         || crate::macros_defs::ascii_isalnum(regname)
 }
 
+/// Whether `regname` appends rather than replaces
+/// (`is_append_register`, `register.h`).
+#[must_use]
+pub fn is_append_register(regname: i32) -> bool {
+    crate::macros_defs::ascii_isupper(regname)
+}
+
 /// Queue a pending Insert-mode restart after any register text
 /// (`put_reedit_in_typebuf`).
 ///
@@ -1198,6 +1205,17 @@ mod tests {
             assert!(!is_literal_register(i32::from(name)));
         }
         assert!(!is_literal_register(-1));
+    }
+
+    #[test]
+    fn is_append_register_accepts_only_uppercase_ascii_letters() {
+        for &name in b"AZ" {
+            assert!(is_append_register(i32::from(name)));
+        }
+        for &name in b"az09+_" {
+            assert!(!is_append_register(i32::from(name)));
+        }
+        assert!(!is_append_register(-1));
     }
 
     #[test]
