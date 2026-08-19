@@ -302,6 +302,21 @@ pub unsafe fn str_to_reg(
     }
 }
 
+/// Finish a register write (`finish_write_reg`).
+///
+/// Clipboard publication is inert while no provider is available,
+/// matching [`get_clipboard`]'s real fallback. Writes to any register
+/// except `"` restore the previous unnamed-register selection.
+///
+/// # Safety
+/// Mutates shared unnamed-register selection.
+#[allow(dead_code)]
+unsafe fn finish_write_reg(name: i32, _register: &YankregT, previous: Option<usize>) {
+    if name != i32::from(b'"') {
+        unsafe { *Y_PREVIOUS.get_mut() = previous };
+    }
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -1842,6 +1857,40 @@ mod tests {
             register.y_type,
             crate::normal_defs::MotionType::CharWise
         );
+    }
+
+    #[test]
+    fn finish_write_reg_restores_previous_selection_for_named_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe { *Y_PREVIOUS.get_mut() = Some(7) };
+
+        unsafe {
+            finish_write_reg(
+                i32::from(b'a'),
+                &YankregT::default(),
+                Some(3),
+            )
+        };
+
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(3));
+    }
+
+    #[test]
+    fn finish_write_reg_keeps_unnamed_selection_for_quote_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe { *Y_PREVIOUS.get_mut() = Some(7) };
+
+        unsafe {
+            finish_write_reg(
+                i32::from(b'"'),
+                &YankregT::default(),
+                Some(3),
+            )
+        };
+
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(7));
     }
 
     #[test]
