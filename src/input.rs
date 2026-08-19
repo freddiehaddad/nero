@@ -104,7 +104,8 @@
 //! typeahead-buffer/mapping-application machinery.
 //!
 //! `redobuff`/`old_redobuff` and their `ResetRedobuff`/
-//! `restoreRedobuff`/`AppendToRedobuff`/`AppendCharToRedobuff`/
+//! `restoreRedobuff`/`AppendToRedobuff`/`AppendToRedobuffLit`/
+//! `AppendToRedobuffSpec`/`AppendCharToRedobuff`/
 //! `AppendNumberToRedobuff` group ARE now translated, along with
 //! `block_redo`/`typeahead_char` and `typeahead_noflush`. The
 //! original's `free_buff` calls before each buffer move are subsumed
@@ -456,6 +457,67 @@ pub unsafe fn append_to_redobuff_spec(s: &[u8]) {
                 crate::mbyte::mb_cptr2char_adv(&s[offset..end]);
             add_char_buff(unsafe { REDOBUFF.get_mut() }, c);
             offset += consumed.max(1);
+        }
+    }
+}
+
+/// Append text literally to the redo buffer, escaping control and
+/// special characters with CTRL-V (`AppendToRedobuffLit`).
+///
+/// The Rust slice carries the original's separate explicit length.
+/// A NUL still terminates the input, matching both original length
+/// modes.
+///
+/// # Safety
+/// Must not run concurrently with redo-buffer state.
+pub unsafe fn append_to_redobuff_lit(text: &[u8]) {
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    let end = text
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(text.len());
+    let mut offset = 0;
+    while offset < end {
+        let start = offset;
+        while offset < end
+            && (b' '..crate::ascii_defs::DEL).contains(&text[offset])
+        {
+            offset += 1;
+        }
+        if offset == end
+            && offset > start
+            && matches!(text[offset - 1], b'0' | b'^')
+        {
+            offset -= 1;
+        }
+        if offset > start {
+            add_buff(
+                unsafe { REDOBUFF.get_mut() },
+                &text[start..offset],
+            );
+        }
+        if offset >= end {
+            break;
+        }
+
+        let (c, consumed) =
+            crate::mbyte::mb_cptr2char_adv(&text[offset..end]);
+        offset += consumed.max(1);
+        if c < i32::from(b' ')
+            || c == i32::from(crate::ascii_defs::DEL)
+            || (offset == end && matches!(c, value if value == i32::from(b'0') || value == i32::from(b'^')))
+        {
+            add_char_buff(
+                unsafe { REDOBUFF.get_mut() },
+                i32::from(crate::ascii_defs::CTRL_V),
+            );
+        }
+        if offset == end && c == i32::from(b'0') {
+            add_buff(unsafe { REDOBUFF.get_mut() }, b"048");
+        } else {
+            add_char_buff(unsafe { REDOBUFF.get_mut() }, c);
         }
     }
 }
@@ -2603,6 +2665,87 @@ mod tests {
         unsafe { *BLOCK_REDO.get_mut() = true };
 
         unsafe { append_to_redobuff_spec(b"ignored") };
+
+        assert!(unsafe { REDOBUFF.get_mut() }.blocks.is_empty());
+    }
+
+    #[test]
+    fn append_to_redobuff_lit_copies_printable_runs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe { append_to_redobuff_lit(b"plain text") };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            b"plain text"
+        );
+    }
+
+    #[test]
+    fn append_to_redobuff_lit_prefixes_controls_with_ctrl_v() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe {
+            append_to_redobuff_lit(&[
+                b'a',
+                crate::ascii_defs::TAB,
+                crate::ascii_defs::DEL,
+                b'b',
+            ])
+        };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            vec![
+                b'a',
+                crate::ascii_defs::CTRL_V,
+                crate::ascii_defs::TAB,
+                crate::ascii_defs::CTRL_V,
+                crate::ascii_defs::DEL,
+                b'b',
+            ]
+        );
+    }
+
+    #[test]
+    fn append_to_redobuff_lit_expands_a_trailing_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe { append_to_redobuff_lit(b"10") };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            vec![b'1', crate::ascii_defs::CTRL_V, b'0', b'4', b'8']
+        );
+    }
+
+    #[test]
+    fn append_to_redobuff_lit_escapes_a_trailing_caret() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe { append_to_redobuff_lit(b"a^") };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            vec![b'a', crate::ascii_defs::CTRL_V, b'^']
+        );
+    }
+
+    #[test]
+    fn append_to_redobuff_lit_is_inert_while_redo_is_blocked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = true };
+
+        unsafe { append_to_redobuff_lit(b"ignored") };
 
         assert!(unsafe { REDOBUFF.get_mut() }.blocks.is_empty());
     }
