@@ -1012,6 +1012,19 @@ pub fn arg_autocmd_flag_get(flag: &mut bool, command: &[u8], pattern: &[u8]) -> 
     }
 }
 
+/// Parse a leading `<nomodeline>` modifier (`check_nomodeline`).
+///
+/// Returns `(call_modelines, remaining_offset)`.
+#[must_use]
+pub fn check_nomodeline(argument: &[u8]) -> (bool, usize) {
+    if argument.starts_with(b"<nomodeline>") {
+        let offset = 12 + crate::charset::skipwhite(&argument[12..]);
+        (false, offset)
+    } else {
+        (true, 0)
+    }
+}
+
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
 ///
 /// `win` selects the window-local option, which accepts only entries
@@ -2095,6 +2108,13 @@ mod tests {
             arg_autocmd_flag_get(&mut once, b"++once echo", b"++once"),
             (true, 0)
         );
+    }
+
+    #[test]
+    fn check_nomodeline_consumes_only_the_exact_modifier() {
+        assert_eq!(check_nomodeline(b"<nomodeline>  BufEnter"), (false, 14));
+        assert_eq!(check_nomodeline(b"BufEnter"), (true, 0));
+        assert_eq!(check_nomodeline(b"<nomodelines>"), (true, 0));
     }
 
     #[test]
