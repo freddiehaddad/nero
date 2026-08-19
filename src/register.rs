@@ -112,6 +112,53 @@ pub fn op_reg_amount() -> usize {
         .count()
 }
 
+/// One result from [`op_reg_iter`].
+#[derive(Debug, Clone)]
+pub struct RegisterIterItem {
+    /// Register name character.
+    pub name: i32,
+    /// Deep owned copy of the register contents/metadata.
+    pub register: YankregT,
+    /// Whether this is the current unnamed register.
+    pub is_unnamed: bool,
+    /// Index to pass to the next call, or `None` after the last item.
+    pub next: Option<usize>,
+}
+
+/// Iterate nonempty ShaDa-saved registers (`op_reg_iter`).
+///
+/// The original's opaque pointer cursor becomes an array index.
+#[must_use]
+pub fn op_reg_iter(
+    iter: Option<usize>,
+    registers: &[YankregT; NUM_REGISTERS],
+    unnamed: Option<usize>,
+) -> Option<RegisterIterItem> {
+    let index = (iter.unwrap_or(0)..NUM_SAVED_REGISTERS)
+        .find(|&index| !reg_empty(&registers[index]))?;
+    let next = (index + 1..NUM_SAVED_REGISTERS)
+        .find(|&candidate| !reg_empty(&registers[candidate]));
+    Some(RegisterIterItem {
+        name: get_register_name(index as i32),
+        register: registers[index].clone(),
+        is_unnamed: Some(index) == unnamed,
+        next,
+    })
+}
+
+/// Iterate the process-global register array (`op_global_reg_iter`).
+///
+/// # Safety
+/// Reads shared register storage and unnamed-register selection.
+#[must_use]
+pub unsafe fn op_global_reg_iter(
+    iter: Option<usize>,
+) -> Option<RegisterIterItem> {
+    let registers = unsafe { &*Y_REGS.as_ptr() };
+    let unnamed = unsafe { *Y_PREVIOUS.get_mut() };
+    op_reg_iter(iter, registers, unnamed)
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -1424,6 +1471,50 @@ mod tests {
         }
 
         assert_eq!(op_reg_amount(), 2);
+    }
+
+    #[test]
+    fn op_reg_iter_skips_empty_and_clipboard_registers() {
+        let mut registers: [YankregT; NUM_REGISTERS] =
+            std::array::from_fn(|_| YankregT::default());
+        registers[0].y_array = Some(vec![b"zero".to_vec()]);
+        registers[1].y_array = Some(vec![Vec::new()]);
+        registers[2] = YankregT {
+            y_array: Some(vec![Vec::new()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            ..Default::default()
+        };
+        registers[PLUS_REGISTER].y_array =
+            Some(vec![b"clipboard".to_vec()]);
+
+        let first = op_reg_iter(None, &registers, Some(2)).unwrap();
+        assert_eq!(first.name, i32::from(b'0'));
+        assert!(!first.is_unnamed);
+        assert_eq!(first.next, Some(2));
+        let second = op_reg_iter(first.next, &registers, Some(2)).unwrap();
+        assert_eq!(second.name, i32::from(b'2'));
+        assert!(second.is_unnamed);
+        assert_eq!(second.next, None);
+        assert!(op_reg_iter(Some(NUM_SAVED_REGISTERS), &registers, None).is_none());
+    }
+
+    #[test]
+    fn op_global_reg_iter_uses_global_contents_and_unnamed_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe {
+            for register in Y_REGS.get_mut() {
+                *register = YankregT::default();
+            }
+            Y_REGS.get_mut()[3].y_array = Some(vec![b"value".to_vec()]);
+            *Y_PREVIOUS.get_mut() = Some(3);
+        }
+
+        let item = unsafe { op_global_reg_iter(None) }.unwrap();
+        assert_eq!(item.name, i32::from(b'3'));
+        assert_eq!(item.register.y_array.as_deref(), Some([b"value".to_vec()].as_slice()));
+        assert!(item.is_unnamed);
+        assert_eq!(item.next, None);
     }
 
     #[test]
