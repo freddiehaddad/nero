@@ -41,13 +41,26 @@ use crate::context_defs::{CtxSwitch, CtxSwitchMode, CtxWin};
 /// The `ctx_win[]` pool of temporary "autocmd window" scratch windows
 /// (`ctx_win_vec`, `context.h`'s `kvec_t(CtxWin)` - modeled as a plain
 /// growable `Vec`, matching this crate's own established idiom for a
-/// C `kvec_t`). Always empty today - nothing in this crate can
-/// currently allocate a real autocmd window (`win_alloc`/the
-/// window-splitting machinery needed by the not-yet-translated
-/// `ctx_win_get`/`ctx_win_release` pair, `context.c`'s own
-/// producer/consumer of this pool, neither translated).
+/// C `kvec_t`).
 pub(crate) static CTX_WIN_VEC: std::sync::LazyLock<crate::globals::GlobalCell<Vec<CtxWin>>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Vec::new()));
+static NEXT_CTX_WIN_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
+    crate::globals::GlobalCell::new(1_000_000_000);
+
+#[cfg(test)]
+unsafe fn reset_ctx_win_pool_for_test() {
+    let entries = std::mem::take(unsafe { CTX_WIN_VEC.get_mut() });
+    for entry in entries {
+        if !entry.cw_win.is_null() {
+            let vars = unsafe { (*entry.cw_win).w_vars };
+            if !vars.is_null() {
+                unsafe { crate::eval::typval::tv_dict_free(vars) };
+            }
+            unsafe { drop(Box::from_raw(entry.cw_win)) };
+        }
+    }
+    unsafe { *NEXT_CTX_WIN_HANDLE.get_mut() = 1_000_000_000 };
+}
 
 /// Whether `win` is an active entry in `CTX_WIN_VEC` (the pool of
 /// temporary scratch windows) (`is_ctx_win`).
@@ -61,6 +74,108 @@ pub fn is_ctx_win(win: *mut crate::buffer_defs::WinT) -> bool {
     // SAFETY: no overlapping live access - see this crate's
     // established GlobalCell::get_mut convention.
     unsafe { CTX_WIN_VEC.get_mut() }.iter().any(|cw| cw.cw_used && std::ptr::eq(cw.cw_win, win))
+}
+
+unsafe fn ctx_win_alloc(index: usize) -> *mut crate::buffer_defs::WinT {
+    let handle = unsafe { NEXT_CTX_WIN_HANDLE.get_mut() };
+    let mut win = Box::new(crate::buffer_defs::WinT::default());
+    win.handle = *handle;
+    *handle += 1;
+    win.w_config.width = unsafe { crate::globals::GLOBALS.get_mut() }.Columns;
+    win.w_config.height = 5;
+    win.w_config.focusable = false;
+    win.w_config.mouse = false;
+    win.w_config.hide = true;
+    win.w_vars = crate::eval::typval::tv_dict_alloc();
+    unsafe {
+        crate::eval::vars::init_var_dict(
+            &mut *win.w_vars,
+            &mut win.w_winvar,
+            crate::eval::typval_defs::ScopeType::Scope,
+        )
+    };
+    let win = Box::into_raw(win);
+    let entries = unsafe { CTX_WIN_VEC.get_mut() };
+    entries[index].cw_win = win;
+    win
+}
+
+unsafe fn ctx_win_prep(
+    cs: &mut CtxSwitch,
+    buf: *mut crate::buffer_defs::BufT,
+) -> *mut crate::buffer_defs::WinT {
+    let index = {
+        let windows = unsafe { CTX_WIN_VEC.get_mut() };
+        windows
+            .iter()
+            .position(|entry| !entry.cw_used)
+            .unwrap_or_else(|| {
+                windows.push(CtxWin::default());
+                windows.len() - 1
+            })
+    };
+    let existing = unsafe { CTX_WIN_VEC.get_mut() }[index].cw_win;
+    let win = if existing.is_null() {
+        unsafe { ctx_win_alloc(index) }
+    } else {
+        existing
+    };
+    let entries = unsafe { CTX_WIN_VEC.get_mut() };
+    entries[index].cw_used = true;
+    cs.cs_ctxwin_idx = index as i32;
+
+    unsafe {
+        (*win).w_buffer = buf;
+        (*win).w_s = std::ptr::addr_of_mut!((*buf).b_s);
+        (*buf).b_nwindows += 1;
+        (*win).w_lines_valid = 0;
+        (*win).w_cursor = crate::pos_defs::PosT {
+            lnum: 1,
+            col: 0,
+            coladd: 0,
+        };
+        (*win).w_curswant = 0;
+        (*win).w_pcmark.lnum = 1;
+        (*win).w_pcmark.col = 0;
+        (*win).w_prev_pcmark.lnum = 0;
+        (*win).w_prev_pcmark.col = 0;
+        (*win).w_topline = 1;
+        (*win).w_topfill = 0;
+        (*win).w_botline = 2;
+        (*win).w_valid = 0;
+        (*win).w_localdir = None;
+        crate::drawscreen::redraw_later(
+            win,
+            crate::drawscreen::UPD_NOT_VALID,
+        );
+    }
+
+    let current_tab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    cs.cs_tp_localdir = unsafe { (*current_tab).tp_localdir.take() };
+    cs.cs_globaldir =
+        unsafe { crate::globals::GLOBALS.get_mut() }.globaldir.take();
+    let last = unsafe { crate::globals::GLOBALS.get_mut() }.lastwin;
+    unsafe { crate::window::win_append(last, win, std::ptr::null_mut()) };
+    win
+}
+
+unsafe fn ctx_win_rest(cs: &CtxSwitch) -> *mut crate::buffer_defs::WinT {
+    let index = cs.cs_ctxwin_idx as usize;
+    let win = unsafe { CTX_WIN_VEC.get_mut() }[index].cw_win;
+    if !std::ptr::eq(
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+        win,
+    ) {
+        unimplemented!(
+            "ctx_win_rest: finding a moved autocmd window needs goto_tabpage_tp/win_goto"
+        );
+    }
+    unsafe {
+        (*(*win).w_buffer).b_nwindows -= 1;
+        crate::window::win_remove(win, std::ptr::null_mut());
+        CTX_WIN_VEC.get_mut()[index].cw_used = false;
+    }
+    win
 }
 
 /// `_ctx_saved_curwin` - the window that was current when the
@@ -215,21 +330,18 @@ pub unsafe fn ctx_switch(
                 candidate = unsafe { (*candidate).w_next };
             }
         }
-        if target.is_null() {
-            unimplemented!(
-                "ctx_switch: an unshown buffer needs a temporary autocmd window"
-            );
-        }
         CtxSwitchMode::Buf
     };
     *cs = CtxSwitch::default();
     cs.cs_flags = flags;
     cs.cs_mode = mode;
     cs.cs_ctxwin_idx = -1;
-    if !unsafe { crate::window::win_valid(target) } {
+    if !target.is_null() && !unsafe { crate::window::win_valid(target) } {
         return false;
     }
-    if flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0 {
+    if flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0
+        && !target.is_null()
+    {
         cs.cs_target_win = unsafe { (*target).handle };
         cs.cs_target_old_pos = unsafe { (*target).w_cursor };
     }
@@ -281,6 +393,12 @@ pub unsafe fn ctx_switch(
             );
             crate::window::use_tabpage(tp);
         }
+    }
+    if mode == CtxSwitchMode::Buf && target.is_null() {
+        target = unsafe { ctx_win_prep(cs, buf) };
+        let current = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::window::leaving_window(current) };
+        unsafe { crate::globals::GLOBALS.get_mut() }.prevwin = current;
     }
     let curbuf = {
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
@@ -339,36 +457,70 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
             crate::window::use_tabpage(cs.cs_curtab);
         }
     }
+    let mut temp_win = std::ptr::null_mut();
     if cs.cs_mode == CtxSwitchMode::Buf {
         if cs.cs_ctxwin_idx >= 0 {
-            unimplemented!(
-                "ctx_restore: temporary autocmd windows need ctx_win_rest"
-            );
-        }
-        let current_win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        let current_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
-        let saved_buf = cs.cs_new_curbuf.br_buf;
-        if unsafe { (*current_win).handle } == cs.cs_new_curwin
-            && !std::ptr::eq(current_buf, saved_buf)
-            && unsafe { crate::buffer::bufref_valid(&cs.cs_new_curbuf) }
-            && !unsafe { (*saved_buf).b_ml.ml_mfp }.is_null()
-        {
-            let old_s = unsafe { std::ptr::addr_of_mut!((*current_buf).b_s) };
-            if std::ptr::eq(unsafe { (*current_win).w_s }, old_s) {
-                unsafe {
-                    (*current_win).w_s =
-                        std::ptr::addr_of_mut!((*saved_buf).b_s);
+            temp_win = unsafe { ctx_win_rest(cs) };
+        } else {
+            let current_win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            let current_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            let saved_buf = cs.cs_new_curbuf.br_buf;
+            if unsafe { (*current_win).handle } == cs.cs_new_curwin
+                && !std::ptr::eq(current_buf, saved_buf)
+                && unsafe { crate::buffer::bufref_valid(&cs.cs_new_curbuf) }
+                && !unsafe { (*saved_buf).b_ml.ml_mfp }.is_null()
+            {
+                let old_s = unsafe { std::ptr::addr_of_mut!((*current_buf).b_s) };
+                if std::ptr::eq(unsafe { (*current_win).w_s }, old_s) {
+                    unsafe {
+                        (*current_win).w_s =
+                            std::ptr::addr_of_mut!((*saved_buf).b_s);
+                    }
                 }
-            }
-            unsafe {
-                (*current_buf).b_nwindows -= 1;
-                crate::globals::GLOBALS.get_mut().curbuf = saved_buf;
-                (*current_win).w_buffer = saved_buf;
-                (*saved_buf).b_nwindows += 1;
+                unsafe {
+                    (*current_buf).b_nwindows -= 1;
+                    crate::globals::GLOBALS.get_mut().curbuf = saved_buf;
+                    (*current_win).w_buffer = saved_buf;
+                    (*saved_buf).b_nwindows += 1;
+                }
             }
         }
     }
-    unsafe { ctx_restore_curwin(cs, std::ptr::null_mut()) };
+    let fallback = if temp_win.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+    };
+    unsafe { ctx_restore_curwin(cs, fallback) };
+    if !temp_win.is_null() {
+        let globals = crate::globals::GLOBALS.as_ptr();
+        let current = unsafe { (*globals).curwin };
+        unsafe { crate::window::entering_window(current) };
+        let curbuf = unsafe { (*globals).curbuf };
+        if unsafe { crate::buffer::bt_prompt(Some(&*curbuf)) } {
+            unsafe { (*curbuf).b_prompt_insert = cs.cs_prompt_insert };
+        }
+        let vars = unsafe { (*temp_win).w_vars };
+        if !vars.is_null() {
+            unsafe { crate::eval::vars::vars_clear(&mut *vars) };
+        }
+        if unsafe { (*temp_win).w_localdir.is_some() } {
+            unimplemented!(
+                "ctx_restore: :lcd in an autocmd window needs win_fix_current_dir"
+            );
+        }
+        let curtab = unsafe { (*globals).curtab };
+        unsafe {
+            (*curtab).tp_localdir = cs.cs_tp_localdir.clone();
+            (*globals).globaldir = cs.cs_globaldir.clone();
+        }
+        if unsafe { (*current).w_topline > (*curbuf).b_ml.ml_line_count } {
+            unsafe {
+                (*current).w_topline = (*curbuf).b_ml.ml_line_count;
+                (*current).w_topfill = 0;
+            }
+        }
+    }
     if !cs.cs_same_win {
         unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active =
             cs.cs_visual_active;
@@ -480,6 +632,38 @@ mod tests {
     impl Drop for AutochdirGuard {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_acd = self.0;
+        }
+    }
+
+    struct CtxWinPoolGuard;
+
+    struct GlobaldirGuard(Option<Vec<u8>>);
+
+    impl GlobaldirGuard {
+        fn set(value: Option<Vec<u8>>) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let previous = std::mem::replace(&mut globals.globaldir, value);
+            Self(previous)
+        }
+    }
+
+    impl Drop for GlobaldirGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.globaldir =
+                self.0.take();
+        }
+    }
+
+    impl CtxWinPoolGuard {
+        fn reset() -> Self {
+            unsafe { reset_ctx_win_pool_for_test() };
+            Self
+        }
+    }
+
+    impl Drop for CtxWinPoolGuard {
+        fn drop(&mut self) {
+            unsafe { reset_ctx_win_pool_for_test() };
         }
     }
 
@@ -879,21 +1063,103 @@ mod tests {
     }
 
     #[test]
+    fn ctx_switch_prepares_and_releases_an_autocmd_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _pool = CtxWinPoolGuard::reset();
+        let _g = CurwinGuard::save();
+        let mut current_buf = crate::buffer_defs::BufT::default();
+        let current_buf_ptr = std::ptr::addr_of_mut!(current_buf);
+        let mut target_buf = crate::buffer_defs::BufT::default();
+        let target_buf_ptr = std::ptr::addr_of_mut!(target_buf);
+        let mut current = crate::buffer_defs::WinT {
+            handle: 51,
+            w_buffer: current_buf_ptr,
+            ..Default::default()
+        };
+        let current_ptr = std::ptr::addr_of_mut!(current);
+        let mut tab = crate::buffer_defs::TabpageT {
+            tp_curwin: current_ptr,
+            tp_firstwin: current_ptr,
+            tp_lastwin: current_ptr,
+            tp_localdir: Some(b"tab-local".to_vec()),
+            ..Default::default()
+        };
+        let tab_ptr = std::ptr::addr_of_mut!(tab);
+        {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = current_ptr;
+            globals.curwin = current_ptr;
+            globals.curbuf = current_buf_ptr;
+        }
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastwin,
+                current_ptr,
+            )
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                tab_ptr,
+            )
+        };
+        let _firsttab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                tab_ptr,
+            )
+        };
+        let _globaldir =
+            GlobaldirGuard::set(Some(b"global-dir".to_vec()));
+        let mut switch = CtxSwitch::default();
+
+        assert!(unsafe {
+            ctx_switch(
+                &mut switch,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                target_buf_ptr,
+                crate::context_defs::ctx_switch_flags::NO_EVENTS,
+            )
+        });
+
+        let temp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        assert!(is_ctx_win(temp));
+        assert_eq!(unsafe { (*temp).w_buffer }, target_buf_ptr);
+        assert_eq!(unsafe { (*target_buf_ptr).b_nwindows }, 1);
+        assert_eq!(unsafe { (*current_ptr).w_next }, temp);
+        assert!(switch.cs_ctxwin_idx >= 0);
+        assert!(unsafe { (*tab_ptr).tp_localdir.is_none() });
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.globaldir.is_none());
+
+        unsafe { ctx_restore(&switch) };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curwin, current_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curbuf, current_buf_ptr);
+        assert_eq!(unsafe { (*target_buf_ptr).b_nwindows }, 0);
+        assert!(unsafe { (*current_ptr).w_next }.is_null());
+        assert!(!is_ctx_win(temp));
+        assert_eq!(
+            unsafe { (*tab_ptr).tp_localdir.as_deref() },
+            Some(b"tab-local".as_slice())
+        );
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.globaldir.as_deref(),
+            Some(b"global-dir".as_slice())
+        );
+        assert!(!crate::autocmd::is_autocmd_blocked());
+    }
+
+    #[test]
     fn ctx_restore_is_a_noop_for_a_default_zeroed_ctx_switch() {
         let cs = CtxSwitch::default();
         unsafe { ctx_restore(&cs) }; // must not panic
     }
 
     #[test]
-    #[should_panic(expected = "temporary autocmd windows")]
-    fn ctx_restore_panics_for_a_temporary_buffer_window() {
-        let cs = CtxSwitch { cs_mode: CtxSwitchMode::Buf, ..Default::default() };
-        unsafe { ctx_restore(&cs) };
-    }
-
-    #[test]
     fn is_ctx_win_false_when_pool_is_empty() {
         let _lock = crate::globals::global_state_test_lock();
+        let _pool = CtxWinPoolGuard::reset();
         let mut win = crate::buffer_defs::WinT::default();
         assert!(unsafe { CTX_WIN_VEC.get_mut() }.is_empty());
         assert!(!is_ctx_win(&mut win as *mut crate::buffer_defs::WinT));
