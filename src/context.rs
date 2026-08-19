@@ -5,22 +5,13 @@
 //! machinery used by autocommand execution (`ctx_switch`/
 //! `ctx_restore`, e.g. to run autocmds "as if" a different
 //! window/buffer were current, then switch back). Window-target
-//! switching/restoration is translated, including no-event,
-//! no-display tab switches, and buffer targets already shown in a
-//! window. Temporary autocmd windows for unshown buffers, cwd
-//! preservation, and display-changing tab switches remain deferred.
-//!
-//! This one check is enough to make `src/autocmd.rs`'s
-//! `apply_autocmds` family real: every call site there constructs its
-//! own `CtxSwitch::default()` (`cs_mode` defaults to
-//! `CtxSwitchMode::None`, matching the original's `CtxSwitch aco =
-//! { 0 }`) and NEVER calls a (not-yet-translated) `ctx_switch` on it
-//! before calling [`ctx_restore`] - so the early-return branch is not
-//! just reachable, it is the ONLY branch ever exercised anywhere in
-//! this crate today, matching [`ctx_restore`]'s own doc comment
-//! (translated near-verbatim below) which explicitly names exactly
-//! this "skipped `ctx_switch()`" usage pattern as a first-class,
-//! intentional no-op case - not an edge case being special-cased away.
+//! switching/restoration is translated, including no-event/no-display
+//! tab switches. Buffer targets use an existing window when available
+//! or a pooled temporary autocmd window otherwise. Cwd and
+//! `'autochdir'` preservation are real too. Display-changing tab
+//! switches, recovery when a temporary window was moved to another
+//! tab, and `:lcd` directory repair in a temporary window remain
+//! deferred.
 //!
 //! Also translated: [`ctx_saved_curwin`] (the window that was current
 //! when the outermost `ctx_switch()` began) and
@@ -181,9 +172,8 @@ unsafe fn ctx_win_rest(cs: &CtxSwitch) -> *mut crate::buffer_defs::WinT {
 /// `_ctx_saved_curwin` - the window that was current when the
 /// outermost `ctx_switch()` began.
 ///
-/// Only ever set by `ctx_switch`/`ctx_restore` (neither translated),
-/// so this stays `0` in this crate today, matching this file's own
-/// established treatment of `CTX_WIN_VEC`.
+/// Set and cleared by the real [`ctx_switch`]/[`ctx_restore`] buffer
+/// target lifecycle.
 static CTX_SAVED_CURWIN: crate::globals::GlobalCell<crate::types_defs::HandleT> =
     crate::globals::GlobalCell::new(0);
 static CTX_SWITCH_DEPTH: crate::globals::GlobalCell<i32> =
@@ -336,9 +326,6 @@ pub unsafe fn ctx_switch(
     cs.cs_flags = flags;
     cs.cs_mode = mode;
     cs.cs_ctxwin_idx = -1;
-    if !target.is_null() && !unsafe { crate::window::win_valid(target) } {
-        return false;
-    }
     if flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0
         && !target.is_null()
     {
@@ -399,6 +386,11 @@ pub unsafe fn ctx_switch(
         let current = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
         unsafe { crate::window::leaving_window(current) };
         unsafe { crate::globals::GLOBALS.get_mut() }.prevwin = current;
+    }
+    if mode == CtxSwitchMode::Buf {
+        debug_assert!(unsafe { crate::window::win_valid(target) });
+    } else if !unsafe { crate::window::win_valid(target) } {
+        return false;
     }
     let curbuf = {
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
@@ -586,6 +578,10 @@ mod tests {
         curbuf: *mut crate::buffer_defs::BufT,
         prevwin: *mut crate::buffer_defs::WinT,
         firstwin: *mut crate::buffer_defs::WinT,
+        lastwin: *mut crate::buffer_defs::WinT,
+        curtab: *mut crate::buffer_defs::TabpageT,
+        first_tabpage: *mut crate::buffer_defs::TabpageT,
+        topframe: *mut crate::buffer_defs::FrameT,
         visual_active: bool,
     }
 
@@ -597,6 +593,10 @@ mod tests {
                 curbuf: g.curbuf,
                 prevwin: g.prevwin,
                 firstwin: g.firstwin,
+                lastwin: g.lastwin,
+                curtab: g.curtab,
+                first_tabpage: g.first_tabpage,
+                topframe: g.topframe,
                 visual_active: g.Visual.active,
             }
         }
@@ -609,6 +609,10 @@ mod tests {
             g.curbuf = self.curbuf;
             g.prevwin = self.prevwin;
             g.firstwin = self.firstwin;
+            g.lastwin = self.lastwin;
+            g.curtab = self.curtab;
+            g.first_tabpage = self.first_tabpage;
+            g.topframe = self.topframe;
             g.Visual.active = self.visual_active;
         }
     }
@@ -835,6 +839,82 @@ mod tests {
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curwin, first_ptr);
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curbuf, first_buf_ptr);
         assert!(unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active);
+        assert!(!crate::autocmd::is_autocmd_blocked());
+    }
+
+    #[test]
+    fn ctx_switch_validates_a_window_after_installing_its_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurwinGuard::save();
+
+        let mut current_buf = crate::buffer_defs::BufT::default();
+        let current_buf_ptr = std::ptr::addr_of_mut!(current_buf);
+        let mut target_buf = crate::buffer_defs::BufT::default();
+        let target_buf_ptr = std::ptr::addr_of_mut!(target_buf);
+        let mut current_win = crate::buffer_defs::WinT {
+            handle: 31,
+            w_buffer: current_buf_ptr,
+            ..Default::default()
+        };
+        let current_win_ptr = std::ptr::addr_of_mut!(current_win);
+        let mut target_win = crate::buffer_defs::WinT {
+            handle: 32,
+            w_buffer: target_buf_ptr,
+            ..Default::default()
+        };
+        let target_win_ptr = std::ptr::addr_of_mut!(target_win);
+        let command_height =
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch;
+        let mut target_tab = crate::buffer_defs::TabpageT {
+            tp_curwin: target_win_ptr,
+            tp_firstwin: target_win_ptr,
+            tp_lastwin: target_win_ptr,
+            tp_ch_used: command_height,
+            ..Default::default()
+        };
+        let target_tab_ptr = std::ptr::addr_of_mut!(target_tab);
+        let mut current_tab = crate::buffer_defs::TabpageT {
+            tp_next: target_tab_ptr,
+            tp_curwin: current_win_ptr,
+            tp_firstwin: current_win_ptr,
+            tp_lastwin: current_win_ptr,
+            tp_ch_used: command_height,
+            ..Default::default()
+        };
+        let current_tab_ptr = std::ptr::addr_of_mut!(current_tab);
+        {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = current_buf_ptr;
+            globals.curwin = current_win_ptr;
+            globals.firstwin = current_win_ptr;
+            globals.lastwin = current_win_ptr;
+            globals.curtab = current_tab_ptr;
+            globals.first_tabpage = current_tab_ptr;
+            globals.prevwin = std::ptr::null_mut();
+        }
+
+        let mut switch = CtxSwitch::default();
+        assert!(unsafe {
+            ctx_switch(
+                &mut switch,
+                target_win_ptr,
+                target_tab_ptr,
+                std::ptr::null_mut(),
+                crate::context_defs::ctx_switch_flags::NO_EVENTS
+                    | crate::context_defs::ctx_switch_flags::NO_DISPLAY,
+            )
+        });
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(globals.curtab, target_tab_ptr);
+        assert_eq!(globals.curwin, target_win_ptr);
+        assert_eq!(globals.curbuf, target_buf_ptr);
+        assert!(crate::autocmd::is_autocmd_blocked());
+
+        unsafe { ctx_restore(&switch) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(globals.curtab, current_tab_ptr);
+        assert_eq!(globals.curwin, current_win_ptr);
+        assert_eq!(globals.curbuf, current_buf_ptr);
         assert!(!crate::autocmd::is_autocmd_blocked());
     }
 
