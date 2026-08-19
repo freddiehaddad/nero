@@ -8,8 +8,9 @@
 //! `assert_notmatch()` need the real regex engine (`pattern_match`,
 //! confirmed globally blocked, matching `search.c`'s own already-
 //! documented status). `assert_fails()`/`assert_beeps()`/
-//! `assert_nobeep()`/`assert_exception()` need real Ex-command
-//! execution/terminal-bell tracking, neither translated.
+//! `assert_nobeep()` need real Ex-command execution/terminal-bell
+//! tracking, neither translated. `assert_exception()` validates the
+//! already-recorded `v:exception`.
 //! `test_garbagecollect_now()` needs a real GC sweep and remains
 //! deferred. `assert_equalfile` compares files and records detailed
 //! byte/line diagnostics. None of the remaining deferred functions
@@ -458,6 +459,50 @@ pub(crate) unsafe fn assert_equalfile(argvars: &[TypvalT]) -> i64 {
     1
 }
 
+/// Check that `v:exception` contains the expected text
+/// (`assert_exception`).
+///
+/// # Safety
+/// Reads shared Vim variables and appends failures to `v:errors`.
+pub(crate) unsafe fn assert_exception(argvars: &[TypvalT]) -> i64 {
+    let expected = crate::eval::typval::tv_get_string_chk(&argvars[0]);
+    let exception = unsafe {
+        crate::eval::vars::get_vim_var_str(
+            crate::eval::vars::VimVarIndex::Exception,
+        )
+    };
+    if exception.is_empty() {
+        let mut gap = prepare_assert_error();
+        gap.extend_from_slice(b"v:exception is not set");
+        unsafe { assert_error(&gap) };
+        return 1;
+    }
+    if expected.as_deref().is_some_and(|needle| {
+        !needle.is_empty()
+            && !exception.windows(needle.len()).any(|window| window == needle)
+    }) {
+        let mut gap = prepare_assert_error();
+        let actual = unsafe {
+            &*crate::eval::vars::get_vim_var_tv(
+                crate::eval::vars::VimVarIndex::Exception,
+            )
+        };
+        unsafe {
+            fill_assert_error(
+                &mut gap,
+                argvars.get(1),
+                None,
+                Some(&argvars[0]),
+                actual,
+                AssertType::Other,
+            )
+        };
+        unsafe { assert_error(&gap) };
+        return 1;
+    }
+    0
+}
+
 /// Common logic for `assert_true()`/`assert_false()` (`assert_bool`).
 ///
 /// # Safety
@@ -541,6 +586,36 @@ mod tests {
     }
 
     struct TempFiles(Vec<std::path::PathBuf>);
+
+    struct ExceptionGuard(Vec<u8>);
+
+    impl ExceptionGuard {
+        fn set(value: &[u8]) -> Self {
+            let previous = unsafe {
+                crate::eval::vars::get_vim_var_str(
+                    crate::eval::vars::VimVarIndex::Exception,
+                )
+            };
+            unsafe {
+                crate::eval::vars::set_vim_var_string(
+                    crate::eval::vars::VimVarIndex::Exception,
+                    Some(value),
+                )
+            };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ExceptionGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::eval::vars::set_vim_var_string(
+                    crate::eval::vars::VimVarIndex::Exception,
+                    Some(&self.0),
+                )
+            };
+        }
+    }
 
     impl TempFiles {
         fn pair() -> (Self, std::path::PathBuf, std::path::PathBuf) {
@@ -769,6 +844,50 @@ mod tests {
             0
         );
         assert!(v_errors().is_empty());
+        reset_v_errors();
+    }
+
+    #[test]
+    fn assert_exception_reports_when_v_exception_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        let _exception = ExceptionGuard::set(b"");
+        assert_eq!(unsafe { assert_exception(&[string(b"E42")]) }, 1);
+        assert_eq!(
+            v_errors(),
+            vec!["v:exception is not set".to_string()]
+        );
+        reset_v_errors();
+    }
+
+    #[test]
+    fn assert_exception_accepts_a_matching_substring() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        let _exception = ExceptionGuard::set(b"Vim:E42: problem");
+        assert_eq!(unsafe { assert_exception(&[string(b"E42")]) }, 0);
+        assert!(v_errors().is_empty());
+        reset_v_errors();
+    }
+
+    #[test]
+    fn assert_exception_records_expected_and_actual_with_a_message() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        let _exception = ExceptionGuard::set(b"Vim:E42: problem");
+        assert_eq!(
+            unsafe {
+                assert_exception(&[string(b"E99"), string(b"exception")])
+            },
+            1
+        );
+        assert_eq!(
+            v_errors(),
+            vec![
+                "exception: Expected 'E99' but got 'Vim:E42: problem'"
+                    .to_string()
+            ]
+        );
         reset_v_errors();
     }
 
