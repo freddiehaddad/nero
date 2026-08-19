@@ -45,6 +45,18 @@ impl Mparm {
     }
 }
 
+/// Initialize startup parameters (`init_params`).
+#[must_use]
+pub fn init_params(argv: Vec<Vec<u8>>) -> Mparm {
+    Mparm {
+        argv,
+        use_debug_break_level: -1,
+        window_count: -1,
+        lua_arg0: -1,
+        ..Default::default()
+    }
+}
+
 /// Parse a decimal number at `argument[*index]` (`get_number_arg`).
 ///
 /// Leaves `default` and `index` unchanged when the next byte is not a
@@ -119,5 +131,15 @@ mod tests {
         assert_eq!(params.commands.len(), MAX_ARG_CMDS);
         assert_eq!(params.pre_commands.len(), MAX_ARG_CMDS);
         assert_eq!(params.cmds_tofree, [false; MAX_ARG_CMDS]);
+    }
+
+    #[test]
+    fn init_params_sets_main_c_sentinel_defaults() {
+        let params = init_params(vec![b"nvim".to_vec(), b"file".to_vec()]);
+        assert_eq!(params.argc(), 2);
+        assert_eq!(params.use_debug_break_level, -1);
+        assert_eq!(params.window_count, -1);
+        assert_eq!(params.lua_arg0, -1);
+        assert_eq!(params.remote, 0);
     }
 }
