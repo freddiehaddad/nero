@@ -548,6 +548,49 @@ fn au_cleanup() {
 /// definition side isn't translated).
 static MAP_AUGROUP_NAME_TO_ID: LazyLock<GlobalCell<std::collections::HashMap<Vec<u8>, i32>>> =
     LazyLock::new(|| GlobalCell::new(std::collections::HashMap::new()));
+static MAP_AUGROUP_ID_TO_NAME: LazyLock<GlobalCell<std::collections::HashMap<i32, Vec<u8>>>> =
+    LazyLock::new(|| GlobalCell::new(std::collections::HashMap::new()));
+static NEXT_AUGROUP_ID: GlobalCell<i32> = GlobalCell::new(1);
+static CURRENT_AUGROUP: GlobalCell<i32> = GlobalCell::new(augroup::DEFAULT);
+
+/// Add an augroup name or return its existing ID (`augroup_add`).
+///
+/// # Safety
+/// Mutates the shared augroup registries and allocation counter.
+pub unsafe fn augroup_add(name: &[u8]) -> i32 {
+    debug_assert!(!name.eq_ignore_ascii_case(b"end"));
+    let existing = augroup_find(name);
+    if existing > 0 {
+        return existing;
+    }
+    if existing == augroup::DELETED {
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.remove(name);
+    }
+    let next = unsafe { NEXT_AUGROUP_ID.get_mut() };
+    let id = *next;
+    *next += 1;
+    unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(name.to_vec(), id);
+    unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.insert(id, name.to_vec());
+    id
+}
+
+/// Get an augroup name by ID (`augroup_name`).
+///
+/// # Safety
+/// Reads shared augroup registries and current-group state.
+#[must_use]
+pub unsafe fn augroup_name(mut group: i32) -> Option<Vec<u8>> {
+    if group == augroup::DELETED {
+        return Some(b"--- DELETED ---".to_vec());
+    }
+    if group == augroup::ALL {
+        group = unsafe { *CURRENT_AUGROUP.get_mut() };
+    }
+    if group <= 0 || group >= unsafe { *NEXT_AUGROUP_ID.get_mut() } {
+        return None;
+    }
+    unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.get(&group).cloned()
+}
 
 /// Find the ID of an autocmd group name, or
 /// [`crate::autocmd_defs::augroup::ERROR`] if not found
@@ -1297,6 +1340,31 @@ mod tests {
 
     fn reset_augroup_map() {
         unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.clear();
+        unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.clear();
+        unsafe { *NEXT_AUGROUP_ID.get_mut() = 1 };
+        unsafe { *CURRENT_AUGROUP.get_mut() = augroup::DEFAULT };
+    }
+
+    #[test]
+    fn augroup_add_allocates_and_reuses_group_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        let first = unsafe { augroup_add(b"GroupA") };
+        let same = unsafe { augroup_add(b"GroupA") };
+        let second = unsafe { augroup_add(b"GroupB") };
+        assert_eq!(first, 1);
+        assert_eq!(same, first);
+        assert_eq!(second, 2);
+        assert_eq!(
+            unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.get(&first),
+            Some(&b"GroupA".to_vec())
+        );
+        assert_eq!(unsafe { augroup_name(first) }, Some(b"GroupA".to_vec()));
+        assert_eq!(
+            unsafe { augroup_name(augroup::DELETED) },
+            Some(b"--- DELETED ---".to_vec())
+        );
+        reset_augroup_map();
     }
 
     #[test]
