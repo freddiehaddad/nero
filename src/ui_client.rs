@@ -11,6 +11,7 @@ pub static UI_CLIENT_ATTACHED: GlobalCell<bool> = GlobalCell::new(false);
 pub static UI_CLIENT_FORWARD_STDIN: GlobalCell<bool> = GlobalCell::new(false);
 static TUI_WIDTH: GlobalCell<i32> = GlobalCell::new(0);
 static TUI_HEIGHT: GlobalCell<i32> = GlobalCell::new(0);
+pub static UI_CLIENT_ERROR_EXIT: GlobalCell<i32> = GlobalCell::new(0);
 
 /// Update the UI client's known dimensions (`ui_client_set_size`).
 ///
@@ -47,6 +48,18 @@ pub fn handle_ui_client_redraw(
     crate::api::private::defs::Object::Nil
 }
 
+/// Handle the UI client's `error_exit` event
+/// (`ui_client_event_error_exit`).
+///
+/// # Safety
+/// Mutates shared UI-client exit state.
+pub unsafe fn ui_client_event_error_exit(args: &crate::api::private::defs::Array) {
+    let Some(crate::api::private::defs::Object::Integer(status)) = args.first() else {
+        return;
+    };
+    unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() = *status as i32 };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +89,22 @@ mod tests {
             error.msg.as_deref(),
             Some("'redraw' cannot be sent as a request")
         );
+    }
+
+    #[test]
+    fn ui_client_event_error_exit_records_integer_status() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() };
+        unsafe {
+            ui_client_event_error_exit(&vec![crate::api::private::defs::Object::Integer(7)])
+        };
+        assert_eq!(unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() }, 7);
+        unsafe {
+            ui_client_event_error_exit(&vec![crate::api::private::defs::Object::String(
+                b"bad".to_vec(),
+            )]);
+        }
+        assert_eq!(unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() }, 7);
+        unsafe { *UI_CLIENT_ERROR_EXIT.get_mut() = old };
     }
 }
