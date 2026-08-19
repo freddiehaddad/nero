@@ -125,6 +125,49 @@ pub unsafe fn ctx_restore_curwin(cs: &CtxSwitch, fallback: *mut crate::buffer_de
     unsafe { crate::globals::GLOBALS.get_mut() }.prevwin = prevwin;
 }
 
+unsafe fn ctx_cwd_save(
+    cs: &mut CtxSwitch,
+    wp: *mut crate::buffer_defs::WinT,
+    tp: *mut crate::buffer_defs::TabpageT,
+) {
+    cs.cs_cwd_status = crate::vim_defs::FAIL;
+    let autochdir = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_acd != 0;
+    if autochdir {
+        unimplemented!("ctx_cwd_save: 'autochdir' needs do_autochdir");
+    }
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let target_tab = if tp.is_null() { globals.curtab } else { tp };
+    let need_save = !std::ptr::eq(globals.curwin, wp)
+        && (unsafe { (*globals.curwin).w_localdir.is_some() }
+            || (!wp.is_null() && unsafe { (*wp).w_localdir.is_some() })
+            || (!std::ptr::eq(globals.curtab, target_tab)
+                && (unsafe { (*globals.curtab).tp_localdir.is_some() }
+                    || unsafe { (*target_tab).tp_localdir.is_some() })));
+    if need_save
+        && let Some(cwd) = crate::os::fs::os_dirname()
+    {
+        cs.cs_cwd = Some(cwd);
+        cs.cs_cwd_status = crate::vim_defs::OK;
+    }
+}
+
+fn bytes_path(path: &[u8]) -> Option<std::path::PathBuf> {
+    std::str::from_utf8(path)
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+unsafe fn ctx_cwd_restore(cs: &CtxSwitch) {
+    if cs.cs_apply_acd {
+        unimplemented!("ctx_cwd_restore: 'autochdir' needs do_autochdir");
+    }
+    if cs.cs_cwd_status == crate::vim_defs::OK
+        && let Some(path) = cs.cs_cwd.as_deref().and_then(bytes_path)
+    {
+        let _ = crate::os::fs::os_chdir(&path);
+    }
+}
+
 /// Temporarily switch the current window (`ctx_switch`, window target).
 ///
 /// # Safety
@@ -163,10 +206,6 @@ pub unsafe fn ctx_switch(
         }
         CtxSwitchMode::Buf
     };
-    if flags & crate::context_defs::ctx_switch_flags::KEEP_CWD != 0 {
-        unimplemented!("ctx_switch: KEEP_CWD needs ctx_cwd_save");
-    }
-
     *cs = CtxSwitch::default();
     cs.cs_flags = flags;
     cs.cs_mode = mode;
@@ -177,6 +216,19 @@ pub unsafe fn ctx_switch(
     if flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0 {
         cs.cs_target_win = unsafe { (*target).handle };
         cs.cs_target_old_pos = unsafe { (*target).w_cursor };
+    }
+    if flags & crate::context_defs::ctx_switch_flags::KEEP_CWD != 0 {
+        unsafe {
+            ctx_cwd_save(
+                cs,
+                target,
+                if tp.is_null() {
+                    crate::globals::GLOBALS.get_mut().curtab
+                } else {
+                    tp
+                },
+            )
+        };
     }
 
     {
@@ -320,7 +372,7 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
         crate::autocmd::unblock_autocmds();
     }
     if cs.cs_flags & crate::context_defs::ctx_switch_flags::KEEP_CWD != 0 {
-        unimplemented!("ctx_restore: KEEP_CWD needs ctx_cwd_restore");
+        unsafe { ctx_cwd_restore(cs) };
     }
     if cs.cs_flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0 {
         let target =
@@ -390,6 +442,50 @@ mod tests {
             g.prevwin = self.prevwin;
             g.firstwin = self.firstwin;
             g.Visual.active = self.visual_active;
+        }
+    }
+
+    struct TempCwdGuard {
+        original: std::path::PathBuf,
+        root: std::path::PathBuf,
+    }
+
+    struct AutochdirGuard(i32);
+
+    impl AutochdirGuard {
+        fn disable() -> Self {
+            let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let previous = options.p_acd;
+            options.p_acd = 0;
+            Self(previous)
+        }
+    }
+
+    impl Drop for AutochdirGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_acd = self.0;
+        }
+    }
+
+    impl TempCwdGuard {
+        fn new() -> Self {
+            let original = std::env::current_dir().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "nero-context-cwd-{}-{}",
+                std::process::id(),
+                crate::profile::profile_start()
+            ));
+            std::fs::create_dir_all(root.join("one")).unwrap();
+            std::fs::create_dir_all(root.join("two")).unwrap();
+            std::env::set_current_dir(root.join("one")).unwrap();
+            Self { original, root }
+        }
+    }
+
+    impl Drop for TempCwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -593,6 +689,94 @@ mod tests {
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curbuf, first_buf_ptr);
         assert!(unsafe { ctx_saved_curwin() }.is_null());
         assert!(!crate::autocmd::is_autocmd_blocked());
+    }
+
+    #[test]
+    fn ctx_switch_keep_cwd_is_inert_without_local_directories() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurwinGuard::save();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = crate::buffer_defs::WinT {
+            handle: 21,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = win_ptr;
+            globals.curwin = win_ptr;
+            globals.curbuf = buf_ptr;
+        }
+        let mut switch = CtxSwitch::default();
+        assert!(unsafe {
+            ctx_switch(
+                &mut switch,
+                win_ptr,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                crate::context_defs::ctx_switch_flags::KEEP_CWD,
+            )
+        });
+        assert_eq!(switch.cs_cwd_status, crate::vim_defs::FAIL);
+        assert!(switch.cs_cwd.is_none());
+        unsafe { ctx_restore(&switch) };
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate this test's real directory creation and chdir calls"
+    )]
+    fn ctx_switch_keep_cwd_restores_a_changed_directory() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let cwd = TempCwdGuard::new();
+        let first_dir = std::env::current_dir().unwrap();
+        let second_dir = cwd.root.join("two");
+        let _g = CurwinGuard::save();
+        let _acd = AutochdirGuard::disable();
+        let mut first_buf = crate::buffer_defs::BufT::default();
+        let first_buf_ptr = std::ptr::addr_of_mut!(first_buf);
+        let mut second_buf = crate::buffer_defs::BufT::default();
+        let second_buf_ptr = std::ptr::addr_of_mut!(second_buf);
+        let mut second = crate::buffer_defs::WinT {
+            handle: 32,
+            w_buffer: second_buf_ptr,
+            w_localdir: Some(b"local".to_vec()),
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = crate::buffer_defs::WinT {
+            handle: 31,
+            w_buffer: first_buf_ptr,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = first_ptr;
+            globals.curwin = first_ptr;
+            globals.curbuf = first_buf_ptr;
+        }
+        let mut switch = CtxSwitch::default();
+        assert!(unsafe {
+            ctx_switch(
+                &mut switch,
+                second_ptr,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                crate::context_defs::ctx_switch_flags::KEEP_CWD,
+            )
+        });
+        assert_eq!(switch.cs_cwd_status, crate::vim_defs::OK);
+        std::env::set_current_dir(&second_dir).unwrap();
+
+        unsafe { ctx_restore(&switch) };
+
+        assert_eq!(std::env::current_dir().unwrap(), first_dir);
     }
 
     #[test]
