@@ -4,6 +4,47 @@
 //! command, and file-loading subsystems. [`get_number_arg`] is an
 //! independent command-line parser used by that flow.
 
+/// Maximum number of `+`/`-c`/`--cmd` commands (`MAX_ARG_CMDS`).
+pub const MAX_ARG_CMDS: usize = 10;
+
+/// Parameters shared by `main()` startup helpers (`mparm_T`).
+#[derive(Debug, Clone, Default)]
+pub struct Mparm {
+    pub argv: Vec<Vec<u8>>,
+    pub use_vimrc: Option<Vec<u8>>,
+    pub clean: bool,
+    pub n_commands: i32,
+    pub commands: [Option<Vec<u8>>; MAX_ARG_CMDS],
+    pub cmds_tofree: [bool; MAX_ARG_CMDS],
+    pub n_pre_commands: i32,
+    pub pre_commands: [Option<Vec<u8>>; MAX_ARG_CMDS],
+    pub luaf: Option<Vec<u8>>,
+    pub lua_arg0: i32,
+    pub edit_type: i32,
+    pub tagname: Option<Vec<u8>>,
+    pub use_ef: Option<Vec<u8>>,
+    pub input_istext: bool,
+    pub no_swap_file: i32,
+    pub use_debug_break_level: i32,
+    pub window_count: i32,
+    pub window_layout: i32,
+    pub diff_mode: i32,
+    pub listen_addr: Option<Vec<u8>>,
+    pub remote: i32,
+    pub server_addr: Option<Vec<u8>>,
+    pub scriptin: Option<Vec<u8>>,
+    pub scriptout: Option<Vec<u8>>,
+    pub scriptout_append: bool,
+    pub had_stdin_file: bool,
+}
+
+impl Mparm {
+    #[must_use]
+    pub fn argc(&self) -> i32 {
+        self.argv.len() as i32
+    }
+}
+
 /// Parse a decimal number at `argument[*index]` (`get_number_arg`).
 ///
 /// Leaves `default` and `index` unchanged when the next byte is not a
@@ -69,5 +110,14 @@ mod tests {
             asan_default_options(),
             "handle_abort=1,handle_sigill=1"
         );
+    }
+
+    #[test]
+    fn mparm_default_has_exact_command_capacities() {
+        let params = Mparm::default();
+        assert_eq!(params.argc(), 0);
+        assert_eq!(params.commands.len(), MAX_ARG_CMDS);
+        assert_eq!(params.pre_commands.len(), MAX_ARG_CMDS);
+        assert_eq!(params.cmds_tofree, [false; MAX_ARG_CMDS]);
     }
 }
