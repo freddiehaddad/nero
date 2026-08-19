@@ -28,6 +28,8 @@
 //! undertaking); every OTHER real code path in [`get_yank_register`]
 //! still behaves correctly given this, matching the original's own
 //! "clipboard unavailable" fallback exactly.
+//! [`get_default_register_name`] therefore returns NUL through that
+//! same real fallback until provider dispatch exists.
 //!
 //! Because nothing yet WRITES to `Y_REGS`/`last_cmdline`/the
 //! `"="`-register expression/the last-inserted-text state, every
@@ -642,6 +644,16 @@ pub fn valid_yank_reg(regname: i32, writing: bool) -> bool {
 #[must_use]
 fn get_clipboard(_regname: i32) -> bool {
     false
+}
+
+/// Clipboard-backed default register, or NUL when no provider is
+/// available (`get_default_register_name`).
+#[must_use]
+pub fn get_default_register_name() -> i32 {
+    if get_clipboard(0) {
+        unreachable!("clipboard provider selection is not translated")
+    }
+    i32::from(crate::ascii_defs::NUL)
 }
 
 /// The 39 yank/delete/numbered/named registers (`y_regs[]`).
@@ -2419,6 +2431,14 @@ mod tests {
     fn get_clipboard_always_fails() {
         assert!(!get_clipboard(i32::from(b'*')));
         assert!(!get_clipboard(i32::from(b'+')));
+    }
+
+    #[test]
+    fn get_default_register_name_is_nul_without_a_clipboard_provider() {
+        assert_eq!(
+            get_default_register_name(),
+            i32::from(crate::ascii_defs::NUL)
+        );
     }
 
     // --- get_yank_register ---
