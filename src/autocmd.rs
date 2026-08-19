@@ -769,6 +769,15 @@ pub fn event_name2nr(start: &[u8]) -> (Option<EventT>, usize) {
     (event, consumed)
 }
 
+/// Resolve an entire event-name string (`event_name2nr_str`).
+#[must_use]
+pub fn event_name2nr_str(name: &[u8]) -> Option<EventT> {
+    crate::autocmd_defs::EVENT_NAMES
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(name))
+        .map(|entry| entry.event)
+}
+
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
 ///
 /// `win` selects the window-local option, which accepts only entries
@@ -1682,6 +1691,13 @@ mod tests {
         let (event, consumed) = event_name2nr(b"NotAnEvent,next");
         assert_eq!(event, None);
         assert_eq!(consumed, b"NotAnEvent,".len());
+    }
+
+    #[test]
+    fn event_name2nr_str_requires_and_resolves_the_whole_name() {
+        assert_eq!(event_name2nr_str(b"bufenter"), Some(EventT::BufEnter));
+        assert_eq!(event_name2nr_str(b"BufEnter tail"), None);
+        assert_eq!(event_name2nr_str(b"missing"), None);
     }
 
     #[test]
