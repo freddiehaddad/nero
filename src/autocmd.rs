@@ -635,6 +635,20 @@ static NEXT_AUGROUP_ID: GlobalCell<i32> = GlobalCell::new(1);
 static CURRENT_AUGROUP: GlobalCell<i32> = GlobalCell::new(augroup::DEFAULT);
 static AUTOCMD_BUFNR: GlobalCell<i32> = GlobalCell::new(0);
 
+/// Remove augroup registry entries by name and/or ID
+/// (`augroup_map_del`).
+///
+/// # Safety
+/// Mutates both shared augroup maps.
+pub unsafe fn augroup_map_del(id: i32, name: Option<&[u8]>) {
+    if let Some(name) = name {
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.remove(name);
+    }
+    if id > 0 {
+        unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.remove(&id);
+    }
+}
+
 /// Add an augroup name or return its existing ID (`augroup_add`).
 ///
 /// # Safety
@@ -646,7 +660,7 @@ pub unsafe fn augroup_add(name: &[u8]) -> i32 {
         return existing;
     }
     if existing == augroup::DELETED {
-        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.remove(name);
+        unsafe { augroup_map_del(existing, Some(name)) };
     }
     let next = unsafe { NEXT_AUGROUP_ID.get_mut() };
     let id = *next;
@@ -704,8 +718,7 @@ pub unsafe fn augroup_del(name: &[u8]) -> Result<(), &'static str> {
         return Err("Cannot delete the current group");
     }
     unsafe { augroup_clear(group) };
-    unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.remove(name);
-    unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.remove(&group);
+    unsafe { augroup_map_del(group, Some(name)) };
     Ok(())
 }
 
@@ -1602,6 +1615,19 @@ mod tests {
         assert_eq!(augroup_find(b"Disposable"), augroup::ERROR);
         assert_eq!(unsafe { augroup_name(id) }, None);
         assert_eq!(unsafe { augroup_del(b"Missing") }, Err("No such group"));
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn augroup_map_del_can_remove_each_direction_independently() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        let id = unsafe { augroup_add(b"Partial") };
+        unsafe { augroup_map_del(0, Some(b"Partial")) };
+        assert_eq!(augroup_find(b"Partial"), augroup::ERROR);
+        assert_eq!(unsafe { augroup_name(id) }, Some(b"Partial".to_vec()));
+        unsafe { augroup_map_del(id, None) };
+        assert_eq!(unsafe { augroup_name(id) }, None);
         reset_augroup_map();
     }
 
