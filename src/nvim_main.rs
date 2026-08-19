@@ -58,17 +58,17 @@ pub fn init_params(argv: Vec<Vec<u8>>) -> Mparm {
         lua_arg0: -1,
         ..Default::default()
     }
+}
 
-    /// Select the default split direction for diff mode
-    /// (`set_window_layout`).
-    pub fn set_window_layout(params: &mut Mparm) {
-        if params.diff_mode != 0 && params.window_layout == 0 {
-            params.window_layout = if crate::diff::diffopt_horizontal() {
-                WIN_HOR
-            } else {
-                WIN_VER
-            };
-        }
+/// Select the default split direction for diff mode
+/// (`set_window_layout`).
+pub fn set_window_layout(params: &mut Mparm) {
+    if params.diff_mode != 0 && params.window_layout == 0 {
+        params.window_layout = if crate::diff::diffopt_horizontal() {
+            WIN_HOR
+        } else {
+            WIN_VER
+        };
     }
 }
 
