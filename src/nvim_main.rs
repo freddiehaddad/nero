@@ -6,6 +6,9 @@
 
 /// Maximum number of `+`/`-c`/`--cmd` commands (`MAX_ARG_CMDS`).
 pub const MAX_ARG_CMDS: usize = 10;
+pub const WIN_HOR: i32 = 1;
+pub const WIN_VER: i32 = 2;
+pub const WIN_TABS: i32 = 3;
 
 /// Parameters shared by `main()` startup helpers (`mparm_T`).
 #[derive(Debug, Clone, Default)]
@@ -54,6 +57,18 @@ pub fn init_params(argv: Vec<Vec<u8>>) -> Mparm {
         window_count: -1,
         lua_arg0: -1,
         ..Default::default()
+    }
+
+    /// Select the default split direction for diff mode
+    /// (`set_window_layout`).
+    pub fn set_window_layout(params: &mut Mparm) {
+        if params.diff_mode != 0 && params.window_layout == 0 {
+            params.window_layout = if crate::diff::diffopt_horizontal() {
+                WIN_HOR
+            } else {
+                WIN_VER
+            };
+        }
     }
 }
 
@@ -141,5 +156,22 @@ mod tests {
         assert_eq!(params.window_count, -1);
         assert_eq!(params.lua_arg0, -1);
         assert_eq!(params.remote, 0);
+    }
+
+    #[test]
+    fn set_window_layout_selects_diff_split_only_when_unspecified() {
+        let mut params = Mparm {
+            diff_mode: 1,
+            ..Default::default()
+        };
+        set_window_layout(&mut params);
+        assert!(matches!(params.window_layout, WIN_HOR | WIN_VER));
+        let mut explicit = Mparm {
+            diff_mode: 1,
+            window_layout: WIN_TABS,
+            ..Default::default()
+        };
+        set_window_layout(&mut explicit);
+        assert_eq!(explicit.window_layout, WIN_TABS);
     }
 }
