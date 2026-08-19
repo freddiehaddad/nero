@@ -289,6 +289,33 @@ pub fn nvim_get_proc_children(pid: Integer, err: &mut Error) -> Array {
         .collect()
 }
 
+/// Get process metadata (`nvim_get_proc`).
+#[must_use]
+pub fn nvim_get_proc(pid: Integer, err: &mut Error) -> Object {
+    if pid <= 0 || pid > i64::from(i32::MAX) {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Invalid 'pid': {pid}"));
+        return Object::Nil;
+    }
+    let Some(info) = crate::os::proc::os_proc_info(pid as i32) else {
+        return Object::Nil;
+    };
+    Object::Dict(vec![
+        crate::api::private::defs::KeyValuePair {
+            key: b"pid".to_vec(),
+            value: Object::Integer(i64::from(info.pid)),
+        },
+        crate::api::private::defs::KeyValuePair {
+            key: b"ppid".to_vec(),
+            value: Object::Integer(i64::from(info.ppid)),
+        },
+        crate::api::private::defs::KeyValuePair {
+            key: b"name".to_vec(),
+            value: Object::String(info.name),
+        },
+    ])
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1233,6 +1260,29 @@ mod tests {
         assert!(children
             .iter()
             .all(|child| matches!(child, Object::Integer(pid) if *pid > 0)));
+    }
+
+    #[test]
+    fn nvim_get_proc_validates_pid() {
+        let mut err = Error::default();
+        assert!(matches!(nvim_get_proc(0, &mut err), Object::Nil));
+        assert_eq!(err.msg.as_deref(), Some("Invalid 'pid': 0"));
+    }
+
+    #[test]
+    fn nvim_get_proc_describes_the_current_process() {
+        let pid = i64::from(std::process::id());
+        let mut err = Error::default();
+        let Object::Dict(info) = nvim_get_proc(pid, &mut err) else {
+            panic!("process info dict")
+        };
+        assert!(!err.is_set());
+        assert!(info
+            .iter()
+            .any(|item| item.key == b"pid" && matches!(item.value, Object::Integer(value) if value == pid)));
+        assert!(info
+            .iter()
+            .any(|item| item.key == b"name" && matches!(&item.value, Object::String(name) if !name.is_empty())));
     }
 
     #[test]
