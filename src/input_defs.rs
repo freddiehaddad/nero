@@ -82,8 +82,8 @@ pub struct TasaveT {
     pub save_inputbuf: NvimString,
 }
 
-/// Values for the "noremap" argument of `ins_typebuf()` (not yet
-/// translated). Also used for `map->m_noremap` and `menu->noremap[]`
+/// Values for the "noremap" argument of `ins_typebuf()`. Also used
+/// for `map->m_noremap` and `menu->noremap[]`
 /// (`enum RemapValues`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RemapValues {

@@ -94,9 +94,13 @@
 //! can set that register.c-owned flag, so the original's own
 //! add-to-readbuf-only path is always taken today.
 //!
+//! [`ins_typebuf`] is real too: Rust's owned vectors replace the
+//! original's manual capacity/reallocation branches while preserving
+//! the logical offset, valid-byte, remap, mapped/silent and
+//! abbreviation counters exactly.
+//!
 //! Deferred: everything else - `vgetc`/`vgetorpeek` and the whole
-//! typeahead-buffer/mapping-application machinery, and `ins_typebuf`
-//! itself (the real typeahead-buffer WRITE path).
+//! typeahead-buffer/mapping-application machinery.
 //!
 //! `redobuff`/`old_redobuff` and their `ResetRedobuff`/
 //! `restoreRedobuff`/`AppendToRedobuff`/`AppendCharToRedobuff`/
@@ -743,6 +747,10 @@ static TYPEBUF: GlobalCell<TypebufT> = GlobalCell::new(TypebufT {
 pub const RM_NONE: i32 = 1;
 /// `tb_noremap`: remap local script mappings (`RM_SCRIPT`).
 pub const RM_SCRIPT: i32 = 2;
+/// `tb_noremap`: allow abbreviations but no mapping (`RM_ABBR`).
+pub const RM_ABBR: i32 = 4;
+/// `tb_noremap`: allow normal remapping (`RM_YES`).
+pub const RM_YES: i32 = 0;
 
 /// Character put back by `vungetc()` (`old_char`), file-static in the
 /// original. Starts at `-1` ("none put back"), matching the original's
@@ -954,6 +962,124 @@ pub fn typebuf_changed(tb_change_cnt: i32) -> bool {
     tb_change_cnt != 0
         && (unsafe { TYPEBUF.get_mut() }.tb_change_cnt != tb_change_cnt
             || unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled)
+}
+
+/// Insert bytes at `offset` in the typeahead buffer (`ins_typebuf`).
+///
+/// `noremap` accepts a [`crate::input_defs::RemapValues`] discriminant
+/// or a positive count of leading bytes that cannot be remapped.
+/// Input ends at the first NUL, matching the original's C-string
+/// contract.
+///
+/// # Panics
+/// Debug-asserts that `offset` is within the current valid byte range,
+/// matching the original's caller precondition.
+pub fn ins_typebuf(
+    text: &[u8],
+    noremap: i32,
+    offset: i32,
+    nottyped: bool,
+    silent: bool,
+) -> i32 {
+    init_typebuf();
+    let tb = unsafe { TYPEBUF.get_mut() };
+    tb.tb_change_cnt = tb.tb_change_cnt.wrapping_add(1);
+    if tb.tb_change_cnt == 0 {
+        tb.tb_change_cnt = 1;
+    }
+    crate::state::state_no_longer_safe();
+
+    let addlen = text
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(text.len());
+    let text = &text[..addlen];
+    let old_len = usize::try_from(tb.tb_len).expect("typebuf length is nonnegative");
+    let old_off = usize::try_from(tb.tb_off).expect("typebuf offset is nonnegative");
+    let offset = usize::try_from(offset).expect("typebuf insertion offset is nonnegative");
+    debug_assert!(offset <= old_len);
+    if offset > old_len {
+        return crate::vim_defs::FAIL;
+    }
+    if addlen > i32::MAX as usize
+        || old_len > i32::MAX as usize - addlen
+    {
+        return crate::vim_defs::FAIL;
+    }
+
+    let old_bytes = if old_len == 0 {
+        Vec::new()
+    } else {
+        debug_assert!(old_off + old_len <= tb.tb_buf.len());
+        tb.tb_buf[old_off..old_off + old_len].to_vec()
+    };
+    let old_noremap = if old_len == 0 {
+        Vec::new()
+    } else {
+        debug_assert!(old_off + old_len <= tb.tb_noremap.len());
+        tb.tb_noremap[old_off..old_off + old_len].to_vec()
+    };
+
+    let new_off = if offset == 0 && addlen <= old_off {
+        old_off - addlen
+    } else {
+        MAXMAPLEN as usize + 4
+    };
+    let new_len = old_len + addlen;
+    let mut bytes = Vec::with_capacity(new_off + new_len + 1);
+    bytes.resize(new_off, 0);
+    bytes.extend_from_slice(&old_bytes[..offset]);
+    bytes.extend_from_slice(text);
+    bytes.extend_from_slice(&old_bytes[offset..]);
+    bytes.push(0);
+
+    let mut remap = Vec::with_capacity(new_off + new_len);
+    remap.resize(new_off, 0);
+    remap.extend_from_slice(&old_noremap[..offset]);
+    remap.resize(remap.len() + addlen, RM_YES as u8);
+    remap.extend_from_slice(&old_noremap[offset..]);
+
+    let value = if noremap == crate::input_defs::RemapValues::Script as i32 {
+        RM_SCRIPT
+    } else if noremap == crate::input_defs::RemapValues::Skip as i32 {
+        RM_ABBR
+    } else {
+        RM_NONE
+    };
+    let mut remaining = if noremap == crate::input_defs::RemapValues::Skip as i32 {
+        1
+    } else if noremap < 0 {
+        i32::try_from(addlen).expect("typebuf insertion length fits i32")
+    } else {
+        noremap
+    };
+    for flag in &mut remap[new_off + offset..new_off + offset + addlen] {
+        remaining -= 1;
+        *flag = if remaining >= 0 {
+            value as u8
+        } else {
+            RM_YES as u8
+        };
+    }
+
+    let offset_i32 = i32::try_from(offset).expect("typebuf insertion offset fits i32");
+    let addlen_i32 = i32::try_from(addlen).expect("typebuf insertion length fits i32");
+    if nottyped || tb.tb_maplen > offset_i32 {
+        tb.tb_maplen += addlen_i32;
+    }
+    if silent || tb.tb_silent > offset_i32 {
+        tb.tb_silent += addlen_i32;
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent = true;
+    }
+    if tb.tb_no_abbr_cnt != 0 && offset == 0 {
+        tb.tb_no_abbr_cnt += addlen_i32;
+    }
+
+    tb.tb_buf = bytes;
+    tb.tb_noremap = remap;
+    tb.tb_off = i32::try_from(new_off).expect("typebuf offset fits i32");
+    tb.tb_len = i32::try_from(new_len).expect("typebuf length fits i32");
+    crate::vim_defs::OK
 }
 
 /// Add byte string `s` to `buf` (`add_buff`). Doesn't add empty
@@ -2735,6 +2861,146 @@ mod tests {
             "é".as_bytes()
         );
         reset_buffers();
+    }
+
+    fn current_typebuf() -> (Vec<u8>, Vec<u8>) {
+        let tb = unsafe { TYPEBUF.get_mut() };
+        let start = tb.tb_off as usize;
+        let end = start + tb.tb_len as usize;
+        (
+            tb.tb_buf[start..end].to_vec(),
+            tb.tb_noremap[start..end].to_vec(),
+        )
+    }
+
+    #[test]
+    fn ins_typebuf_inserts_at_the_front_and_updates_change_count() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+
+        assert_eq!(
+            ins_typebuf(
+                b"abc",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(current_typebuf(), (b"abc".to_vec(), vec![0, 0, 0]));
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert_eq!(tb.tb_off, MAXMAPLEN + 4 - 3);
+        assert_eq!(tb.tb_change_cnt, 2);
+    }
+
+    #[test]
+    fn ins_typebuf_inserts_in_the_middle_and_tracks_mapped_silent_bytes() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _cmd_silent = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmd_silent,
+                false,
+            )
+        };
+        assert_eq!(
+            ins_typebuf(
+                b"abc",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            ins_typebuf(
+                b"X",
+                crate::input_defs::RemapValues::None as i32,
+                1,
+                true,
+                true,
+            ),
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            current_typebuf(),
+            (b"aXbc".to_vec(), vec![RM_YES as u8, RM_NONE as u8, RM_YES as u8, RM_YES as u8])
+        );
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert_eq!(tb.tb_maplen, 1);
+        assert_eq!(tb.tb_silent, 1);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent);
+    }
+
+    #[test]
+    fn ins_typebuf_assigns_skip_script_and_counted_remap_flags() {
+        let _lock = global_state_test_lock();
+        for (noremap, expected) in [
+            (
+                crate::input_defs::RemapValues::Skip as i32,
+                vec![RM_ABBR as u8, RM_YES as u8, RM_YES as u8],
+            ),
+            (
+                crate::input_defs::RemapValues::Script as i32,
+                vec![RM_SCRIPT as u8; 3],
+            ),
+            (2, vec![RM_NONE as u8, RM_NONE as u8, RM_YES as u8]),
+        ] {
+            let _typebuf = TypebufStateGuard::install(0);
+            assert_eq!(
+                ins_typebuf(b"abc", noremap, 0, false, false),
+                crate::vim_defs::OK
+            );
+            assert_eq!(current_typebuf().1, expected);
+        }
+    }
+
+    #[test]
+    fn ins_typebuf_extends_the_no_abbreviation_prefix() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        init_typebuf();
+        unsafe { TYPEBUF.get_mut() }.tb_no_abbr_cnt = 2;
+
+        assert_eq!(
+            ins_typebuf(
+                b"xy",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_no_abbr_cnt, 4);
+    }
+
+    #[test]
+    fn ins_typebuf_wraps_change_count_away_from_zero_and_stops_at_nul() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        init_typebuf();
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = -1;
+
+        assert_eq!(
+            ins_typebuf(
+                b"a\0ignored",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(current_typebuf().0, b"a");
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_change_cnt, 1);
     }
 
     #[test]
