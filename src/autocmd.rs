@@ -610,6 +610,25 @@ pub unsafe fn augroup_clear(group: i32) {
     }
 }
 
+/// Delete an augroup and its commands (`augroup_del`, non-legacy
+/// mode).
+///
+/// # Safety
+/// Mutates shared augroup/autocmd registries.
+pub unsafe fn augroup_del(name: &[u8]) -> Result<(), &'static str> {
+    let group = augroup_find(name);
+    if group == augroup::ERROR {
+        return Err("No such group");
+    }
+    if group == unsafe { *CURRENT_AUGROUP.get_mut() } {
+        return Err("Cannot delete the current group");
+    }
+    unsafe { augroup_clear(group) };
+    unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.remove(name);
+    unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.remove(&group);
+    Ok(())
+}
+
 /// Find the ID of an autocmd group name, or
 /// [`crate::autocmd_defs::augroup::ERROR`] if not found
 /// (`augroup_find`).
@@ -1383,6 +1402,18 @@ mod tests {
             Some(b"--- DELETED ---".to_vec())
         );
         unsafe { augroup_clear(first) };
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn augroup_del_removes_both_registry_directions() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        let id = unsafe { augroup_add(b"Disposable") };
+        assert_eq!(unsafe { augroup_del(b"Disposable") }, Ok(()));
+        assert_eq!(augroup_find(b"Disposable"), augroup::ERROR);
+        assert_eq!(unsafe { augroup_name(id) }, None);
+        assert_eq!(unsafe { augroup_del(b"Missing") }, Err("No such group"));
         reset_augroup_map();
     }
 
