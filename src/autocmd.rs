@@ -859,6 +859,42 @@ pub fn autocmd_supported(event: &[u8]) -> bool {
     event_name2nr(event).0.is_some()
 }
 
+/// Whether an event is included in `'eventignore'` or
+/// `'eventignorewin'` (`event_ignored`).
+#[must_use]
+pub fn event_ignored(event: EventT, eventignore: &[u8], global: bool) -> bool {
+    let mut ignored = false;
+    let mut offset = 0;
+    while offset < eventignore.len() && eventignore[offset] != 0 {
+        let unignore = eventignore[offset] == b'-';
+        offset += usize::from(unignore);
+        let rest = &eventignore[offset..];
+        if rest.len() >= 3
+            && rest[..3].eq_ignore_ascii_case(b"all")
+            && matches!(rest.get(3), None | Some(0 | b','))
+        {
+            let window_local = crate::autocmd_defs::EVENT_NAMES
+                .get(event as usize)
+                .is_some_and(|entry| entry.win_local);
+            ignored = global || window_local;
+            offset += 3 + usize::from(rest.get(3) == Some(&b','));
+        } else {
+            let (parsed, consumed) = event_name2nr(rest);
+            offset += consumed;
+            if parsed == Some(event) {
+                if unignore {
+                    return false;
+                }
+                ignored = true;
+            }
+            if consumed == 0 {
+                break;
+            }
+        }
+    }
+    ignored
+}
+
 /// Whether a pattern uses `<buffer...>` syntax
 /// (`aupat_is_buflocal`).
 #[must_use]
@@ -1921,6 +1957,18 @@ mod tests {
         assert!(autocmd_supported(b"BufEnter"));
         assert!(autocmd_supported(b"BufCreate"));
         assert!(!autocmd_supported(b"NeroMissingEvent"));
+    }
+
+    #[test]
+    fn event_ignored_handles_all_explicit_and_negative_entries() {
+        assert!(event_ignored(EventT::BufEnter, b"all", true));
+        assert!(event_ignored(EventT::BufEnter, b"BufEnter", true));
+        assert!(!event_ignored(
+            EventT::BufEnter,
+            b"all,-BufEnter",
+            true
+        ));
+        assert!(!event_ignored(EventT::BufEnter, b"BufLeave", true));
     }
 
     #[test]
