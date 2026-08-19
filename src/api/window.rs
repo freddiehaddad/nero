@@ -13,8 +13,9 @@
 //! Deferred (each needs a real, not-yet-translated subsystem beyond
 //! `find_window_by_handle` itself): `nvim_win_set_buf` (needs
 //! `apply_autocmds`'s real buffer-switch semantics plus
-//! `win_set_buf`), `nvim_win_get_cursor`/`nvim_win_set_cursor` (need
-//! `Array`/`ArrayOf` conversion), `nvim_win_set_height`/
+//! `win_set_buf`). [`nvim_win_set_cursor`] is real for the current
+//! window; a non-current window still needs `ctx_switch` to update its
+//! visible scroll state. `nvim_win_set_height`/
 //! `nvim_win_set_width` (need `win_setheight`/`win_setwidth`, the
 //! real frame-resizing algorithms), `nvim_win_get_var`/
 //! `nvim_win_set_var`/`nvim_win_del_var` (need `dict_get_value`/
@@ -60,6 +61,59 @@ pub unsafe fn nvim_win_get_cursor(win: Window, err: &mut Error) -> Array {
         Object::Integer(i64::from(unsafe { (*window).w_cursor.lnum })),
         Object::Integer(i64::from(unsafe { (*window).w_cursor.col })),
     ]
+}
+
+/// Set the `(1, 0)`-indexed buffer-relative cursor position
+/// (`nvim_win_set_cursor`).
+///
+/// # Safety
+/// Forwarded from [`find_window_by_handle`] and
+/// [`crate::cursor::check_cursor_col`].
+pub unsafe fn nvim_win_set_cursor(
+    win: Window,
+    position: &Array,
+    err: &mut Error,
+) {
+    let window = unsafe { find_window_by_handle(win, err) };
+    if window.is_null() {
+        return;
+    }
+    let [Object::Integer(row), Object::Integer(col)] = position.as_slice()
+    else {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(
+            "Invalid 'pos': Expected [row, col] array".to_string(),
+        );
+        return;
+    };
+    let line_count = unsafe { (*(*window).w_buffer).b_ml.ml_line_count };
+    if *row <= 0 || *row > i64::from(line_count) {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Invalid 'cursor line': out of range".to_string());
+        return;
+    }
+    if *col < 0 || *col > i64::from(crate::pos_defs::MAXCOL) {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Invalid 'cursor column': out of range".to_string());
+        return;
+    }
+    if !std::ptr::eq(
+        window,
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+    ) {
+        unimplemented!(
+            "nvim_win_set_cursor: non-current window scrolling needs ctx_switch"
+        );
+    }
+
+    unsafe {
+        (*window).w_cursor.lnum = *row as crate::pos_defs::LinenrT;
+        (*window).w_cursor.col = *col as crate::pos_defs::ColnrT;
+        (*window).w_cursor.coladd = 0;
+        crate::cursor::check_cursor_col(window);
+        (*window).w_set_curswant = true;
+        (*window).w_redr_status = true;
+    }
 }
 
 /// Get the height (row count) of window `win` (`0` for the current
@@ -570,6 +624,76 @@ mod tests {
         let mut err = Error::default();
         assert!(unsafe { nvim_win_get_cursor(99, &mut err) }.is_empty());
         assert_eq!(err.msg.as_deref(), Some("Invalid window id: 99"));
+    }
+
+    #[test]
+    fn nvim_win_set_cursor_updates_and_clamps_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(15);
+        unsafe { (*fx.buf).b_ml.ml_line_count = 1 };
+        let mut err = Error::default();
+
+        unsafe {
+            nvim_win_set_cursor(
+                15,
+                &vec![Object::Integer(1), Object::Integer(12)],
+                &mut err,
+            )
+        };
+
+        assert!(!err.is_set());
+        assert_eq!(unsafe { (*fx.win).w_cursor.lnum }, 1);
+        assert_eq!(unsafe { (*fx.win).w_cursor.col }, 0);
+        assert_eq!(unsafe { (*fx.win).w_cursor.coladd }, 0);
+        assert!(unsafe { (*fx.win).w_set_curswant });
+        assert!(unsafe { (*fx.win).w_redr_status });
+    }
+
+    #[test]
+    fn nvim_win_set_cursor_validates_position_shape() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = RawWinFixture::new(16);
+        let mut err = Error::default();
+        unsafe {
+            nvim_win_set_cursor(16, &vec![Object::Integer(1)], &mut err)
+        };
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("Invalid 'pos': Expected [row, col] array")
+        );
+    }
+
+    #[test]
+    fn nvim_win_set_cursor_validates_line_and_column_ranges() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(17);
+        unsafe { (*fx.buf).b_ml.ml_line_count = 2 };
+
+        let mut line_err = Error::default();
+        unsafe {
+            nvim_win_set_cursor(
+                17,
+                &vec![Object::Integer(3), Object::Integer(0)],
+                &mut line_err,
+            )
+        };
+        assert_eq!(
+            line_err.msg.as_deref(),
+            Some("Invalid 'cursor line': out of range")
+        );
+
+        let mut col_err = Error::default();
+        unsafe {
+            nvim_win_set_cursor(
+                17,
+                &vec![Object::Integer(1), Object::Integer(-1)],
+                &mut col_err,
+            )
+        };
+        assert_eq!(
+            col_err.msg.as_deref(),
+            Some("Invalid 'cursor column': out of range")
+        );
     }
 
     #[test]
