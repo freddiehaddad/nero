@@ -491,6 +491,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getreg"[..], EvalFuncDefT { min_argc: 0, max_argc: 3, base_arg: 1, func: f_getreg });
         m.insert(&b"getregtype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getregtype });
         m.insert(&b"getreginfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getreginfo });
+        m.insert(&b"setreg"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: BASE_NONE, func: f_setreg });
         m.insert(&b"changenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_changenr });
         m.insert(&b"interrupt"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_interrupt });
         m.insert(&b"invert"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_invert });
@@ -3779,10 +3780,7 @@ unsafe fn f_win_getid(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// consumed count here is likewise the index of that byte, not one
 /// past it - the caller advances by one afterwards either way.
 ///
-/// Marked `#[allow(dead_code)]`: its only caller is `f_setreg`, which
-/// is not translated yet. Matches `alist_name`'s own precedent in this
-/// file for a helper landed ahead of its consumer.
-#[allow(dead_code)]
+/// Used by the real [`f_setreg`] implementation below.
 #[must_use]
 fn get_yank_type(pp: &[u8]) -> Option<(crate::normal_defs::MotionType, Option<i32>, usize)> {
     use crate::normal_defs::MotionType;
@@ -6308,6 +6306,187 @@ unsafe fn f_getreginfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
             crate::eval::typval_defs::BoolVarValue::False
         };
         crate::eval::typval::tv_dict_add_bool(dict, b"isunnamed", is_unnamed);
+    }
+}
+
+/// `setreg({regname}, {value} [, {options}])` - replace or append to
+/// a register (`f_setreg`, `funcs.c`).
+///
+/// # Safety
+/// Mutates shared register storage through
+/// [`crate::register::write_reg_contents_ex`]/
+/// [`crate::register::write_reg_contents_lst`].
+unsafe fn f_setreg(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(1);
+
+    let Some(regname_string) =
+        crate::eval::typval::tv_get_string_chk(&argvars[0])
+    else {
+        return;
+    };
+    let mut regname = i32::from(
+        regname_string.first().copied().unwrap_or_default(),
+    );
+    if regname == 0 || regname == i32::from(b'@') {
+        regname = i32::from(b'"');
+    }
+
+    let mut regcontents = Some(&argvars[1] as *const TypvalT);
+    let mut pointreg = 0i32;
+    let mut yank_type = None;
+    let mut block_len = None;
+
+    if let TypvalValue::Dict(dict) = &argvars[1].value {
+        let dict = *dict;
+        if crate::eval::typval::tv_dict_len(unsafe { dict.as_ref() })
+            == 0
+        {
+            unsafe {
+                crate::register::write_reg_contents_lst(
+                    regname,
+                    &[],
+                    false,
+                    None,
+                    None,
+                )
+            };
+            return;
+        }
+
+        regcontents = crate::eval::typval::tv_dict_find(
+            unsafe { dict.as_mut() },
+            b"regcontents",
+        )
+        .map(|item| unsafe { std::ptr::addr_of!((*item).di_tv) });
+
+        if let Some(regtype) = unsafe {
+            crate::eval::typval::tv_dict_get_string(
+                dict.as_mut(),
+                b"regtype",
+            )
+        } {
+            let Some((motion, width, used)) = get_yank_type(&regtype)
+            else {
+                return;
+            };
+            if used + 1 != regtype.len() {
+                return;
+            }
+            yank_type = Some(motion);
+            block_len = width;
+        }
+
+        if regname == i32::from(b'"') {
+            if let Some(points_to) = unsafe {
+                crate::eval::typval::tv_dict_get_string(
+                    dict.as_mut(),
+                    b"points_to",
+                )
+            } {
+                pointreg =
+                    i32::from(points_to.first().copied().unwrap_or_default());
+                regname = pointreg;
+            }
+        } else if unsafe {
+            crate::eval::typval::tv_dict_get_number(
+                dict.as_mut(),
+                b"isunnamed",
+            )
+        } != 0
+        {
+            pointreg = regname;
+        }
+    }
+
+    let mut append = false;
+    let mut set_unnamed = false;
+    if let Some(options_tv) = argvars.get(2) {
+        if yank_type.is_some() {
+            return;
+        }
+        let Some(options) =
+            crate::eval::typval::tv_get_string_chk(options_tv)
+        else {
+            return;
+        };
+        let mut offset = 0usize;
+        while offset < options.len() {
+            match options[offset] {
+                b'a' | b'A' => append = true,
+                b'u' | b'"' => set_unnamed = true,
+                _ => {
+                    if let Some((motion, width, used)) =
+                        get_yank_type(&options[offset..])
+                    {
+                        yank_type = Some(motion);
+                        block_len = width;
+                        offset += used;
+                    }
+                }
+            }
+            offset += 1;
+        }
+    }
+
+    if let Some(regcontents) = regcontents {
+        let regcontents = unsafe { &*regcontents };
+        if let TypvalValue::List(list) = &regcontents.value {
+            let list = *list;
+            let mut lines = Vec::new();
+            let mut item =
+                unsafe { crate::eval::typval::tv_list_first(list) };
+            let mut valid = true;
+            while !item.is_null() {
+                let Some(line) = crate::eval::typval::tv_get_string_chk(
+                    unsafe { &(*item).li_tv },
+                ) else {
+                    valid = false;
+                    break;
+                };
+                lines.push(line);
+                item = unsafe { (*item).li_next };
+            }
+            if valid {
+                unsafe {
+                    crate::register::write_reg_contents_lst(
+                        regname,
+                        &lines,
+                        append,
+                        yank_type,
+                        block_len,
+                    )
+                };
+            }
+        } else {
+            let Some(text) =
+                crate::eval::typval::tv_get_string_chk(regcontents)
+            else {
+                return;
+            };
+            unsafe {
+                crate::register::write_reg_contents_ex(
+                    regname,
+                    &text,
+                    append,
+                    yank_type,
+                    block_len,
+                )
+            };
+        }
+    }
+
+    if pointreg != 0 {
+        unsafe {
+            let _ = crate::register::get_yank_register(
+                pointreg,
+                crate::register_defs::YregModeT::Yank,
+            );
+        };
+    }
+    rettv.value = TypvalValue::Number(0);
+
+    if set_unnamed {
+        unsafe { crate::register::op_reg_set_previous(regname) };
     }
 }
 
@@ -9136,6 +9315,7 @@ mod tests {
             "getreg",
             "getregtype",
             "getreginfo",
+            "setreg",
             "changenr",
             "interrupt",
             "invert",
@@ -15729,7 +15909,45 @@ mod tests {
         unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion = saved;
     }
 
-    // --- f_getreg / getreg_get_regname ---
+    struct NamedRegisterGuard {
+        name: i32,
+        saved: Option<crate::register_defs::YankregT>,
+        previous: Option<usize>,
+    }
+
+    impl NamedRegisterGuard {
+        fn save(name: u8) -> Self {
+            let name = i32::from(name);
+            let register = unsafe {
+                crate::register::op_reg_get(name)
+                    .expect("named register slot")
+            };
+            Self {
+                name,
+                saved: Some(unsafe { &*register }.clone()),
+                previous: unsafe {
+                    crate::register::replace_previous_register_for_test(None)
+                },
+            }
+        }
+    }
+
+    impl Drop for NamedRegisterGuard {
+        fn drop(&mut self) {
+            unsafe {
+                assert!(crate::register::op_reg_set(
+                    self.name,
+                    self.saved.take().expect("saved register"),
+                    false,
+                ));
+                crate::register::replace_previous_register_for_test(
+                    self.previous,
+                );
+            }
+        }
+    }
+
+    // --- f_getreg / f_setreg / getreg_get_regname ---
 
     #[test]
     fn getreg_black_hole_register_is_an_empty_string() {
@@ -15975,6 +16193,257 @@ mod tests {
             }
             other => panic!("expected 2 Dicts, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn setreg_writes_a_characterwise_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _register = NamedRegisterGuard::save(b'a');
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_setreg(&[string(b"a"), string(b"hello")], &mut rettv)
+        };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(
+            unsafe {
+                crate::register::get_reg_contents(i32::from(b'a'), 0)
+            },
+            Some(crate::register_defs::RegContents::Str(
+                b"hello".to_vec()
+            ))
+        );
+        assert_eq!(
+            unsafe { crate::register::get_reg_type(i32::from(b'a'), None) },
+            Some(crate::normal_defs::MotionType::CharWise)
+        );
+    }
+
+    #[test]
+    fn setreg_options_select_block_type_and_append() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _register = NamedRegisterGuard::save(b'a');
+
+        unsafe {
+            f_setreg(
+                &[string(b"a"), string(b"one"), string(b"b5")],
+                &mut TypvalT::default(),
+            );
+            f_setreg(
+                &[string(b"a"), string(b"two"), string(b"ab5")],
+                &mut TypvalT::default(),
+            );
+        }
+
+        let register = unsafe {
+            &*crate::register::op_reg_get(i32::from(b'a')).unwrap()
+        };
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::BlockWise
+        );
+        assert_eq!(register.y_width, 4);
+    }
+
+    #[test]
+    fn setreg_list_value_writes_a_linewise_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _register = NamedRegisterGuard::save(b'a');
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                list,
+                Some(b"one"),
+            );
+            crate::eval::typval::tv_list_append_string(
+                list,
+                Some(b"two"),
+            );
+        }
+        let value = TypvalT {
+            value: TypvalValue::List(list),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_setreg(&[string(b"a"), value], &mut rettv) };
+
+        let register = unsafe {
+            &*crate::register::op_reg_get(i32::from(b'a')).unwrap()
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn setreg_accepts_the_dictionary_returned_by_getreginfo() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _source = NamedRegisterGuard::save(b'a');
+        let _target = NamedRegisterGuard::save(b'b');
+        unsafe {
+            crate::register::write_reg_contents_lst(
+                i32::from(b'a'),
+                &[b"one".to_vec(), b"two".to_vec()],
+                false,
+                Some(crate::normal_defs::MotionType::LineWise),
+                None,
+            );
+        }
+        let mut info = TypvalT::default();
+        unsafe { f_getreginfo(&[string(b"a")], &mut info) };
+        let info_dict = match info.value {
+            TypvalValue::Dict(dict) => dict,
+            ref other => panic!("expected register info Dict, got {other:?}"),
+        };
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_setreg(
+                &[
+                    string(b"b"),
+                    TypvalT {
+                        value: TypvalValue::Dict(info_dict),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            )
+        };
+
+        let target = unsafe {
+            &*crate::register::op_reg_get(i32::from(b'b')).unwrap()
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(
+            target.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            target.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+        unsafe { crate::eval::typval::tv_dict_unref(info_dict) };
+    }
+
+    #[test]
+    fn setreg_empty_dict_clears_register_but_keeps_failure_return() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _register = NamedRegisterGuard::save(b'a');
+        unsafe {
+            crate::register::write_reg_contents(
+                i32::from(b'a'),
+                b"before",
+                false,
+            );
+        }
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_setreg(
+                &[
+                    string(b"a"),
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            )
+        };
+
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert!(
+            unsafe {
+                &*crate::register::op_reg_get(i32::from(b'a')).unwrap()
+            }
+            .y_array
+            .is_none()
+        );
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setreg_rejects_invalid_dictionary_regtype_without_writing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _register = NamedRegisterGuard::save(b'a');
+        unsafe {
+            crate::register::write_reg_contents(
+                i32::from(b'a'),
+                b"before",
+                false,
+            );
+        }
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_str(
+                &mut *dict,
+                b"regcontents",
+                Some(b"after"),
+            );
+            crate::eval::typval::tv_dict_add_str(
+                &mut *dict,
+                b"regtype",
+                Some(b"x"),
+            );
+        }
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_setreg(
+                &[
+                    string(b"a"),
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            )
+        };
+
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert_eq!(
+            unsafe {
+                crate::register::get_reg_contents(i32::from(b'a'), 0)
+            },
+            Some(crate::register_defs::RegContents::Str(
+                b"before".to_vec()
+            ))
+        );
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setreg_unnamed_option_redirects_the_unnamed_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _register = NamedRegisterGuard::save(b'a');
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_setreg(
+                &[string(b"a"), string(b"value"), string(b"u")],
+                &mut rettv,
+            )
+        };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(
+            unsafe { crate::register::get_unname_register() },
+            i32::try_from(
+                crate::register::op_reg_index(i32::from(b'a')).unwrap()
+            )
+            .unwrap()
+        );
     }
 
     // --- f_eval ---

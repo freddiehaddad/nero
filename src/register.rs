@@ -1135,6 +1135,18 @@ static Y_REGS: std::sync::LazyLock<crate::globals::GlobalCell<[YankregT; NUM_REG
 /// `NULL`; direct register writes update it through `YREG_YANK` mode.
 static Y_PREVIOUS: crate::globals::GlobalCell<Option<usize>> = crate::globals::GlobalCell::new(None);
 
+/// Replace `Y_PREVIOUS` for cross-module tests, returning its old
+/// value.
+///
+/// # Safety
+/// The caller must hold `global_state_test_lock()`.
+#[cfg(test)]
+pub(crate) unsafe fn replace_previous_register_for_test(
+    value: Option<usize>,
+) -> Option<usize> {
+    std::mem::replace(unsafe { Y_PREVIOUS.get_mut() }, value)
+}
+
 /// A permanently-empty register, returned by [`get_yank_register`] for
 /// `'*'`/`'+'` in `YregModeT::Put` mode when the clipboard is
 /// unavailable (`static yankreg_T empty_reg` in the original - a
