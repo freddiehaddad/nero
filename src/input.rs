@@ -153,6 +153,11 @@ static RECORDBUFF: GlobalCell<BuffheaderT> =
     GlobalCell::new(BuffheaderT { blocks: Vec::new(), bh_index: 0 });
 /// Number of bytes appended by the last input key (`last_recorded_len`).
 static LAST_RECORDED_LEN: GlobalCell<usize> = GlobalCell::new(0);
+/// Bytes waiting to be reported to `vim.on_key()` (`on_key_buf`).
+static ON_KEY_BUF: GlobalCell<Vec<u8>> = GlobalCell::new(Vec::new());
+/// Leading bytes excluded from the next `vim.on_key()` report
+/// (`on_key_ignore_len`).
+static ON_KEY_IGNORE_LEN: GlobalCell<usize> = GlobalCell::new(0);
 
 /// Whether appending to the redo buffer is currently suppressed
 /// (`block_redo`). File-static in the original.
@@ -1167,6 +1172,41 @@ pub fn del_typebuf(len: i32, offset: i32) {
     if tb.tb_change_cnt == 0 {
         tb.tb_change_cnt = 1;
     }
+}
+
+/// Undo the reporting/recording effects of consuming `len` bytes
+/// (`ungetchars`).
+fn ungetchars(len: usize, recorded: bool) {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if !globals.KeyTyped {
+        return;
+    }
+    if recorded && globals.reg_recording != 0 {
+        delete_buff_tail(
+            unsafe { RECORDBUFF.get_mut() },
+            len,
+        );
+        unsafe { *LAST_RECORDED_LEN.get_mut() -= len };
+    }
+    let on_key = unsafe { ON_KEY_BUF.get_mut() };
+    let trim = len.min(on_key.len());
+    on_key.truncate(on_key.len() - trim);
+    unsafe { *ON_KEY_IGNORE_LEN.get_mut() += len - trim };
+}
+
+/// Put one consumed key back into typeahead for normal reprocessing
+/// (`requeue_key`).
+///
+/// # Safety
+/// Mutates the shared typeahead, recording and `vim.on_key()` state.
+pub unsafe fn requeue_key(c: i32, modifiers: i32, recorded: bool) {
+    let bytes = crate::keycodes::special_to_buf(c, modifiers, true);
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let noremap = unsafe { *KEY_NOREMAP.get_mut() };
+    let key_typed = globals.KeyTyped;
+    let cmd_silent = globals.cmd_silent;
+    let _ = ins_typebuf(&bytes, noremap, 0, !key_typed, cmd_silent);
+    ungetchars(bytes.len(), recorded);
 }
 
 /// Remove stuffed input and some or all typeahead (`flush_buffers`).
@@ -2309,6 +2349,42 @@ mod tests {
 
     struct TypebufStateGuard(crate::input_defs::TypebufT);
 
+    struct RequeueStateGuard {
+        key_noremap: i32,
+        recordbuf: BuffheaderT,
+        last_recorded_len: usize,
+        on_key_buf: Vec<u8>,
+        on_key_ignore_len: usize,
+    }
+
+    impl RequeueStateGuard {
+        fn save() -> Self {
+            Self {
+                key_noremap: unsafe { *KEY_NOREMAP.get_mut() },
+                recordbuf: std::mem::take(unsafe { RECORDBUFF.get_mut() }),
+                last_recorded_len: unsafe {
+                    std::mem::replace(LAST_RECORDED_LEN.get_mut(), 0)
+                },
+                on_key_buf: std::mem::take(unsafe { ON_KEY_BUF.get_mut() }),
+                on_key_ignore_len: unsafe {
+                    std::mem::replace(ON_KEY_IGNORE_LEN.get_mut(), 0)
+                },
+            }
+        }
+    }
+
+    impl Drop for RequeueStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *KEY_NOREMAP.get_mut() = self.key_noremap;
+                *RECORDBUFF.get_mut() = std::mem::take(&mut self.recordbuf);
+                *LAST_RECORDED_LEN.get_mut() = self.last_recorded_len;
+                *ON_KEY_BUF.get_mut() = std::mem::take(&mut self.on_key_buf);
+                *ON_KEY_IGNORE_LEN.get_mut() = self.on_key_ignore_len;
+            }
+        }
+    }
+
     impl TypebufStateGuard {
         fn install(maplen: i32) -> Self {
             let replacement = crate::input_defs::TypebufT {
@@ -3320,6 +3396,85 @@ mod tests {
         let _lock = global_state_test_lock();
         let _typebuf = TypebufStateGuard::install(0);
         flush_buffers(FlushBuffers::Input);
+    }
+
+    #[test]
+    fn requeue_key_restores_typeahead_metadata_for_an_untyped_key() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _state = RequeueStateGuard::save();
+        let _typed = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.KeyTyped,
+                false,
+            )
+        };
+        unsafe { *KEY_NOREMAP.get_mut() = RM_SCRIPT };
+
+        unsafe { requeue_key(i32::from(b'x'), 0, true) };
+
+        assert_eq!(current_typebuf().0, b"x");
+        // KeyNoremap is passed as a positive count here, so
+        // ins_typebuf marks the requeued byte RM_NONE.
+        assert_eq!(current_typebuf().1, vec![RM_NONE as u8]);
+        assert!(unsafe { RECORDBUFF.get_mut() }.blocks.is_empty());
+        assert_eq!(unsafe { *ON_KEY_IGNORE_LEN.get_mut() }, 0);
+    }
+
+    #[test]
+    fn requeue_key_removes_typed_bytes_from_recording_and_on_key() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _state = RequeueStateGuard::save();
+        let _typed = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.KeyTyped,
+                true,
+            )
+        };
+        let _recording = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_recording,
+                i32::from(b'q'),
+            )
+        };
+        unsafe {
+            add_buff(RECORDBUFF.get_mut(), b"abcd");
+            *LAST_RECORDED_LEN.get_mut() = 4;
+            *ON_KEY_BUF.get_mut() = b"abc".to_vec();
+        }
+
+        unsafe { requeue_key(i32::from(b'x'), 0, true) };
+
+        assert_eq!(
+            get_buffcont(unsafe { RECORDBUFF.get_mut() }, true),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(unsafe { *LAST_RECORDED_LEN.get_mut() }, 3);
+        assert_eq!(unsafe { ON_KEY_BUF.get_mut() }.as_slice(), b"ab");
+        assert_eq!(unsafe { *ON_KEY_IGNORE_LEN.get_mut() }, 0);
+    }
+
+    #[test]
+    fn requeue_key_accounts_for_unreported_bytes_beyond_on_key_buffer() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _state = RequeueStateGuard::save();
+        let _typed = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.KeyTyped,
+                true,
+            )
+        };
+        unsafe { *ON_KEY_BUF.get_mut() = Vec::new() };
+
+        unsafe { requeue_key(crate::keycodes_defs::K_UP, 0, false) };
+
+        assert_eq!(
+            current_typebuf().0,
+            vec![crate::keycodes_defs::K_SPECIAL, b'k', b'u']
+        );
+        assert_eq!(unsafe { *ON_KEY_IGNORE_LEN.get_mut() }, 3);
     }
 
     #[test]
