@@ -54,6 +54,7 @@ pub fn os_proc_info(pid: i32) -> Option<ProcInfo> {
     if pid <= 0 {
         return None;
     }
+
     #[cfg(target_os = "linux")]
     {
         let name = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
@@ -73,6 +74,56 @@ pub fn os_proc_info(pid: i32) -> Option<ProcInfo> {
     {
         None
     }
+}
+
+/// Kill a process tree (`os_proc_tree_kill`).
+///
+/// Unix sends the signal to the process group led by `pid`; Windows
+/// recursively terminates descendants before the root.
+///
+/// # Safety
+/// This performs the requested destructive OS process operation.
+pub unsafe fn os_proc_tree_kill(pid: i32, signal: i32) -> bool {
+    debug_assert!(signal == 15 || signal == 9);
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(-pid, signal) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        os_proc_tree_kill_windows(pid, signal)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn os_proc_tree_kill_windows(pid: i32, signal: i32) -> bool {
+    const PROCESS_ALL_ACCESS: u32 = 0x001f_0fff;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> ProcessHandle;
+        fn TerminateProcess(process: ProcessHandle, exit_code: u32) -> i32;
+    }
+    if pid <= 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid as u32) };
+    if process.is_null() {
+        return false;
+    }
+    let (_, children) = os_proc_children_windows(pid);
+    for child in children {
+        let _ = os_proc_tree_kill_windows(child, signal);
+    }
+    let terminated = unsafe { TerminateProcess(process, signal as u32) } != 0;
+    unsafe { CloseHandle(process) };
+    terminated
 }
 
 #[cfg(windows)]
@@ -391,6 +442,12 @@ mod tests {
         assert!(info.ppid >= 0);
         assert!(!info.name.is_empty());
         assert!(os_proc_info(-1).is_none());
+    }
+
+    #[test]
+    fn os_proc_tree_kill_never_kills_pid_zero() {
+        assert!(!unsafe { os_proc_tree_kill(0, 15) });
+        assert!(!unsafe { os_proc_tree_kill(0, 9) });
     }
 
     #[test]
