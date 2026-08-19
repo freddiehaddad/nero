@@ -58,6 +58,22 @@ pub unsafe fn nvim_del_augroup_by_id(id: Integer, err: &mut Error) {
     unsafe { nvim_del_augroup_by_name(&name, err) };
 }
 
+/// Delete one autocmd by ID (`nvim_del_autocmd`).
+///
+/// # Safety
+/// Mutates shared autocmd/pattern/callback state.
+pub unsafe fn nvim_del_autocmd(id: Integer, err: &mut Error) {
+    if id <= 0 {
+        err.r#type = crate::api::private::defs::ErrorType::Validation;
+        err.msg = Some(format!("Invalid autocmd id: {id}"));
+        return;
+    }
+    if !unsafe { crate::autocmd::autocmd_delete_id(id) } {
+        err.r#type = crate::api::private::defs::ErrorType::Exception;
+        err.msg = Some("Failed to delete autocmd".to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +139,16 @@ mod tests {
         unsafe { nvim_del_augroup_by_id(id, &mut err) };
         assert_eq!(crate::autocmd::augroup_find(&name), crate::autocmd_defs::augroup::ERROR);
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_del_autocmd_validates_and_reports_missing_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut invalid = Error::default();
+        unsafe { nvim_del_autocmd(0, &mut invalid) };
+        assert_eq!(invalid.msg.as_deref(), Some("Invalid autocmd id: 0"));
+        let mut missing = Error::default();
+        unsafe { nvim_del_autocmd(i64::MAX, &mut missing) };
+        assert_eq!(missing.msg.as_deref(), Some("Failed to delete autocmd"));
     }
 }
