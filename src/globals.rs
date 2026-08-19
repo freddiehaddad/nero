@@ -136,6 +136,13 @@ pub const SID_LUA: i32 = -8;
 pub const SID_API_CLIENT: i32 = -9;
 pub const SID_STR: i32 = -10;
 
+/// Profiling has not started (`PROF_NONE`).
+pub const PROF_NONE: i32 = 0;
+/// Profiling is active (`PROF_YES`).
+pub const PROF_YES: i32 = 1;
+/// Profiling is paused (`PROF_PAUSED`).
+pub const PROF_PAUSED: i32 = 2;
+
 // These flags are set based upon 'fileencoding'. The characters are
 // internally stored as UTF-8 to avoid trouble with NUL bytes.
 pub const DBCS_JPN: i32 = 932;

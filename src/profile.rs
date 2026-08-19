@@ -18,6 +18,8 @@
 //! [`set_context_in_profile_cmd`]/[`get_profile_name`].
 //! [`profile_reset`] clears all accumulated script/function timing
 //! records.
+//! [`ex_profile`] implements the start/pause/continue/dump/stop
+//! command lifecycle; debugger-backed `file`/`func` remain deferred.
 //! The complete `--startuptime` report lifecycle is translated through
 //! [`time_init`]/[`time_start`]/[`time_msg`]/[`time_finish`].
 //!
@@ -57,6 +59,10 @@ static PEXPAND_WHAT: crate::globals::GlobalCell<PexpandWhat> =
 /// File receiving profile output (`profile_fname`).
 static PROFILE_FNAME: crate::globals::GlobalCell<Option<Vec<u8>>> =
     crate::globals::GlobalCell::new(None);
+
+/// Timestamp captured when `:profile pause` begins (`pause_time`).
+static PAUSE_TIME: crate::globals::GlobalCell<ProftimeT> =
+    crate::globals::GlobalCell::new(0);
 
 /// Reset all profiling information (`profile_reset`).
 ///
@@ -1083,6 +1089,78 @@ pub unsafe fn profile_dump() -> std::io::Result<()> {
     writer.flush()
 }
 
+/// Execute a `:profile` command (`ex_profile`).
+///
+/// `file`/`func` subcommands share the debugger breakpoint parser
+/// (`ex_breakadd`) and remain deferred with that subsystem.
+///
+/// # Safety
+/// Mutates shared profiling, Vim-variable, script, and function state.
+pub unsafe fn ex_profile(
+    eap: &crate::ex_cmds_defs::ExargT,
+) -> std::io::Result<()> {
+    let argument = eap.arg.as_deref().unwrap_or_default();
+    let end_subcmd = crate::charset::skiptowhite(argument);
+    let rest_start =
+        end_subcmd + crate::charset::skipwhite(&argument[end_subcmd..]);
+    let subcmd = &argument[..end_subcmd];
+    let rest = &argument[rest_start..];
+    let profiling =
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling;
+
+    if subcmd == b"start" && !rest.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        *unsafe { PROFILE_FNAME.get_mut() } =
+            Some(unsafe { crate::os::env::expand_env_save_opt(rest, true, None) });
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling =
+            crate::globals::PROF_YES;
+        profile_set_wait(profile_zero());
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Profiling,
+                1,
+            )
+        };
+    } else if profiling == crate::globals::PROF_NONE {
+        // The original displays E750 and otherwise leaves state alone.
+    } else if argument == b"stop" {
+        // Match the original's ordering: even a dump-open failure still
+        // stops and resets profiling.
+        let result = unsafe { profile_dump() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling =
+            crate::globals::PROF_NONE;
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Profiling,
+                0,
+            )
+        };
+        unsafe { profile_reset() };
+        result?;
+    } else if argument == b"pause" {
+        if profiling == crate::globals::PROF_YES {
+            unsafe { *PAUSE_TIME.get_mut() = profile_start() };
+        }
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling =
+            crate::globals::PROF_PAUSED;
+    } else if argument == b"continue" {
+        if profiling == crate::globals::PROF_PAUSED {
+            let paused =
+                profile_end(unsafe { *PAUSE_TIME.get_mut() });
+            profile_set_wait(profile_add(profile_get_wait(), paused));
+        }
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling =
+            crate::globals::PROF_YES;
+    } else if argument == b"dump" {
+        unsafe { profile_dump() }?;
+    } else {
+        unimplemented!(
+            "ex_profile: file/func subcommands need debugger::ex_breakadd"
+        );
+    }
+    Ok(())
+}
+
 /// Compare two functions by total time, for sorting
 /// (`prof_total_cmp`).
 ///
@@ -1160,6 +1238,46 @@ mod tests {
     struct StartupReportGuard(std::path::PathBuf);
 
     struct ProfileFilenameGuard(Option<Vec<u8>>);
+
+    struct ProfilingStateGuard {
+        do_profiling: i32,
+        wait: ProftimeT,
+        pause: ProftimeT,
+        vimvar: crate::eval::typval_defs::VarnumberT,
+    }
+
+    impl ProfilingStateGuard {
+        fn new() -> Self {
+            Self {
+                do_profiling: unsafe {
+                    crate::globals::GLOBALS.get_mut()
+                }
+                .do_profiling,
+                wait: profile_get_wait(),
+                pause: unsafe { *PAUSE_TIME.get_mut() },
+                vimvar: unsafe {
+                    crate::eval::vars::get_vim_var_nr(
+                        crate::eval::vars::VimVarIndex::Profiling,
+                    )
+                },
+            }
+        }
+    }
+
+    impl Drop for ProfilingStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::globals::GLOBALS.get_mut().do_profiling =
+                    self.do_profiling;
+                *PAUSE_TIME.get_mut() = self.pause;
+                crate::eval::vars::set_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Profiling,
+                    self.vimvar,
+                );
+            }
+            profile_set_wait(self.wait);
+        }
+    }
 
     impl ProfileFilenameGuard {
         fn set(name: Option<Vec<u8>>) -> Self {
@@ -2056,6 +2174,144 @@ mod tests {
             crate::eval::userfunc::func_init();
             drop(Box::from_raw(function));
         }
+    }
+
+    #[test]
+    fn ex_profile_start_initializes_output_and_shared_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ProfilingStateGuard::new();
+        let _name = ProfileFilenameGuard::set(None);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().do_profiling =
+                crate::globals::PROF_NONE;
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Profiling,
+                0,
+            );
+        }
+        profile_set_wait(99);
+        let eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"start profile.log".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { ex_profile(&eap) }.unwrap();
+
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling,
+            crate::globals::PROF_YES
+        );
+        assert_eq!(profile_get_wait(), 0);
+        assert_eq!(
+            unsafe {
+                crate::eval::vars::get_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Profiling,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe { PROFILE_FNAME.get_mut() }.as_deref(),
+            Some(b"profile.log".as_slice())
+        );
+    }
+
+    #[test]
+    fn ex_profile_pause_and_continue_account_for_paused_time() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ProfilingStateGuard::new();
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling =
+            crate::globals::PROF_YES;
+        profile_set_wait(0);
+
+        let pause = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"pause".to_vec()),
+            ..Default::default()
+        };
+        unsafe { ex_profile(&pause) }.unwrap();
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling,
+            crate::globals::PROF_PAUSED
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let resume = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"continue".to_vec()),
+            ..Default::default()
+        };
+        unsafe { ex_profile(&resume) }.unwrap();
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling,
+            crate::globals::PROF_YES
+        );
+        assert!(profile_get_wait() > 0);
+    }
+
+    #[test]
+    fn ex_profile_requires_start_before_other_subcommands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ProfilingStateGuard::new();
+        unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling =
+            crate::globals::PROF_NONE;
+        let eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"pause".to_vec()),
+            ..Default::default()
+        };
+        unsafe { ex_profile(&eap) }.unwrap();
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling,
+            crate::globals::PROF_NONE
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows create/truncate file-open mode"
+    )]
+    fn ex_profile_stop_dumps_and_resets_profiling() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = ProfilingStateGuard::new();
+        crate::runtime::tests_reset_for_test();
+        crate::eval::userfunc::func_init();
+        let path = std::env::temp_dir().join(format!(
+            "nero-profile-stop-{}-{}.log",
+            std::process::id(),
+            profile_start()
+        ));
+        let _file = StartupReportGuard(path.clone());
+        let _name = ProfileFilenameGuard::set(Some(
+            path.to_string_lossy().into_owned().into_bytes(),
+        ));
+        unsafe {
+            crate::globals::GLOBALS.get_mut().do_profiling =
+                crate::globals::PROF_YES;
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Profiling,
+                1,
+            );
+        }
+        let eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"stop".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { ex_profile(&eap) }.unwrap();
+
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.do_profiling,
+            crate::globals::PROF_NONE
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::vars::get_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Profiling,
+                )
+            },
+            0
+        );
+        assert!(unsafe { PROFILE_FNAME.get_mut() }.is_none());
+        assert!(path.exists());
     }
 
     // --- get_profile_name / prof_def_func ---
