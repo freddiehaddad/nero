@@ -65,6 +65,31 @@ static PUM_IS_VISIBLE: GlobalCell<bool> = GlobalCell::new(false);
 /// stays `false` forever in this crate today.
 static PUM_EXTERNAL: GlobalCell<bool> = GlobalCell::new(false);
 
+/// Popup-menu screen grid (`pum_grid`).
+pub static PUM_GRID: GlobalCell<crate::grid_defs::ScreenGrid> =
+    GlobalCell::new(crate::grid_defs::ScreenGrid {
+        handle: 0,
+        chars: std::ptr::null_mut(),
+        attrs: std::ptr::null_mut(),
+        vcols: std::ptr::null_mut(),
+        line_offset: std::ptr::null_mut(),
+        dirty_col: std::ptr::null_mut(),
+        rows: 0,
+        cols: 0,
+        valid: false,
+        throttled: false,
+        blending: false,
+        mouse_enabled: true,
+        zindex: 0,
+        comp_row: 0,
+        comp_col: 0,
+        comp_width: 0,
+        comp_height: 0,
+        comp_index: 0,
+        comp_disabled: false,
+        pending_comp_index_update: false,
+    });
+
 /// `pum_height` - the number of popup-menu entries currently
 /// displayed. Only ever set by `pum_compute_vertical_placement`
 /// (part of `pum_display`'s own layout computation) and
@@ -426,6 +451,16 @@ pub fn pum_set_event_info(_dict: &mut crate::eval::typval_defs::DictT) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn pum_grid_starts_unallocated_with_zero_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let grid = unsafe { PUM_GRID.get_mut() };
+        assert_eq!(grid.handle, 0);
+        assert!(grid.chars.is_null());
+        assert_eq!(grid.rows, 0);
+        assert_eq!(grid.cols, 0);
+    }
 
     /// Test-only helper letting other modules' own tests (e.g.
     /// `eval::funcs`'s `f_pumvisible` test) directly set the
