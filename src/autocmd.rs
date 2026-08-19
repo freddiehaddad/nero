@@ -821,6 +821,19 @@ pub unsafe fn aupat_get_buflocal_nr(pattern: &[u8]) -> i32 {
     0
 }
 
+/// Normalize a buffer-local pattern (`aupat_normalize_buflocal_pat`).
+///
+/// # Safety
+/// A zero buffer number reads `GLOBALS.curbuf`.
+#[must_use]
+pub unsafe fn aupat_normalize_buflocal_pat(pattern: &[u8], mut bufnr: i32) -> Vec<u8> {
+    debug_assert!(aupat_is_buflocal(pattern));
+    if bufnr == 0 {
+        bufnr = unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).handle };
+    }
+    format!("<buffer={bufnr}>").into_bytes()
+}
+
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
 ///
 /// `win` selects the window-local option, which accepts only entries
@@ -1776,6 +1789,14 @@ mod tests {
         assert_eq!(unsafe { aupat_get_buflocal_nr(b"<buffer=42>") }, 42);
         assert_eq!(unsafe { aupat_get_buflocal_nr(b"<buffer=x>") }, 0);
         unsafe { *AUTOCMD_BUFNR.get_mut() = old_abuf };
+    }
+
+    #[test]
+    fn aupat_normalize_buflocal_pat_uses_standard_numeric_form() {
+        assert_eq!(
+            unsafe { aupat_normalize_buflocal_pat(b"<buffer=anything>", 42) },
+            b"<buffer=42>"
+        );
     }
 
     #[test]
