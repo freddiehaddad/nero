@@ -19,6 +19,25 @@ use crate::api::private::defs::{
     Window,
 };
 
+/// Terminal channel read-pause callback (`term_read_pause`).
+///
+/// Upstream intentionally does nothing because sending to a terminal
+/// channel is already disallowed during buffer updates.
+#[allow(dead_code)]
+fn term_read_pause(_pause: bool, _data: *mut std::ffi::c_void) {}
+
+/// Terminal resize callback (`term_resize`).
+///
+/// Upstream currently leaves this as a TODO for a future Lua callback.
+#[allow(dead_code)]
+fn term_resize(_width: u16, _height: u16, _data: *mut std::ffi::c_void) {}
+
+/// Terminal resume callback (`term_resume`).
+///
+/// Upstream intentionally has an empty body.
+#[allow(dead_code)]
+fn term_resume(_data: *mut std::ffi::c_void) {}
+
 /// Return a deep owned copy of `obj` (`nvim__id`).
 #[must_use]
 #[allow(non_snake_case)]
@@ -779,6 +798,14 @@ pub unsafe fn nvim_set_hl_ns_fast(ns_id: Integer) {
 mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, TabpageT, WinT};
+
+    #[test]
+    fn terminal_stub_callbacks_are_noops() {
+        term_read_pause(true, std::ptr::null_mut());
+        term_read_pause(false, std::ptr::null_mut());
+        term_resize(80, 24, std::ptr::null_mut());
+        term_resume(std::ptr::null_mut());
+    }
 
     #[test]
     fn nvim_list_bufs_returns_every_linked_buffer() {
