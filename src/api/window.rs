@@ -13,9 +13,9 @@
 //! Deferred (each needs a real, not-yet-translated subsystem beyond
 //! `find_window_by_handle` itself): `nvim_win_set_buf` (needs
 //! `apply_autocmds`'s real buffer-switch semantics plus
-//! `win_set_buf`). [`nvim_win_set_cursor`] is real for the current
-//! window; a non-current window still needs `ctx_switch` to update its
-//! visible scroll state. `nvim_win_set_height`/
+//! `win_set_buf`). [`nvim_win_set_cursor`] uses the real window context
+//! switch for current and non-current windows; `update_topline`'s exact
+//! scroll correction remains deferred. `nvim_win_set_height`/
 //! `nvim_win_set_width` (need `win_setheight`/`win_setwidth`, the
 //! real frame-resizing algorithms), `nvim_win_get_var`/
 //! `nvim_win_set_var`/`nvim_win_del_var` (need `dict_get_value`/
@@ -97,21 +97,33 @@ pub unsafe fn nvim_win_set_cursor(
         err.msg = Some("Invalid 'cursor column': out of range".to_string());
         return;
     }
-    if !std::ptr::eq(
-        window,
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
-    ) {
-        unimplemented!(
-            "nvim_win_set_cursor: non-current window scrolling needs ctx_switch"
-        );
-    }
-
     unsafe {
         (*window).w_cursor.lnum = *row as crate::pos_defs::LinenrT;
         (*window).w_cursor.col = *col as crate::pos_defs::ColnrT;
         (*window).w_cursor.coladd = 0;
         crate::cursor::check_cursor_col(window);
         (*window).w_set_curswant = true;
+    }
+
+    let mut switch = crate::context_defs::CtxSwitch::default();
+    if unsafe {
+        crate::context::ctx_switch(
+            &mut switch,
+            window,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            crate::context_defs::ctx_switch_flags::NO_EVENTS
+                | crate::context_defs::ctx_switch_flags::NO_DISPLAY,
+        )
+    } {
+        // `update_topline`/`validate_cursor` remain with move.c's
+        // display-validity machinery; the cursor itself is checked
+        // above and once more in its temporary current context.
+        unsafe { crate::cursor::check_cursor(window) };
+    }
+    unsafe { crate::context::ctx_restore(&switch) };
+    unsafe {
+        crate::drawscreen::redraw_later(window, crate::drawscreen::UPD_VALID);
         (*window).w_redr_status = true;
     }
 }
@@ -455,6 +467,7 @@ mod tests {
         _tab: Box<TabpageT>,
         prev_firstwin: *mut WinT,
         prev_curwin: *mut WinT,
+        prev_curbuf: *mut BufT,
         prev_curtab: *mut TabpageT,
         prev_first_tabpage: *mut TabpageT,
     }
@@ -482,10 +495,12 @@ mod tests {
                 let g = crate::globals::GLOBALS.get_mut();
                 let prev_firstwin = g.firstwin;
                 let prev_curwin = g.curwin;
+                let prev_curbuf = g.curbuf;
                 let prev_curtab = g.curtab;
                 let prev_first_tabpage = g.first_tabpage;
                 g.firstwin = win_ptr;
                 g.curwin = win_ptr;
+                g.curbuf = buf_ptr;
                 g.curtab = tab_ptr;
                 g.first_tabpage = tab_ptr;
                 WinFixture {
@@ -494,6 +509,7 @@ mod tests {
                     _tab: tab,
                     prev_firstwin,
                     prev_curwin,
+                    prev_curbuf,
                     prev_curtab,
                     prev_first_tabpage,
                 }
@@ -508,6 +524,7 @@ mod tests {
                 let g = crate::globals::GLOBALS.get_mut();
                 g.firstwin = self.prev_firstwin;
                 g.curwin = self.prev_curwin;
+                g.curbuf = self.prev_curbuf;
                 g.curtab = self.prev_curtab;
                 g.first_tabpage = self.prev_first_tabpage;
             }
@@ -520,6 +537,7 @@ mod tests {
         tab: *mut TabpageT,
         prev_firstwin: *mut WinT,
         prev_curwin: *mut WinT,
+        prev_curbuf: *mut BufT,
         prev_curtab: *mut TabpageT,
         prev_first_tabpage: *mut TabpageT,
     }
@@ -547,11 +565,13 @@ mod tests {
                 tab,
                 prev_firstwin: globals.firstwin,
                 prev_curwin: globals.curwin,
+                prev_curbuf: globals.curbuf,
                 prev_curtab: globals.curtab,
                 prev_first_tabpage: globals.first_tabpage,
             };
             globals.firstwin = win;
             globals.curwin = win;
+            globals.curbuf = buf;
             globals.curtab = tab;
             globals.first_tabpage = tab;
             fixture
@@ -564,6 +584,7 @@ mod tests {
                 let globals = crate::globals::GLOBALS.get_mut();
                 globals.firstwin = self.prev_firstwin;
                 globals.curwin = self.prev_curwin;
+                globals.curbuf = self.prev_curbuf;
                 globals.curtab = self.prev_curtab;
                 globals.first_tabpage = self.prev_first_tabpage;
                 drop(Box::from_raw(self.tab));
@@ -694,6 +715,52 @@ mod tests {
             col_err.msg.as_deref(),
             Some("Invalid 'cursor column': out of range")
         );
+    }
+
+    #[test]
+    fn nvim_win_set_cursor_switches_to_and_restores_a_noncurrent_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = RawWinFixture::new(18);
+        let target_buf = Box::into_raw(Box::new(BufT {
+            b_ml: crate::memline_defs::MemlineT {
+                ml_line_count: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let target_win = Box::into_raw(Box::new(WinT {
+            handle: 19,
+            w_buffer: target_buf,
+            w_config: Default::default(),
+            ..Default::default()
+        }));
+        unsafe { (*fx.win).w_next = target_win };
+        let current_before = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        let mut err = Error::default();
+
+        unsafe {
+            nvim_win_set_cursor(
+                19,
+                &vec![Object::Integer(1), Object::Integer(3)],
+                &mut err,
+            )
+        };
+
+        assert!(!err.is_set());
+        assert_eq!(unsafe { (*target_win).w_cursor.lnum }, 1);
+        assert_eq!(unsafe { (*target_win).w_cursor.col }, 0);
+        assert!(unsafe { (*target_win).w_redr_status });
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+            current_before
+        );
+        assert!(!crate::autocmd::is_autocmd_blocked());
+
+        unsafe {
+            (*fx.win).w_next = std::ptr::null_mut();
+            drop(Box::from_raw(target_win));
+            drop(Box::from_raw(target_buf));
+        }
     }
 
     #[test]
