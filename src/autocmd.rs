@@ -571,6 +571,29 @@ pub unsafe fn autocmd_delete_id(id: i64) -> bool {
     found
 }
 
+/// Free all autocmds and augroup registries (`free_all_autocmds`).
+///
+/// # Safety
+/// Invalidates every autocmd/pattern/group reference.
+pub unsafe fn free_all_autocmds() {
+    {
+        let autocmds = unsafe { AUTOCMDS.get_mut() };
+        for commands in autocmds {
+            for command in commands.iter_mut() {
+                if !command.pat.is_null() {
+                    unsafe { aucmd_del(command) };
+                }
+            }
+            commands.clear();
+        }
+    }
+    unsafe { *AU_NEED_CLEAN.get_mut() = false };
+    unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.clear();
+    unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.clear();
+    unsafe { *NEXT_AUGROUP_ID.get_mut() = 1 };
+    unsafe { *CURRENT_AUGROUP.get_mut() = augroup::DEFAULT };
+}
+
 /// Cleanup autocommands that have been deleted. This is only done
 /// when not executing autocommands (`au_cleanup`).
 fn au_cleanup() {
@@ -1506,6 +1529,16 @@ mod tests {
         assert!(unsafe { autocmd_delete_id(42) });
         assert!(unsafe { AUTOCMDS.get_mut() }[EventT::BufEnter as usize].is_empty());
         assert!(!unsafe { autocmd_delete_id(42) });
+    }
+
+    #[test]
+    fn free_all_autocmds_resets_group_registries() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        assert_eq!(unsafe { augroup_add(b"Temporary") }, 1);
+        unsafe { free_all_autocmds() };
+        assert_eq!(augroup_find(b"Temporary"), augroup::ERROR);
+        assert_eq!(unsafe { *NEXT_AUGROUP_ID.get_mut() }, 1);
     }
 
     #[test]
