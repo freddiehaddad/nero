@@ -165,6 +165,46 @@ unsafe fn put_in_typebuf(
     }
 }
 
+/// Join backward-processed Ex-register continuation lines
+/// (`execreg_line_continuation`).
+///
+/// `idx` is updated to the first line consumed. Comment-continuation
+/// lines (`"\\ `) participate in the backward search but contribute
+/// no output, matching the original.
+#[allow(dead_code)] // do_execreg, the real caller, is not translated yet.
+fn execreg_line_continuation(
+    lines: &[Vec<u8>],
+    idx: &mut usize,
+) -> Vec<u8> {
+    let mut command_start = *idx;
+    debug_assert!(command_start > 0);
+    let command_end = command_start;
+
+    loop {
+        command_start -= 1;
+        if command_start == 0 {
+            break;
+        }
+        let line = &lines[command_start]
+            [crate::charset::skipwhite(&lines[command_start])..];
+        if line.first() != Some(&b'\\')
+            && !(line.starts_with(b"\"\\ "))
+        {
+            break;
+        }
+    }
+
+    let mut output = lines[command_start].clone();
+    for line in &lines[command_start + 1..=command_end] {
+        let line = &line[crate::charset::skipwhite(line)..];
+        if line.first() == Some(&b'\\') {
+            output.extend_from_slice(&line[1..]);
+        }
+    }
+    *idx = command_start;
+    output
+}
+
 /// Convert a register name character to its `Y_REGS` index
 /// (`op_reg_index`). Returns `None` for a name with no direct slot
 /// (matching the original's own `-1`) - digits map to `0..=9`,
@@ -934,6 +974,52 @@ mod tests {
         ]);
         assert_eq!(crate::input::typebuf_bytes_for_test(), expected);
         assert!(unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent);
+    }
+
+    #[test]
+    fn execreg_line_continuation_joins_preceding_backslash_lines() {
+        let lines = vec![
+            b"echo 'a'".to_vec(),
+            b"  \\ . 'b'".to_vec(),
+            b"\\ . 'c'".to_vec(),
+        ];
+        let mut index = 2;
+
+        let joined = execreg_line_continuation(&lines, &mut index);
+
+        assert_eq!(joined, b"echo 'a' . 'b' . 'c'");
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn execreg_line_continuation_ignores_comment_continuations() {
+        let lines = vec![
+            b"echo 'a'".to_vec(),
+            b"\"\\ ignored".to_vec(),
+            b"\\ . 'b'".to_vec(),
+        ];
+        let mut index = 2;
+
+        let joined = execreg_line_continuation(&lines, &mut index);
+
+        assert_eq!(joined, b"echo 'a' . 'b'");
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn execreg_line_continuation_stops_at_the_nearest_command_start() {
+        let lines = vec![
+            b"echo 'old'".to_vec(),
+            b"\\ . 'ignored'".to_vec(),
+            b"echo 'new'".to_vec(),
+            b"\\ . 'tail'".to_vec(),
+        ];
+        let mut index = 3;
+
+        let joined = execreg_line_continuation(&lines, &mut index);
+
+        assert_eq!(joined, b"echo 'new' . 'tail'");
+        assert_eq!(index, 2);
     }
 
     // --- get_y_register / yank_register_mline ---
