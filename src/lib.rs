@@ -88,6 +88,8 @@ pub mod linematch;
 pub mod insert_defs;
 pub mod log;
 pub mod macros_defs;
+#[path = "nvim_main.rs"]
+pub mod main;
 pub mod map;
 pub mod map_glyph_cache;
 pub mod mapping;
