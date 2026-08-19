@@ -722,6 +722,49 @@ pub unsafe fn augroup_del(name: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Execute `:augroup` state changes (`do_augroup`).
+///
+/// The returned list replaces the original message output for the
+/// no-argument listing form.
+///
+/// # Safety
+/// Mutates shared augroup/autocmd state.
+pub unsafe fn do_augroup(
+    argument: &[u8],
+    delete_group: bool,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    if delete_group {
+        if argument.is_empty() {
+            return Err("Argument required");
+        }
+        unsafe { augroup_del(argument) }?;
+        return Ok(Vec::new());
+    }
+    if argument.eq_ignore_ascii_case(b"end") {
+        unsafe { *CURRENT_AUGROUP.get_mut() = augroup::DEFAULT };
+        return Ok(Vec::new());
+    }
+    if !argument.is_empty() {
+        unsafe { *CURRENT_AUGROUP.get_mut() = augroup_add(argument) };
+        return Ok(Vec::new());
+    }
+    let mut groups: Vec<(i32, Vec<u8>)> = unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }
+        .iter()
+        .map(|(name, id)| (*id, name.clone()))
+        .collect();
+    groups.sort_by_key(|(id, _)| *id);
+    Ok(groups
+        .into_iter()
+        .map(|(id, name)| {
+            if id > 0 {
+                name
+            } else {
+                unsafe { augroup_name(id) }.unwrap_or_default()
+            }
+        })
+        .collect())
+}
+
 /// Find the ID of an autocmd group name, or
 /// [`crate::autocmd_defs::augroup::ERROR`] if not found
 /// (`augroup_find`).
@@ -1628,6 +1671,23 @@ mod tests {
         assert_eq!(unsafe { augroup_name(id) }, Some(b"Partial".to_vec()));
         unsafe { augroup_map_del(id, None) };
         assert_eq!(unsafe { augroup_name(id) }, None);
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn do_augroup_switches_lists_ends_and_deletes_groups() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        assert_eq!(unsafe { do_augroup(b"GroupA", false) }, Ok(Vec::new()));
+        assert_eq!(unsafe { *CURRENT_AUGROUP.get_mut() }, 1);
+        assert_eq!(
+            unsafe { do_augroup(b"", false) },
+            Ok(vec![b"GroupA".to_vec()])
+        );
+        assert_eq!(unsafe { do_augroup(b"END", false) }, Ok(Vec::new()));
+        assert_eq!(unsafe { *CURRENT_AUGROUP.get_mut() }, augroup::DEFAULT);
+        assert_eq!(unsafe { do_augroup(b"GroupA", true) }, Ok(Vec::new()));
+        assert_eq!(unsafe { do_augroup(b"", true) }, Err("Argument required"));
         reset_augroup_map();
     }
 
