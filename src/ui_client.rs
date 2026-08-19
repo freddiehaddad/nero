@@ -35,6 +35,18 @@ pub unsafe fn ui_client_size() -> (i32, i32) {
     unsafe { (*TUI_WIDTH.get_mut(), *TUI_HEIGHT.get_mut()) }
 }
 
+/// Reject synchronous `redraw` requests (`handle_ui_client_redraw`).
+#[must_use]
+pub fn handle_ui_client_redraw(
+    _channel_id: u64,
+    _args: &crate::api::private::defs::Array,
+    error: &mut crate::api::private::defs::Error,
+) -> crate::api::private::defs::Object {
+    error.r#type = crate::api::private::defs::ErrorType::Validation;
+    error.msg = Some("'redraw' cannot be sent as a request".to_string());
+    crate::api::private::defs::Object::Nil
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +63,18 @@ mod tests {
             ui_client_set_size(old_size.0, old_size.1);
             *UI_CLIENT_ATTACHED.get_mut() = old_attached;
         }
+    }
+
+    #[test]
+    fn handle_ui_client_redraw_returns_validation_error() {
+        let mut error = crate::api::private::defs::Error::default();
+        assert!(matches!(
+            handle_ui_client_redraw(1, &Vec::new(), &mut error),
+            crate::api::private::defs::Object::Nil
+        ));
+        assert_eq!(
+            error.msg.as_deref(),
+            Some("'redraw' cannot be sent as a request")
+        );
     }
 }
