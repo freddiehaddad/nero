@@ -1238,6 +1238,59 @@ pub fn free_register(reg: &mut YankregT) {
     reg.y_array = None;
 }
 
+/// Copy one prepared block range into a register (`yank_copy_line`).
+///
+/// # Safety
+/// `block.textstart` must address at least `block.textlen` readable
+/// bytes when `textlen > 0`, and `register.y_array[y_idx]` must exist.
+#[allow(dead_code)] // Used by op_yank_reg once its full write path lands.
+unsafe fn yank_copy_line(
+    register: &mut YankregT,
+    block: &mut crate::register_defs::BlockDefT,
+    y_idx: usize,
+    exclude_trailing_space: bool,
+) {
+    if exclude_trailing_space {
+        block.endspaces = 0;
+    }
+    let startspaces =
+        usize::try_from(block.startspaces).expect("startspaces is nonnegative");
+    let endspaces =
+        usize::try_from(block.endspaces).expect("endspaces is nonnegative");
+    let textlen =
+        usize::try_from(block.textlen).expect("textlen is nonnegative");
+    let text = if textlen == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(block.textstart, textlen) }
+    };
+
+    let mut line = vec![b' '; startspaces];
+    line.extend_from_slice(text);
+    line.resize(startspaces + textlen + endspaces, b' ');
+
+    if exclude_trailing_space {
+        let mut remaining = textlen + endspaces;
+        while remaining > 0
+            && crate::ascii_defs::ascii_iswhite(i32::from(
+                text[remaining - 1],
+            ))
+        {
+            let head_off = usize::try_from(unsafe {
+                crate::mbyte::utf_head_off(text, remaining - 1)
+            })
+            .expect("UTF-8 head offset is nonnegative");
+            remaining -= head_off + 1;
+            line.pop();
+        }
+    }
+
+    register
+        .y_array
+        .as_mut()
+        .expect("yank register line array must be allocated")[y_idx] = line;
+}
+
 /// Updates a blockwise register's width from its contents
 /// (`update_yankreg_width`).
 ///
@@ -3667,6 +3720,105 @@ mod tests {
         free_register(&mut reg);
         free_register(&mut reg);
         assert!(reg.y_array.is_none());
+    }
+
+    #[test]
+    fn yank_copy_line_copies_text_with_leading_and_trailing_spaces() {
+        let mut text = b"abc".to_vec();
+        let mut block = crate::register_defs::BlockDefT {
+            startspaces: 2,
+            endspaces: 1,
+            textlen: 3,
+            textstart: text.as_mut_ptr(),
+            ..Default::default()
+        };
+        let mut register = YankregT {
+            y_array: Some(vec![Vec::new()]),
+            ..Default::default()
+        };
+
+        unsafe { yank_copy_line(&mut register, &mut block, 0, false) };
+
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"  abc ".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn yank_copy_line_excludes_trailing_whitespace() {
+        let mut text = b"a \t".to_vec();
+        let mut block = crate::register_defs::BlockDefT {
+            startspaces: 1,
+            endspaces: 4,
+            textlen: 3,
+            textstart: text.as_mut_ptr(),
+            ..Default::default()
+        };
+        let mut register = YankregT {
+            y_array: Some(vec![Vec::new()]),
+            ..Default::default()
+        };
+
+        unsafe { yank_copy_line(&mut register, &mut block, 0, true) };
+
+        assert_eq!(block.endspaces, 0);
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b" a".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn yank_copy_line_replaces_only_the_requested_slot() {
+        let mut text = b"middle".to_vec();
+        let mut block = crate::register_defs::BlockDefT {
+            textlen: 6,
+            textstart: text.as_mut_ptr(),
+            ..Default::default()
+        };
+        let mut register = YankregT {
+            y_array: Some(vec![
+                b"first".to_vec(),
+                Vec::new(),
+                b"last".to_vec(),
+            ]),
+            ..Default::default()
+        };
+
+        unsafe { yank_copy_line(&mut register, &mut block, 1, false) };
+
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some(
+                [
+                    b"first".to_vec(),
+                    b"middle".to_vec(),
+                    b"last".to_vec(),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn yank_copy_line_accepts_empty_text_with_a_null_pointer() {
+        let mut block = crate::register_defs::BlockDefT {
+            startspaces: 2,
+            textstart: std::ptr::null_mut(),
+            ..Default::default()
+        };
+        let mut register = YankregT {
+            y_array: Some(vec![Vec::new()]),
+            ..Default::default()
+        };
+
+        unsafe { yank_copy_line(&mut register, &mut block, 0, false) };
+
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"  ".to_vec()].as_slice())
+        );
     }
 
     #[test]
