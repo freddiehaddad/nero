@@ -351,6 +351,52 @@ pub unsafe fn nvim__cmdwin_set(
     globals.cmdwin_buf = buffer;
 }
 
+/// Inspect one screen cell (`nvim__inspect_cell`).
+///
+/// # Safety
+/// Reads raw allocated grid arrays and shared highlight state. Every
+/// selected grid's pointers must cover its declared dimensions.
+#[must_use]
+#[allow(non_snake_case)]
+pub unsafe fn nvim__inspect_cell(
+    grid: Integer,
+    row: Integer,
+    col: Integer,
+    err: &mut Error,
+) -> Array {
+    let mut selected = std::ptr::from_mut(unsafe { crate::grid::DEFAULT_GRID.get_mut() });
+    let pum = std::ptr::from_mut(unsafe { crate::popupmenu::PUM_GRID.get_mut() });
+    if grid == unsafe { (*pum).handle }.into() {
+        selected = pum;
+    } else if grid > 1 {
+        let window = unsafe { crate::grid::get_win_by_grid_handle(grid as i32) };
+        if window.is_null() || unsafe { (*window).w_grid_alloc.chars }.is_null() {
+            err.r#type = ErrorType::Validation;
+            err.msg = Some(format!("Invalid 'grid handle': {grid}"));
+            return Vec::new();
+        }
+        selected = unsafe { std::ptr::addr_of_mut!((*window).w_grid_alloc) };
+    }
+    if row < 0
+        || row >= i64::from(unsafe { (*selected).rows })
+        || col < 0
+        || col >= i64::from(unsafe { (*selected).cols })
+    {
+        return Vec::new();
+    }
+    let offset = unsafe { *(*selected).line_offset.add(row as usize) } + col as usize;
+    let glyph = crate::grid::schar_get(unsafe { *(*selected).chars.add(offset) });
+    let attr = unsafe { *(*selected).attrs.add(offset) };
+    let mut result = vec![
+        Object::String(glyph),
+        Object::Dict(unsafe { crate::highlight::hl_get_attr_by_id(i64::from(attr), true, err) }),
+    ];
+    if !unsafe { crate::highlight::highlight_use_hlstate() } {
+        result.push(Object::Array(unsafe { crate::highlight::hl_inspect(attr) }));
+    }
+    result
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1353,6 +1399,16 @@ mod tests {
         }
         drop(_lastbuf);
         unsafe { drop(Box::from_raw(buf)) };
+    }
+
+    #[test]
+    fn nvim_inspect_cell_returns_empty_out_of_bounds_and_validates_grid_handles() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut err = Error::default();
+        assert!(unsafe { nvim__inspect_cell(1, -1, 0, &mut err) }.is_empty());
+        assert!(!err.is_set());
+        assert!(unsafe { nvim__inspect_cell(9999, 0, 0, &mut err) }.is_empty());
+        assert_eq!(err.msg.as_deref(), Some("Invalid 'grid handle': 9999"));
     }
 
     #[test]
