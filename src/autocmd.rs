@@ -834,6 +834,27 @@ pub unsafe fn aupat_normalize_buflocal_pat(pattern: &[u8], mut bufnr: i32) -> Ve
     format!("<buffer={bufnr}>").into_bytes()
 }
 
+/// Parse one `:autocmd` boolean flag (`arg_autocmd_flag_get`).
+///
+/// Returns `(duplicate, remaining_offset)`.
+#[must_use]
+pub fn arg_autocmd_flag_get(flag: &mut bool, command: &[u8], pattern: &[u8]) -> (bool, usize) {
+    if command.starts_with(pattern)
+        && command
+            .get(pattern.len())
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        if *flag {
+            return (true, 0);
+        }
+        *flag = true;
+        let offset = pattern.len() + crate::charset::skipwhite(&command[pattern.len()..]);
+        (false, offset)
+    } else {
+        (false, 0)
+    }
+}
+
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
 ///
 /// `win` selects the window-local option, which accepts only entries
@@ -1796,6 +1817,20 @@ mod tests {
         assert_eq!(
             unsafe { aupat_normalize_buflocal_pat(b"<buffer=anything>", 42) },
             b"<buffer=42>"
+        );
+    }
+
+    #[test]
+    fn arg_autocmd_flag_get_consumes_once_and_rejects_duplicates() {
+        let mut once = false;
+        assert_eq!(
+            arg_autocmd_flag_get(&mut once, b"++once  echo", b"++once"),
+            (false, 8)
+        );
+        assert!(once);
+        assert_eq!(
+            arg_autocmd_flag_get(&mut once, b"++once echo", b"++once"),
+            (true, 0)
         );
     }
 
