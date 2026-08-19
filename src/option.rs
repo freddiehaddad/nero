@@ -4090,9 +4090,9 @@ pub unsafe fn set_option_value_give_err(
 /// Set an option value for an explicit scope target
 /// (`set_option_value_for`).
 ///
-/// Global/current-context writes and the original's special
-/// non-current-tab `'cmdheight'` path are complete. Switching to a
-/// different buffer/window still needs `switch_option_context`.
+/// Global, current-context, cross-window, shown-buffer, and the
+/// non-current-tab `'cmdheight'` paths are complete. An unshown buffer
+/// still needs a temporary autocmd window from `ctx_switch`.
 ///
 /// # Safety
 /// `from` must point to a live value matching `scope`; forwarded from
@@ -4121,19 +4121,49 @@ pub unsafe fn set_option_value_for(
         return None;
     }
 
-    match scope {
-        OptScope::Global | OptScope::Tab => {}
-        OptScope::Win if from.cast::<WinT>() == curwin => {}
-        OptScope::Buf if from.cast::<BufT>() == curbuf => {}
-        OptScope::Win | OptScope::Buf => {
-            unimplemented!(
-                "set_option_value_for: cross-window/buffer writes need switch_option_context"
-            )
+    let mut context = crate::context_defs::CtxSwitch::default();
+    let switched = match scope {
+        OptScope::Global | OptScope::Tab => false,
+        OptScope::Win if from.cast::<WinT>() == curwin => false,
+        OptScope::Buf if from.cast::<BufT>() == curbuf => false,
+        OptScope::Win => {
+            let win = from.cast::<WinT>();
+            let tab = unsafe { crate::window::win_find_tabpage(win) };
+            if !unsafe {
+                crate::context::ctx_switch(
+                    &mut context,
+                    win,
+                    tab,
+                    std::ptr::null_mut(),
+                    crate::context_defs::ctx_switch_flags::NO_DISPLAY,
+                )
+            } {
+                unsafe { crate::context::ctx_restore(&context) };
+                return Some(crate::errors::e_invarg);
+            }
+            true
         }
-    }
+        OptScope::Buf => {
+            unsafe {
+                crate::context::ctx_switch(
+                    &mut context,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    from.cast::<BufT>(),
+                    0,
+                )
+            };
+            true
+        }
+    };
 
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { set_option_value_handle_tty(name, opt_idx, value, opt_flags) }
+    let result =
+        unsafe { set_option_value_handle_tty(name, opt_idx, value, opt_flags) };
+    if switched {
+        unsafe { crate::context::ctx_restore(&context) };
+    }
+    result
 }
 
 /// Get an option value for an explicit scope target
@@ -8802,23 +8832,78 @@ mod did_set_option_tests {
     }
 
     #[test]
-    #[should_panic(expected = "switch_option_context")]
-    fn set_option_value_for_cross_window_needs_context_switching() {
+    fn set_option_value_for_writes_a_cross_window_local_value() {
         let _lock = crate::globals::global_state_test_lock();
         reset_shared_state();
-        let (_guard, _buf, _win) = setup_curbuf_curwin();
-        let mut target = WinT::default();
-        let target_ptr = std::ptr::from_mut(&mut target);
-        unsafe {
-            let _ = set_option_value_for(
+        let (_guard, _buf, current) = setup_curbuf_curwin();
+        let target_buf = Box::into_raw(Box::new(BufT::default()));
+        let target = Box::into_raw(Box::new(WinT {
+            handle: 72,
+            w_buffer: target_buf,
+            w_s: unsafe { std::ptr::addr_of_mut!((*target_buf).b_s) },
+            ..Default::default()
+        }));
+        let tab = Box::into_raw(Box::new(crate::buffer_defs::TabpageT {
+            tp_curwin: current,
+            tp_firstwin: current,
+            tp_lastwin: target,
+            ..Default::default()
+        }));
+        unsafe { (*current).w_next = target };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                current,
+            )
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastwin,
+                target,
+            )
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                tab,
+            )
+        };
+        let _first_tab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                tab,
+            )
+        };
+
+        assert_eq!(
+            unsafe {
+                set_option_value_for(
                 b"scrolloff",
                 OptIndex::Scrolloff,
                 OptVal::Number(2),
                 crate::option_defs::opt_set_flags::OPT_LOCAL,
                 OptScope::Win,
-                target_ptr.cast(),
-            );
-        };
+                    target.cast(),
+                )
+            },
+            None
+        );
+        assert_eq!(unsafe { (*target).w_onebuf_opt.wo_so }, 2);
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+            current
+        );
+
+        drop(_first_tab);
+        drop(_curtab);
+        drop(_lastwin);
+        drop(_firstwin);
+        unsafe {
+            (*current).w_next = std::ptr::null_mut();
+            drop(Box::from_raw(tab));
+            drop(Box::from_raw(target));
+            drop(Box::from_raw(target_buf));
+        }
     }
 
     #[test]
