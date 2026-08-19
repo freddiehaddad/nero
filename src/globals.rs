@@ -877,7 +877,10 @@ pub struct Globals {
     pub spell_redraw_lnum: LinenrT,
 
     /// Where to write `--startuptime` report.
-    pub time_fd: *mut libc::FILE,
+    ///
+    /// The original owns a buffered `FILE *`; Rust's owned buffered
+    /// file is its direct resource-management equivalent.
+    pub time_fd: Option<std::io::BufWriter<std::fs::File>>,
 
     // Some compilers warn for not using a return value, but in some
     // situations we can't do anything useful with the value. Assign to
@@ -1155,7 +1158,7 @@ impl Default for Globals {
             virtual_op: TriState::None,
             display_tick: 0,
             spell_redraw_lnum: 0,
-            time_fd: std::ptr::null_mut(),
+            time_fd: None,
             vim_ignored: 0,
             embedded_mode: false,
             headless_mode: false,

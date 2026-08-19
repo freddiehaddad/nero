@@ -17,6 +17,8 @@
 //! [`set_context_in_profile_cmd`]/[`get_profile_name`].
 //! [`profile_reset`] clears all accumulated script/function timing
 //! records.
+//! The complete `--startuptime` report lifecycle is translated through
+//! [`time_init`]/[`time_start`]/[`time_msg`]/[`time_finish`].
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -27,6 +29,7 @@
 //! once `os/time.c` is done.
 
 use crate::types_defs::ProftimeT;
+use std::io::Write;
 
 /// Subcommands offered when completing `:profile`
 /// (`pexpand_cmds`). File-static in the original, which terminates
@@ -548,6 +551,10 @@ pub fn profile_sub(tm1: ProftimeT, tm2: ProftimeT) -> ProftimeT {
 static G_PREV_TIME: crate::globals::GlobalCell<ProftimeT> =
     crate::globals::GlobalCell::new(0);
 
+/// Startup-report baseline (`g_start_time`).
+static G_START_TIME: crate::globals::GlobalCell<ProftimeT> =
+    crate::globals::GlobalCell::new(0);
+
 /// Saves timing state before an operation that may nest (`time_push`).
 ///
 /// The original writes elapsed time and the new start through two
@@ -574,6 +581,121 @@ pub unsafe fn time_pop(tp: ProftimeT) {
     // SAFETY: forwarded from this function's own safety doc.
     let previous = unsafe { *G_PREV_TIME.get_mut() };
     unsafe { *G_PREV_TIME.get_mut() = previous.wrapping_sub(tp) };
+}
+
+/// Format the difference between two startup timestamps (`time_diff`)
+/// as milliseconds with three fractional digits.
+fn time_diff(then: ProftimeT, now: ProftimeT) -> String {
+    let diff = profile_sub(now, then);
+    format!("{:07.3}", diff as f64 / 1.0e6)
+}
+
+/// Initialize startup timing and write the report headings
+/// (`time_start`).
+///
+/// # Safety
+/// Mutates shared startup timing and output state.
+pub unsafe fn time_start(message: &[u8]) -> std::io::Result<()> {
+    if unsafe { crate::globals::GLOBALS.get_mut() }
+        .time_fd
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let now = profile_start();
+    unsafe {
+        *G_PREV_TIME.get_mut() = now;
+        *G_START_TIME.get_mut() = now;
+    }
+    {
+        let writer = unsafe { crate::globals::GLOBALS.get_mut() }
+            .time_fd
+            .as_mut()
+            .expect("checked above");
+        writer.write_all(b"\ntimes in msec\n")?;
+        writer.write_all(b" clock   self+sourced   self:  sourced script\n")?;
+        writer.write_all(b" clock   elapsed:              other lines\n\n")?;
+    }
+    unsafe { time_msg(message, None) }
+}
+
+/// Write one startup timing record (`time_msg`).
+///
+/// # Safety
+/// Mutates shared startup timing and output state.
+pub unsafe fn time_msg(
+    message: &[u8],
+    start: Option<ProftimeT>,
+) -> std::io::Result<()> {
+    if unsafe { crate::globals::GLOBALS.get_mut() }
+        .time_fd
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let now = profile_start();
+    let absolute = time_diff(unsafe { *G_START_TIME.get_mut() }, now);
+    let sourced = start.map(|started| time_diff(started, now));
+    let elapsed = time_diff(unsafe { *G_PREV_TIME.get_mut() }, now);
+    unsafe { *G_PREV_TIME.get_mut() = now };
+
+    let writer = unsafe { crate::globals::GLOBALS.get_mut() }
+        .time_fd
+        .as_mut()
+        .expect("checked above");
+    writer.write_all(absolute.as_bytes())?;
+    if let Some(sourced) = sourced {
+        writer.write_all(b"  ")?;
+        writer.write_all(sourced.as_bytes())?;
+    }
+    writer.write_all(b"  ")?;
+    writer.write_all(elapsed.as_bytes())?;
+    writer.write_all(b": ")?;
+    writer.write_all(message)?;
+    writer.write_all(b"\n")
+}
+
+/// Open and buffer the `--startuptime` report (`time_init`).
+///
+/// # Safety
+/// Mutates shared startup report state and must be called at most once
+/// before [`time_finish`].
+pub unsafe fn time_init(
+    path: &std::path::Path,
+    process_name: &[u8],
+) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut writer = std::io::BufWriter::with_capacity(8193, file);
+    writer.write_all(b"--- Startup times for process: ")?;
+    writer.write_all(process_name)?;
+    writer.write_all(b" ---\n")?;
+    unsafe { crate::globals::GLOBALS.get_mut() }.time_fd = Some(writer);
+    Ok(())
+}
+
+/// Finish and flush the `--startuptime` report (`time_finish`).
+///
+/// # Safety
+/// Mutates shared startup timing and output state.
+pub unsafe fn time_finish() -> std::io::Result<()> {
+    if unsafe { crate::globals::GLOBALS.get_mut() }
+        .time_fd
+        .is_none()
+    {
+        return Ok(());
+    }
+    unsafe { time_msg(b"--- NVIM STARTED ---\n", None) }?;
+    if let Some(mut writer) =
+        unsafe { crate::globals::GLOBALS.get_mut() }.time_fd.take()
+    {
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 /// Adds the `self` time from the total time and the `children` time
@@ -700,6 +822,19 @@ mod tests {
     struct CurrentFunccallGuard(*mut crate::eval::typval_defs::FunccallT);
 
     struct ProfileExestackGuard(Vec<crate::runtime_defs::EstackT>);
+
+    struct StartupReportGuard(std::path::PathBuf);
+
+    impl Drop for StartupReportGuard {
+        fn drop(&mut self) {
+            if let Some(mut writer) =
+                unsafe { crate::globals::GLOBALS.get_mut() }.time_fd.take()
+            {
+                let _ = writer.flush();
+            }
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     impl ProfileExestackGuard {
         fn line(line: crate::pos_defs::LinenrT) -> Self {
@@ -1134,6 +1269,68 @@ mod tests {
         assert!(after_two >= after_one, "a second wait accumulates too");
 
         profile_set_wait(before);
+    }
+
+    #[test]
+    fn time_diff_formats_milliseconds_with_three_fractional_digits() {
+        assert_eq!(time_diff(1_000_000, 2_234_000), "001.234");
+        assert_eq!(time_diff(0, 12_345_678), "012.346");
+    }
+
+    #[test]
+    fn startup_time_functions_are_noops_without_an_open_report() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(
+            unsafe { crate::globals::GLOBALS.get_mut() }
+                .time_fd
+                .is_none()
+        );
+        unsafe {
+            time_start(b"ignored").unwrap();
+            time_msg(b"ignored", Some(0)).unwrap();
+            time_finish().unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows append-mode CreateFileW access flags"
+    )]
+    fn startup_time_report_is_appended_buffered_and_flushed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "nero-startuptime-{}-{}.log",
+            std::process::id(),
+            profile_start()
+        ));
+        let _file = StartupReportGuard(path.clone());
+
+        unsafe {
+            time_init(&path, b"nero-test").unwrap();
+            time_start(b"starting").unwrap();
+            let source_start = profile_start();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            time_msg(b"sourced", Some(source_start)).unwrap();
+            time_finish().unwrap();
+        }
+
+        assert!(
+            unsafe { crate::globals::GLOBALS.get_mut() }
+                .time_fd
+                .is_none()
+        );
+        let report = std::fs::read_to_string(path).unwrap();
+        assert!(report.starts_with(
+            "--- Startup times for process: nero-test ---\n\ntimes in msec\n"
+        ));
+        assert!(report.contains(concat!(
+            " clock   self+sourced   self:  sourced script\n",
+            " clock   elapsed:              other lines\n\n"
+        )));
+        assert!(report.contains(": starting\n"));
+        assert!(report.contains(": sourced\n"));
+        assert!(report.ends_with(": --- NVIM STARTED ---\n\n"));
     }
 
     // --- prof_total_cmp / prof_self_cmp ---
