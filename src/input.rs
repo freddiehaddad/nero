@@ -332,6 +332,40 @@ pub fn merge_modifiers(c_arg: i32, modifiers: &mut i32) -> i32 {
     c
 }
 
+/// Escape NUL and unescaped `K_SPECIAL` bytes read from a script
+/// (`fix_input_buffer`).
+///
+/// User input is returned unchanged. Rust returns a new owned buffer
+/// instead of requiring the caller to reserve three times the input
+/// capacity for in-place expansion.
+#[must_use]
+pub fn fix_input_buffer(input: &[u8]) -> Vec<u8> {
+    if !using_script() {
+        return input.to_vec();
+    }
+
+    let mut output = Vec::with_capacity(input.len().saturating_mul(3));
+    let mut offset = 0;
+    while offset < input.len() {
+        let byte = input[offset];
+        if byte == crate::ascii_defs::NUL
+            || (byte == crate::keycodes_defs::K_SPECIAL
+                && (offset + 2 >= input.len()
+                    || input[offset + 1] != crate::keycodes_defs::KS_EXTRA))
+        {
+            output.extend_from_slice(&[
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::k_second(i32::from(byte)),
+                crate::keycodes_defs::k_third(i32::from(byte)),
+            ]);
+        } else {
+            output.push(byte);
+        }
+        offset += 1;
+    }
+    output
+}
+
 /// Set a typeahead character that will not be flushed
 /// (`typeahead_noflush`).
 ///
@@ -2020,6 +2054,80 @@ mod tests {
         reset_buffers();
         unsafe { *CURSCRIPT.get_mut() = 0 };
         assert!(using_script());
+        reset_buffers();
+    }
+
+    #[test]
+    fn fix_input_buffer_leaves_user_input_unescaped() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        let input = [
+            b'a',
+            crate::ascii_defs::NUL,
+            crate::keycodes_defs::K_SPECIAL,
+        ];
+        assert_eq!(fix_input_buffer(&input), input);
+        reset_buffers();
+    }
+
+    #[test]
+    fn fix_input_buffer_escapes_nul_and_k_special_from_a_script() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { *CURSCRIPT.get_mut() = 0 };
+
+        assert_eq!(
+            fix_input_buffer(&[
+                b'a',
+                crate::ascii_defs::NUL,
+                crate::keycodes_defs::K_SPECIAL,
+            ]),
+            vec![
+                b'a',
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_ZERO,
+                crate::keycodes_defs::KE_FILLER,
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+            ]
+        );
+        reset_buffers();
+    }
+
+    #[test]
+    fn fix_input_buffer_preserves_an_existing_ks_extra_sequence() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { *CURSCRIPT.get_mut() = 0 };
+        let input = [
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_EXTRA,
+            crate::keycodes_defs::KE_IGNORE,
+        ];
+
+        assert_eq!(fix_input_buffer(&input), input);
+        reset_buffers();
+    }
+
+    #[test]
+    fn fix_input_buffer_escapes_a_truncated_special_sequence() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { *CURSCRIPT.get_mut() = 0 };
+
+        assert_eq!(
+            fix_input_buffer(&[
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_EXTRA,
+            ]),
+            vec![
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+                crate::keycodes_defs::KS_EXTRA,
+            ]
+        );
         reset_buffers();
     }
 
