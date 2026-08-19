@@ -427,6 +427,73 @@ pub unsafe fn nvim__invalidate_glyph_cache() {
         crate::drawscreen::UPD_CLEAR;
 }
 
+/// Queue keys in the typeahead buffer (`nvim_feedkeys`).
+///
+/// Normal mapped/nonmapped, typed and front-insertion modes are
+/// complete. Low-level raw input still needs `input_enqueue_raw`;
+/// immediate execution (`"x"`) still needs `exec_normal`.
+///
+/// # Safety
+/// Mutates the shared typeahead buffer and input globals; forwarded
+/// from [`crate::input::ins_typebuf`].
+pub unsafe fn nvim_feedkeys(
+    keys: &NvimString,
+    mode: &NvimString,
+    escape_ks: Boolean,
+) {
+    let mut remap = true;
+    let mut insert = false;
+    let mut typed = false;
+    let mut execute = false;
+    let mut lowlevel = false;
+    for &flag in mode {
+        match flag {
+            b'n' => remap = false,
+            b'm' => remap = true,
+            b't' => typed = true,
+            b'i' => insert = true,
+            b'x' => execute = true,
+            b'L' => lowlevel = true,
+            b'!' => {}
+            _ => {}
+        }
+    }
+
+    if keys.is_empty() && !execute {
+        return;
+    }
+    let escaped;
+    let keys = if escape_ks {
+        escaped = crate::keycodes::vim_strsave_escape_ks(keys);
+        escaped.as_slice()
+    } else {
+        keys.as_slice()
+    };
+    if lowlevel {
+        unimplemented!(
+            "nvim_feedkeys: low-level mode needs input_enqueue_raw"
+        );
+    }
+
+    let offset = if insert {
+        0
+    } else {
+        crate::input::typebuf_len()
+    };
+    let noremap = if remap {
+        crate::input_defs::RemapValues::Yes as i32
+    } else {
+        crate::input_defs::RemapValues::None as i32
+    };
+    let _ = crate::input::ins_typebuf(keys, noremap, offset, !typed, false);
+    if unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy != 0 {
+        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+    }
+    if execute {
+        unimplemented!("nvim_feedkeys: immediate execution needs exec_normal");
+    }
+}
+
 /// Replace terminal/key codes in a string (`nvim_replace_termcodes`).
 ///
 /// # Safety
@@ -799,12 +866,108 @@ mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, TabpageT, WinT};
 
+    struct TypeaheadGuard(crate::input_defs::TasaveT);
+
+    impl TypeaheadGuard {
+        fn save() -> Self {
+            let mut saved = crate::input_defs::TasaveT::default();
+            crate::input::save_typeahead(&mut saved);
+            Self(saved)
+        }
+    }
+
+    impl Drop for TypeaheadGuard {
+        fn drop(&mut self) {
+            crate::input::restore_typeahead(&mut self.0);
+        }
+    }
+
     #[test]
     fn terminal_stub_callbacks_are_noops() {
         term_read_pause(true, std::ptr::null_mut());
         term_read_pause(false, std::ptr::null_mut());
         term_resize(80, 24, std::ptr::null_mut());
         term_resume(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn nvim_feedkeys_queues_and_front_inserts_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+
+        unsafe {
+            nvim_feedkeys(&b"tail".to_vec(), &Vec::new(), false);
+            nvim_feedkeys(&b"head".to_vec(), &b"i".to_vec(), false);
+        }
+
+        assert_eq!(crate::input::typebuf_len(), 8);
+        assert_eq!(
+            crate::input::typebuf_bytes_for_test(),
+            b"headtail"
+        );
+        assert_eq!(crate::input::typebuf_maplen(), 8);
+    }
+
+    #[test]
+    fn nvim_feedkeys_typed_mode_does_not_extend_mapped_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+
+        unsafe { nvim_feedkeys(&b"typed".to_vec(), &b"t".to_vec(), false) };
+
+        assert_eq!(crate::input::typebuf_len(), 5);
+        assert_eq!(crate::input::typebuf_maplen(), 0);
+    }
+
+    #[test]
+    fn nvim_feedkeys_nonremap_mode_marks_the_queued_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+
+        unsafe { nvim_feedkeys(&b"xy".to_vec(), &b"n".to_vec(), false) };
+
+        assert_eq!(
+            crate::input::typebuf_remap_for_test(),
+            vec![crate::input::RM_NONE as u8; 2]
+        );
+    }
+
+    #[test]
+    fn nvim_feedkeys_marks_typebuf_filled_while_vgetc_is_busy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let _busy = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.vgetc_busy,
+                1,
+            )
+        };
+        let _filled = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.typebuf_was_filled,
+                false,
+            )
+        };
+
+        unsafe { nvim_feedkeys(&b"x".to_vec(), &Vec::new(), false) };
+
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled);
+    }
+
+    #[test]
+    #[should_panic(expected = "input_enqueue_raw")]
+    fn nvim_feedkeys_lowlevel_mode_needs_the_raw_input_queue() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        unsafe { nvim_feedkeys(&b"x".to_vec(), &b"L".to_vec(), false) };
+    }
+
+    #[test]
+    #[should_panic(expected = "exec_normal")]
+    fn nvim_feedkeys_execute_mode_queues_before_needing_execution() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        unsafe { nvim_feedkeys(&b"x".to_vec(), &b"x".to_vec(), false) };
     }
 
     #[test]

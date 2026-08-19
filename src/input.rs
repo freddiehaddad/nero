@@ -949,6 +949,22 @@ pub fn typebuf_len() -> i32 {
     unsafe { TYPEBUF.get_mut() }.tb_len
 }
 
+#[cfg(test)]
+pub(crate) fn typebuf_bytes_for_test() -> Vec<u8> {
+    let tb = unsafe { TYPEBUF.get_mut() };
+    let start = tb.tb_off as usize;
+    let end = start + tb.tb_len as usize;
+    tb.tb_buf[start..end].to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn typebuf_remap_for_test() -> Vec<u8> {
+    let tb = unsafe { TYPEBUF.get_mut() };
+    let start = tb.tb_off as usize;
+    let end = start + tb.tb_len as usize;
+    tb.tb_noremap[start..end].to_vec()
+}
+
 /// Whether the typeahead buffer was changed (while waiting for a
 /// character to arrive) since `tb_change_cnt` was snapshotted -
 /// happens when a message was received from a client or from
