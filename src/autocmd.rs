@@ -784,6 +784,15 @@ pub fn autocmd_supported(event: &[u8]) -> bool {
     event_name2nr(event).0.is_some()
 }
 
+/// Whether a pattern uses `<buffer...>` syntax
+/// (`aupat_is_buflocal`).
+#[must_use]
+pub fn aupat_is_buflocal(pattern: &[u8]) -> bool {
+    pattern.len() >= 8
+        && pattern.starts_with(b"<buffer")
+        && pattern.last() == Some(&b'>')
+}
+
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
 ///
 /// `win` selects the window-local option, which accepts only entries
@@ -1711,6 +1720,14 @@ mod tests {
         assert!(autocmd_supported(b"BufEnter"));
         assert!(autocmd_supported(b"BufCreate"));
         assert!(!autocmd_supported(b"NeroMissingEvent"));
+    }
+
+    #[test]
+    fn aupat_is_buflocal_checks_the_exact_envelope() {
+        assert!(aupat_is_buflocal(b"<buffer>"));
+        assert!(aupat_is_buflocal(b"<buffer=12>"));
+        assert!(!aupat_is_buflocal(b"<Buffer>"));
+        assert!(!aupat_is_buflocal(b"<buffer"));
     }
 
     #[test]
