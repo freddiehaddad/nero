@@ -592,6 +592,24 @@ pub unsafe fn augroup_name(mut group: i32) -> Option<Vec<u8>> {
     unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.get(&group).cloned()
 }
 
+/// Delete every autocmd in one augroup (`aucmd_del_for_event_and_group`
+/// across all events).
+///
+/// # Safety
+/// Mutates the shared autocmd registry.
+pub unsafe fn augroup_clear(group: i32) {
+    let has_entries = unsafe { AUTOCMDS.get_mut() }.iter().any(|commands| {
+        commands
+            .iter()
+            .any(|command| !command.pat.is_null() && unsafe { (*command.pat).group } == group)
+    });
+    if has_entries {
+        unimplemented!(
+            "augroup_clear: deleting populated groups needs aucmd_del and callback cleanup"
+        );
+    }
+}
+
 /// Find the ID of an autocmd group name, or
 /// [`crate::autocmd_defs::augroup::ERROR`] if not found
 /// (`augroup_find`).
@@ -1364,6 +1382,7 @@ mod tests {
             unsafe { augroup_name(augroup::DELETED) },
             Some(b"--- DELETED ---".to_vec())
         );
+        unsafe { augroup_clear(first) };
         reset_augroup_map();
     }
 
