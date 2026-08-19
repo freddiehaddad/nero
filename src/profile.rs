@@ -939,6 +939,119 @@ unsafe fn func_dump_profile() -> String {
     report
 }
 
+/// Read source bytes in the same chunks as `vim_fgets(IOSIZE)`.
+fn profile_source_chunks(source: &[u8]) -> Vec<Vec<u8>> {
+    let mut chunks = Vec::new();
+    let mut position = 0;
+    while position < source.len() {
+        let remaining = &source[position..];
+        let read_len = remaining
+            .iter()
+            .take(crate::globals::IOSIZE - 1)
+            .position(|&byte| byte == b'\n')
+            .map_or(
+                remaining.len().min(crate::globals::IOSIZE - 1),
+                |newline| newline + 1,
+            );
+        let mut chunk = remaining[..read_len].to_vec();
+        position += read_len;
+
+        if chunk.len() == crate::globals::IOSIZE - 1
+            && chunk.last().is_some_and(|&byte| byte != 0 && byte != b'\n')
+        {
+            let mut end = chunk.len() - 1;
+            while end > 0 && chunk[end] & 0xc0 == 0x80 {
+                end -= 1;
+            }
+            chunk.truncate(end);
+            chunk.push(b'\n');
+        }
+        if let Some(nul) = chunk.iter().position(|&byte| byte == 0) {
+            chunk.truncate(nul);
+        }
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Format profiling results for every profiled script
+/// (`script_dump_profile`).
+///
+/// # Safety
+/// Reads the shared script registry, whose pointers must remain live and
+/// whose contents must not change during this call.
+#[allow(dead_code)]
+unsafe fn script_dump_profile() -> Vec<u8> {
+    let mut report = Vec::new();
+    for sid in 1..=crate::runtime::script_item_count() {
+        let script = crate::runtime::script_item(sid);
+        // SAFETY: forwarded from this function's own safety doc.
+        let script = unsafe { &*script };
+        if !script.sn_prof_on {
+            continue;
+        }
+        let name = script.sn_name.as_deref().unwrap_or_default();
+        report.extend_from_slice(b"SCRIPT  ");
+        report.extend_from_slice(name);
+        report.push(b'\n');
+        if script.sn_pr_count == 1 {
+            report.extend_from_slice(b"Sourced 1 time\n");
+        } else {
+            report.extend_from_slice(
+                format!("Sourced {} times\n", script.sn_pr_count)
+                    .as_bytes(),
+            );
+        }
+        report.extend_from_slice(
+            format!(
+                "Total time: {}\n Self time: {}\n\n\
+                 count  total (s)   self (s)\n",
+                profile_msg(script.sn_pr_total),
+                profile_msg(script.sn_pr_self),
+            )
+            .as_bytes(),
+        );
+
+        #[cfg(unix)]
+        let source = {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(name));
+            std::fs::read(path).ok()
+        };
+        #[cfg(windows)]
+        let source = std::str::from_utf8(name)
+            .ok()
+            .and_then(|path| std::fs::read(path).ok());
+        let Some(source) = source else {
+            report.extend_from_slice(b"Cannot open file!\n\n");
+            continue;
+        };
+        for (index, chunk) in profile_source_chunks(&source)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(line) = script.sn_prl_ga.get(index)
+                && line.snp_count > 0
+            {
+                report.extend_from_slice(
+                    prof_func_line(
+                        line.snp_count,
+                        line.sn_prl_total,
+                        line.sn_prl_self,
+                        true,
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                report.extend_from_slice(b"                            ");
+            }
+            report.extend_from_slice(&chunk);
+        }
+        report.push(b'\n');
+    }
+    report
+}
+
 /// Compare two functions by total time, for sorting
 /// (`prof_total_cmp`).
 ///
@@ -1746,6 +1859,97 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         crate::eval::userfunc::func_init();
         assert!(unsafe { func_dump_profile() }.is_empty());
+    }
+
+    #[test]
+    fn profile_source_chunks_matches_fgets_line_and_size_boundaries() {
+        assert_eq!(
+            profile_source_chunks(b"one\nlast"),
+            vec![b"one\n".to_vec(), b"last".to_vec()]
+        );
+
+        let source = vec![b'x'; crate::globals::IOSIZE];
+        let chunks = profile_source_chunks(&source);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), crate::globals::IOSIZE - 1);
+        assert_eq!(chunks[0].last(), Some(&b'\n'));
+        assert_eq!(chunks[1], vec![b'x']);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows file-open mode used by std::fs::read"
+    )]
+    fn script_dump_profile_formats_source_lines_and_timings() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let path = std::env::temp_dir().join(format!(
+            "nero-profile-source-{}-{}.vim",
+            std::process::id(),
+            profile_start()
+        ));
+        let _file = StartupReportGuard(path.clone());
+        std::fs::write(&path, b"let x = 1\nreturn x\n").unwrap();
+        let name = path.to_string_lossy().into_owned().into_bytes();
+        let (_, script) = crate::runtime::new_script_item(Some(name.clone()));
+        unsafe {
+            (*script).sn_prof_on = true;
+            (*script).sn_pr_count = 2;
+            (*script).sn_pr_total = 2_000_000_000;
+            (*script).sn_pr_self = 1_000_000_000;
+            (*script).sn_prl_ga = vec![
+                crate::runtime_defs::SnPrlT {
+                    snp_count: 2,
+                    sn_prl_total: 1_500_000_000,
+                    sn_prl_self: 500_000_000,
+                },
+                crate::runtime_defs::SnPrlT {
+                    snp_count: 1,
+                    sn_prl_total: 500_000_000,
+                    sn_prl_self: 500_000_000,
+                },
+            ];
+        }
+
+        let report = unsafe { script_dump_profile() };
+
+        let mut heading = b"SCRIPT  ".to_vec();
+        heading.extend_from_slice(&name);
+        heading.push(b'\n');
+        assert!(report.starts_with(&heading));
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("Sourced 2 times\n"));
+        assert!(report.contains("Total time:   2.000000\n"));
+        assert!(report.contains(" Self time:   1.000000\n"));
+        assert!(report.contains("let x = 1\n"));
+        assert!(report.contains("return x\n"));
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows file-open mode used by std::fs::read"
+    )]
+    fn script_dump_profile_reports_an_unreadable_source() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (_, script) = crate::runtime::new_script_item(Some(
+            b"this/profile/source/does/not/exist.vim".to_vec(),
+        ));
+        unsafe { (*script).sn_prof_on = true };
+
+        let report = unsafe { script_dump_profile() };
+
+        assert!(report.ends_with(b"Cannot open file!\n\n"));
+    }
+
+    #[test]
+    fn script_dump_profile_skips_unprofiled_scripts() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        crate::runtime::new_script_item(Some(b"plain.vim".to_vec()));
+        assert!(unsafe { script_dump_profile() }.is_empty());
     }
 
     // --- get_profile_name / prof_def_func ---
