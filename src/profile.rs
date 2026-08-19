@@ -805,6 +805,26 @@ fn prof_func_line(
     line
 }
 
+fn profile_function_name(
+    function: &crate::eval::typval_defs::UfuncT,
+) -> String {
+    let mut name = function.uf_name.as_slice();
+    if name.last() == Some(&0) {
+        name = &name[..name.len() - 1];
+    }
+    let mut display = String::new();
+    if name.starts_with(&[
+        crate::keycodes_defs::K_SPECIAL,
+        crate::keycodes_defs::KS_EXTRA,
+        crate::keycodes_defs::KE_SNR,
+    ]) {
+        display.push_str("<SNR>");
+        name = &name[3..];
+    }
+    display.push_str(&String::from_utf8_lossy(name));
+    display
+}
+
 /// Format one sorted function table (`prof_sort_list`).
 ///
 /// The input is already sorted, matching the original's `sorttab`
@@ -828,22 +848,94 @@ fn prof_sort_list(
         ));
         report.push(' ');
 
-        let mut name = function.uf_name.as_slice();
-        if name.last() == Some(&0) {
-            name = &name[..name.len() - 1];
-        }
-        if name.starts_with(&[
-            crate::keycodes_defs::K_SPECIAL,
-            crate::keycodes_defs::KS_EXTRA,
-            crate::keycodes_defs::KE_SNR,
-        ]) {
-            report.push_str("<SNR>");
-            name = &name[3..];
-        }
-        report.push_str(&String::from_utf8_lossy(name));
+        report.push_str(&profile_function_name(function));
         report.push_str("()\n");
     }
     report.push('\n');
+    report
+}
+
+/// Format profiling results for every registered user function
+/// (`func_dump_profile`).
+///
+/// The original writes directly to a `FILE *`; this returns the same
+/// report bytes for the eventual owned profile writer.
+///
+/// # Safety
+/// Reads the shared function and script registries. Registered pointers
+/// must remain live and neither registry may change during the call.
+#[allow(dead_code)]
+unsafe fn func_dump_profile() -> String {
+    // SAFETY: forwarded from this function's own safety doc.
+    let pointers = unsafe { crate::eval::userfunc::func_tbl_values() };
+    let mut functions = Vec::new();
+    let mut report = String::new();
+
+    for pointer in pointers {
+        // SAFETY: func_tbl_values returns registered live functions.
+        let function = unsafe { &*pointer };
+        if function.uf_prof_initialized == 0 {
+            continue;
+        }
+        functions.push(function);
+        report.push_str("FUNCTION  ");
+        report.push_str(&profile_function_name(function));
+        report.push_str("()\n");
+        if function.uf_script_ctx.sc_sid != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let name = unsafe {
+                crate::runtime::get_scriptname(function.uf_script_ctx)
+            };
+            report.push_str("    Defined: ");
+            report.push_str(&String::from_utf8_lossy(&name));
+            report.push(':');
+            report.push_str(&function.uf_script_ctx.sc_lnum.to_string());
+            report.push('\n');
+        }
+        if function.uf_tm_count == 1 {
+            report.push_str("Called 1 time\n");
+        } else {
+            report.push_str(&format!(
+                "Called {} times\n",
+                function.uf_tm_count
+            ));
+        }
+        report.push_str("Total time: ");
+        report.push_str(&profile_msg(function.uf_tm_total));
+        report.push_str("\n Self time: ");
+        report.push_str(&profile_msg(function.uf_tm_self));
+        report.push_str("\n\ncount  total (s)   self (s)\n");
+
+        for (index, line) in function.uf_lines.iter().enumerate() {
+            let Some(line) = line else {
+                continue;
+            };
+            report.push_str(&prof_func_line(
+                function.uf_tml_count[index],
+                function.uf_tml_total[index],
+                function.uf_tml_self[index],
+                true,
+            ));
+            report.push_str(&String::from_utf8_lossy(line));
+            report.push('\n');
+        }
+        report.push('\n');
+    }
+
+    if !functions.is_empty() {
+        functions.sort_by(|left, right| {
+            prof_total_cmp(left, right).cmp(&0)
+        });
+        report.push_str(&prof_sort_list(
+            &functions,
+            "TOTAL",
+            false,
+        ));
+        functions.sort_by(|left, right| {
+            prof_self_cmp(left, right).cmp(&0)
+        });
+        report.push_str(&prof_sort_list(&functions, "SELF", true));
+    }
     report
 }
 
@@ -1545,6 +1637,115 @@ mod tests {
         assert!(report.contains(" Function19()\n"));
         assert!(!report.contains(" Function20()\n"));
         assert_eq!(report.matches("()\n").count(), 20);
+    }
+
+    #[test]
+    fn func_dump_profile_formats_details_lines_and_rankings() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        crate::eval::userfunc::func_init();
+        let (sid, _) =
+            crate::runtime::new_script_item(Some(b"profile.vim".to_vec()));
+
+        let normal = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: b"Normal\0".to_vec(),
+                uf_prof_initialized: 1,
+                uf_tm_count: 2,
+                uf_tm_total: 2_000_000_000,
+                uf_tm_self: 250_000_000,
+                uf_lines: vec![
+                    Some(b"let x = 1".to_vec()),
+                    None,
+                    Some(b"return x".to_vec()),
+                ],
+                uf_tml_count: vec![2, 0, 1],
+                uf_tml_total: vec![1_000_000_000, 0, 500_000_000],
+                uf_tml_self: vec![750_000_000, 0, 250_000_000],
+                uf_script_ctx: crate::eval::typval_defs::SctxT {
+                    sc_sid: sid,
+                    sc_lnum: 12,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
+        let mut snr_name = vec![
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_EXTRA,
+            crate::keycodes_defs::KE_SNR,
+        ];
+        snr_name.extend_from_slice(b"4_Local\0");
+        let script_local = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: snr_name,
+                uf_prof_initialized: 1,
+                uf_tm_count: 1,
+                uf_tm_total: 1_000_000_000,
+                uf_tm_self: 750_000_000,
+                uf_lines: vec![Some(b"return 1".to_vec())],
+                uf_tml_count: vec![1],
+                uf_tml_total: vec![1_000_000_000],
+                uf_tml_self: vec![750_000_000],
+                ..Default::default()
+            },
+        ));
+        let untouched = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: b"Untouched\0".to_vec(),
+                ..Default::default()
+            },
+        ));
+        unsafe {
+            assert_eq!(
+                crate::eval::userfunc::func_hashtab_add(normal),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::eval::userfunc::func_hashtab_add(script_local),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::eval::userfunc::func_hashtab_add(untouched),
+                crate::vim_defs::OK
+            );
+        }
+
+        let report = unsafe { func_dump_profile() };
+
+        assert!(report.contains("FUNCTION  Normal()\n"));
+        assert!(report.contains("    Defined: profile.vim:12\n"));
+        assert!(report.contains("Called 2 times\n"));
+        assert!(report.contains("let x = 1\n"));
+        assert!(report.contains("return x\n"));
+        assert!(!report.contains("Untouched()"));
+        assert!(report.contains("FUNCTION  <SNR>4_Local()\n"));
+        let total = report.find("FUNCTIONS SORTED ON TOTAL TIME").unwrap();
+        let self_time = report.find("FUNCTIONS SORTED ON SELF TIME").unwrap();
+        let total_section = &report[total..self_time];
+        assert!(
+            total_section.find("Normal()").unwrap()
+                < total_section.find("<SNR>4_Local()").unwrap()
+        );
+        let self_section = &report[self_time..];
+        assert!(
+            self_section.find("<SNR>4_Local()").unwrap()
+                < self_section.find("Normal()").unwrap()
+        );
+
+        unsafe {
+            crate::eval::userfunc::func_init();
+            drop(Box::from_raw(normal));
+            drop(Box::from_raw(script_local));
+            drop(Box::from_raw(untouched));
+        }
+    }
+
+    #[test]
+    fn func_dump_profile_is_empty_without_initialized_functions() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        assert!(unsafe { func_dump_profile() }.is_empty());
     }
 
     // --- get_profile_name / prof_def_func ---
