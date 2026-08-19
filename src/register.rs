@@ -18,8 +18,8 @@
 //! `execreg_line_continuation`/[`do_execreg`] (the register execution
 //! queue builder), [`do_record`] (macro recording start/stop), and
 //! [`insert_reg`] (register-to-stuff-buffer
-//! insertion), [`str_to_reg`]/[`write_reg_contents_ex`] (direct
-//! register writes),
+//! insertion), [`str_to_reg`]/[`write_reg_contents`]/
+//! [`write_reg_contents_ex`] (direct register writes),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
 //! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
@@ -382,6 +382,16 @@ pub unsafe fn write_reg_contents_ex(
             block_len,
         );
         finish_write_reg(name, &*register, previous);
+    }
+}
+
+/// Store `text` in register `name` (`write_reg_contents`).
+///
+/// # Safety
+/// Forwarded from [`write_reg_contents_ex`].
+pub unsafe fn write_reg_contents(name: i32, text: &[u8], must_append: bool) {
+    unsafe {
+        write_reg_contents_ex(name, text, must_append, None, Some(0));
     }
 }
 
@@ -2154,6 +2164,27 @@ mod tests {
                 None,
             )
         };
+    }
+
+    #[test]
+    fn write_reg_contents_delegates_with_auto_detected_motion_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'c')).unwrap();
+
+        unsafe {
+            write_reg_contents(i32::from(b'c'), b"one\ntwo\n", false);
+        }
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
     }
 
     #[test]
