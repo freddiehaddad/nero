@@ -571,6 +571,24 @@ pub unsafe fn autocmd_delete_id(id: i64) -> bool {
     found
 }
 
+/// Delete every autocmd for one event and augroup
+/// (`aucmd_del_for_event_and_group`).
+///
+/// # Safety
+/// Mutates shared autocmd/pattern/callback state.
+pub unsafe fn aucmd_del_for_event_and_group(event: EventT, group: i32) {
+    {
+    let autocmds = unsafe { AUTOCMDS.get_mut() };
+    let commands = &mut autocmds[event as usize];
+        for command in commands {
+            if !command.pat.is_null() && unsafe { (*command.pat).group } == group {
+                unsafe { aucmd_del(command) };
+            }
+        }
+    }
+    au_cleanup();
+}
+
 /// Free all autocmds and augroup registries (`free_all_autocmds`).
 ///
 /// # Safety
@@ -1615,6 +1633,41 @@ mod tests {
         assert!(unsafe { autocmd_delete_id(42) });
         assert!(unsafe { AUTOCMDS.get_mut() }[EventT::BufEnter as usize].is_empty());
         assert!(!unsafe { autocmd_delete_id(42) });
+    }
+
+    #[test]
+    fn aucmd_del_for_event_and_group_only_removes_matching_event_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let make = |event: EventT| {
+            let pattern = Box::into_raw(Box::new(crate::autocmd_defs::AutoPat {
+                refcount: 1,
+                pat: Some(b"*".to_vec()),
+                reg_prog: std::ptr::null_mut(),
+                group: 7,
+                patlen: 1,
+                buflocal_nr: 0,
+                allow_dirs: false,
+            }));
+            let autocmds = unsafe { AUTOCMDS.get_mut() };
+            autocmds[event as usize].push(
+                crate::autocmd_defs::AutoCmd {
+                    pat: pattern,
+                    id: i64::from(event as i32),
+                    desc: None,
+                    handler_cmd: Some(b"echo".to_vec()),
+                    handler_fn: Default::default(),
+                    script_ctx: Default::default(),
+                    once: false,
+                    nested: false,
+                },
+            );
+        };
+        make(EventT::BufEnter);
+        make(EventT::BufLeave);
+        unsafe { aucmd_del_for_event_and_group(EventT::BufEnter, 7) };
+        assert!(unsafe { AUTOCMDS.get_mut() }[EventT::BufEnter as usize].is_empty());
+        assert_eq!(unsafe { AUTOCMDS.get_mut() }[EventT::BufLeave as usize].len(), 1);
+        unsafe { aucmd_del_for_event_and_group(EventT::BufLeave, 7) };
     }
 
     #[test]
