@@ -1112,6 +1112,30 @@ pub(crate) fn typebuf_remap_for_test() -> Vec<u8> {
     tb.tb_noremap[start..end].to_vec()
 }
 
+#[cfg(test)]
+pub(crate) fn take_recording_state_for_test() -> (BuffheaderT, usize) {
+    (
+        std::mem::take(unsafe { RECORDBUFF.get_mut() }),
+        unsafe { std::mem::replace(LAST_RECORDED_LEN.get_mut(), 0) },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn restore_recording_state_for_test(
+    state: (BuffheaderT, usize),
+) {
+    unsafe {
+        *RECORDBUFF.get_mut() = state.0;
+        *LAST_RECORDED_LEN.get_mut() = state.1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_recorded_state_for_test(bytes: &[u8], last_len: usize) {
+    add_buff(unsafe { RECORDBUFF.get_mut() }, bytes);
+    unsafe { *LAST_RECORDED_LEN.get_mut() = last_len };
+}
+
 /// Whether the typeahead buffer was changed (while waiting for a
 /// character to arrive) since `tb_change_cnt` was snapshotted -
 /// happens when a message was received from a client or from

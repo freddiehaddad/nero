@@ -16,7 +16,8 @@
 //! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller),
 //! `put_reedit_in_typebuf`/`put_in_typebuf`/
 //! `execreg_line_continuation`/[`do_execreg`] (the register execution
-//! queue builder), and [`insert_reg`] (register-to-stuff-buffer
+//! queue builder), [`do_record`] (macro recording start/stop), and
+//! [`insert_reg`] (register-to-stuff-buffer
 //! insertion),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
@@ -106,7 +107,6 @@ pub unsafe fn copy_register(name: i32) -> YankregT {
 ///
 /// # Safety
 /// Mutates shared register storage and reads the system clock.
-#[allow(dead_code)] // Used when real macro-recording stop is translated.
 unsafe fn stuff_yank(regname: i32, text: &[u8]) -> i32 {
     if regname != 0 && !valid_yank_reg(regname, true) {
         return crate::vim_defs::FAIL;
@@ -133,6 +133,65 @@ unsafe fn stuff_yank(regname: i32, text: &[u8]) -> i32 {
     }
     register.timestamp = crate::os::time::os_time();
     crate::vim_defs::OK
+}
+
+/// Register selected when macro recording began (`do_record`'s
+/// function-local static `regname`).
+static RECORD_REGNAME: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Start or stop macro recording (`do_record`).
+///
+/// Display updates are omitted. A genuinely registered RecordingEnter
+/// or RecordingLeave handler still needs the full `v:event` payload
+/// lifecycle and stops at that point.
+///
+/// # Safety
+/// Mutates shared recording, register and autocmd state.
+pub unsafe fn do_record(c: i32) -> i32 {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    if unsafe { (*globals).reg_recording } == 0 {
+        if c < 0
+            || (!crate::macros_defs::ascii_isalnum(c)
+                && c != i32::from(b'"'))
+        {
+            return crate::vim_defs::FAIL;
+        }
+        unsafe {
+            (*globals).reg_recording = c;
+            *RECORD_REGNAME.get_mut() = c;
+        }
+        if crate::autocmd::has_event(
+            crate::autocmd_defs::EventT::RecordingEnter,
+        ) {
+            unimplemented!(
+                "do_record: RecordingEnter handlers need the v:event lifecycle"
+            );
+        }
+        return crate::vim_defs::OK;
+    }
+
+    if crate::autocmd::has_event(
+        crate::autocmd_defs::EventT::RecordingLeave,
+    ) {
+        unimplemented!(
+            "do_record: RecordingLeave handlers need the v:event lifecycle"
+        );
+    }
+    let mut recorded = unsafe { crate::input::get_recorded() };
+    let len = crate::keycodes::vim_unescape_ks(&mut recorded);
+    recorded.truncate(len);
+    let recording = unsafe { (*globals).reg_recording };
+    unsafe {
+        (*globals).reg_recorded = recording;
+        (*globals).reg_recording = 0;
+    }
+
+    let previous = unsafe { *Y_PREVIOUS.get_mut() };
+    let result =
+        unsafe { stuff_yank(*RECORD_REGNAME.get_mut(), &recorded) };
+    unsafe { *Y_PREVIOUS.get_mut() = previous };
+    result
 }
 
 /// Queue a pending Insert-mode restart after any register text
@@ -480,6 +539,7 @@ pub unsafe fn insert_reg(
                 "insert_reg: characterwise small-delete insertion needs do_put"
             );
         }
+
         crate::input::stuffescaped(line, literally);
         if register.y_type == crate::normal_defs::MotionType::LineWise
             || index + 1 < lines.len()
@@ -1150,6 +1210,7 @@ mod tests {
 
     struct TypeaheadGuard(crate::input_defs::TasaveT);
     struct LastInsertResetGuard;
+    struct InputRecordingGuard(Option<(crate::input_defs::BuffheaderT, usize)>);
 
     impl TypeaheadGuard {
         fn save() -> Self {
@@ -1168,6 +1229,20 @@ mod tests {
     impl Drop for LastInsertResetGuard {
         fn drop(&mut self) {
             unsafe { crate::insert::reset_last_insert_for_test() };
+        }
+    }
+
+    impl InputRecordingGuard {
+        fn save() -> Self {
+            Self(Some(crate::input::take_recording_state_for_test()))
+        }
+    }
+
+    impl Drop for InputRecordingGuard {
+        fn drop(&mut self) {
+            crate::input::restore_recording_state_for_test(
+                self.0.take().expect("saved input recording state"),
+            );
         }
     }
 
@@ -1271,6 +1346,7 @@ mod tests {
     fn copy_register_deep_copies_lines_and_metadata() {
         let _lock = crate::globals::global_state_test_lock();
         let _registers = RegisterStateGuard::save();
+        let _input_recording = InputRecordingGuard::save();
         let index = op_reg_index(i32::from(b'a')).unwrap();
         unsafe {
             Y_REGS.get_mut()[index] = YankregT {
@@ -1297,6 +1373,7 @@ mod tests {
     fn copy_register_normalizes_an_empty_allocated_array_to_none() {
         let _lock = crate::globals::global_state_test_lock();
         let _registers = RegisterStateGuard::save();
+        let _input_recording = InputRecordingGuard::save();
         let index = op_reg_index(i32::from(b'b')).unwrap();
         unsafe {
             Y_REGS.get_mut()[index].y_array = Some(Vec::new());
@@ -1371,6 +1448,71 @@ mod tests {
             unsafe { stuff_yank(i32::from(b'%'), b"invalid") },
             crate::vim_defs::FAIL
         );
+    }
+
+    #[test]
+    fn do_record_rejects_invalid_names_and_starts_valid_recording() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _input_recording = InputRecordingGuard::save();
+        let _recording = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_recording,
+                0,
+            )
+        };
+
+        assert_eq!(unsafe { do_record(i32::from(b'!')) }, crate::vim_defs::FAIL);
+        assert_eq!(unsafe { do_record(i32::from(b'a')) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.reg_recording,
+            i32::from(b'a')
+        );
+    }
+
+    #[test]
+    fn do_record_stops_and_stores_the_recorded_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _input_recording = InputRecordingGuard::save();
+        let _recording = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_recording,
+                0,
+            )
+        };
+        let _recorded = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_recorded,
+                0,
+            )
+        };
+        unsafe { *Y_PREVIOUS.get_mut() = Some(0) };
+
+        assert_eq!(unsafe { do_record(i32::from(b'b')) }, crate::vim_defs::OK);
+        crate::input::set_recorded_state_for_test(
+            &[
+                b'a',
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+                b'q',
+            ],
+            1,
+        );
+        assert_eq!(unsafe { do_record(0) }, crate::vim_defs::OK);
+
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        assert_eq!(
+            unsafe { Y_REGS.get_mut()[index].y_array.as_deref() },
+            Some([vec![b'a', crate::keycodes_defs::K_SPECIAL]].as_slice())
+        );
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.reg_recorded,
+            i32::from(b'b')
+        );
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.reg_recording, 0);
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(0));
     }
 
     #[test]
@@ -1619,6 +1761,7 @@ mod tests {
         regs: Option<[YankregT; NUM_REGISTERS]>,
         previous: Option<usize>,
         execreg_lastc: i32,
+        record_regname: i32,
     }
 
     impl RegisterStateGuard {
@@ -1628,6 +1771,7 @@ mod tests {
                 regs: Some(unsafe { Y_REGS.get_mut() }.clone()),
                 previous: unsafe { *Y_PREVIOUS.get_mut() },
                 execreg_lastc: unsafe { *EXECR_LASTC.get_mut() },
+                record_regname: unsafe { *RECORD_REGNAME.get_mut() },
             }
         }
     }
@@ -1640,6 +1784,7 @@ mod tests {
                 *Y_REGS.get_mut() = self.regs.take().expect("saved register state");
                 *Y_PREVIOUS.get_mut() = self.previous;
                 *EXECR_LASTC.get_mut() = self.execreg_lastc;
+                *RECORD_REGNAME.get_mut() = self.record_regname;
             }
         }
     }
