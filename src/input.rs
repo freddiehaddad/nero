@@ -94,7 +94,8 @@
 //! can set that register.c-owned flag, so the original's own
 //! add-to-readbuf-only path is always taken today.
 //!
-//! [`ins_typebuf`] is real too: Rust's owned vectors replace the
+//! [`ins_typebuf`]/[`del_typebuf`] are real too: Rust's owned vectors
+//! replace the
 //! original's manual capacity/reallocation branches while preserving
 //! the logical offset, valid-byte, remap, mapped/silent and
 //! abbreviation counters exactly.
@@ -1096,6 +1097,64 @@ pub fn ins_typebuf(
     tb.tb_off = i32::try_from(new_off).expect("typebuf offset fits i32");
     tb.tb_len = i32::try_from(new_len).expect("typebuf length fits i32");
     crate::vim_defs::OK
+}
+
+/// Remove `len` bytes at `offset` from the typeahead buffer
+/// (`del_typebuf`).
+///
+/// The original's choice between advancing `tb_off` and moving bytes
+/// is a raw-buffer capacity optimization. This translation advances
+/// `tb_off` for a front deletion and uses `Vec::drain` otherwise,
+/// preserving all observable bytes, flags and counters.
+///
+/// # Panics
+/// Debug-asserts that the removal range lies inside the valid bytes,
+/// matching the original's caller precondition.
+pub fn del_typebuf(len: i32, offset: i32) {
+    if len == 0 {
+        return;
+    }
+    let len = usize::try_from(len).expect("typebuf deletion length is nonnegative");
+    let offset =
+        usize::try_from(offset).expect("typebuf deletion offset is nonnegative");
+    let tb = unsafe { TYPEBUF.get_mut() };
+    let old_len = usize::try_from(tb.tb_len).expect("typebuf length is nonnegative");
+    let old_off = usize::try_from(tb.tb_off).expect("typebuf offset is nonnegative");
+    debug_assert!(offset + len <= old_len);
+    if offset + len > old_len {
+        return;
+    }
+
+    tb.tb_len -= i32::try_from(len).expect("typebuf deletion length fits i32");
+    if offset == 0 {
+        tb.tb_off += i32::try_from(len).expect("typebuf deletion length fits i32");
+    } else {
+        let start = old_off + offset;
+        tb.tb_buf.drain(start..start + len);
+        tb.tb_noremap.drain(start..start + len);
+    }
+
+    let offset = i32::try_from(offset).expect("typebuf deletion offset fits i32");
+    let len = i32::try_from(len).expect("typebuf deletion length fits i32");
+    for count in [
+        &mut tb.tb_maplen,
+        &mut tb.tb_silent,
+        &mut tb.tb_no_abbr_cnt,
+    ] {
+        if *count > offset {
+            if *count < offset + len {
+                *count = offset;
+            } else {
+                *count -= len;
+            }
+        }
+    }
+
+    unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = false;
+    tb.tb_change_cnt = tb.tb_change_cnt.wrapping_add(1);
+    if tb.tb_change_cnt == 0 {
+        tb.tb_change_cnt = 1;
+    }
 }
 
 /// Add byte string `s` to `buf` (`add_buff`). Doesn't add empty
@@ -3016,6 +3075,98 @@ mod tests {
         );
 
         assert_eq!(current_typebuf().0, b"a");
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_change_cnt, 1);
+    }
+
+    #[test]
+    fn del_typebuf_removes_front_bytes_by_advancing_the_offset() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        assert_eq!(
+            ins_typebuf(
+                b"abcdef",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+        let old_off = unsafe { TYPEBUF.get_mut() }.tb_off;
+
+        del_typebuf(2, 0);
+
+        assert_eq!(current_typebuf().0, b"cdef");
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_off, old_off + 2);
+    }
+
+    #[test]
+    fn del_typebuf_removes_middle_bytes_and_parallel_remap_flags() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        assert_eq!(
+            ins_typebuf(b"abcdef", 3, 0, false, false),
+            crate::vim_defs::OK
+        );
+
+        del_typebuf(2, 2);
+
+        assert_eq!(
+            current_typebuf(),
+            (b"abef".to_vec(), vec![RM_NONE as u8, RM_NONE as u8, RM_YES as u8, RM_YES as u8])
+        );
+    }
+
+    #[test]
+    fn del_typebuf_clamps_or_decrements_prefix_counters() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        assert_eq!(
+            ins_typebuf(b"abcdef", 0, 0, false, false),
+            crate::vim_defs::OK
+        );
+        {
+            let tb = unsafe { TYPEBUF.get_mut() };
+            tb.tb_maplen = 3;
+            tb.tb_silent = 5;
+            tb.tb_no_abbr_cnt = 6;
+        }
+
+        del_typebuf(2, 2);
+
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert_eq!(tb.tb_maplen, 2);
+        assert_eq!(tb.tb_silent, 3);
+        assert_eq!(tb.tb_no_abbr_cnt, 4);
+    }
+
+    #[test]
+    fn del_typebuf_resets_filled_and_wraps_change_count_away_from_zero() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _filled = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.typebuf_was_filled,
+                true,
+            )
+        };
+        assert_eq!(
+            ins_typebuf(
+                b"x",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                false,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = -1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+
+        del_typebuf(1, 0);
+
+        assert!(current_typebuf().0.is_empty());
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled);
         assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_change_cnt, 1);
     }
 
