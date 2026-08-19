@@ -5,19 +5,17 @@
 //!
 //! Translated: [`nvim_tabpage_list_wins`], [`nvim_tabpage_get_win`],
 //! [`nvim_tabpage_get_number`], [`nvim_tabpage_get_var`],
-//! [`nvim_tabpage_is_valid`].
+//! [`nvim_tabpage_set_win`], [`nvim_tabpage_is_valid`].
 //!
-//! Deferred (each needs a real, not-yet-translated subsystem beyond
-//! `find_tab_by_handle` itself): `nvim_tabpage_get/set/del_var`
-//! (`dict_get_value`/`dict_set_var`, the API layer's `Object`-to-
-//! `typval_T` bridge), `nvim_tabpage_set_win` (needs `win_goto`'s
-//! real window-switching machinery for the "switching to the current
-//! tabpage" branch).
+//! Deferred: [`nvim_tabpage_set_win`] is complete for non-current
+//! tabpages; switching the current tabpage still needs `win_goto`'s
+//! real window-switching machinery.
 
 use crate::api::private::defs::{
     Array, Boolean, Error, Integer, NvimString, Object, Tabpage, Window,
 };
 use crate::api::private::helpers::find_tab_by_handle;
+use crate::api::private::helpers::find_window_by_handle;
 
 /// List every window in `tabpage` (`nvim_tabpage_list_wins`).
 ///
@@ -87,6 +85,45 @@ pub unsafe fn nvim_tabpage_get_win(tabpage: Tabpage, err: &mut Error) -> Window 
         "nvim_tabpage_get_win: tab.tp_curwin was not a member of tab's own window list - \
          there should always be a current window for a tabpage"
     );
+}
+
+/// Set the current window in `tabpage` (`nvim_tabpage_set_win`).
+///
+/// # Safety
+/// Forwarded from the handle lookup and tabpage window-list helpers.
+pub unsafe fn nvim_tabpage_set_win(
+    tabpage: Tabpage,
+    win: Window,
+    err: &mut Error,
+) {
+    let tab = unsafe { find_tab_by_handle(tabpage, err) };
+    if tab.is_null() {
+        return;
+    }
+    let window = unsafe { find_window_by_handle(win, err) };
+    if window.is_null() {
+        return;
+    }
+    if !unsafe { crate::window::tabpage_win_valid(tab, window) } {
+        err.r#type = crate::api::private::defs::ErrorType::Exception;
+        err.msg = Some(format!(
+            "Window does not belong to tabpage {}",
+            unsafe { (*tab).handle }
+        ));
+        return;
+    }
+
+    if std::ptr::eq(tab, unsafe { crate::globals::GLOBALS.get_mut() }.curtab) {
+        unimplemented!(
+            "nvim_tabpage_set_win: current-tab switching needs win_goto"
+        );
+    }
+    if !std::ptr::eq(unsafe { (*tab).tp_curwin }, window) {
+        unsafe {
+            (*tab).tp_prevwin = (*tab).tp_curwin;
+            (*tab).tp_curwin = window;
+        }
+    }
 }
 
 /// Get the 1-based tabpage number of `tabpage` (`0` for the current
@@ -411,6 +448,88 @@ mod tests {
 
         assert_eq!(win_handle, 11);
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_tabpage_set_win_updates_a_noncurrent_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut old_win = WinT { handle: 21, ..Default::default() };
+        let old_ptr = std::ptr::addr_of_mut!(old_win);
+        let mut new_win = WinT { handle: 22, ..Default::default() };
+        let new_ptr = std::ptr::addr_of_mut!(new_win);
+        unsafe { (*old_ptr).w_next = new_ptr };
+        let fx = TabFixture::new(11);
+        unsafe {
+            (*fx.tab_ptr).tp_firstwin = old_ptr;
+            (*fx.tab_ptr).tp_lastwin = new_ptr;
+            (*fx.tab_ptr).tp_curwin = old_ptr;
+            crate::globals::GLOBALS.get_mut().curtab = std::ptr::null_mut();
+        }
+        let mut err = Error::default();
+
+        unsafe { nvim_tabpage_set_win(fx.handle(), 22, &mut err) };
+
+        assert!(!err.is_set());
+        assert_eq!(unsafe { (*fx.tab_ptr).tp_prevwin }, old_ptr);
+        assert_eq!(unsafe { (*fx.tab_ptr).tp_curwin }, new_ptr);
+    }
+
+    #[test]
+    fn nvim_tabpage_set_win_keeps_prevwin_when_already_current() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT { handle: 23, ..Default::default() };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let fx = TabFixture::new(12);
+        unsafe {
+            (*fx.tab_ptr).tp_firstwin = win_ptr;
+            (*fx.tab_ptr).tp_lastwin = win_ptr;
+            (*fx.tab_ptr).tp_curwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().curtab = std::ptr::null_mut();
+        }
+        let mut err = Error::default();
+
+        unsafe { nvim_tabpage_set_win(fx.handle(), 23, &mut err) };
+
+        assert!(!err.is_set());
+        assert!(unsafe { (*fx.tab_ptr).tp_prevwin }.is_null());
+        assert_eq!(unsafe { (*fx.tab_ptr).tp_curwin }, win_ptr);
+    }
+
+    #[test]
+    fn nvim_tabpage_set_win_rejects_a_window_from_another_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut target_win = WinT { handle: 24, ..Default::default() };
+        let target_win_ptr = std::ptr::addr_of_mut!(target_win);
+        let mut foreign_win = WinT { handle: 25, ..Default::default() };
+        let foreign_win_ptr = std::ptr::addr_of_mut!(foreign_win);
+        let fx = TabFixture::new(13);
+        let foreign_tab = Box::into_raw(Box::new(TabpageT {
+            handle: 14,
+            tp_firstwin: foreign_win_ptr,
+            tp_lastwin: foreign_win_ptr,
+            tp_curwin: foreign_win_ptr,
+            ..Default::default()
+        }));
+        unsafe {
+            (*fx.tab_ptr).tp_firstwin = target_win_ptr;
+            (*fx.tab_ptr).tp_lastwin = target_win_ptr;
+            (*fx.tab_ptr).tp_curwin = target_win_ptr;
+            (*fx.tab_ptr).tp_next = foreign_tab;
+            crate::globals::GLOBALS.get_mut().curtab = std::ptr::null_mut();
+        }
+        let mut err = Error::default();
+
+        unsafe { nvim_tabpage_set_win(fx.handle(), 25, &mut err) };
+
+        assert_eq!(
+            err.msg.as_deref(),
+            Some("Window does not belong to tabpage 13")
+        );
+        assert_eq!(unsafe { (*fx.tab_ptr).tp_curwin }, target_win_ptr);
+        unsafe {
+            (*fx.tab_ptr).tp_next = std::ptr::null_mut();
+            drop(Box::from_raw(foreign_tab));
+        }
     }
 
     #[test]
