@@ -194,6 +194,39 @@ pub unsafe fn nvim_buf_get_text(
     result
 }
 
+/// Return the byte offset of a zero-based buffer line
+/// (`nvim_buf_get_offset`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`] and
+/// [`crate::memline::ml_find_line_or_offset`].
+pub unsafe fn nvim_buf_get_offset(
+    buf: Buffer,
+    index: Integer,
+    err: &mut Error,
+) -> Integer {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return 0;
+    }
+    if unsafe { (*buf).b_ml.ml_mfp }.is_null() {
+        return -1;
+    }
+    if index < 0 || index > i64::from(unsafe { (*buf).b_ml.ml_line_count }) {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Index out of bounds".to_string());
+        return 0;
+    }
+    i64::from(unsafe {
+        crate::memline::ml_find_line_or_offset(
+            &mut *buf,
+            index as crate::pos_defs::LinenrT + 1,
+            None,
+            true,
+        )
+    })
+}
+
 /// Get the number of lines in buffer `buf` (`0` for the current
 /// buffer), or `0` on failure/if the buffer is unloaded
 /// (`nvim_buf_line_count`).
@@ -737,6 +770,44 @@ mod tests {
             Some("start_col must be less than or equal to end_col")
         );
         unsafe { close_memline(&mut fx) };
+    }
+
+    #[test]
+    fn nvim_buf_get_offset_returns_real_memline_byte_offsets() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(56);
+        assert_eq!(unsafe { crate::memline::ml_open(fx.buf_mut()) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(fx.buf_mut(), 1, b"one\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(fx.buf_mut(), 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+        let mut err = Error::default();
+        assert_eq!(unsafe { nvim_buf_get_offset(fx.handle(), 0, &mut err) }, 0);
+        assert_eq!(unsafe { nvim_buf_get_offset(fx.handle(), 1, &mut err) }, 4);
+        assert!(!err.is_set());
+        let mut invalid = Error::default();
+        assert_eq!(
+            unsafe { nvim_buf_get_offset(fx.handle(), 3, &mut invalid) },
+            0
+        );
+        assert_eq!(invalid.msg.as_deref(), Some("Index out of bounds"));
+        unsafe { close_memline(&mut fx) };
+    }
+
+    #[test]
+    fn nvim_buf_get_offset_rejects_out_of_bounds_and_reports_unloaded() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = BufFixture::new(57);
+        let mut unloaded = Error::default();
+        assert_eq!(
+            unsafe { nvim_buf_get_offset(fx.handle(), 0, &mut unloaded) },
+            -1
+        );
+        assert!(!unloaded.is_set());
     }
 
     #[test]
