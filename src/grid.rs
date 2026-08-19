@@ -723,6 +723,35 @@ pub fn schar_get(sc: ScharT) -> Vec<u8> {
     }
 }
 
+/// Clear the interned glyph cache and regenerate cached character
+/// options (`schar_cache_clear`).
+///
+/// # Safety
+/// Mutates shared decoration, glyph-cache, and option-derived schar
+/// state.
+pub unsafe fn schar_cache_clear() {
+    unsafe { crate::decoration::decor_check_invalid_glyphs() };
+    unsafe { GLYPH_CACHE.get_mut() }.clear();
+    if unsafe { crate::optionstr::check_chars_options() }.is_some() {
+        std::process::abort();
+    }
+}
+
+/// Clear the glyph cache once it exceeds its safety margin
+/// (`schar_cache_clear_if_full`).
+///
+/// # Safety
+/// Forwarded from [`schar_cache_clear`].
+#[must_use]
+pub unsafe fn schar_cache_clear_if_full() -> bool {
+    if unsafe { GLYPH_CACHE.get_mut() }.len() > (1 << 21) {
+        unsafe { schar_cache_clear() };
+        true
+    } else {
+        false
+    }
+}
+
 /// Release a grid's four owned parallel arrays (`grid_free`).
 ///
 /// # Safety
@@ -965,6 +994,13 @@ pub unsafe fn grid_getchar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schar_cache_clear_if_full_keeps_a_small_cache() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe { GLYPH_CACHE.get_mut() }.len() <= (1 << 21));
+        assert!(!unsafe { schar_cache_clear_if_full() });
+    }
 
     struct GridLineStateGuard([i32; 9]);
 
