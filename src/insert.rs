@@ -458,6 +458,56 @@ pub unsafe fn get_last_insert_save() -> Option<Vec<u8>> {
     Some(s)
 }
 
+/// Stuff the last inserted text into the read buffer
+/// (`stuff_inserted`).
+///
+/// # Safety
+/// Reads the last-insert statics and mutates the shared input stuff
+/// buffer.
+pub unsafe fn stuff_inserted(c: i32, count: i32, no_esc: bool) -> i32 {
+    let Some(mut inserted) = (unsafe { get_last_insert() }) else {
+        return crate::vim_defs::FAIL;
+    };
+    if c != i32::from(crate::ascii_defs::NUL) {
+        crate::input::stuffchar_readbuff(c);
+    }
+    if let Some(escape) = inserted
+        .iter()
+        .rposition(|&byte| byte == crate::ascii_defs::ESC)
+    {
+        inserted.truncate(escape);
+    }
+
+    let mut last = None;
+    if matches!(inserted.last(), Some(b'0' | b'^'))
+        && (no_esc
+            || (inserted.first() == Some(&crate::ascii_defs::CTRL_D)
+                && count > 1))
+    {
+        last = inserted.pop();
+    }
+    for _ in 0..count.max(1) {
+        crate::input::stuff_readbuff_len(&inserted);
+        match last {
+            Some(b'0') => crate::input::stuff_readbuff_len(&[
+                crate::ascii_defs::CTRL_V,
+                b'0',
+                b'4',
+                b'8',
+            ]),
+            Some(b'^') => crate::input::stuff_readbuff_len(&[
+                crate::ascii_defs::CTRL_V,
+                b'^',
+            ]),
+            _ => {}
+        }
+    }
+    if !no_esc {
+        crate::input::stuffchar_readbuff(i32::from(crate::ascii_defs::ESC));
+    }
+    crate::vim_defs::OK
+}
+
 /// Releases the stored last-insert text (`free_last_insert`).
 ///
 /// The skip count is deliberately retained: the original clears only
@@ -798,6 +848,56 @@ mod tests {
     use crate::buffer_defs::{BufT, WinT};
     use crate::globals::global_state_test_lock;
     use crate::memline_defs::MemlineT;
+
+    struct TypeaheadGuard(crate::input_defs::TasaveT);
+
+    impl TypeaheadGuard {
+        fn save() -> Self {
+            let mut saved = crate::input_defs::TasaveT::default();
+            crate::input::save_typeahead(&mut saved);
+            Self(saved)
+        }
+    }
+
+    impl Drop for TypeaheadGuard {
+        fn drop(&mut self) {
+            crate::input::restore_typeahead(&mut self.0);
+        }
+    }
+
+    struct LastInsertGuard {
+        value: Option<Vec<u8>>,
+        skip: usize,
+    }
+
+    impl LastInsertGuard {
+        fn save() -> Self {
+            Self {
+                value: unsafe { LAST_INSERT.get_mut() }.take(),
+                skip: unsafe { *LAST_INSERT_SKIP.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for LastInsertGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *LAST_INSERT.get_mut() = self.value.take();
+                *LAST_INSERT_SKIP.get_mut() = self.skip;
+            }
+        }
+    }
+
+    fn stuffed_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = crate::input::read_readbuffers(true);
+            if byte == crate::ascii_defs::NUL {
+                return bytes;
+            }
+            bytes.push(byte);
+        }
+    }
 
     struct ReplaceStackGuard(Vec<u8>);
 
@@ -1528,6 +1628,63 @@ mod tests {
         // get_last_insert_save drops the terminating <Esc>.
         assert_eq!(unsafe { get_last_insert_save() }, Some(vec![b'a']));
         unsafe { reset_last_insert_for_test() };
+    }
+
+    #[test]
+    fn stuff_inserted_repeats_text_and_frames_it_with_command_and_escape() {
+        let _lock = global_state_test_lock();
+        let _last = LastInsertGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        unsafe { set_last_insert(i32::from(b'x')) };
+
+        assert_eq!(
+            unsafe { stuff_inserted(i32::from(b'i'), 2, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            stuffed_bytes(),
+            vec![b'i', b'x', b'x', crate::ascii_defs::ESC]
+        );
+    }
+
+    #[test]
+    fn stuff_inserted_quotes_a_trailing_zero_without_escape() {
+        let _lock = global_state_test_lock();
+        let _last = LastInsertGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        unsafe { set_last_insert(i32::from(b'0')) };
+
+        assert_eq!(
+            unsafe {
+                stuff_inserted(i32::from(crate::ascii_defs::NUL), 1, true)
+            },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            stuffed_bytes(),
+            vec![crate::ascii_defs::CTRL_V, b'0', b'4', b'8']
+        );
+    }
+
+    #[test]
+    fn stuff_inserted_fails_when_no_insert_was_recorded() {
+        let _lock = global_state_test_lock();
+        let _last = LastInsertGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        unsafe {
+            *LAST_INSERT.get_mut() = None;
+            *LAST_INSERT_SKIP.get_mut() = 0;
+        }
+
+        assert_eq!(
+            unsafe {
+                stuff_inserted(i32::from(crate::ascii_defs::NUL), 1, true)
+            },
+            crate::vim_defs::FAIL
+        );
+        assert!(stuffed_bytes().is_empty());
     }
 
     #[test]
