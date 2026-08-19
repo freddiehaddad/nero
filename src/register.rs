@@ -71,7 +71,7 @@
 //!   `op_delete`, `shada.c`'s register entries) - no real caller
 //!   exists for any of these yet.
 
-use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
+use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REGISTERS, NUM_SAVED_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
 
 /// Whether register `regname` is inserted literally
 /// (`is_literal_register`, `register.h`).
@@ -100,6 +100,16 @@ pub fn reg_empty(reg: &YankregT) -> bool {
         || (lines.len() == 1
             && reg.y_type == crate::normal_defs::MotionType::CharWise
             && lines[0].is_empty())
+}
+
+/// Number of nonempty registers saved to ShaDa (`op_reg_amount`).
+#[must_use]
+pub fn op_reg_amount() -> usize {
+    let registers = unsafe { Y_REGS.get_mut() };
+    registers[..NUM_SAVED_REGISTERS]
+        .iter()
+        .filter(|register| !reg_empty(register))
+        .count()
 }
 
 /// Return an owned deep copy of register `name` (`copy_register`).
@@ -1392,6 +1402,28 @@ mod tests {
             y_array: Some(vec![b"x".to_vec()]),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn op_reg_amount_counts_only_nonempty_saved_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe {
+            for register in Y_REGS.get_mut() {
+                *register = YankregT::default();
+            }
+            Y_REGS.get_mut()[0].y_array = Some(vec![b"zero".to_vec()]);
+            Y_REGS.get_mut()[1] = YankregT {
+                y_array: Some(vec![Vec::new()]),
+                y_type: crate::normal_defs::MotionType::LineWise,
+                ..Default::default()
+            };
+            Y_REGS.get_mut()[2].y_array = Some(vec![Vec::new()]);
+            Y_REGS.get_mut()[PLUS_REGISTER].y_array =
+                Some(vec![b"clipboard".to_vec()]);
+        }
+
+        assert_eq!(op_reg_amount(), 2);
     }
 
     #[test]
