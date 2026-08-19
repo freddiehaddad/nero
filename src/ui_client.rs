@@ -16,6 +16,9 @@ static RESTART_ARGS: std::sync::LazyLock<
     GlobalCell<crate::api::private::defs::Array>,
 > = std::sync::LazyLock::new(|| GlobalCell::new(Vec::new()));
 static RESTART_PENDING: GlobalCell<bool> = GlobalCell::new(false);
+static RESTART_ARGS_AFTER_CRASH_EXIT: std::sync::LazyLock<
+    GlobalCell<crate::api::private::defs::Array>,
+> = std::sync::LazyLock::new(|| GlobalCell::new(Vec::new()));
 
 /// Update the UI client's known dimensions (`ui_client_set_size`).
 ///
@@ -72,6 +75,18 @@ pub unsafe fn ui_client_event_error_exit(args: &crate::api::private::defs::Array
 pub unsafe fn ui_client_event_restart(args: &crate::api::private::defs::Array) {
     *unsafe { RESTART_ARGS.get_mut() } = args.clone();
     unsafe { *RESTART_PENDING.get_mut() = true };
+}
+
+/// Save fallback restart arguments for an unexpected server exit
+/// (`ui_client_event__set_restart_on_crash_exit`).
+///
+/// # Safety
+/// Replaces shared restart state.
+#[allow(non_snake_case)]
+pub unsafe fn ui_client_event__set_restart_on_crash_exit(
+    args: &crate::api::private::defs::Array,
+) {
+    *unsafe { RESTART_ARGS_AFTER_CRASH_EXIT.get_mut() } = args.clone();
 }
 
 #[cfg(test)]
@@ -139,5 +154,21 @@ mod tests {
         ));
         *unsafe { RESTART_ARGS.get_mut() } = old_args;
         unsafe { *RESTART_PENDING.get_mut() = old_pending };
+    }
+
+    #[test]
+    fn ui_client_crash_restart_event_copies_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = std::mem::take(unsafe { RESTART_ARGS_AFTER_CRASH_EXIT.get_mut() });
+        let mut args = vec![crate::api::private::defs::Object::String(
+            b"nvim".to_vec(),
+        )];
+        unsafe { ui_client_event__set_restart_on_crash_exit(&args) };
+        args.clear();
+        assert!(matches!(
+            unsafe { RESTART_ARGS_AFTER_CRASH_EXIT.get_mut() }.as_slice(),
+            [crate::api::private::defs::Object::String(value)] if value == b"nvim"
+        ));
+        *unsafe { RESTART_ARGS_AFTER_CRASH_EXIT.get_mut() } = old;
     }
 }
