@@ -3,9 +3,9 @@
 //! `register.c` (2867 lines) is the yank/delete/put register
 //! subsystem: register storage, `"ay`/`"ap`-style register selection,
 //! clipboard (`'clipboard'`) integration, and ShaDa persistence of
-//! register contents - none of the actual yank/delete/put *commands*
-//! (`op_yank`/`op_delete`/`do_put`, `ops.c`) are translated yet, so
-//! nothing in this crate ever WRITES a real value into a register.
+//! register contents. The direct register-write API is real, while
+//! the actual yank/delete/put *commands* (`op_yank`/`op_delete`/
+//! `do_put`, `ops.c`) are not translated yet.
 //!
 //! Translated: the register-name/index plumbing (`op_reg_index`,
 //! `valid_yank_reg`), the register storage array itself (`Y_REGS`,
@@ -18,7 +18,8 @@
 //! `execreg_line_continuation`/[`do_execreg`] (the register execution
 //! queue builder), [`do_record`] (macro recording start/stop), and
 //! [`insert_reg`] (register-to-stuff-buffer
-//! insertion),
+//! insertion), [`str_to_reg`]/[`write_reg_contents_ex`] (direct
+//! register writes),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
 //! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
@@ -31,13 +32,9 @@
 //! [`get_default_register_name`] therefore returns NUL through that
 //! same real fallback until provider dispatch exists.
 //!
-//! Because nothing yet WRITES to `Y_REGS`/`last_cmdline`/the
-//! `"="`-register expression/the last-inserted-text state, every
-//! named/numbered register (`@a`-`@z`, `@"`, `@0`-`@9`, `@-`, `@*`,
-//! `@+`) and most special registers correctly, faithfully evaluate to
-//! empty/`v:null` today - not a stub, but the genuinely correct
-//! behavior for a session in which nothing has ever yanked, deleted,
-//! put, or run an Ex command yet.
+//! Named/numbered registers and the search/expression special
+//! registers can now be populated through [`write_reg_contents_ex`].
+//! Real yank/delete/put commands remain deferred.
 //!
 //! [`get_reg_contents`]'s `kGRegList` flag (return a `List`, one item
 //! per register line, rather than a joined string) is now real too,
@@ -45,9 +42,8 @@
 //! (`eval/funcs.rs`). [`get_register_name`]/[`get_unname_register`]
 //! (the small `register.h` inverse of [`op_reg_index`], and the index
 //! of the register `""` currently points to) are also translated -
-//! `get_unname_register` always returns `-1` today (`Y_PREVIOUS` is
-//! always `None`, see its own doc comment), matching a real session
-//! in which nothing has ever performed a genuine yank.
+//! `get_unname_register` follows `Y_PREVIOUS`, which direct writes
+//! now update with the same restore rules as the original.
 //!
 //! `@.` (last inserted text) reads the real `last_insert` file-static
 //! via [`crate::insert::get_last_insert_save`], which owns it (matching
@@ -64,12 +60,11 @@
 //!   `file_name_at_cursor`/`find_ident_under_cursor`/`ml_get_buf`
 //!   (`errmsg = true` is unreachable from any real caller in this
 //!   crate today).
-//! - Everything else: `yank_register_mline`, `get_default_register_name`
-//!   (`'clipboard'`-driven default-register selection), `op_reg_iter`
-//!   (ShaDa register enumeration), and the entire real
-//!   yank/delete/put/ShaDa-restore write side (`do_put`, `op_yank`,
-//!   `op_delete`, `shada.c`'s register entries) - no real caller
-//!   exists for any of these yet.
+//! - `write_reg_contents_ex('#', nonnumeric_name, ...)`: resolving an
+//!   alternate buffer by pattern needs `buflist_findpat` and the real
+//!   regex engine. Numeric buffer handles and clearing are real.
+//! - The real yank/delete/put/ShaDa-restore command side (`do_put`,
+//!   `op_yank`, `op_delete`, `shada.c`'s register entries).
 
 use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REGISTERS, NUM_SAVED_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
 
@@ -310,10 +305,83 @@ pub unsafe fn str_to_reg(
 ///
 /// # Safety
 /// Mutates shared unnamed-register selection.
-#[allow(dead_code)]
 unsafe fn finish_write_reg(name: i32, _register: &YankregT, previous: Option<usize>) {
     if name != i32::from(b'"') {
         unsafe { *Y_PREVIOUS.get_mut() = previous };
+    }
+}
+
+/// Store `text` in register `name` (`write_reg_contents_ex`).
+///
+/// `yank_type == None` models `kMTUnknown`; `block_len == None`
+/// models the original's `-1` auto-width sentinel. Rust slices make
+/// the original's separate byte-length parameter unnecessary.
+///
+/// Alternate-file writes by numeric buffer handle are real. The
+/// filename-pattern form is deferred until `buflist_findpat` and the
+/// regex engine exist.
+///
+/// # Safety
+/// Mutates shared register, search-pattern, expression-register, and
+/// current-window state according to `name`.
+pub unsafe fn write_reg_contents_ex(
+    name: i32,
+    text: &[u8],
+    must_append: bool,
+    yank_type: Option<crate::normal_defs::MotionType>,
+    block_len: Option<crate::pos_defs::ColnrT>,
+) {
+    if name == i32::from(b'/') {
+        unsafe { crate::search::set_last_search_pat(text, false, true, true) };
+        return;
+    }
+
+    if name == i32::from(b'#') {
+        if text.is_empty() {
+            let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { (*curwin).w_alt_fnum = 0 };
+            return;
+        }
+
+        if !crate::ascii_defs::ascii_isdigit(i32::from(text[0])) {
+            unimplemented!(
+                "write_reg_contents_ex alternate-file name lookup needs buflist_findpat"
+            );
+        }
+        let (number, _) = crate::charset::getdigits_int(text, false, 0);
+        let buffer = unsafe { crate::buffer::buflist_findnr(number) };
+        if !buffer.is_null() {
+            let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { (*curwin).w_alt_fnum = (*buffer).handle };
+        }
+        return;
+    }
+
+    if name == i32::from(b'=') {
+        let expression = unsafe { EXPR_LINE.get_mut() };
+        if must_append && let Some(current) = expression {
+            current.extend_from_slice(text);
+        } else {
+            *expression = Some(text.to_vec());
+        }
+        return;
+    }
+
+    if name == i32::from(b'_') {
+        return;
+    }
+
+    let Some((register, previous)) = (unsafe { init_write_reg(name, must_append) }) else {
+        return;
+    };
+    unsafe {
+        str_to_reg(
+            &mut *register,
+            yank_type,
+            RegisterInput::Text(text),
+            block_len,
+        );
+        finish_write_reg(name, &*register, previous);
     }
 }
 
@@ -893,8 +961,7 @@ static Y_REGS: std::sync::LazyLock<crate::globals::GlobalCell<[YankregT; NUM_REG
 /// original - modeled as an index rather than a pointer, since
 /// `Y_REGS` is a fixed-size array rather than individually heap-
 /// allocated registers). `None` matches the original's own initial
-/// `NULL` - stays `None` forever today, since nothing ever performs a
-/// real yank (`YREG_YANK` mode) yet.
+/// `NULL`; direct register writes update it through `YREG_YANK` mode.
 static Y_PREVIOUS: crate::globals::GlobalCell<Option<usize>> = crate::globals::GlobalCell::new(None);
 
 /// A permanently-empty register, returned by [`get_yank_register`] for
@@ -1151,18 +1218,14 @@ pub unsafe fn get_y_previous() -> *mut YankregT {
 }
 
 /// The expression evaluated for the `"="` register (`expr_line`, a
-/// file-static in the original). Always `None` today: nothing in this
-/// crate translates `:let @= = ...`/`c_CTRL-R_=`-style assignment yet,
-/// so the `"="` register always evaluates to `v:null` - a genuinely
-/// correct, not merely stubbed, state for a session where nothing has
-/// ever set it.
+/// file-static in the original). Direct writes through
+/// [`write_reg_contents_ex`] populate it.
 static EXPR_LINE: crate::globals::GlobalCell<Option<Vec<u8>>> = crate::globals::GlobalCell::new(None);
 
 /// Set the expression for the `"="` register (`set_expr_line`).
 ///
-/// Not yet called by anything real in this crate (needs the
-/// `c_CTRL-R_=`/`:let @=`-style assignment machinery), but translated
-/// for completeness alongside its own `EXPR_LINE` storage.
+/// Used by tests and available alongside the direct register-write
+/// API.
 pub fn set_expr_line(new_line: Option<Vec<u8>>) {
     unsafe { *EXPR_LINE.get_mut() = new_line };
 }
@@ -1171,9 +1234,7 @@ pub fn set_expr_line(new_line: Option<Vec<u8>>) {
 ///
 /// # Safety
 /// Forwarded from `crate::eval::eval::eval_to_string`'s own safety
-/// doc (only reached when `EXPR_LINE` is actually `Some`, which
-/// nothing in this crate constructs yet - see this module's own doc
-/// comment).
+/// doc.
 #[must_use]
 pub unsafe fn get_expr_line() -> Option<Vec<u8>> {
     let expr_line = unsafe { EXPR_LINE.get_mut() }.clone()?;
@@ -1894,6 +1955,208 @@ mod tests {
     }
 
     #[test]
+    fn write_reg_contents_ex_replaces_named_register_and_restores_previous() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'a')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index].y_array = Some(vec![b"old".to_vec()]);
+            *Y_PREVIOUS.get_mut() = Some(4);
+            write_reg_contents_ex(
+                i32::from(b'a'),
+                b"one\ntwo\n",
+                false,
+                None,
+                None,
+            );
+        }
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(4));
+    }
+
+    #[test]
+    fn write_reg_contents_ex_appends_for_uppercase_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"old".to_vec()]),
+                ..Default::default()
+            };
+            write_reg_contents_ex(
+                i32::from(b'B'),
+                b"new",
+                false,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(
+            unsafe { Y_REGS.get_mut()[index].y_array.as_deref() },
+            Some([b"oldnew".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn write_reg_contents_ex_quote_changes_the_unnamed_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe {
+            *Y_PREVIOUS.get_mut() = Some(5);
+            write_reg_contents_ex(
+                i32::from(b'"'),
+                b"value",
+                false,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(0));
+        assert_eq!(
+            unsafe { Y_REGS.get_mut()[0].y_array.as_deref() },
+            Some([b"value".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn write_reg_contents_ex_ignores_black_hole_and_invalid_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe {
+            Y_REGS.get_mut()[0].y_array = Some(vec![b"before".to_vec()]);
+            *Y_PREVIOUS.get_mut() = Some(0);
+            write_reg_contents_ex(
+                i32::from(b'_'),
+                b"discard",
+                false,
+                None,
+                None,
+            );
+            write_reg_contents_ex(
+                i32::from(b'%'),
+                b"invalid",
+                false,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(
+            unsafe { Y_REGS.get_mut()[0].y_array.as_deref() },
+            Some([b"before".to_vec()].as_slice())
+        );
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(0));
+    }
+
+    #[test]
+    fn write_reg_contents_ex_sets_and_appends_the_expression_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _expression = ExprLineGuard::save();
+        unsafe {
+            write_reg_contents_ex(
+                i32::from(b'='),
+                b"1",
+                false,
+                None,
+                None,
+            );
+            write_reg_contents_ex(
+                i32::from(b'='),
+                b" + 1",
+                true,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(get_expr_line_src(), Some(b"1 + 1".to_vec()));
+    }
+
+    #[test]
+    fn write_reg_contents_ex_sets_the_search_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _search = SearchPatternGuard::save();
+
+        unsafe {
+            write_reg_contents_ex(
+                i32::from(b'/'),
+                b"needle",
+                true,
+                None,
+                None,
+            )
+        };
+
+        let pattern = crate::search::get_search_pattern();
+        assert_eq!(pattern.pat, Some(b"needle".to_vec()));
+        assert!(pattern.magic);
+        assert_eq!(pattern.off.dir, b'/');
+    }
+
+    #[test]
+    fn write_reg_contents_ex_sets_and_clears_numeric_alternate_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alternate = crate::buffer_defs::BufT {
+            handle: 7,
+            ..Default::default()
+        };
+        let alternate_ptr = &mut alternate as *mut crate::buffer_defs::BufT;
+        let _lastbuf = LastbufGuard::set(alternate_ptr);
+        let mut current = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_alt_fnum: 3,
+            ..Default::default()
+        };
+
+        with_curbuf_curwin(&mut current, &mut win, || unsafe {
+            write_reg_contents_ex(
+                i32::from(b'#'),
+                b"7suffix",
+                false,
+                None,
+                None,
+            );
+            assert_eq!((*crate::globals::GLOBALS.get_mut().curwin).w_alt_fnum, 7);
+
+            write_reg_contents_ex(
+                i32::from(b'#'),
+                b"",
+                false,
+                None,
+                None,
+            );
+            assert_eq!((*crate::globals::GLOBALS.get_mut().curwin).w_alt_fnum, 0);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "needs buflist_findpat")]
+    fn write_reg_contents_ex_named_alternate_file_is_deferred() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            write_reg_contents_ex(
+                i32::from(b'#'),
+                b"other.txt",
+                false,
+                None,
+                None,
+            )
+        };
+    }
+
+    #[test]
     fn copy_register_deep_copies_lines_and_metadata() {
         let _lock = crate::globals::global_state_test_lock();
         let _registers = RegisterStateGuard::save();
@@ -2337,6 +2600,38 @@ mod tests {
                 *EXECR_LASTC.get_mut() = self.execreg_lastc;
                 *RECORD_REGNAME.get_mut() = self.record_regname;
             }
+        }
+    }
+
+    struct ExprLineGuard(Option<Vec<u8>>);
+
+    impl ExprLineGuard {
+        fn save() -> Self {
+            Self(get_expr_line_src())
+        }
+    }
+
+    impl Drop for ExprLineGuard {
+        fn drop(&mut self) {
+            set_expr_line(self.0.take());
+        }
+    }
+
+    struct SearchPatternGuard(Option<crate::search::SearchPattern>);
+
+    impl SearchPatternGuard {
+        fn save() -> Self {
+            Self(Some(crate::search::get_search_pattern()))
+        }
+    }
+
+    impl Drop for SearchPatternGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::search::set_search_pattern(
+                    self.0.take().expect("saved search pattern"),
+                )
+            };
         }
     }
 
