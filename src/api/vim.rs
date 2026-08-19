@@ -325,6 +325,32 @@ pub fn nvim_select_popupmenu_item(item: Integer, mut insert: Boolean, finish: Bo
     crate::popupmenu::pum_ext_select_item(item as i32, insert, finish);
 }
 
+/// Record or clear command-window scratch-buffer state
+/// (`nvim__cmdwin_set`).
+///
+/// # Safety
+/// Mutates cmdwin globals and may walk the live buffer list.
+#[allow(non_snake_case)]
+pub unsafe fn nvim__cmdwin_set(
+    type_: &NvimString,
+    buf: Buffer,
+    err: &mut Error,
+) {
+    if type_.is_empty() || buf == 0 {
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.cmdwin_type = 0;
+        globals.cmdwin_buf = std::ptr::null_mut();
+        return;
+    }
+    let buffer = unsafe { crate::api::private::helpers::find_buffer_by_handle(buf, err) };
+    if err.is_set() {
+        return;
+    }
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    globals.cmdwin_type = i32::from(type_[0]);
+    globals.cmdwin_buf = buffer;
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1300,6 +1326,33 @@ mod tests {
         nvim_select_popupmenu_item(0, false, false);
         nvim_select_popupmenu_item(-1, false, true);
         assert!(!crate::popupmenu::pum_visible());
+    }
+
+    #[test]
+    fn nvim_cmdwin_set_records_and_clears_cmdwin_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf = Box::into_raw(Box::new(BufT {
+            handle: 77,
+            ..Default::default()
+        }));
+        let _lastbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf) };
+        let old_type = unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_type;
+        let old_buf = unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_buf;
+        let mut err = Error::default();
+        unsafe { nvim__cmdwin_set(&b":".to_vec(), 77, &mut err) };
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_type, i32::from(b':'));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_buf, buf);
+        unsafe { nvim__cmdwin_set(&Vec::new(), 0, &mut err) };
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_type, 0);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_buf.is_null());
+        assert!(!err.is_set());
+        unsafe {
+            crate::globals::GLOBALS.get_mut().cmdwin_type = old_type;
+            crate::globals::GLOBALS.get_mut().cmdwin_buf = old_buf;
+        }
+        drop(_lastbuf);
+        unsafe { drop(Box::from_raw(buf)) };
     }
 
     #[test]
