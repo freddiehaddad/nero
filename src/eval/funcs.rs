@@ -577,6 +577,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winrestview"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winrestview });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
+        m.insert(&b"screencol"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_screencol });
+        m.insert(&b"screenrow"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_screenrow });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
         m.insert(&b"settagstack"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_settagstack });
@@ -6981,6 +6983,18 @@ unsafe fn f_screenpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
     crate::eval::typval::tv_dict_add_nr(dict, b"col", i64::from(scol));
     crate::eval::typval::tv_dict_add_nr(dict, b"curscol", i64::from(ccol));
     crate::eval::typval::tv_dict_add_nr(dict, b"endcol", i64::from(ecol));
+}
+
+/// Current UI cursor column, one-based (`screencol()`).
+unsafe fn f_screencol(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value =
+        TypvalValue::Number(i64::from(unsafe { crate::ui::ui_current_col() }) + 1);
+}
+
+/// Current UI cursor row, one-based (`screenrow()`).
+unsafe fn f_screenrow(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value =
+        TypvalValue::Number(i64::from(unsafe { crate::ui::ui_current_row() }) + 1);
 }
 
 /// `win_gettype([{nr}])` - the type of window `{nr}` (default the
@@ -16520,6 +16534,21 @@ mod tests {
         assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 });
 
         close_test_buf(buf);
+    }
+
+    #[test]
+    fn screencol_and_screenrow_return_one_based_ui_positions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let expected_col = i64::from(unsafe { crate::ui::ui_current_col() }) + 1;
+        let expected_row = i64::from(unsafe { crate::ui::ui_current_row() }) + 1;
+        let mut col = TypvalT::default();
+        let mut row = TypvalT::default();
+        unsafe {
+            f_screencol(&[], &mut col);
+            f_screenrow(&[], &mut row);
+        }
+        assert!(matches!(col.value, TypvalValue::Number(value) if value == expected_col));
+        assert!(matches!(row.value, TypvalValue::Number(value) if value == expected_row));
     }
 
     // --- f_win_screenpos ---
