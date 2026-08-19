@@ -182,6 +182,126 @@ unsafe fn init_write_reg(
     Some((register, previous))
 }
 
+/// Input accepted by [`str_to_reg`].
+pub enum RegisterInput<'a> {
+    /// One newline-separated byte string.
+    Text(&'a [u8]),
+    /// An already-separated list of register lines.
+    Lines(&'a [Vec<u8>]),
+}
+
+unsafe fn register_line_cells(line: &[u8]) -> usize {
+    let mut cells = 0usize;
+    let mut offset = 0usize;
+    while offset < line.len() {
+        if line[offset] == crate::ascii_defs::NUL {
+            cells += 1;
+            offset += 1;
+        } else {
+            cells += usize::try_from(unsafe {
+                crate::mbyte::utf_ptr2cells_len(
+                    &line[offset..],
+                    i32::try_from(line.len() - offset)
+                        .expect("register line length fits i32"),
+                )
+            })
+            .expect("character cell width is nonnegative");
+            offset += usize::try_from(crate::mbyte::utf_ptr2len_len(
+                &line[offset..],
+                line.len() - offset,
+            ).max(1))
+            .expect("character length is nonnegative");
+        }
+    }
+    cells
+}
+
+/// Append string/list input to a register (`str_to_reg`).
+///
+/// `yank_type == None` models `kMTUnknown` and auto-detects linewise
+/// input. `block_len == None` models `-1` and derives block width.
+///
+/// # Safety
+/// Reads multibyte width state and the system clock.
+pub unsafe fn str_to_reg(
+    register: &mut YankregT,
+    yank_type: Option<crate::normal_defs::MotionType>,
+    input: RegisterInput<'_>,
+    block_len: Option<crate::pos_defs::ColnrT>,
+) {
+    let resolved_type = yank_type.unwrap_or_else(|| match &input {
+        RegisterInput::Lines(_) => crate::normal_defs::MotionType::LineWise,
+        RegisterInput::Text(text)
+            if text.last().is_some_and(|last| matches!(last, b'\n' | b'\r')) =>
+        {
+            crate::normal_defs::MotionType::LineWise
+        }
+        RegisterInput::Text(_) => crate::normal_defs::MotionType::CharWise,
+    });
+    let mut lines = register.y_array.take().unwrap_or_default();
+    let mut max_cells = 0usize;
+
+    match input {
+        RegisterInput::Lines(new_lines) => {
+            for line in new_lines {
+                if resolved_type == crate::normal_defs::MotionType::BlockWise {
+                    max_cells = max_cells.max(unsafe { register_line_cells(line) });
+                }
+                lines.push(line.clone());
+            }
+        }
+        RegisterInput::Text(text) => {
+            let include_trailing = resolved_type
+                == crate::normal_defs::MotionType::CharWise
+                || text.is_empty()
+                || text.last() != Some(&b'\n');
+            let mut new_lines: Vec<Vec<u8>> =
+                text.split(|&byte| byte == b'\n')
+                    .map(|line| {
+                        line.iter()
+                            .map(|&byte| {
+                                if byte == crate::ascii_defs::NUL {
+                                    b'\n'
+                                } else {
+                                    byte
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+            if !include_trailing && new_lines.last().is_some_and(Vec::is_empty) {
+                new_lines.pop();
+            }
+            if resolved_type == crate::normal_defs::MotionType::BlockWise {
+                for line in text.split(|&byte| byte == b'\n') {
+                    max_cells = max_cells.max(unsafe { register_line_cells(line) });
+                }
+            }
+            if !lines.is_empty()
+                && register.y_type == crate::normal_defs::MotionType::CharWise
+                && let Some(first) = new_lines.first()
+            {
+                lines.last_mut().unwrap().extend_from_slice(first);
+                new_lines.remove(0);
+            }
+            lines.extend(new_lines);
+        }
+    }
+
+    register.y_array = (!lines.is_empty()).then_some(lines);
+    register.y_type = resolved_type;
+    register.timestamp = crate::os::time::os_time();
+    if resolved_type == crate::normal_defs::MotionType::BlockWise {
+        register.y_width = block_len.unwrap_or_else(|| {
+            i32::try_from(max_cells)
+                .expect("register block width fits i32")
+                - 1
+        });
+    } else {
+        register.y_width = 0;
+    }
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -1574,6 +1694,154 @@ mod tests {
             Some([b"old".to_vec()].as_slice())
         );
         assert!(unsafe { init_write_reg(i32::from(b'%'), false) }.is_none());
+    }
+
+    #[test]
+    fn str_to_reg_auto_detects_characterwise_and_linewise_text() {
+        let mut characterwise = YankregT::default();
+        unsafe {
+            str_to_reg(
+                &mut characterwise,
+                None,
+                RegisterInput::Text(b"one\ntwo"),
+                None,
+            )
+        };
+        assert_eq!(
+            characterwise.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            characterwise.y_type,
+            crate::normal_defs::MotionType::CharWise
+        );
+
+        let mut linewise = YankregT::default();
+        unsafe {
+            str_to_reg(
+                &mut linewise,
+                None,
+                RegisterInput::Text(b"one\ntwo\n"),
+                None,
+            )
+        };
+        assert_eq!(
+            linewise.y_array.as_deref(),
+            Some([b"one".to_vec(), b"two".to_vec()].as_slice())
+        );
+        assert_eq!(
+            linewise.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+    }
+
+    #[test]
+    fn str_to_reg_appends_the_first_text_line_to_characterwise_contents() {
+        let mut register = YankregT {
+            y_array: Some(vec![b"old".to_vec()]),
+            y_type: crate::normal_defs::MotionType::CharWise,
+            ..Default::default()
+        };
+
+        unsafe {
+            str_to_reg(
+                &mut register,
+                Some(crate::normal_defs::MotionType::CharWise),
+                RegisterInput::Text(b"+new\nsecond"),
+                None,
+            )
+        };
+
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"old+new".to_vec(), b"second".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn str_to_reg_lines_auto_detect_linewise_and_preserve_empty_lines() {
+        let mut register = YankregT::default();
+        let lines = vec![b"one".to_vec(), Vec::new()];
+
+        unsafe {
+            str_to_reg(
+                &mut register,
+                None,
+                RegisterInput::Lines(&lines),
+                None,
+            )
+        };
+
+        assert_eq!(register.y_array.as_deref(), Some(lines.as_slice()));
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+    }
+
+    #[test]
+    fn str_to_reg_converts_embedded_nul_without_splitting_the_line() {
+        let mut register = YankregT::default();
+
+        unsafe {
+            str_to_reg(
+                &mut register,
+                None,
+                RegisterInput::Text(b"a\0b\n"),
+                None,
+            )
+        };
+
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"a\nb".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn str_to_reg_derives_or_accepts_block_width() {
+        let mut derived = YankregT::default();
+        unsafe {
+            str_to_reg(
+                &mut derived,
+                Some(crate::normal_defs::MotionType::BlockWise),
+                RegisterInput::Lines(&[b"abc".to_vec(), b"x".to_vec()]),
+                None,
+            )
+        };
+        assert_eq!(derived.y_width, 2);
+
+        let mut explicit = YankregT::default();
+        unsafe {
+            str_to_reg(
+                &mut explicit,
+                Some(crate::normal_defs::MotionType::BlockWise),
+                RegisterInput::Text(b"abc"),
+                Some(9),
+            )
+        };
+        assert_eq!(explicit.y_width, 9);
+    }
+
+    #[test]
+    fn str_to_reg_empty_text_creates_one_empty_characterwise_line() {
+        let mut register = YankregT::default();
+        unsafe {
+            str_to_reg(
+                &mut register,
+                None,
+                RegisterInput::Text(b""),
+                None,
+            )
+        };
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([Vec::new()].as_slice())
+        );
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::CharWise
+        );
     }
 
     #[test]
