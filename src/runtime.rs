@@ -43,6 +43,8 @@
 //! `'runtimepath'` traversal + file I/O + actually sourcing a script)
 //! is `unimplemented!()` - see [`script_autoload`]'s own doc comment
 //! for why that is safe to leave for now.
+//! [`get_scriptname`] resolves both sentinel and real script contexts
+//! for verbose/profile reporting.
 //!
 //! Deferred: everything else in this file (runtime-path search,
 //! `:runtime`, `:scriptnames`, per-script `:profile` reporting,
@@ -272,6 +274,45 @@ pub fn new_script_item(name: Option<Vec<u8>>) -> (ScidT, *mut ScriptitemT) {
 pub fn script_item_count() -> ScidT {
     // SAFETY: forwarded from script_item's own reasoning.
     unsafe { SCRIPT_ITEMS.get_mut() }.len() as ScidT
+}
+
+/// Return the display name for one script context (`get_scriptname`).
+///
+/// The original sometimes returns static storage and sometimes an
+/// allocated home-abbreviated path plus a `should_free` out-parameter.
+/// Returning an owned byte string removes that ownership split.
+///
+/// # Safety
+/// Real script IDs must be valid registry entries. Resolving a real
+/// path also reads shared home/option state through `home_replace_save`.
+#[must_use]
+pub unsafe fn get_scriptname(
+    script_ctx: crate::eval::typval_defs::SctxT,
+) -> Vec<u8> {
+    match script_ctx.sc_sid {
+        crate::globals::SID_MODELINE => b"modeline".to_vec(),
+        crate::globals::SID_CMDARG => b"--cmd argument".to_vec(),
+        crate::globals::SID_CARG => b"-c argument".to_vec(),
+        crate::globals::SID_ENV => b"environment variable".to_vec(),
+        crate::globals::SID_ERROR => b"error handler".to_vec(),
+        crate::globals::SID_WINLAYOUT => b"changed window size".to_vec(),
+        crate::globals::SID_LUA => b"Lua".to_vec(),
+        crate::globals::SID_API_CLIENT => {
+            format!("API client (channel id {})", script_ctx.sc_chan)
+                .into_bytes()
+        }
+        crate::globals::SID_STR => b"anonymous :source".to_vec(),
+        sid => {
+            let script = script_item(sid);
+            // SAFETY: forwarded from this function's own safety doc.
+            let Some(name) = (unsafe { &*script }).sn_name.as_deref() else {
+                return format!("anonymous :source (script id {sid})")
+                    .into_bytes();
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::os::env::home_replace_save(None, Some(name)) }
+        }
+    }
 }
 
 /// Whether script id `sid` denotes a Lua script (`script_is_lua`).
@@ -839,6 +880,75 @@ mod tests {
         new_script_item(None);
         new_script_item(None);
         assert_eq!(script_item_count(), 3);
+    }
+
+    #[test]
+    fn get_scriptname_resolves_sentinel_contexts() {
+        let cases = [
+            (crate::globals::SID_MODELINE, b"modeline".as_slice()),
+            (crate::globals::SID_CMDARG, b"--cmd argument".as_slice()),
+            (crate::globals::SID_CARG, b"-c argument".as_slice()),
+            (
+                crate::globals::SID_ENV,
+                b"environment variable".as_slice(),
+            ),
+            (crate::globals::SID_ERROR, b"error handler".as_slice()),
+            (
+                crate::globals::SID_WINLAYOUT,
+                b"changed window size".as_slice(),
+            ),
+            (crate::globals::SID_LUA, b"Lua".as_slice()),
+            (crate::globals::SID_STR, b"anonymous :source".as_slice()),
+        ];
+        for (sid, expected) in cases {
+            let ctx = crate::eval::typval_defs::SctxT {
+                sc_sid: sid,
+                ..Default::default()
+            };
+            assert_eq!(unsafe { get_scriptname(ctx) }, expected);
+        }
+    }
+
+    #[test]
+    fn get_scriptname_formats_api_client_channels() {
+        let ctx = crate::eval::typval_defs::SctxT {
+            sc_sid: crate::globals::SID_API_CLIENT,
+            sc_chan: 42,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { get_scriptname(ctx) },
+            b"API client (channel id 42)"
+        );
+    }
+
+    #[test]
+    fn get_scriptname_resolves_named_and_anonymous_script_items() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        let (named_sid, _) =
+            new_script_item(Some(b"relative/profile.vim".to_vec()));
+        let (anonymous_sid, _) = new_script_item(None);
+
+        assert_eq!(
+            unsafe {
+                get_scriptname(crate::eval::typval_defs::SctxT {
+                    sc_sid: named_sid,
+                    ..Default::default()
+                })
+            },
+            b"relative/profile.vim"
+        );
+        assert_eq!(
+            unsafe {
+                get_scriptname(crate::eval::typval_defs::SctxT {
+                    sc_sid: anonymous_sid,
+                    ..Default::default()
+                })
+            },
+            format!("anonymous :source (script id {anonymous_sid})")
+                .into_bytes()
+        );
     }
 
     #[test]
