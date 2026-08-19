@@ -101,6 +101,40 @@ pub unsafe fn copy_register(name: i32) -> YankregT {
     copy
 }
 
+/// Store one line in register `regname`, appending for uppercase names
+/// (`stuff_yank`).
+///
+/// # Safety
+/// Mutates shared register storage and reads the system clock.
+#[allow(dead_code)] // Used when real macro-recording stop is translated.
+unsafe fn stuff_yank(regname: i32, text: &[u8]) -> i32 {
+    if regname != 0 && !valid_yank_reg(regname, true) {
+        return crate::vim_defs::FAIL;
+    }
+    if regname == i32::from(b'_') {
+        return crate::vim_defs::OK;
+    }
+    let end = text
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(text.len());
+    let text = &text[..end];
+    let register = unsafe { get_yank_register(regname, YregModeT::Yank) };
+    let register = unsafe { &mut *register };
+    if is_append_register(regname)
+        && let Some(lines) = register.y_array.as_mut()
+        && let Some(last) = lines.last_mut()
+    {
+        last.extend_from_slice(text);
+    } else {
+        free_register(register);
+        register.y_array = Some(vec![text.to_vec()]);
+        register.y_type = crate::normal_defs::MotionType::CharWise;
+    }
+    register.timestamp = crate::os::time::os_time();
+    crate::vim_defs::OK
+}
+
 /// Queue a pending Insert-mode restart after any register text
 /// (`put_reedit_in_typebuf`).
 ///
@@ -1271,6 +1305,72 @@ mod tests {
         assert!(unsafe { copy_register(i32::from(b'b')) }
             .y_array
             .is_none());
+    }
+
+    #[test]
+    fn stuff_yank_replaces_a_lowercase_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'a')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"old".to_vec()]),
+                y_type: crate::normal_defs::MotionType::LineWise,
+                y_width: 7,
+                ..Default::default()
+            };
+        }
+
+        assert_eq!(
+            unsafe { stuff_yank(i32::from(b'a'), b"new\0ignored") },
+            crate::vim_defs::OK
+        );
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert_eq!(register.y_array.as_deref(), Some([b"new".to_vec()].as_slice()));
+        assert_eq!(register.y_type, crate::normal_defs::MotionType::CharWise);
+        assert_eq!(register.y_width, 7);
+        assert!(register.timestamp > 0);
+    }
+
+    #[test]
+    fn stuff_yank_appends_to_the_last_line_for_uppercase_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"first".to_vec(), b"last".to_vec()]),
+                y_type: crate::normal_defs::MotionType::LineWise,
+                ..Default::default()
+            };
+        }
+
+        assert_eq!(
+            unsafe { stuff_yank(i32::from(b'B'), b"+more") },
+            crate::vim_defs::OK
+        );
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"first".to_vec(), b"last+more".to_vec()].as_slice())
+        );
+        assert_eq!(register.y_type, crate::normal_defs::MotionType::LineWise);
+    }
+
+    #[test]
+    fn stuff_yank_accepts_black_hole_and_rejects_readonly_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        assert_eq!(
+            unsafe { stuff_yank(i32::from(b'_'), b"discard") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { stuff_yank(i32::from(b'%'), b"invalid") },
+            crate::vim_defs::FAIL
+        );
     }
 
     #[test]
