@@ -15,6 +15,8 @@
 //! the paired function/script child measurement.
 //! `:profile` subcommand completion is translated through
 //! [`set_context_in_profile_cmd`]/[`get_profile_name`].
+//! [`profile_reset`] clears all accumulated script/function timing
+//! records.
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -47,6 +49,65 @@ pub enum PexpandWhat {
 
 static PEXPAND_WHAT: crate::globals::GlobalCell<PexpandWhat> =
     crate::globals::GlobalCell::new(PexpandWhat::Subcmd);
+
+/// File receiving profile output (`profile_fname`).
+static PROFILE_FNAME: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Reset all profiling information (`profile_reset`).
+///
+/// # Safety
+/// Mutates the script registry, function registry, and profile output
+/// file name. No profiling operation may run concurrently.
+pub unsafe fn profile_reset() {
+    for sid in 1..=crate::runtime::script_item_count() {
+        let script = crate::runtime::script_item(sid);
+        // SAFETY: forwarded from this function's own safety doc; script
+        // registry pointers remain live for the process lifetime.
+        let script = unsafe { &mut *script };
+        if script.sn_prof_on {
+            script.sn_prof_on = false;
+            script.sn_pr_force = false;
+            script.sn_pr_child = profile_zero();
+            script.sn_pr_nest = 0;
+            script.sn_pr_count = 0;
+            script.sn_pr_total = profile_zero();
+            script.sn_pr_self = profile_zero();
+            script.sn_pr_start = profile_zero();
+            script.sn_pr_children = profile_zero();
+            script.sn_prl_ga.clear();
+            script.sn_prl_start = profile_zero();
+            script.sn_prl_children = profile_zero();
+            script.sn_prl_wait = profile_zero();
+            script.sn_prl_idx = -1;
+            script.sn_prl_execed = 0;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    for function in unsafe { crate::eval::userfunc::func_tbl_values() } {
+        // SAFETY: func_tbl_values returns live registered functions.
+        let function = unsafe { &mut *function };
+        if function.uf_prof_initialized != 0 {
+            function.uf_profiling = 0;
+            function.uf_tm_count = 0;
+            function.uf_tm_total = profile_zero();
+            function.uf_tm_self = profile_zero();
+            function.uf_tm_children = profile_zero();
+            function.uf_tml_count.fill(0);
+            function.uf_tml_total.fill(0);
+            function.uf_tml_self.fill(0);
+            function.uf_tml_start = profile_zero();
+            function.uf_tml_children = profile_zero();
+            function.uf_tml_wait = profile_zero();
+            function.uf_tml_idx = -1;
+            function.uf_tml_execed = 0;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *PROFILE_FNAME.get_mut() = None };
+}
 
 /// Set what `:profile` completion should offer.
 ///
@@ -1140,6 +1201,115 @@ mod tests {
             assert_eq!(get_profile_name(0), None);
 
             set_pexpand_what(prev);
+        }
+    }
+
+    #[test]
+    fn profile_reset_clears_script_function_and_output_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        crate::eval::userfunc::func_init();
+
+        let (_, script) =
+            crate::runtime::new_script_item(Some(b"profile.vim".to_vec()));
+        let (_, untouched_script) =
+            crate::runtime::new_script_item(Some(b"plain.vim".to_vec()));
+        unsafe {
+            (*script).sn_prof_on = true;
+            (*script).sn_pr_force = true;
+            (*script).sn_pr_child = 1;
+            (*script).sn_pr_nest = 2;
+            (*script).sn_pr_count = 3;
+            (*script).sn_pr_total = 4;
+            (*script).sn_pr_self = 5;
+            (*script).sn_pr_start = 6;
+            (*script).sn_pr_children = 7;
+            (*script).sn_prl_ga.push(crate::runtime_defs::SnPrlT::default());
+            (*script).sn_prl_start = 8;
+            (*script).sn_prl_children = 9;
+            (*script).sn_prl_wait = 10;
+            (*script).sn_prl_idx = 11;
+            (*script).sn_prl_execed = 1;
+            (*untouched_script).sn_pr_count = 99;
+        }
+
+        let function = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: b"Profiled\0".to_vec(),
+                uf_profiling: 1,
+                uf_prof_initialized: 1,
+                uf_tm_count: 2,
+                uf_tm_total: 3,
+                uf_tm_self: 4,
+                uf_tm_children: 5,
+                uf_tml_count: vec![1, 2],
+                uf_tml_total: vec![3, 4],
+                uf_tml_self: vec![5, 6],
+                uf_tml_start: 7,
+                uf_tml_children: 8,
+                uf_tml_wait: 9,
+                uf_tml_idx: 1,
+                uf_tml_execed: 1,
+                ..Default::default()
+            },
+        ));
+        let untouched_function = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: b"Untouched\0".to_vec(),
+                uf_prof_initialized: 0,
+                uf_tm_count: 99,
+                ..Default::default()
+            },
+        ));
+        unsafe {
+            assert_eq!(
+                crate::eval::userfunc::func_hashtab_add(function),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::eval::userfunc::func_hashtab_add(untouched_function),
+                crate::vim_defs::OK
+            );
+            *PROFILE_FNAME.get_mut() = Some(b"profile.log".to_vec());
+
+            profile_reset();
+
+            assert!(!(*script).sn_prof_on);
+            assert!(!(*script).sn_pr_force);
+            assert_eq!((*script).sn_pr_child, 0);
+            assert_eq!((*script).sn_pr_nest, 0);
+            assert_eq!((*script).sn_pr_count, 0);
+            assert_eq!((*script).sn_pr_total, 0);
+            assert_eq!((*script).sn_pr_self, 0);
+            assert_eq!((*script).sn_pr_start, 0);
+            assert_eq!((*script).sn_pr_children, 0);
+            assert!((*script).sn_prl_ga.is_empty());
+            assert_eq!((*script).sn_prl_start, 0);
+            assert_eq!((*script).sn_prl_children, 0);
+            assert_eq!((*script).sn_prl_wait, 0);
+            assert_eq!((*script).sn_prl_idx, -1);
+            assert_eq!((*script).sn_prl_execed, 0);
+            assert_eq!((*untouched_script).sn_pr_count, 99);
+
+            assert_eq!((*function).uf_profiling, 0);
+            assert_eq!((*function).uf_tm_count, 0);
+            assert_eq!((*function).uf_tm_total, 0);
+            assert_eq!((*function).uf_tm_self, 0);
+            assert_eq!((*function).uf_tm_children, 0);
+            assert_eq!((*function).uf_tml_count.as_slice(), &[0, 0]);
+            assert_eq!((*function).uf_tml_total.as_slice(), &[0, 0]);
+            assert_eq!((*function).uf_tml_self.as_slice(), &[0, 0]);
+            assert_eq!((*function).uf_tml_start, 0);
+            assert_eq!((*function).uf_tml_children, 0);
+            assert_eq!((*function).uf_tml_wait, 0);
+            assert_eq!((*function).uf_tml_idx, -1);
+            assert_eq!((*function).uf_tml_execed, 0);
+            assert_eq!((*untouched_function).uf_tm_count, 99);
+            assert!(PROFILE_FNAME.get_mut().is_none());
+
+            crate::eval::userfunc::func_init();
+            drop(Box::from_raw(function));
+            drop(Box::from_raw(untouched_function));
         }
     }
 

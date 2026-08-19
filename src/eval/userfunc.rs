@@ -305,6 +305,26 @@ pub fn func_tbl_get() -> *mut HashtabT {
     unsafe { &mut FUNC_HASHTAB.get_mut().ht as *mut HashtabT }
 }
 
+/// Return the registered function pointers for code that must walk the
+/// whole function table.
+///
+/// NEW: the original recovers each `ufunc_T` directly from a
+/// `hashitem_T` key via `HI2UF`. This crate's owned `uf_name` cannot
+/// support that pointer-arithmetic recovery, so whole-table consumers
+/// use the same side index as [`find_func`].
+///
+/// # Safety
+/// The returned pointers remain valid only while the function table is
+/// unchanged and every registered function remains alive.
+pub(crate) unsafe fn func_tbl_values() -> Vec<*mut UfuncT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { FUNC_HASHTAB.get_mut() }
+        .index
+        .values()
+        .copied()
+        .collect()
+}
+
 /// Add `fp` to the function hash table, keyed by its own `uf_name`.
 ///
 /// NEW: not a separate function in the original, which inlines
