@@ -39,35 +39,113 @@ pub fn os_proc_children(ppid: i32) -> (i32, Vec<i32>) {
     }
 }
 
+/// Process metadata returned by [`os_proc_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInfo {
+    pub name: Vec<u8>,
+    pub pid: i32,
+    pub ppid: i32,
+}
+
+/// Get process name, PID, and parent PID (`os_proc_info` plus the
+/// non-Windows `vim._os_proc_info` fallback).
+#[must_use]
+pub fn os_proc_info(pid: i32) -> Option<ProcInfo> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
+        let name = name.strip_suffix(b"\n").unwrap_or(name.as_slice()).to_vec();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_name = stat.rsplit_once(") ")?.1;
+        let mut fields = after_name.split_ascii_whitespace();
+        let _state = fields.next()?;
+        let ppid = fields.next()?.parse::<i32>().ok()?;
+        Some(ProcInfo { name, pid, ppid })
+    }
+    #[cfg(windows)]
+    {
+        os_proc_info_windows(pid)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+type ProcessHandle = *mut std::ffi::c_void;
+#[cfg(windows)]
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+#[cfg(windows)]
+const MAX_PATH: usize = 260;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: ProcessHandle = -1isize as ProcessHandle;
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessEntry32 {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_process_id: u32,
+    th32_default_heap_id: usize,
+    th32_module_id: u32,
+    cnt_threads: u32,
+    th32_parent_process_id: u32,
+    pc_pri_class_base: i32,
+    dw_flags: u32,
+    sz_exe_file: [u16; MAX_PATH],
+}
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> ProcessHandle;
+    fn Process32FirstW(snapshot: ProcessHandle, entry: *mut ProcessEntry32) -> i32;
+    fn Process32NextW(snapshot: ProcessHandle, entry: *mut ProcessEntry32) -> i32;
+    fn CloseHandle(handle: ProcessHandle) -> i32;
+}
+
+#[cfg(windows)]
+fn os_proc_info_windows(pid: i32) -> Option<ProcInfo> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = ProcessEntry32 {
+        dw_size: std::mem::size_of::<ProcessEntry32>() as u32,
+        cnt_usage: 0,
+        th32_process_id: 0,
+        th32_default_heap_id: 0,
+        th32_module_id: 0,
+        cnt_threads: 0,
+        th32_parent_process_id: 0,
+        pc_pri_class_base: 0,
+        dw_flags: 0,
+        sz_exe_file: [0; MAX_PATH],
+    };
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        unsafe { CloseHandle(snapshot) };
+        return None;
+    }
+    loop {
+        if entry.th32_process_id == pid as u32 {
+            let len = entry.sz_exe_file.iter().position(|value| *value == 0).unwrap_or(MAX_PATH);
+            let name = String::from_utf16_lossy(&entry.sz_exe_file[..len]).into_bytes();
+            let info = ProcInfo { name, pid, ppid: entry.th32_parent_process_id as i32 };
+            unsafe { CloseHandle(snapshot) };
+            return Some(info);
+        }
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            break;
+        }
+    }
+    unsafe { CloseHandle(snapshot) };
+    None
+}
+
 #[cfg(windows)]
 fn os_proc_children_windows(ppid: i32) -> (i32, Vec<i32>) {
-    type Handle = *mut std::ffi::c_void;
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-    const MAX_PATH: usize = 260;
-    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
-
-    #[repr(C)]
-    struct ProcessEntry32 {
-        dw_size: u32,
-        cnt_usage: u32,
-        th32_process_id: u32,
-        th32_default_heap_id: usize,
-        th32_module_id: u32,
-        cnt_threads: u32,
-        th32_parent_process_id: u32,
-        pc_pri_class_base: i32,
-        dw_flags: u32,
-        sz_exe_file: [u16; MAX_PATH],
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
-        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32) -> i32;
-        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32) -> i32;
-        fn CloseHandle(handle: Handle) -> i32;
-    }
-
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return (2, Vec::new());
@@ -303,6 +381,16 @@ mod tests {
     fn os_proc_children_accepts_the_current_process() {
         let (status, _children) = os_proc_children(std::process::id() as i32);
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn os_proc_info_describes_the_current_process() {
+        let pid = std::process::id() as i32;
+        let info = os_proc_info(pid).expect("current process");
+        assert_eq!(info.pid, pid);
+        assert!(info.ppid >= 0);
+        assert!(!info.name.is_empty());
+        assert!(os_proc_info(-1).is_none());
     }
 
     #[test]
