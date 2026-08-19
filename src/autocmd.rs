@@ -778,6 +778,12 @@ pub fn event_name2nr_str(name: &[u8]) -> Option<EventT> {
         .map(|entry| entry.event)
 }
 
+/// Whether an event name is supported (`autocmd_supported`).
+#[must_use]
+pub fn autocmd_supported(event: &[u8]) -> bool {
+    event_name2nr(event).0.is_some()
+}
+
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
 ///
 /// `win` selects the window-local option, which accepts only entries
@@ -1698,6 +1704,13 @@ mod tests {
         assert_eq!(event_name2nr_str(b"bufenter"), Some(EventT::BufEnter));
         assert_eq!(event_name2nr_str(b"BufEnter tail"), None);
         assert_eq!(event_name2nr_str(b"missing"), None);
+    }
+
+    #[test]
+    fn autocmd_supported_accepts_known_names_and_aliases() {
+        assert!(autocmd_supported(b"BufEnter"));
+        assert!(autocmd_supported(b"BufCreate"));
+        assert!(!autocmd_supported(b"NeroMissingEvent"));
     }
 
     #[test]
