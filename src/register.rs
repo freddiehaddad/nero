@@ -14,8 +14,9 @@
 //! `"="`-register expression-source/result state ([`get_expr_line`]/
 //! [`get_expr_line_src`]/[`set_expr_line`]), [`get_reg_contents`]/
 //! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller),
-//! `put_reedit_in_typebuf`/`put_in_typebuf` (the queue-building core
-//! used when executing a register),
+//! `put_reedit_in_typebuf`/`put_in_typebuf`/
+//! `execreg_line_continuation`/[`do_execreg`] (the register execution
+//! queue builder),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
 //! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
@@ -73,7 +74,6 @@ use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REG
 ///
 /// # Safety
 /// Touches `GLOBALS.restart_edit` and the shared typeahead buffer.
-#[allow(dead_code)] // do_execreg, the real caller, is not translated yet.
 unsafe fn put_reedit_in_typebuf(silent: bool) {
     let restart = unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit;
     if restart == i32::from(crate::ascii_defs::NUL) {
@@ -115,7 +115,6 @@ unsafe fn put_reedit_in_typebuf(silent: bool) {
 /// # Safety
 /// Forwarded from [`put_reedit_in_typebuf`] and
 /// [`crate::input::ins_typebuf`].
-#[allow(dead_code)] // do_execreg, the real caller, is not translated yet.
 unsafe fn put_in_typebuf(
     text: &[u8],
     escape: bool,
@@ -171,7 +170,6 @@ unsafe fn put_in_typebuf(
 /// `idx` is updated to the first line consumed. Comment-continuation
 /// lines (`"\\ `) participate in the backward search but contribute
 /// no output, matching the original.
-#[allow(dead_code)] // do_execreg, the real caller, is not translated yet.
 fn execreg_line_continuation(
     lines: &[Vec<u8>],
     idx: &mut usize,
@@ -203,6 +201,154 @@ fn execreg_line_continuation(
     }
     *idx = command_start;
     output
+}
+
+/// Last register executed by [`do_execreg`] (`execreg_lastc`).
+static EXECR_LASTC: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Queue a register for execution (`do_execreg`).
+///
+/// Message display is omitted. The expression-register branch reaches
+/// the existing `eval_to_string(..., use_simple_function=true)` gap
+/// only when an expression was actually stored.
+///
+/// # Safety
+/// Mutates shared register, typeahead and editor global state.
+pub unsafe fn do_execreg(
+    mut regname: i32,
+    colon: bool,
+    addcr: bool,
+    silent: bool,
+) -> i32 {
+    if regname == i32::from(b'@') {
+        regname = unsafe { *EXECR_LASTC.get_mut() };
+        if regname == 0 {
+            return crate::vim_defs::FAIL;
+        }
+    }
+    if regname == i32::from(b'%')
+        || regname == i32::from(b'#')
+        || !valid_yank_reg(regname, false)
+    {
+        return crate::vim_defs::FAIL;
+    }
+    unsafe { *EXECR_LASTC.get_mut() = regname };
+
+    if regname == i32::from(b'_') {
+        return crate::vim_defs::OK;
+    }
+    if regname == i32::from(b':') {
+        let globals = crate::globals::GLOBALS.as_ptr();
+        let Some(command) = (unsafe { (*globals).last_cmdline.clone() }) else {
+            return crate::vim_defs::FAIL;
+        };
+        unsafe { (*globals).new_last_cmdline = None };
+        let controls: Vec<u8> = (1..=31).collect();
+        let escaped = unsafe {
+            crate::strings::vim_strsave_escaped_ext(
+                &command,
+                &controls,
+                crate::ascii_defs::CTRL_V,
+                false,
+            )
+        };
+        let text = if unsafe { (*globals).Visual.active }
+            && escaped.starts_with(b"'<,'>")
+        {
+            &escaped[5..]
+        } else {
+            escaped.as_slice()
+        };
+        return unsafe { put_in_typebuf(text, true, true, silent) };
+    }
+    if regname == i32::from(b'=') {
+        let Some(expression) = (unsafe { get_expr_line() }) else {
+            return crate::vim_defs::FAIL;
+        };
+        return unsafe { put_in_typebuf(&expression, true, colon, silent) };
+    }
+    if regname == i32::from(b'.') {
+        let Some(inserted) = get_last_insert_save() else {
+            return crate::vim_defs::FAIL;
+        };
+        return unsafe { put_in_typebuf(&inserted, false, colon, silent) };
+    }
+
+    let register = unsafe { get_yank_register(regname, YregModeT::Paste) };
+    let (Some(lines), yank_type) =
+        (unsafe { ((*register).y_array.clone(), (*register).y_type) })
+    else {
+        return crate::vim_defs::FAIL;
+    };
+    let remap = if colon {
+        crate::input_defs::RemapValues::None as i32
+    } else {
+        crate::input_defs::RemapValues::Yes as i32
+    };
+    unsafe { put_reedit_in_typebuf(silent) };
+    let line_count = lines.len();
+    let mut index = line_count;
+    while index > 0 {
+        index -= 1;
+        let add_newline =
+            yank_type == crate::normal_defs::MotionType::LineWise
+            || index < line_count - 1
+            || addcr;
+        if add_newline
+            && crate::input::ins_typebuf(
+                b"\n",
+                remap,
+                0,
+                true,
+                silent,
+            ) != crate::vim_defs::OK
+        {
+            return crate::vim_defs::FAIL;
+        }
+
+        let text = if colon
+            && index > 0
+            && {
+                let line =
+                    &lines[index][crate::charset::skipwhite(&lines[index])..];
+                line.first() == Some(&b'\\') || line.starts_with(b"\"\\ ")
+            }
+        {
+            execreg_line_continuation(&lines, &mut index)
+        } else {
+            lines[index].clone()
+        };
+        let escaped = crate::keycodes::vim_strsave_escape_ks(&text);
+        if crate::input::ins_typebuf(
+            &escaped,
+            remap,
+            0,
+            true,
+            silent,
+        ) != crate::vim_defs::OK
+        {
+            return crate::vim_defs::FAIL;
+        }
+        if colon
+            && crate::input::ins_typebuf(
+                b":",
+                remap,
+                0,
+                true,
+                silent,
+            ) != crate::vim_defs::OK
+        {
+            return crate::vim_defs::FAIL;
+        }
+    }
+    let globals = crate::globals::GLOBALS.as_ptr();
+    unsafe {
+        (*globals).reg_executing =
+            if regname == 0 { i32::from(b'"') } else { regname };
+        (*globals).pending_end_reg_executing = false;
+    }
+    crate::vim_defs::OK
 }
 
 /// Convert a register name character to its `Y_REGS` index
@@ -879,6 +1025,32 @@ mod tests {
         }
     }
 
+    struct CmdlineGuard {
+        last: Option<Vec<u8>>,
+        new_last: Option<Vec<u8>>,
+    }
+
+    impl CmdlineGuard {
+        fn set(last: Option<Vec<u8>>, new_last: Option<Vec<u8>>) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            Self {
+                last: std::mem::replace(&mut globals.last_cmdline, last),
+                new_last: std::mem::replace(
+                    &mut globals.new_last_cmdline,
+                    new_last,
+                ),
+            }
+        }
+    }
+
+    impl Drop for CmdlineGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.last_cmdline = self.last.take();
+            globals.new_last_cmdline = self.new_last.take();
+        }
+    }
+
     #[test]
     fn put_reedit_in_typebuf_queues_the_matching_start_command() {
         let _lock = crate::globals::global_state_test_lock();
@@ -1157,6 +1329,7 @@ mod tests {
     struct RegisterStateGuard {
         regs: Option<[YankregT; NUM_REGISTERS]>,
         previous: Option<usize>,
+        execreg_lastc: i32,
     }
 
     impl RegisterStateGuard {
@@ -1165,6 +1338,7 @@ mod tests {
             Self {
                 regs: Some(unsafe { Y_REGS.get_mut() }.clone()),
                 previous: unsafe { *Y_PREVIOUS.get_mut() },
+                execreg_lastc: unsafe { *EXECR_LASTC.get_mut() },
             }
         }
     }
@@ -1176,8 +1350,210 @@ mod tests {
             unsafe {
                 *Y_REGS.get_mut() = self.regs.take().expect("saved register state");
                 *Y_PREVIOUS.get_mut() = self.previous;
+                *EXECR_LASTC.get_mut() = self.execreg_lastc;
             }
         }
+    }
+
+    #[test]
+    fn do_execreg_queues_a_multiline_characterwise_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        let _executing = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_executing,
+                0,
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.pending_end_reg_executing,
+                true,
+            )
+        };
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+        let index = op_reg_index(i32::from(b'a')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"one".to_vec(), b"two".to_vec()]),
+                y_type: crate::normal_defs::MotionType::CharWise,
+                ..Default::default()
+            };
+        }
+
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b'a'), false, false, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(crate::input::typebuf_bytes_for_test(), b"one\ntwo");
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.reg_executing,
+            i32::from(b'a')
+        );
+    }
+
+    #[test]
+    fn do_execreg_linewise_register_includes_a_final_newline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        let _executing = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_executing,
+                0,
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.pending_end_reg_executing,
+                true,
+            )
+        };
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"one".to_vec(), b"two".to_vec()]),
+                y_type: crate::normal_defs::MotionType::LineWise,
+                ..Default::default()
+            };
+        }
+
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b'b'), false, false, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(crate::input::typebuf_bytes_for_test(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn do_execreg_colon_mode_joins_continuations_and_prefixes_colon() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        let _executing = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_executing,
+                0,
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.pending_end_reg_executing,
+                true,
+            )
+        };
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+        let index = op_reg_index(i32::from(b'c')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![
+                    b"echo 'a'".to_vec(),
+                    b"\\ . 'b'".to_vec(),
+                ]),
+                y_type: crate::normal_defs::MotionType::CharWise,
+                ..Default::default()
+            };
+        }
+
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b'c'), true, true, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            crate::input::typebuf_bytes_for_test(),
+            b":echo 'a' . 'b'\n"
+        );
+    }
+
+    #[test]
+    fn do_execreg_repeats_the_last_register_and_accepts_black_hole() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        let _executing = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.reg_executing,
+                0,
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.pending_end_reg_executing,
+                true,
+            )
+        };
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+        let index = op_reg_index(i32::from(b'd')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"x".to_vec()]),
+                ..Default::default()
+            };
+        }
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b'd'), false, false, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b'@'), false, false, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b'_'), false, false, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(crate::input::typebuf_bytes_for_test(), b"xx");
+    }
+
+    #[test]
+    fn do_execreg_queues_the_last_command_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let _typeahead = TypeaheadGuard::save();
+        let _cmdline =
+            CmdlineGuard::set(Some(b"echo 1".to_vec()), Some(b"old".to_vec()));
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+
+        assert_eq!(
+            unsafe { do_execreg(i32::from(b':'), false, false, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(crate::input::typebuf_bytes_for_test(), b":echo 1\n");
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }
+            .new_last_cmdline
+            .is_none());
     }
 
     #[test]
