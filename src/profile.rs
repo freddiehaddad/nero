@@ -10,6 +10,7 @@
 //! Per-function/per-script profiling remains mostly deferred, but
 //! [`func_line_exec`]/[`func_line_end`]/[`script_line_exec`] are now
 //! translated because their function/script records have real fields.
+//! [`func_do_profile`] initializes and enables per-function timing.
 //! [`script_prof_save`]/[`script_prof_restore`] record nested-child
 //! timing state, and [`prof_child_enter`]/[`prof_child_exit`] perform
 //! the paired function/script child measurement.
@@ -110,6 +111,29 @@ pub unsafe fn profile_reset() {
 
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *PROFILE_FNAME.get_mut() = None };
+}
+
+/// Initialize and enable profiling for one user function
+/// (`func_do_profile`).
+pub fn func_do_profile(function: &mut crate::eval::typval_defs::UfuncT) {
+    if function.uf_prof_initialized == 0 {
+        let len = function.uf_lines.len().max(1);
+        function.uf_tm_count = 0;
+        function.uf_tm_self = profile_zero();
+        function.uf_tm_total = profile_zero();
+        if function.uf_tml_count.is_empty() {
+            function.uf_tml_count = vec![0; len];
+        }
+        if function.uf_tml_total.is_empty() {
+            function.uf_tml_total = vec![profile_zero(); len];
+        }
+        if function.uf_tml_self.is_empty() {
+            function.uf_tml_self = vec![profile_zero(); len];
+        }
+        function.uf_tml_idx = -1;
+        function.uf_prof_initialized = 1;
+    }
+    function.uf_profiling = 1;
 }
 
 /// Set what `:profile` completion should offer.
@@ -1508,6 +1532,65 @@ mod tests {
             drop(Box::from_raw(function));
             drop(Box::from_raw(untouched_function));
         }
+    }
+
+    #[test]
+    fn func_do_profile_initializes_line_timing_arrays() {
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_lines: vec![Some(b"one".to_vec()), None, Some(b"three".to_vec())],
+            uf_tm_count: 7,
+            uf_tm_total: 8,
+            uf_tm_self: 9,
+            ..Default::default()
+        };
+
+        func_do_profile(&mut function);
+
+        assert_eq!(function.uf_profiling, 1);
+        assert_eq!(function.uf_prof_initialized, 1);
+        assert_eq!(function.uf_tm_count, 0);
+        assert_eq!(function.uf_tm_total, 0);
+        assert_eq!(function.uf_tm_self, 0);
+        assert_eq!(function.uf_tml_count, vec![0; 3]);
+        assert_eq!(function.uf_tml_total, vec![0; 3]);
+        assert_eq!(function.uf_tml_self, vec![0; 3]);
+        assert_eq!(function.uf_tml_idx, -1);
+    }
+
+    #[test]
+    fn func_do_profile_allocates_one_slot_for_an_empty_function() {
+        let mut function = crate::eval::typval_defs::UfuncT::default();
+        func_do_profile(&mut function);
+        assert_eq!(function.uf_tml_count, vec![0]);
+        assert_eq!(function.uf_tml_total, vec![0]);
+        assert_eq!(function.uf_tml_self, vec![0]);
+    }
+
+    #[test]
+    fn func_do_profile_preserves_initialized_timing_data() {
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_profiling: 0,
+            uf_prof_initialized: 1,
+            uf_tm_count: 7,
+            uf_tm_total: 8,
+            uf_tm_self: 9,
+            uf_tml_count: vec![10],
+            uf_tml_total: vec![11],
+            uf_tml_self: vec![12],
+            uf_tml_idx: 0,
+            ..Default::default()
+        };
+
+        func_do_profile(&mut function);
+
+        assert_eq!(function.uf_profiling, 1);
+        assert_eq!(function.uf_tm_count, 7);
+        assert_eq!(function.uf_tm_total, 8);
+        assert_eq!(function.uf_tm_self, 9);
+        assert_eq!(function.uf_tml_count, vec![10]);
+        assert_eq!(function.uf_tml_total, vec![11]);
+        assert_eq!(function.uf_tml_self, vec![12]);
+        assert_eq!(function.uf_tml_idx, 0);
     }
 
     #[test]
