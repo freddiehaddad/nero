@@ -1,12 +1,9 @@
-//! Translated from `src/nvim/os/proc.c` (tractable core only).
+//! Translated from `src/nvim/os/proc.c`.
 //!
-//! Translated: `os_proc_running`.
-//!
-//! Deferred: `os_proc_tree_kill_rec`/`os_proc_tree_kill`/
-//! `os_proc_children`/`os_proc_info` - process tree enumeration needs
-//! platform-specific process-listing APIs (`/proc` on Linux,
-//! `Toolhelp32Snapshot` on Windows) well beyond a single-PID liveness
-//! check, out of scope for this pass.
+//! Process liveness, child enumeration, metadata lookup, and recursive
+//! tree termination are implemented for Windows and Linux. Other Unix
+//! targets retain the original process-group tree-kill behavior but do
+//! not yet have platform-specific child/info enumeration.
 
 /// Get immediate child process IDs (`os_proc_children`).
 ///
@@ -94,7 +91,7 @@ pub unsafe fn os_proc_tree_kill(pid: i32, signal: i32) -> bool {
     }
     #[cfg(windows)]
     {
-        os_proc_tree_kill_windows(pid, signal)
+        os_proc_tree_kill_rec(pid, signal)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -103,7 +100,7 @@ pub unsafe fn os_proc_tree_kill(pid: i32, signal: i32) -> bool {
 }
 
 #[cfg(windows)]
-fn os_proc_tree_kill_windows(pid: i32, signal: i32) -> bool {
+fn os_proc_tree_kill_rec(pid: i32, signal: i32) -> bool {
     const PROCESS_ALL_ACCESS: u32 = 0x001f_0fff;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -119,7 +116,7 @@ fn os_proc_tree_kill_windows(pid: i32, signal: i32) -> bool {
     }
     let (_, children) = os_proc_children_windows(pid);
     for child in children {
-        let _ = os_proc_tree_kill_windows(child, signal);
+        let _ = os_proc_tree_kill_rec(child, signal);
     }
     let terminated = unsafe { TerminateProcess(process, signal as u32) } != 0;
     unsafe { CloseHandle(process) };
