@@ -156,6 +156,93 @@ pub unsafe fn nvim_get_option_value(
     }
 }
 
+fn option_info_dict(opt_idx: OptIndex) -> crate::api::private::defs::Dict {
+    use crate::api::private::defs::KeyValuePair;
+    use crate::option_defs::{OptValType, opt_flags};
+    let option = crate::option::get_option(opt_idx);
+    let scope = if crate::option::option_has_scope(opt_idx, OptScope::Buf) {
+        b"buf".as_slice()
+    } else if crate::option::option_has_scope(opt_idx, OptScope::Win) {
+        b"win".as_slice()
+    } else if crate::option::option_has_scope(opt_idx, OptScope::Tab) {
+        b"tab".as_slice()
+    } else {
+        b"global".as_slice()
+    };
+    let type_name = match crate::option::option_get_type(opt_idx) {
+        OptValType::Nil => b"nil".as_slice(),
+        OptValType::Boolean => b"boolean".as_slice(),
+        OptValType::Number => b"number".as_slice(),
+        OptValType::String => b"string".as_slice(),
+    };
+    let mut result = Vec::with_capacity(13);
+    let mut put = |key: &[u8], value: Object| {
+        result.push(KeyValuePair {
+            key: key.to_vec(),
+            value,
+        });
+    };
+    put(b"name", Object::String(option.fullname.to_vec()));
+    put(
+        b"shortname",
+        Object::String(option.shortname.unwrap_or_default().to_vec()),
+    );
+    put(b"scope", Object::String(scope.to_vec()));
+    put(
+        b"global_local",
+        Object::Boolean(crate::option::option_is_global_local(opt_idx)),
+    );
+    put(
+        b"commalist",
+        Object::Boolean(option.flags & opt_flags::COMMA != 0),
+    );
+    put(
+        b"flaglist",
+        Object::Boolean(option.flags & opt_flags::FLAG_LIST != 0),
+    );
+    put(
+        b"was_set",
+        Object::Boolean(option.flags & opt_flags::WAS_SET != 0),
+    );
+    put(
+        b"last_set_sid",
+        Object::Integer(i64::from(option.script_ctx.sc_sid)),
+    );
+    put(
+        b"last_set_linenr",
+        Object::Integer(i64::from(option.script_ctx.sc_lnum)),
+    );
+    put(
+        b"last_set_chan",
+        Object::Integer(option.script_ctx.sc_chan as i64),
+    );
+    put(b"type", Object::String(type_name.to_vec()));
+    put(
+        b"default",
+        crate::option::optval_as_object(option.def_val.clone()),
+    );
+    put(
+        b"allows_duplicates",
+        Object::Boolean(option.flags & opt_flags::NO_DUP == 0),
+    );
+    result
+}
+
+/// Get metadata for every option (`nvim_get_all_options_info`).
+#[must_use]
+pub fn nvim_get_all_options_info() -> crate::api::private::defs::Dict {
+    (0..crate::option_defs::OPT_COUNT)
+        .filter_map(OptIndex::from_index)
+        .map(|opt_idx| {
+            let option = crate::option::get_option(opt_idx);
+            crate::api::private::defs::KeyValuePair {
+                key: option.fullname.to_vec(),
+                value: Object::Dict(option_info_dict(opt_idx)),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +360,27 @@ mod tests {
             )
         };
         assert_eq!(conflict.msg.as_deref(), Some("Cannot use 'buf' with 'win'"));
+    }
+
+    #[test]
+    fn nvim_get_all_options_info_exports_every_option() {
+        let options = nvim_get_all_options_info();
+        assert_eq!(options.len(), crate::option_defs::OPT_COUNT);
+        let tabstop = options
+            .iter()
+            .find(|item| item.key == b"tabstop")
+            .expect("tabstop metadata");
+        let Object::Dict(metadata) = &tabstop.value else {
+            panic!("metadata dict")
+        };
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"shortname" && matches!(&item.value, Object::String(value) if value == b"ts")));
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"scope" && matches!(&item.value, Object::String(value) if value == b"buf")));
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"type" && matches!(&item.value, Object::String(value) if value == b"number")));
     }
 }
