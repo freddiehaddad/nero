@@ -1,11 +1,10 @@
 //! Translated from `src/nvim/register_defs.h` (tractable core only).
 //!
 //! Translated: the register-index constants, `GRegFlags`, `yankreg_T`
-//! (as [`YankregT`]), and `yreg_mode_t` (as [`YregModeT`]). `struct
-//! block_def` (blockwise-operator bookkeeping for `op_delete`/
-//! `op_yank`/etc., none of which are translated yet) and the `PUT_*`
-//! flags (`do_put`, not yet translated) are deferred alongside their
-//! own not-yet-translated callers.
+//! (as [`YankregT`]), `yreg_mode_t` (as [`YregModeT`]), and
+//! `struct block_def` (as [`BlockDefT`]). The `PUT_*` flags (`do_put`,
+//! not yet translated) are deferred alongside their own
+//! not-yet-translated caller.
 //!
 //! [`YankregT`] omits the original's own `additional_data` field
 //! (ShaDa-file extra data) - this crate has no ShaDa persistence
@@ -38,6 +37,60 @@ pub const STAR_REGISTER: usize = 37;
 pub const PLUS_REGISTER: usize = 38;
 /// Total number of register slots (`NUM_REGISTERS`).
 pub const NUM_REGISTERS: usize = 39;
+
+/// Blockwise-operator bookkeeping (`struct block_def`).
+#[derive(Debug, Clone, Copy)]
+pub struct BlockDefT {
+    /// Extra screen columns before the first character.
+    pub startspaces: i32,
+    /// Extra screen columns after the last character.
+    pub endspaces: i32,
+    /// Number of bytes in the block's text.
+    pub textlen: i32,
+    /// Pointer to the first character partly or wholly in the block.
+    pub textstart: *mut u8,
+    /// Byte column of the block text.
+    pub textcol: crate::pos_defs::ColnrT,
+    /// Start virtual column of the first wholly-contained character.
+    pub start_vcol: crate::pos_defs::ColnrT,
+    /// Start virtual column of the first character after the block.
+    pub end_vcol: crate::pos_defs::ColnrT,
+    /// Whether the line is too short for the block.
+    pub is_short: i32,
+    /// Whether the operation began with `curswant == MAXCOL`.
+    pub is_max: i32,
+    /// Whether the whole block lies within one character.
+    pub is_one_char: i32,
+    /// Screen columns of whitespace before the block.
+    pub pre_whitesp: i32,
+    /// Characters of whitespace before the block.
+    pub pre_whitesp_c: i32,
+    /// Virtual columns occupied by the post-block character.
+    pub end_char_vcols: crate::pos_defs::ColnrT,
+    /// Virtual columns occupied by the pre-block character.
+    pub start_char_vcols: crate::pos_defs::ColnrT,
+}
+
+impl Default for BlockDefT {
+    fn default() -> Self {
+        Self {
+            startspaces: 0,
+            endspaces: 0,
+            textlen: 0,
+            textstart: std::ptr::null_mut(),
+            textcol: 0,
+            start_vcol: 0,
+            end_vcol: 0,
+            is_short: 0,
+            is_max: 0,
+            is_one_char: 0,
+            pre_whitesp: 0,
+            pre_whitesp_c: 0,
+            end_char_vcols: 0,
+            start_char_vcols: 0,
+        }
+    }
+}
 
 /// Flags for `get_reg_contents` (`GRegFlags`).
 pub mod greg_flags {
@@ -100,4 +153,28 @@ pub enum YregModeT {
     Yank,
     /// `YREG_PUT`
     Put,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_def_default_matches_zero_initialized_c_storage() {
+        let block = BlockDefT::default();
+        assert_eq!(block.startspaces, 0);
+        assert_eq!(block.endspaces, 0);
+        assert_eq!(block.textlen, 0);
+        assert!(block.textstart.is_null());
+        assert_eq!(block.textcol, 0);
+        assert_eq!(block.start_vcol, 0);
+        assert_eq!(block.end_vcol, 0);
+        assert_eq!(block.is_short, 0);
+        assert_eq!(block.is_max, 0);
+        assert_eq!(block.is_one_char, 0);
+        assert_eq!(block.pre_whitesp, 0);
+        assert_eq!(block.pre_whitesp_c, 0);
+        assert_eq!(block.end_char_vcols, 0);
+        assert_eq!(block.start_char_vcols, 0);
+    }
 }
