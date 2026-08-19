@@ -30,6 +30,17 @@ pub unsafe fn nvim_create_augroup(
     i64::from(group)
 }
 
+/// Delete an augroup by name (`nvim_del_augroup_by_name`).
+///
+/// # Safety
+/// Mutates shared augroup/autocmd registries.
+pub unsafe fn nvim_del_augroup_by_name(name: &NvimString, err: &mut Error) {
+    if let Err(message) = unsafe { crate::autocmd::augroup_del(name) } {
+        err.r#type = crate::api::private::defs::ErrorType::Exception;
+        err.msg = Some(format!("{message}: {}", String::from_utf8_lossy(name)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +69,24 @@ mod tests {
             unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx,
             previous
         );
+    }
+
+    #[test]
+    fn nvim_del_augroup_by_name_removes_the_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let name = b"NeroApiDeleteAugroupName".to_vec();
+        let mut err = Error::default();
+        let id = unsafe {
+            nvim_create_augroup(
+                0,
+                &name,
+                CreateAugroupOpts { clear: Some(false) },
+                &mut err,
+            )
+        };
+        assert!(id > 0);
+        unsafe { nvim_del_augroup_by_name(&name, &mut err) };
+        assert_eq!(crate::autocmd::augroup_find(&name), crate::autocmd_defs::augroup::ERROR);
+        assert!(!err.is_set());
     }
 }
