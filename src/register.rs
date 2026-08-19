@@ -451,6 +451,68 @@ pub unsafe fn write_reg_contents_lst(
     }
 }
 
+/// The register motion type parsed by [`prepare_yankreg_from_object`].
+///
+/// `Unknown` models the original's `kMTUnknown` sentinel without
+/// putting an invalid discriminant into [`YankregT::y_type`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectYankType {
+    /// Infer characterwise versus linewise from the final line.
+    Unknown,
+    /// The caller provided an explicit valid motion type.
+    Known(crate::normal_defs::MotionType),
+}
+
+/// Validate and initialize register metadata from an API object
+/// (`prepare_yankreg_from_object`).
+///
+/// The original's `lines` parameter is currently unused but retained
+/// for signature fidelity.
+#[must_use]
+pub fn prepare_yankreg_from_object(
+    register: &mut YankregT,
+    regtype: &[u8],
+    _lines: usize,
+) -> Option<ObjectYankType> {
+    let yank_type = match regtype.first().copied().unwrap_or_default() {
+        0 => ObjectYankType::Unknown,
+        b'v' | b'c' => ObjectYankType::Known(
+            crate::normal_defs::MotionType::CharWise,
+        ),
+        b'V' | b'l' => ObjectYankType::Known(
+            crate::normal_defs::MotionType::LineWise,
+        ),
+        b'b' | crate::ascii_defs::CTRL_V => ObjectYankType::Known(
+            crate::normal_defs::MotionType::BlockWise,
+        ),
+        _ => return None,
+    };
+
+    register.y_type = match yank_type {
+        ObjectYankType::Unknown => crate::normal_defs::MotionType::CharWise,
+        ObjectYankType::Known(motion) => motion,
+    };
+    register.y_width = 0;
+
+    if regtype.len() > 1 {
+        if yank_type
+            != ObjectYankType::Known(crate::normal_defs::MotionType::BlockWise)
+            || !crate::ascii_defs::ascii_isdigit(i32::from(regtype[1]))
+        {
+            return None;
+        }
+        let (width, consumed) =
+            crate::charset::getdigits_int(&regtype[1..], false, 1);
+        register.y_width = width - 1;
+        if 1 + consumed < regtype.len() {
+            return None;
+        }
+    }
+
+    register.timestamp = 0;
+    Some(yank_type)
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -2357,6 +2419,99 @@ mod tests {
         }
 
         assert_eq!(get_expr_line_src(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn prepare_yankreg_from_object_maps_every_motion_type_spelling() {
+        for (regtype, expected) in [
+            (
+                &b"v"[..],
+                crate::normal_defs::MotionType::CharWise,
+            ),
+            (
+                &b"c"[..],
+                crate::normal_defs::MotionType::CharWise,
+            ),
+            (
+                &b"V"[..],
+                crate::normal_defs::MotionType::LineWise,
+            ),
+            (
+                &b"l"[..],
+                crate::normal_defs::MotionType::LineWise,
+            ),
+            (
+                &b"b"[..],
+                crate::normal_defs::MotionType::BlockWise,
+            ),
+            (
+                &[crate::ascii_defs::CTRL_V][..],
+                crate::normal_defs::MotionType::BlockWise,
+            ),
+        ] {
+            let mut register = YankregT {
+                timestamp: 42,
+                ..Default::default()
+            };
+            assert_eq!(
+                prepare_yankreg_from_object(&mut register, regtype, 3),
+                Some(ObjectYankType::Known(expected))
+            );
+            assert_eq!(register.y_type, expected);
+            assert_eq!(register.y_width, 0);
+            assert_eq!(register.timestamp, 0);
+        }
+    }
+
+    #[test]
+    fn prepare_yankreg_from_object_keeps_unknown_type_out_of_register_field() {
+        let mut register = YankregT {
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            y_width: 9,
+            timestamp: 42,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            prepare_yankreg_from_object(&mut register, b"", 0),
+            Some(ObjectYankType::Unknown)
+        );
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::CharWise
+        );
+        assert_eq!(register.y_width, 0);
+        assert_eq!(register.timestamp, 0);
+    }
+
+    #[test]
+    fn prepare_yankreg_from_object_parses_block_width() {
+        let mut register = YankregT::default();
+        assert_eq!(
+            prepare_yankreg_from_object(&mut register, b"b7", 2),
+            Some(ObjectYankType::Known(
+                crate::normal_defs::MotionType::BlockWise
+            ))
+        );
+        assert_eq!(register.y_width, 6);
+    }
+
+    #[test]
+    fn prepare_yankreg_from_object_rejects_invalid_type_and_width() {
+        for regtype in [
+            &b"x"[..],
+            &b"v7"[..],
+            &b"bx"[..],
+            &b"b7x"[..],
+            &[crate::ascii_defs::CTRL_V, b'3', b'x'][..],
+        ] {
+            let mut register = YankregT::default();
+            assert_eq!(
+                prepare_yankreg_from_object(&mut register, regtype, 1),
+                None,
+                "regtype {regtype:?}"
+            );
+        }
     }
 
     #[test]
