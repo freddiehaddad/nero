@@ -5,11 +5,23 @@
 //! shifts - a word-at-a-time optimization of standard base64 encoding, and
 //! the reason for the `htobe64`/`vim_htobe64` endian-conversion helpers.
 //! This translation produces the identical output using the plain
-//! byte-at-a-time algorithm directly (`chunks_exact(3)`), which needs no
-//! endian conversion at all since it never reinterprets bytes as a machine
-//! word - so `vim_htobe64`/`vim_htobe32` have no Rust counterpart.
+//! byte-at-a-time algorithm directly (`chunks_exact(3)`), while retaining
+//! `vim_htobe64`/`vim_htobe32` as direct `to_be` counterparts to the
+//! original's conditional portability helpers.
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Convert a host-order 64-bit word to big endian (`vim_htobe64`).
+#[must_use]
+pub const fn vim_htobe64(value: u64) -> u64 {
+    value.to_be()
+}
+
+/// Convert a host-order 32-bit word to big endian (`vim_htobe32`).
+#[must_use]
+pub const fn vim_htobe32(value: u32) -> u32 {
+    value.to_be()
+}
 
 /// `char_to_index` (1-based; `None` means "not part of the alphabet",
 /// matching the original's `0` sentinel).
@@ -174,5 +186,17 @@ mod tests {
     fn decode_rejects_padding_in_the_wrong_place() {
         assert_eq!(base64_decode(b"=bcd"), None);
         assert_eq!(base64_decode(b"ab=d"), None);
+    }
+
+    #[test]
+    fn endian_helpers_match_big_endian_byte_order() {
+        assert_eq!(
+            vim_htobe64(0x0102_0304_0506_0708).to_ne_bytes(),
+            0x0102_0304_0506_0708_u64.to_be_bytes()
+        );
+        assert_eq!(
+            vim_htobe32(0x0102_0304).to_ne_bytes(),
+            0x0102_0304_u32.to_be_bytes()
+        );
     }
 }
