@@ -508,6 +508,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"assert_false"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_assert_false });
         m.insert(&b"assert_report"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_assert_report });
         m.insert(&b"assert_inrange"[..], EvalFuncDefT { min_argc: 3, max_argc: 4, base_arg: 3, func: f_assert_inrange });
+        m.insert(&b"test_write_list_log"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_test_write_list_log });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
@@ -3604,6 +3605,12 @@ unsafe fn f_assert_inrange(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
     // SAFETY: forwarded from this function's own safety doc.
     rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_inrange(argvars) });
+}
+
+/// Validate the test log filename (`f_test_write_list_log`,
+/// `testing.c`).
+unsafe fn f_test_write_list_log(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    crate::testing::test_write_list_log(argvars);
 }
 
 /// `sha256({expr})` - the SHA256 checksum of `{expr}` (a String or a

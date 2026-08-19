@@ -35,6 +35,14 @@
 
 use crate::eval::typval_defs::{DictT, TypvalT, TypvalValue};
 
+/// Validate `test_write_list_log()`'s filename argument.
+///
+/// The upstream function intentionally has no body beyond this checked
+/// conversion.
+pub(crate) fn test_write_list_log(argvars: &[TypvalT]) {
+    let _ = crate::eval::typval::tv_get_string_chk(&argvars[0]);
+}
+
 /// Which assert_* check is being performed (`assert_type_T`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssertType {
@@ -697,6 +705,15 @@ mod tests {
         let mut gap = Vec::new();
         ga_concat_shorten_esc(&mut gap, Some(b"hello world"));
         assert_eq!(gap, b"hello world");
+    }
+
+    #[test]
+    fn test_write_list_log_accepts_string_and_rejects_container_values() {
+        test_write_list_log(&[string(b"log.txt")]);
+        test_write_list_log(&[TypvalT {
+            value: TypvalValue::List(std::ptr::null_mut()),
+            ..Default::default()
+        }]);
     }
 
     #[test]
