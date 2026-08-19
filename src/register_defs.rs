@@ -1,10 +1,9 @@
 //! Translated from `src/nvim/register_defs.h` (tractable core only).
 //!
 //! Translated: the register-index constants, `GRegFlags`, `yankreg_T`
-//! (as [`YankregT`]), `yreg_mode_t` (as [`YregModeT`]), and
-//! `struct block_def` (as [`BlockDefT`]). The `PUT_*` flags (`do_put`,
-//! not yet translated) are deferred alongside their own
-//! not-yet-translated caller.
+//! (as [`YankregT`]), `yreg_mode_t` (as [`YregModeT`]),
+//! `struct block_def` (as [`BlockDefT`]), and the `PUT_*` flags
+//! (as [`put_flags`]).
 //!
 //! [`YankregT`] omits the original's own `additional_data` field
 //! (ShaDa-file extra data) - this crate has no ShaDa persistence
@@ -17,6 +16,24 @@
 
 use crate::normal_defs::MotionType;
 use crate::os::time_defs::Timestamp;
+
+/// Flags for `do_put()`.
+pub mod put_flags {
+    /// Adjust inserted text to the surrounding indentation.
+    pub const FIXINDENT: u32 = 1;
+    /// Leave the cursor after the inserted text.
+    pub const CURSEND: u32 = 2;
+    /// Leave the cursor on the last inserted line.
+    pub const CURSLINE: u32 = 4;
+    /// Treat the register as linewise.
+    pub const LINE: u32 = 8;
+    /// Split the current line for a linewise register.
+    pub const LINE_SPLIT: u32 = 16;
+    /// Put a linewise register below the Visual selection.
+    pub const LINE_FORWARD: u32 = 32;
+    /// In block mode, do not add trailing spaces.
+    pub const BLOCK_INNER: u32 = 64;
+}
 
 /// Registers (`enum` in the original):
 /// - `0` = register for latest (unnamed) yank
@@ -176,5 +193,26 @@ mod tests {
         assert_eq!(block.pre_whitesp_c, 0);
         assert_eq!(block.end_char_vcols, 0);
         assert_eq!(block.start_char_vcols, 0);
+    }
+
+    #[test]
+    fn put_flags_match_the_original_bit_positions() {
+        assert_eq!(put_flags::FIXINDENT, 1);
+        assert_eq!(put_flags::CURSEND, 2);
+        assert_eq!(put_flags::CURSLINE, 4);
+        assert_eq!(put_flags::LINE, 8);
+        assert_eq!(put_flags::LINE_SPLIT, 16);
+        assert_eq!(put_flags::LINE_FORWARD, 32);
+        assert_eq!(put_flags::BLOCK_INNER, 64);
+        assert_eq!(
+            put_flags::FIXINDENT
+                | put_flags::CURSEND
+                | put_flags::CURSLINE
+                | put_flags::LINE
+                | put_flags::LINE_SPLIT
+                | put_flags::LINE_FORWARD
+                | put_flags::BLOCK_INNER,
+            127
+        );
     }
 }
