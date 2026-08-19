@@ -29,6 +29,18 @@ pub fn get_number_arg(argument: &[u8], index: &mut usize, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+/// UBSan runtime defaults (`__ubsan_default_options`).
+#[must_use]
+pub const fn ubsan_default_options() -> &'static str {
+    "print_stacktrace=1"
+}
+
+/// ASan runtime defaults (`__asan_default_options`).
+#[must_use]
+pub const fn asan_default_options() -> &'static str {
+    "handle_abort=1,handle_sigill=1"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +60,14 @@ mod tests {
         let mut end = 2;
         assert_eq!(get_number_arg(b"-o", &mut end, 9), 9);
         assert_eq!(end, 2);
+    }
+
+    #[test]
+    fn sanitizer_defaults_match_main_c() {
+        assert_eq!(ubsan_default_options(), "print_stacktrace=1");
+        assert_eq!(
+            asan_default_options(),
+            "handle_abort=1,handle_sigill=1"
+        );
     }
 }
