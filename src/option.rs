@@ -2869,7 +2869,9 @@ pub unsafe fn restore_option_context(
     match scope {
         crate::option_defs::OptScope::Global => {}
         crate::option_defs::OptScope::Win | crate::option_defs::OptScope::Buf => {
-            crate::context::ctx_restore(unsafe { &*(ctx as *const crate::context_defs::CtxSwitch) });
+            unsafe {
+                crate::context::ctx_restore(&*(ctx as *const crate::context_defs::CtxSwitch))
+            };
         }
         crate::option_defs::OptScope::Tab => {
             let saved = unsafe { *(ctx as *const *mut crate::buffer_defs::TabpageT) };

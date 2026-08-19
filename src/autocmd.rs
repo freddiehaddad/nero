@@ -467,7 +467,9 @@ pub fn apply_autocmds_group(
         // this module's own doc comment) - there is no runtime
         // condition under which this branch could fire yet.
 
-        crate::context::ctx_restore(&crate::context_defs::CtxSwitch::default());
+        unsafe {
+            crate::context::ctx_restore(&crate::context_defs::CtxSwitch::default())
+        };
 
         return retval;
     }
