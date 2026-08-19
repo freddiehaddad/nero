@@ -5177,16 +5177,108 @@ pub unsafe fn set_internal_string_var(name: &[u8], value: Option<&[u8]>) {
     unsafe { set_var(name, &mut tv, true) };
 }
 
+fn tv_to_optval(
+    tv: &TypvalT,
+    opt_idx: crate::option_defs::OptIndex,
+    option: &[u8],
+) -> (crate::option_defs::OptVal, bool) {
+    let is_tty = crate::option::is_tty_option(option);
+    let option_has_bool = !is_tty
+        && crate::option::option_has_type(
+            opt_idx,
+            crate::option_defs::OptValType::Boolean,
+        );
+    let option_has_num = !is_tty
+        && crate::option::option_has_type(
+            opt_idx,
+            crate::option_defs::OptValType::Number,
+        );
+    let option_has_str = is_tty
+        || crate::option::option_has_type(
+            opt_idx,
+            crate::option_defs::OptValType::String,
+        );
+
+    if !is_tty
+        && crate::option::get_option(opt_idx).flags
+            & crate::option_defs::opt_flags::FUNC
+            != 0
+        && crate::eval::typval::tv_is_func(tv)
+    {
+        return (
+            crate::option_defs::OptVal::String(unsafe {
+                crate::eval::encode::encode_tv2string(tv)
+            }),
+            false,
+        );
+    }
+    if option_has_bool || option_has_num {
+        let mut error = false;
+        let number = if option_has_num {
+            crate::eval::typval::tv_get_number_chk(tv, Some(&mut error))
+        } else {
+            crate::eval::typval::tv_get_bool_chk(tv, Some(&mut error))
+        };
+        if !error
+            && let TypvalValue::String(value) = &tv.value
+            && number == 0
+        {
+            let value = value.as_deref().unwrap_or_default();
+            error = value.is_empty() || value.iter().any(|&byte| byte != b'0');
+        }
+        let value = if option_has_num {
+            crate::option_defs::OptVal::Number(number)
+        } else {
+            crate::option_defs::OptVal::Boolean(
+                crate::types_defs::tristate_from_int(number),
+            )
+        };
+        return (value, error);
+    }
+    if option_has_str {
+        if matches!(tv.value, TypvalValue::Bool(_) | TypvalValue::Special(_)) {
+            return (
+                crate::option_defs::OptVal::Nil,
+                !is_tty,
+            );
+        }
+        return match crate::eval::typval::tv_get_string_chk(tv) {
+            Some(value) => (
+                crate::option_defs::OptVal::String(value),
+                false,
+            ),
+            None => (crate::option_defs::OptVal::Nil, true),
+        };
+    }
+    unreachable!("every real option has at least one value type")
+}
+
+/// Set one local option from a Vimscript value (`set_option_from_tv`).
+///
+/// # Safety
+/// Forwarded from [`crate::option::set_option_value_handle_tty`].
+pub unsafe fn set_option_from_tv(varname: &[u8], value: &TypvalT) {
+    let opt_idx = crate::option::find_option(varname);
+    if opt_idx == crate::option_defs::OptIndex::Invalid {
+        return;
+    }
+    let (value, error) = tv_to_optval(value, opt_idx, varname);
+    if !error {
+        let _ = unsafe {
+            crate::option::set_option_value_handle_tty(
+                varname,
+                opt_idx,
+                value,
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+            )
+        };
+    }
+}
+
 /// `"setwinvar()"`/`"settabwinvar()"` functions (`setwinvar`).
 ///
 /// `off == 1` selects `settabwinvar()`'s extra leading `{tabnr}`
 /// argument; `off == 0` is plain `setwinvar()`.
-///
-/// # Panics
-/// Panics if `{varname}` starts with `&` (setting an OPTION rather than a
-/// plain `w:` variable) - needs `set_option_from_tv` ->
-/// `set_option_value` (the generic option-value WRITE engine), not
-/// yet translated.
 ///
 /// # Safety
 /// Forwarded from [`get_var_from`]'s own safety doc.
@@ -5216,16 +5308,6 @@ unsafe fn setwinvar(argvars: &[TypvalT], off: usize) {
     }
     let varname = varname.unwrap();
 
-    if varname.first() == Some(&b'&') {
-        unimplemented!(
-            "setwinvar: setting an option (\"&name\") needs set_option_from_tv -> \
-             set_option_value, not yet translated - see this function's own doc comment"
-        );
-    }
-
-    let mut winvarname = Vec::with_capacity(varname.len() + 2);
-    winvarname.extend_from_slice(b"w:");
-    winvarname.extend_from_slice(&varname);
     let need_switch_win = !(std::ptr::eq(
         tp,
         unsafe { crate::globals::GLOBALS.get_mut() }.curtab,
@@ -5245,12 +5327,16 @@ unsafe fn setwinvar(argvars: &[TypvalT], off: usize) {
                     | crate::context_defs::ctx_switch_flags::NO_DISPLAY,
             )
         };
-    // SAFETY: forwarded from this function's own safety doc; argvars
-    // is only ever read through &argvars[off + 2] here, not mutated
-    // (copy = true, matching the original's own set_var(..., true)).
-    let mut varp = argvars[off + 2].clone();
     if can_set {
-        unsafe { set_var(&winvarname, &mut varp, true) };
+        if varname.first() == Some(&b'&') {
+            unsafe { set_option_from_tv(&varname[1..], &argvars[off + 2]) };
+        } else {
+            let mut winvarname = Vec::with_capacity(varname.len() + 2);
+            winvarname.extend_from_slice(b"w:");
+            winvarname.extend_from_slice(&varname);
+            let mut varp = argvars[off + 2].clone();
+            unsafe { set_var(&winvarname, &mut varp, true) };
+        }
     }
     if need_switch_win {
         unsafe { crate::context::ctx_restore(&switch) };
@@ -5277,15 +5363,6 @@ pub unsafe fn f_setwinvar(argvars: &[TypvalT], _rettv: &mut TypvalT) {
 
 /// `"setbufvar()"` function (`f_setbufvar`).
 ///
-/// # Panics
-/// Panics if `{varname}` starts with `&` (setting an OPTION rather
-/// than a plain `b:` variable) - needs the real `ctx_switch`
-/// (`context.c`, called here UNCONDITIONALLY even for `{buf} ==
-/// curbuf`, unlike `get_var_from`'s own narrower "only when
-/// genuinely switching buffers" need) plus `set_option_from_tv` ->
-/// `set_option_value`, neither yet translated. Not reached by setting
-/// an ordinary (non-`&`-prefixed) variable name, on any buffer.
-///
 /// # Safety
 /// `{buf}`, once resolved via `crate::eval::buffer::tv_get_buf_from_arg`,
 /// must be a valid, live `BufT` pointer (or null) - forwarded from
@@ -5307,11 +5384,19 @@ pub unsafe fn f_setbufvar(argvars: &[TypvalT], _rettv: &mut TypvalT) {
     let varname = varname.unwrap();
 
     if varname.first() == Some(&b'&') {
-        unimplemented!(
-            "f_setbufvar: setting an option (\"&name\") needs the real ctx_switch \
-             (context.c) + set_option_from_tv -> set_option_value, not yet translated - see \
-             this function's own doc comment"
-        );
+        let mut switch = crate::context_defs::CtxSwitch::default();
+        unsafe {
+            crate::context::ctx_switch(
+                &mut switch,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                buf,
+                0,
+            );
+            set_option_from_tv(&varname[1..], &argvars[2]);
+            crate::context::ctx_restore(&switch);
+        }
+        return;
     }
 
     let mut bufvarname = Vec::with_capacity(varname.len() + 2);
@@ -5339,10 +5424,14 @@ mod get_var_from_tests {
         unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = Default::default();
     }
 
+    // Keep one raw pointer per allocation for the fixture's whole
+    // lifetime: GLOBALS and option setters mutate through these
+    // pointers, so retaining and later reborrowing an owning Box
+    // would invalidate their Tree Borrows lineage.
     pub(super) struct TestFixture {
-        buf: Box<crate::buffer_defs::BufT>,
-        win: Box<crate::buffer_defs::WinT>,
-        tab: Box<crate::buffer_defs::TabpageT>,
+        buf: *mut crate::buffer_defs::BufT,
+        win: *mut crate::buffer_defs::WinT,
+        tab: *mut crate::buffer_defs::TabpageT,
         prev_curbuf: *mut crate::buffer_defs::BufT,
         prev_curwin: *mut crate::buffer_defs::WinT,
         prev_curtab: *mut crate::buffer_defs::TabpageT,
@@ -5354,12 +5443,13 @@ mod get_var_from_tests {
     impl TestFixture {
         pub(super) fn new() -> Self {
             reset_shared_state();
-            let mut buf = Box::new(crate::buffer_defs::BufT::default());
-            let mut win = Box::new(crate::buffer_defs::WinT::default());
-            let mut tab = Box::new(crate::buffer_defs::TabpageT::default());
-            let buf_ptr = buf.as_mut() as *mut crate::buffer_defs::BufT;
-            let win_ptr = win.as_mut() as *mut crate::buffer_defs::WinT;
-            let tab_ptr = tab.as_mut() as *mut crate::buffer_defs::TabpageT;
+            let buf_ptr =
+                Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+            let win_ptr =
+                Box::into_raw(Box::new(crate::buffer_defs::WinT::default()));
+            let tab_ptr = Box::into_raw(Box::new(
+                crate::buffer_defs::TabpageT::default(),
+            ));
 
             // Wire up b_vars/w_vars/tp_vars + b_bufvar/w_winvar/
             // tp_winvar exactly like the real buflist_new/win_alloc/
@@ -5373,6 +5463,7 @@ mod get_var_from_tests {
                 init_var_dict(&mut *(*buf_ptr).b_vars, &mut (*buf_ptr).b_bufvar, ScopeType::Scope);
                 (*win_ptr).w_vars = crate::eval::typval::tv_dict_alloc();
                 init_var_dict(&mut *(*win_ptr).w_vars, &mut (*win_ptr).w_winvar, ScopeType::Scope);
+                (*win_ptr).w_s = std::ptr::addr_of_mut!((*buf_ptr).b_s);
                 (*tab_ptr).tp_vars = crate::eval::typval::tv_dict_alloc();
                 init_var_dict(&mut *(*tab_ptr).tp_vars, &mut (*tab_ptr).tp_winvar, ScopeType::Scope);
                 (*win_ptr).w_buffer = buf_ptr;
@@ -5394,9 +5485,9 @@ mod get_var_from_tests {
             g.first_tabpage = tab_ptr;
             g.lastbuf = buf_ptr;
             Self {
-                buf,
-                win,
-                tab,
+                buf: buf_ptr,
+                win: win_ptr,
+                tab: tab_ptr,
                 prev_curbuf,
                 prev_curwin,
                 prev_curtab,
@@ -5407,15 +5498,15 @@ mod get_var_from_tests {
         }
 
         pub(super) fn buf_ptr(&mut self) -> *mut crate::buffer_defs::BufT {
-            self.buf.as_mut() as *mut crate::buffer_defs::BufT
+            self.buf
         }
 
         pub(super) fn win_ptr(&mut self) -> *mut crate::buffer_defs::WinT {
-            self.win.as_mut() as *mut crate::buffer_defs::WinT
+            self.win
         }
 
         pub(super) fn tab_ptr(&mut self) -> *mut crate::buffer_defs::TabpageT {
-            self.tab.as_mut() as *mut crate::buffer_defs::TabpageT
+            self.tab
         }
     }
 
@@ -5444,15 +5535,18 @@ mod get_var_from_tests {
             // assert on its contents (the exact leak class this
             // session has repeatedly caught and fixed elsewhere).
             unsafe {
-                if !self.buf.b_vars.is_null() {
-                    crate::eval::typval::tv_dict_free(self.buf.b_vars);
+                if !(*self.buf).b_vars.is_null() {
+                    crate::eval::typval::tv_dict_free((*self.buf).b_vars);
                 }
-                if !self.win.w_vars.is_null() {
-                    crate::eval::typval::tv_dict_free(self.win.w_vars);
+                if !(*self.win).w_vars.is_null() {
+                    crate::eval::typval::tv_dict_free((*self.win).w_vars);
                 }
-                if !self.tab.tp_vars.is_null() {
-                    crate::eval::typval::tv_dict_free(self.tab.tp_vars);
+                if !(*self.tab).tp_vars.is_null() {
+                    crate::eval::typval::tv_dict_free((*self.tab).tp_vars);
                 }
+                drop(Box::from_raw(self.tab));
+                drop(Box::from_raw(self.win));
+                drop(Box::from_raw(self.buf));
             }
             reset_shared_state();
         }
@@ -6083,6 +6177,119 @@ mod set_var_tests {
     // points) ----
 
     #[test]
+    fn tv_to_optval_converts_boolean_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT {
+            value: TypvalValue::Bool(BoolVarValue::True),
+            ..TypvalT::default()
+        };
+
+        assert_eq!(
+            tv_to_optval(&tv, crate::option_defs::OptIndex::Ignorecase, b"ignorecase"),
+            (
+                crate::option_defs::OptVal::Boolean(crate::types_defs::TriState::True),
+                false,
+            )
+        );
+    }
+
+    #[test]
+    fn tv_to_optval_accepts_all_zero_numeric_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT {
+            value: TypvalValue::String(Some(b"000".to_vec())),
+            ..TypvalT::default()
+        };
+
+        assert_eq!(
+            tv_to_optval(&tv, crate::option_defs::OptIndex::Tabstop, b"tabstop"),
+            (crate::option_defs::OptVal::Number(0), false)
+        );
+    }
+
+    #[test]
+    fn tv_to_optval_rejects_empty_and_nonzero_numeric_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        for string in [b"".as_slice(), b"00x".as_slice()] {
+            let tv = TypvalT {
+                value: TypvalValue::String(Some(string.to_vec())),
+                ..TypvalT::default()
+            };
+            assert_eq!(
+                tv_to_optval(&tv, crate::option_defs::OptIndex::Tabstop, b"tabstop"),
+                (crate::option_defs::OptVal::Number(0), true)
+            );
+        }
+    }
+
+    #[test]
+    fn tv_to_optval_stringifies_numbers_for_string_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT {
+            value: TypvalValue::Number(42),
+            ..TypvalT::default()
+        };
+
+        assert_eq!(
+            tv_to_optval(&tv, crate::option_defs::OptIndex::Ambiwidth, b"ambiwidth"),
+            (crate::option_defs::OptVal::String(b"42".to_vec()), false)
+        );
+    }
+
+    #[test]
+    fn tv_to_optval_rejects_boolean_values_for_string_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT {
+            value: TypvalValue::Bool(BoolVarValue::False),
+            ..TypvalT::default()
+        };
+
+        assert_eq!(
+            tv_to_optval(&tv, crate::option_defs::OptIndex::Ambiwidth, b"ambiwidth"),
+            (crate::option_defs::OptVal::Nil, true)
+        );
+    }
+
+    #[test]
+    fn tv_to_optval_preserves_tty_bool_special_compatibility() {
+        let _lock = crate::globals::global_state_test_lock();
+        for value in [
+            TypvalValue::Bool(BoolVarValue::True),
+            TypvalValue::Special(SpecialVarValue::Null),
+        ] {
+            let tv = TypvalT {
+                value,
+                ..TypvalT::default()
+            };
+            assert_eq!(
+                tv_to_optval(
+                    &tv,
+                    crate::option_defs::OptIndex::Invalid,
+                    b"t_Co",
+                ),
+                (crate::option_defs::OptVal::Nil, false)
+            );
+        }
+    }
+
+    #[test]
+    fn tv_to_optval_stringifies_function_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT {
+            value: TypvalValue::Func(Some(b"len".to_vec())),
+            ..TypvalT::default()
+        };
+
+        assert_eq!(
+            tv_to_optval(&tv, crate::option_defs::OptIndex::Findfunc, b"findfunc"),
+            (
+                crate::option_defs::OptVal::String(b"function('len')".to_vec()),
+                false,
+            )
+        );
+    }
+
+    #[test]
     fn f_setwinvar_sets_the_current_windows_own_variable() {
         let _lock = crate::globals::global_state_test_lock();
         let mut fx = TestFixture::new();
@@ -6225,8 +6432,7 @@ mod set_var_tests {
     }
 
     #[test]
-    #[should_panic(expected = "set_option_from_tv")]
-    fn f_setwinvar_option_name_panics() {
+    fn f_setwinvar_sets_a_window_local_option() {
         let _lock = crate::globals::global_state_test_lock();
         let _fx = TestFixture::new();
 
@@ -6237,6 +6443,7 @@ mod set_var_tests {
         ];
         let mut rettv = TypvalT::default();
         unsafe { f_setwinvar(&argvars, &mut rettv) };
+        assert_eq!(unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_onebuf_opt.wo_nu }, 1);
     }
 
     #[test]
@@ -6279,8 +6486,7 @@ mod set_var_tests {
     }
 
     #[test]
-    #[should_panic(expected = "set_option_from_tv")]
-    fn f_setbufvar_option_name_panics() {
+    fn f_setbufvar_sets_a_buffer_local_option() {
         let _lock = crate::globals::global_state_test_lock();
         let _fx = TestFixture::new();
 
@@ -6291,13 +6497,14 @@ mod set_var_tests {
             // this must use the fixture's own real buffer handle (1),
             // not a bare 0.
             TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() },
-            TypvalT { value: TypvalValue::String(Some(b"&number".to_vec())), ..TypvalT::default() },
-            TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::String(Some(b"&tabstop".to_vec())), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::Number(3), ..TypvalT::default() },
         ];
         let mut rettv = TypvalT::default();
         unsafe {
             f_setbufvar(&argvars, &mut rettv);
         }
+        assert_eq!(unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_ts }, 3);
     }
 }
 
