@@ -1711,6 +1711,37 @@ pub unsafe fn add_regtype_to_dict(
     );
 }
 
+/// Whether `do_autocmd_textyankpost` is already running
+/// (`static bool recursive`).
+static TEXTYANKPOST_RECURSIVE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+/// Trigger the `TextYankPost` autocommand
+/// (`do_autocmd_textyankpost`).
+///
+/// No `TextYankPost` handler can currently be registered, so the
+/// original's own event-presence fast path is always taken. The real
+/// `v:event` payload lifecycle remains deferred until registration is
+/// possible.
+///
+/// # Safety
+/// Reads shared autocmd and recursion state.
+pub unsafe fn do_autocmd_textyankpost(
+    _oap: &crate::normal_defs::OpargT,
+    _reg: &YankregT,
+) {
+    if unsafe { *TEXTYANKPOST_RECURSIVE.get_mut() }
+        || !crate::autocmd::has_event(
+            crate::autocmd_defs::EventT::TextYankPost,
+        )
+    {
+        return;
+    }
+    unimplemented!(
+        "do_autocmd_textyankpost needs the v:event payload lifecycle"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4334,5 +4365,50 @@ mod tests {
                 crate::eval::typval::tv_dict_unref(dict);
             }
         }
+    }
+
+    struct TextYankPostGuard(bool);
+
+    impl TextYankPostGuard {
+        fn set(value: bool) -> Self {
+            Self(unsafe {
+                std::mem::replace(
+                    TEXTYANKPOST_RECURSIVE.get_mut(),
+                    value,
+                )
+            })
+        }
+    }
+
+    impl Drop for TextYankPostGuard {
+        fn drop(&mut self) {
+            unsafe { *TEXTYANKPOST_RECURSIVE.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn do_autocmd_textyankpost_returns_when_no_handler_exists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _recursive = TextYankPostGuard::set(false);
+
+        unsafe {
+            do_autocmd_textyankpost(
+                &crate::normal_defs::OpargT::default(),
+                &YankregT::default(),
+            )
+        };
+    }
+
+    #[test]
+    fn do_autocmd_textyankpost_recursion_guard_returns_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _recursive = TextYankPostGuard::set(true);
+
+        unsafe {
+            do_autocmd_textyankpost(
+                &crate::normal_defs::OpargT::default(),
+                &YankregT::default(),
+            )
+        };
     }
 }
