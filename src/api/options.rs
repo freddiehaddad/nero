@@ -27,6 +27,7 @@ pub struct OptionValueOpts {
 unsafe fn validate_option_value_args(
     opts: &OptionValueOpts,
     name: &[u8],
+    allow_tab: bool,
     err: &mut Error,
 ) -> Option<(OptIndex, u32, OptScope, *mut c_void)> {
     let has_target = opts.scope.is_some()
@@ -46,6 +47,11 @@ unsafe fn validate_option_value_args(
     {
         err.r#type = ErrorType::Validation;
         err.msg = Some("Cannot use 'tab' with 'win', 'buf', 'filetype' or 'scope'".to_string());
+        return None;
+    }
+    if opts.tab.is_some() && !allow_tab {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some("Cannot use 'tab' with this function".to_string());
         return None;
     }
     if opts.win.is_some() && opts.buf.is_some() {
@@ -141,7 +147,7 @@ pub unsafe fn nvim_get_option_value(
     err: &mut Error,
 ) -> Object {
     let Some((opt_idx, opt_flags, scope, from)) =
-        (unsafe { validate_option_value_args(opts, name, err) })
+        (unsafe { validate_option_value_args(opts, name, true, err) })
     else {
         return Object::Nil;
     };
@@ -156,7 +162,12 @@ pub unsafe fn nvim_get_option_value(
     }
 }
 
-fn option_info_dict(opt_idx: OptIndex) -> crate::api::private::defs::Dict {
+fn option_info_dict(
+    opt_idx: OptIndex,
+    opt_flags: u32,
+    buf: *mut crate::buffer_defs::BufT,
+    win: *mut crate::buffer_defs::WinT,
+) -> crate::api::private::defs::Dict {
     use crate::api::private::defs::KeyValuePair;
     use crate::option_defs::{OptValType, opt_flags};
     let option = crate::option::get_option(opt_idx);
@@ -175,6 +186,31 @@ fn option_info_dict(opt_idx: OptIndex) -> crate::api::private::defs::Dict {
         OptValType::Number => b"number".as_slice(),
         OptValType::String => b"string".as_slice(),
     };
+    let mut script_ctx = option.script_ctx;
+    if opt_flags != crate::option_defs::opt_set_flags::OPT_GLOBAL {
+        script_ctx = Default::default();
+        if crate::option::option_has_scope(opt_idx, OptScope::Buf) && !buf.is_null() {
+            let index = option.scope_idx[OptScope::Buf as usize] as usize;
+            let contexts = unsafe { &(*buf).b_p_script_ctx };
+            script_ctx = contexts
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+        }
+        if crate::option::option_has_scope(opt_idx, OptScope::Win) && !win.is_null() {
+            let index = option.scope_idx[OptScope::Win as usize] as usize;
+            let contexts = unsafe { &(*win).w_onebuf_opt.wo_script_ctx };
+            script_ctx = contexts
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+        }
+        if opt_flags != crate::option_defs::opt_set_flags::OPT_LOCAL
+            && script_ctx.sc_sid == 0
+        {
+            script_ctx = option.script_ctx;
+        }
+    }
     let mut result = Vec::with_capacity(13);
     let mut put = |key: &[u8], value: Object| {
         result.push(KeyValuePair {
@@ -206,15 +242,15 @@ fn option_info_dict(opt_idx: OptIndex) -> crate::api::private::defs::Dict {
     );
     put(
         b"last_set_sid",
-        Object::Integer(i64::from(option.script_ctx.sc_sid)),
+        Object::Integer(i64::from(script_ctx.sc_sid)),
     );
     put(
         b"last_set_linenr",
-        Object::Integer(i64::from(option.script_ctx.sc_lnum)),
+        Object::Integer(i64::from(script_ctx.sc_lnum)),
     );
     put(
         b"last_set_chan",
-        Object::Integer(option.script_ctx.sc_chan as i64),
+        Object::Integer(script_ctx.sc_chan as i64),
     );
     put(b"type", Object::String(type_name.to_vec()));
     put(
@@ -237,10 +273,44 @@ pub fn nvim_get_all_options_info() -> crate::api::private::defs::Dict {
             let option = crate::option::get_option(opt_idx);
             crate::api::private::defs::KeyValuePair {
                 key: option.fullname.to_vec(),
-                value: Object::Dict(option_info_dict(opt_idx)),
+                value: Object::Dict(option_info_dict(
+                    opt_idx,
+                    crate::option_defs::opt_set_flags::OPT_GLOBAL,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )),
             }
         })
         .collect()
+}
+
+/// Get metadata for one option (`nvim_get_option_info2`).
+///
+/// # Safety
+/// Forwarded from target-handle lookup.
+#[must_use]
+pub unsafe fn nvim_get_option_info2(
+    name: &NvimString,
+    opts: &OptionValueOpts,
+    err: &mut Error,
+) -> crate::api::private::defs::Dict {
+    let Some((opt_idx, opt_flags, scope, from)) =
+        (unsafe { validate_option_value_args(opts, name, false, err) })
+    else {
+        return Vec::new();
+    };
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let buf = if scope == OptScope::Buf {
+        from.cast()
+    } else {
+        globals.curbuf
+    };
+    let win = if scope == OptScope::Win {
+        from.cast()
+    } else {
+        globals.curwin
+    };
+    option_info_dict(opt_idx, opt_flags, buf, win)
 }
 
 #[cfg(test)]
@@ -382,5 +452,26 @@ mod tests {
         assert!(metadata
             .iter()
             .any(|item| item.key == b"type" && matches!(&item.value, Object::String(value) if value == b"number")));
+    }
+
+    #[test]
+    fn nvim_get_option_info2_returns_named_option_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _context = CurrentOptionContext::new();
+        let mut err = Error::default();
+        let metadata = unsafe {
+            nvim_get_option_info2(
+                &b"tabstop".to_vec(),
+                &OptionValueOpts::default(),
+                &mut err,
+            )
+        };
+        assert!(!err.is_set());
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"name" && matches!(&item.value, Object::String(value) if value == b"tabstop")));
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"scope" && matches!(&item.value, Object::String(value) if value == b"buf")));
     }
 }
