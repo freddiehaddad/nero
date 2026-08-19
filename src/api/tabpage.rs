@@ -8,8 +8,9 @@
 //! [`nvim_tabpage_set_win`], [`nvim_tabpage_is_valid`].
 //!
 //! Deferred: [`nvim_tabpage_set_win`] is complete for non-current
-//! tabpages; switching the current tabpage still needs `win_goto`'s
-//! real window-switching machinery.
+//! tabpages and for idempotently selecting the current tab's existing
+//! current window. Switching the current tab to a different window
+//! still needs `win_goto`'s real window-switching machinery.
 
 use crate::api::private::defs::{
     Array, Boolean, Error, Integer, NvimString, Object, Tabpage, Window,
@@ -114,6 +115,12 @@ pub unsafe fn nvim_tabpage_set_win(
     }
 
     if std::ptr::eq(tab, unsafe { crate::globals::GLOBALS.get_mut() }.curtab) {
+        if std::ptr::eq(
+            window,
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+        ) {
+            return;
+        }
         unimplemented!(
             "nvim_tabpage_set_win: current-tab switching needs win_goto"
         );
@@ -493,6 +500,47 @@ mod tests {
         assert!(!err.is_set());
         assert!(unsafe { (*fx.tab_ptr).tp_prevwin }.is_null());
         assert_eq!(unsafe { (*fx.tab_ptr).tp_curwin }, win_ptr);
+    }
+
+    #[test]
+    fn nvim_tabpage_set_win_accepts_the_current_tabs_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            handle: 34,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let fx = TabFixture::new(34);
+        unsafe {
+            (*fx.tab_ptr).tp_firstwin = win_ptr;
+            (*fx.tab_ptr).tp_lastwin = win_ptr;
+            (*fx.tab_ptr).tp_curwin = win_ptr;
+        }
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                fx.tab_ptr,
+            )
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                win_ptr,
+            )
+        };
+        let mut err = Error::default();
+
+        unsafe { nvim_tabpage_set_win(fx.handle(), 34, &mut err) };
+
+        assert!(!err.is_set());
+        assert_eq!(unsafe { (*fx.tab_ptr).tp_curwin }, win_ptr);
+        assert!(unsafe { (*fx.tab_ptr).tp_prevwin }.is_null());
     }
 
     #[test]
