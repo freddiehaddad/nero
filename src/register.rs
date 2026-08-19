@@ -89,6 +89,19 @@ pub fn is_append_register(regname: i32) -> bool {
     crate::macros_defs::ascii_isupper(regname)
 }
 
+/// Whether a yank register has no meaningful contents (`reg_empty`,
+/// `register.h`).
+#[must_use]
+pub fn reg_empty(reg: &YankregT) -> bool {
+    let Some(lines) = reg.y_array.as_ref() else {
+        return true;
+    };
+    lines.is_empty()
+        || (lines.len() == 1
+            && reg.y_type == crate::normal_defs::MotionType::CharWise
+            && lines[0].is_empty())
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -1352,6 +1365,33 @@ mod tests {
             assert!(!is_append_register(i32::from(name)));
         }
         assert!(!is_append_register(-1));
+    }
+
+    #[test]
+    fn reg_empty_recognizes_each_empty_representation() {
+        assert!(reg_empty(&YankregT::default()));
+        assert!(reg_empty(&YankregT {
+            y_array: Some(Vec::new()),
+            ..Default::default()
+        }));
+        assert!(reg_empty(&YankregT {
+            y_array: Some(vec![Vec::new()]),
+            y_type: crate::normal_defs::MotionType::CharWise,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn reg_empty_keeps_linewise_empty_lines_and_nonempty_text() {
+        assert!(!reg_empty(&YankregT {
+            y_array: Some(vec![Vec::new()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            ..Default::default()
+        }));
+        assert!(!reg_empty(&YankregT {
+            y_array: Some(vec![b"x".to_vec()]),
+            ..Default::default()
+        }));
     }
 
     #[test]
