@@ -5,9 +5,10 @@
 //! machinery used by autocommand execution (`ctx_switch`/
 //! `ctx_restore`, e.g. to run autocmds "as if" a different
 //! window/buffer were current, then switch back). Window-target
-//! switching/restoration is translated, including no-event and
-//! no-display tab switches. Buffer targets, cwd preservation, and
-//! display-changing tab switches remain deferred.
+//! switching/restoration is translated, including no-event,
+//! no-display tab switches, and buffer targets already shown in a
+//! window. Temporary autocmd windows for unshown buffers, cwd
+//! preservation, and display-changing tab switches remain deferred.
 //!
 //! This one check is enough to make `src/autocmd.rs`'s
 //! `apply_autocmds` family real: every call site there constructs its
@@ -69,6 +70,8 @@ pub fn is_ctx_win(win: *mut crate::buffer_defs::WinT) -> bool {
 /// so this stays `0` in this crate today, matching this file's own
 /// established treatment of `CTX_WIN_VEC`.
 static CTX_SAVED_CURWIN: crate::globals::GlobalCell<crate::types_defs::HandleT> =
+    crate::globals::GlobalCell::new(0);
+static CTX_SWITCH_DEPTH: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 
 /// The window that was current when the outermost `ctx_switch()`
@@ -135,25 +138,45 @@ pub unsafe fn ctx_switch(
     flags: i32,
 ) -> bool {
     debug_assert_ne!(wp.is_null(), buf.is_null());
-    if !buf.is_null() {
-        unimplemented!(
-            "ctx_switch: buffer targets need temporary autocmd-window support"
-        );
-    }
+    debug_assert!(buf.is_null() || tp.is_null());
+    let mut target = wp;
+    let mode = if buf.is_null() {
+        CtxSwitchMode::Win
+    } else {
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        if std::ptr::eq(buf, globals.curbuf) {
+            target = globals.curwin;
+        } else {
+            let mut candidate = globals.firstwin;
+            while !candidate.is_null() {
+                if std::ptr::eq(unsafe { (*candidate).w_buffer }, buf) {
+                    target = candidate;
+                    break;
+                }
+                candidate = unsafe { (*candidate).w_next };
+            }
+        }
+        if target.is_null() {
+            unimplemented!(
+                "ctx_switch: an unshown buffer needs a temporary autocmd window"
+            );
+        }
+        CtxSwitchMode::Buf
+    };
     if flags & crate::context_defs::ctx_switch_flags::KEEP_CWD != 0 {
         unimplemented!("ctx_switch: KEEP_CWD needs ctx_cwd_save");
     }
 
     *cs = CtxSwitch::default();
     cs.cs_flags = flags;
-    cs.cs_mode = CtxSwitchMode::Win;
+    cs.cs_mode = mode;
     cs.cs_ctxwin_idx = -1;
-    if !unsafe { crate::window::win_valid(wp) } {
+    if !unsafe { crate::window::win_valid(target) } {
         return false;
     }
     if flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0 {
-        cs.cs_target_win = unsafe { (*wp).handle };
-        cs.cs_target_old_pos = unsafe { (*wp).w_cursor };
+        cs.cs_target_win = unsafe { (*target).handle };
+        cs.cs_target_old_pos = unsafe { (*target).w_cursor };
     }
 
     {
@@ -164,7 +187,7 @@ pub unsafe fn ctx_switch(
         } else {
             unsafe { (*globals.prevwin).handle }
         };
-        cs.cs_same_win = std::ptr::eq(wp, globals.curwin);
+        cs.cs_same_win = std::ptr::eq(target, globals.curwin);
         if unsafe { crate::buffer::bt_prompt(Some(&*globals.curbuf)) } {
             cs.cs_prompt_insert = unsafe { (*globals.curbuf).b_prompt_insert };
         }
@@ -193,14 +216,21 @@ pub unsafe fn ctx_switch(
     }
     let curbuf = {
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        globals.curwin = wp;
-        globals.curbuf = unsafe { (*wp).w_buffer };
+        globals.curwin = target;
+        globals.curbuf = unsafe { (*target).w_buffer };
         globals.curbuf
     };
-    cs.cs_new_curwin = unsafe { (*wp).handle };
+    cs.cs_new_curwin = unsafe { (*target).handle };
     unsafe { crate::buffer::set_bufref(&mut cs.cs_new_curbuf, Some(&*curbuf)) };
+    if mode == CtxSwitchMode::Buf && cs.cs_new_curwin != cs.cs_curwin {
+        let depth = unsafe { CTX_SWITCH_DEPTH.get_mut() };
+        if *depth == 0 {
+            unsafe { *CTX_SAVED_CURWIN.get_mut() = cs.cs_curwin };
+        }
+        *depth += 1;
+    }
     if flags & crate::context_defs::ctx_switch_flags::VALIDATE != 0 {
-        unsafe { crate::cursor::check_cursor(wp) };
+        unsafe { crate::cursor::check_cursor(target) };
     }
     true
 }
@@ -213,9 +243,9 @@ pub unsafe fn ctx_switch(
 /// it.
 ///
 /// # Panics
-/// Panics for buffer targets, cwd-preserving switches, or
-/// display-changing tab switches, which still need their own
-/// substantial subsystems.
+/// Panics for temporary autocmd-window targets, cwd-preserving
+/// switches, or display-changing tab switches, which still need their
+/// own substantial subsystems.
 ///
 /// # Safety
 /// The saved/current window, tabpage, and buffer pointers must remain
@@ -224,12 +254,8 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
     if cs.cs_mode == CtxSwitchMode::None {
         return; // zero-initialized: ctx_switch() was never called on `cs`.
     }
-    if cs.cs_mode != CtxSwitchMode::Win {
-        unimplemented!(
-            "ctx_restore: buffer targets need temporary autocmd-window support"
-        );
-    }
-    if !cs.cs_curtab.is_null()
+    if cs.cs_mode == CtxSwitchMode::Win
+        && !cs.cs_curtab.is_null()
         && unsafe { crate::window::valid_tabpage(cs.cs_curtab) }
     {
         if cs.cs_flags & crate::context_defs::ctx_switch_flags::NO_DISPLAY == 0 {
@@ -245,10 +271,50 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
             crate::window::use_tabpage(cs.cs_curtab);
         }
     }
+    if cs.cs_mode == CtxSwitchMode::Buf {
+        if cs.cs_ctxwin_idx >= 0 {
+            unimplemented!(
+                "ctx_restore: temporary autocmd windows need ctx_win_rest"
+            );
+        }
+        let current_win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        let current_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let saved_buf = cs.cs_new_curbuf.br_buf;
+        if unsafe { (*current_win).handle } == cs.cs_new_curwin
+            && !std::ptr::eq(current_buf, saved_buf)
+            && unsafe { crate::buffer::bufref_valid(&cs.cs_new_curbuf) }
+            && !unsafe { (*saved_buf).b_ml.ml_mfp }.is_null()
+        {
+            let old_s = unsafe { std::ptr::addr_of_mut!((*current_buf).b_s) };
+            if std::ptr::eq(unsafe { (*current_win).w_s }, old_s) {
+                unsafe {
+                    (*current_win).w_s =
+                        std::ptr::addr_of_mut!((*saved_buf).b_s);
+                }
+            }
+            unsafe {
+                (*current_buf).b_nwindows -= 1;
+                crate::globals::GLOBALS.get_mut().curbuf = saved_buf;
+                (*current_win).w_buffer = saved_buf;
+                (*saved_buf).b_nwindows += 1;
+            }
+        }
+    }
     unsafe { ctx_restore_curwin(cs, std::ptr::null_mut()) };
     if !cs.cs_same_win {
         unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active =
             cs.cs_visual_active;
+    }
+    if cs.cs_mode == CtxSwitchMode::Buf {
+        let current = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::cursor::check_cursor(current) };
+        if unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active {
+            let buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            let globals = crate::globals::GLOBALS.as_ptr();
+            let visual_start =
+                unsafe { std::ptr::addr_of_mut!((*globals).Visual.start) };
+            unsafe { crate::cursor::check_pos(&mut *buf, &mut *visual_start) };
+        }
     }
     if cs.cs_flags & crate::context_defs::ctx_switch_flags::NO_EVENTS != 0 {
         crate::autocmd::unblock_autocmds();
@@ -272,6 +338,16 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
             let visual_start =
                 unsafe { std::ptr::addr_of_mut!((*globals).Visual.start) };
             unsafe { crate::cursor::check_pos(&mut *buf, &mut *visual_start) };
+        }
+    }
+    if cs.cs_mode == CtxSwitchMode::Buf
+        && cs.cs_new_curwin != cs.cs_curwin
+    {
+        let depth = unsafe { CTX_SWITCH_DEPTH.get_mut() };
+        debug_assert!(*depth > 0);
+        *depth -= 1;
+        if *depth == 0 {
+            unsafe { *CTX_SAVED_CURWIN.get_mut() = 0 };
         }
     }
 }
@@ -467,14 +543,67 @@ mod tests {
     }
 
     #[test]
+    fn ctx_switch_uses_an_existing_window_for_a_buffer_target() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurwinGuard::save();
+        let mut first_buf = crate::buffer_defs::BufT::default();
+        let first_buf_ptr = std::ptr::addr_of_mut!(first_buf);
+        let mut second_buf = crate::buffer_defs::BufT::default();
+        let second_buf_ptr = std::ptr::addr_of_mut!(second_buf);
+        let mut second = crate::buffer_defs::WinT {
+            handle: 12,
+            w_buffer: second_buf_ptr,
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = crate::buffer_defs::WinT {
+            handle: 11,
+            w_buffer: first_buf_ptr,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = first_ptr;
+            globals.curwin = first_ptr;
+            globals.curbuf = first_buf_ptr;
+            globals.prevwin = std::ptr::null_mut();
+        }
+        let mut switch = CtxSwitch::default();
+
+        assert!(unsafe {
+            ctx_switch(
+                &mut switch,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                second_buf_ptr,
+                crate::context_defs::ctx_switch_flags::NO_EVENTS,
+            )
+        });
+
+        assert_eq!(switch.cs_mode, CtxSwitchMode::Buf);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curwin, second_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curbuf, second_buf_ptr);
+        assert_eq!(unsafe { ctx_saved_curwin() }, first_ptr);
+
+        unsafe { ctx_restore(&switch) };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curwin, first_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curbuf, first_buf_ptr);
+        assert!(unsafe { ctx_saved_curwin() }.is_null());
+        assert!(!crate::autocmd::is_autocmd_blocked());
+    }
+
+    #[test]
     fn ctx_restore_is_a_noop_for_a_default_zeroed_ctx_switch() {
         let cs = CtxSwitch::default();
         unsafe { ctx_restore(&cs) }; // must not panic
     }
 
     #[test]
-    #[should_panic(expected = "buffer targets")]
-    fn ctx_restore_panics_for_a_buffer_mode() {
+    #[should_panic(expected = "temporary autocmd windows")]
+    fn ctx_restore_panics_for_a_temporary_buffer_window() {
         let cs = CtxSwitch { cs_mode: CtxSwitchMode::Buf, ..Default::default() };
         unsafe { ctx_restore(&cs) };
     }
