@@ -9,6 +9,11 @@ pub const MAX_ARG_CMDS: usize = 10;
 pub const WIN_HOR: i32 = 1;
 pub const WIN_VER: i32 = 2;
 pub const WIN_TABS: i32 = 3;
+pub const EDIT_NONE: i32 = 0;
+pub const EDIT_FILE: i32 = 1;
+pub const EDIT_STDIN: i32 = 2;
+pub const EDIT_TAG: i32 = 3;
+pub const EDIT_QF: i32 = 4;
 
 /// Parameters shared by `main()` startup helpers (`mparm_T`).
 #[derive(Debug, Clone, Default)]
@@ -137,6 +142,7 @@ mod tests {
             asan_default_options(),
             "handle_abort=1,handle_sigill=1"
         );
+        assert_eq!([EDIT_NONE, EDIT_FILE, EDIT_STDIN, EDIT_TAG, EDIT_QF], [0, 1, 2, 3, 4]);
     }
 
     #[test]
