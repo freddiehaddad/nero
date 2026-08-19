@@ -467,6 +467,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"prompt_setinterrupt"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: crate::eval::buffer::f_prompt_setinterrupt });
         m.insert(&b"hostname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_hostname });
         m.insert(&b"foreground"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_foreground });
+        m.insert(&b"feedkeys"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_feedkeys });
         m.insert(&b"eventhandler"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_eventhandler });
         m.insert(&b"pumvisible"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pumvisible });
         m.insert(&b"pum_getpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pum_getpos });
@@ -5722,6 +5723,23 @@ fn f_hostname(_argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// `funcs.c`).
 fn f_foreground(_argvars: &[TypvalT], _rettv: &mut TypvalT) {}
 
+/// Queue keys as mapped or typed input (`feedkeys()`).
+///
+/// # Safety
+/// Forwarded from [`crate::ex_cmds::check_secure`] and
+/// [`crate::api::vim::nvim_feedkeys`].
+unsafe fn f_feedkeys(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+    let keys = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mode = argvars
+        .get(1)
+        .map(crate::eval::typval::tv_get_string)
+        .unwrap_or_default();
+    unsafe { crate::api::vim::nvim_feedkeys(&keys, &mode, true) };
+}
+
 /// `eventhandler()` - whether Nvim is currently inside an event
 /// handler (`f_eventhandler`, `funcs.c`), via the already-real
 /// `GLOBALS.vgetc_busy`.
@@ -8043,6 +8061,89 @@ unsafe fn get_xdg_var_list(xdg: crate::os::stdpaths::XdgVarType, rettv: &mut Typ
 mod tests {
     use super::*;
 
+    struct TypeaheadGuard(crate::input_defs::TasaveT);
+
+    impl TypeaheadGuard {
+        fn save() -> Self {
+            let mut saved = crate::input_defs::TasaveT::default();
+            crate::input::save_typeahead(&mut saved);
+            Self(saved)
+        }
+    }
+
+    impl Drop for TypeaheadGuard {
+        fn drop(&mut self) {
+            crate::input::restore_typeahead(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn feedkeys_queues_input_with_and_without_an_explicit_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_feedkeys(
+                &[TypvalT {
+                    value: TypvalValue::String(Some(b"ab".to_vec())),
+                    ..TypvalT::default()
+                }],
+                &mut rettv,
+            );
+            f_feedkeys(
+                &[
+                    TypvalT {
+                        value: TypvalValue::String(Some(b"cd".to_vec())),
+                        ..TypvalT::default()
+                    },
+                    TypvalT {
+                        value: TypvalValue::String(Some(b"n".to_vec())),
+                        ..TypvalT::default()
+                    },
+                ],
+                &mut rettv,
+            );
+        }
+
+        assert_eq!(crate::input::typebuf_bytes_for_test(), b"abcd");
+        assert_eq!(
+            crate::input::typebuf_remap_for_test(),
+            vec![
+                crate::input::RM_YES as u8,
+                crate::input::RM_YES as u8,
+                crate::input::RM_NONE as u8,
+                crate::input::RM_NONE as u8,
+            ]
+        );
+    }
+
+    #[test]
+    fn feedkeys_secure_mode_rejects_input_and_marks_the_violation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                1,
+            )
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_feedkeys(
+                &[TypvalT {
+                    value: TypvalValue::String(Some(b"x".to_vec())),
+                    ..TypvalT::default()
+                }],
+                &mut rettv,
+            )
+        };
+
+        assert_eq!(crate::input::typebuf_len(), 0);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
+    }
+
     #[test]
     fn get_yank_type_maps_each_character_wise_marker() {
         // Cross-verified against real nvim: setreg(..., 'v') and
@@ -9017,6 +9118,7 @@ mod tests {
             "bufwinnr",
             "hostname",
             "foreground",
+            "feedkeys",
             "eventhandler",
             "pumvisible",
             "pum_getpos",
