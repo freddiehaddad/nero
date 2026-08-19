@@ -91,6 +91,24 @@ pub unsafe fn nvim_get_option(name: &NvimString, err: &mut Error) -> Object {
     unsafe { get_option_from(std::ptr::null_mut(), OptScope::Global, name, err) }
 }
 
+/// Get global option metadata (`nvim_get_option_info`).
+///
+/// # Safety
+/// Forwarded from [`crate::api::options::nvim_get_option_info2`].
+#[must_use]
+pub unsafe fn nvim_get_option_info(name: &NvimString, err: &mut Error) -> Dict {
+    unsafe {
+        crate::api::options::nvim_get_option_info2(
+            name,
+            &crate::api::options::OptionValueOpts {
+                scope: Some(b"global".to_vec()),
+                ..Default::default()
+            },
+            err,
+        )
+    }
+}
+
 /// Get a buffer option value (`nvim_buf_get_option`).
 ///
 /// # Safety
@@ -558,6 +576,21 @@ mod tests {
             Object::Nil
         ));
         assert_eq!(empty.msg.as_deref(), Some("Invalid option name: '<empty>'"));
+    }
+
+    #[test]
+    fn nvim_get_option_info_returns_global_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut err = Error::default();
+        let metadata =
+            unsafe { nvim_get_option_info(&b"tabstop".to_vec(), &mut err) };
+        assert!(!err.is_set());
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"name" && matches!(&item.value, Object::String(value) if value == b"tabstop")));
+        assert!(metadata
+            .iter()
+            .any(|item| item.key == b"last_set_sid" && matches!(item.value, Object::Integer(_))));
     }
 
     #[test]
