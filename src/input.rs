@@ -427,6 +427,39 @@ pub unsafe fn append_to_redobuff(s: &[u8]) {
     add_buff(unsafe { REDOBUFF.get_mut() }, s);
 }
 
+/// Append bytes to the redo buffer while preserving complete
+/// special-key triplets and escaping other `K_SPECIAL` bytes
+/// (`AppendToRedobuffSpec`).
+///
+/// # Safety
+/// Must not run concurrently with redo-buffer state.
+pub unsafe fn append_to_redobuff_spec(s: &[u8]) {
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    let end = s
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(s.len());
+    let mut offset = 0;
+    while offset < end {
+        if s[offset] == crate::keycodes_defs::K_SPECIAL
+            && offset + 2 < end
+        {
+            add_buff(
+                unsafe { REDOBUFF.get_mut() },
+                &s[offset..offset + 3],
+            );
+            offset += 3;
+        } else {
+            let (c, consumed) =
+                crate::mbyte::mb_cptr2char_adv(&s[offset..end]);
+            add_char_buff(unsafe { REDOBUFF.get_mut() }, c);
+            offset += consumed.max(1);
+        }
+    }
+}
+
 /// Append one character to the redo buffer (`AppendCharToRedobuff`),
 /// translating special keys, NUL, `K_SPECIAL` and multibyte
 /// characters.
@@ -2522,6 +2555,56 @@ mod tests {
         unsafe { append_to_redobuff(b"abc") };
         unsafe { append_to_redobuff(b"de") };
         assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"abcde".to_vec());
+    }
+
+    #[test]
+    fn append_to_redobuff_spec_preserves_special_keys_and_multibyte_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        let mut input =
+            vec![crate::keycodes_defs::K_SPECIAL, b'k', b'u'];
+        input.extend_from_slice("é".as_bytes());
+
+        unsafe { append_to_redobuff_spec(&input) };
+
+        let mut expected =
+            vec![crate::keycodes_defs::K_SPECIAL, b'k', b'u'];
+        expected.extend_from_slice("é".as_bytes());
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), expected);
+    }
+
+    #[test]
+    fn append_to_redobuff_spec_escapes_an_incomplete_special_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe {
+            append_to_redobuff_spec(&[crate::keycodes_defs::K_SPECIAL, b'k'])
+        };
+
+        assert_eq!(
+            buff_bytes(unsafe { REDOBUFF.get_mut() }),
+            vec![
+                0xc2,
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+                b'k',
+            ]
+        );
+    }
+
+    #[test]
+    fn append_to_redobuff_spec_is_inert_while_redo_is_blocked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = true };
+
+        unsafe { append_to_redobuff_spec(b"ignored") };
+
+        assert!(unsafe { REDOBUFF.get_mut() }.blocks.is_empty());
     }
 
     #[test]
