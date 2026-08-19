@@ -10,8 +10,9 @@
 //! documented status). `assert_fails()`/`assert_beeps()`/
 //! `assert_nobeep()`/`assert_exception()` need real Ex-command
 //! execution/terminal-bell tracking, neither translated.
-//! `assert_equalfile()`/`test_garbagecollect_now()` need file I/O
-//! comparison/a real GC sweep, neither translated. None of these
+//! `test_garbagecollect_now()` needs a real GC sweep and remains
+//! deferred. `assert_equalfile` compares files and records detailed
+//! byte/line diagnostics. None of the remaining deferred functions
 //! `unimplemented!()` - the whole `f_assert_*` entry point for each is
 //! simply not registered in `FUNCTIONS` yet, matching this crate's
 //! usual "just don't translate it yet" treatment for a whole
@@ -341,6 +342,122 @@ pub(crate) unsafe fn assert_equal_common(argvars: &[TypvalT], atype: AssertType)
     0
 }
 
+fn read_assert_file(name: &[u8]) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(
+            name,
+        )))
+    }
+    #[cfg(windows)]
+    {
+        let name = std::str::from_utf8(name).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+        })?;
+        std::fs::read(name)
+    }
+}
+
+/// Compare two files and record a detailed assertion failure
+/// (`assert_equalfile`).
+///
+/// # Safety
+/// A mismatch appends to the shared `v:errors` List through
+/// [`assert_error`].
+pub(crate) unsafe fn assert_equalfile(argvars: &[TypvalT]) -> i64 {
+    let Some(name1) = crate::eval::typval::tv_get_string_chk(&argvars[0])
+    else {
+        return 0;
+    };
+    let Some(name2) = crate::eval::typval::tv_get_string_chk(&argvars[1])
+    else {
+        return 0;
+    };
+
+    let mut context1 = Vec::new();
+    let mut context2 = Vec::new();
+    let reason = match read_assert_file(&name1) {
+        Err(_) => {
+            format!("E485: Can't read file {}", String::from_utf8_lossy(&name1))
+                .into_bytes()
+        }
+        Ok(file1) => match read_assert_file(&name2) {
+            Err(_) => format!(
+                "E485: Can't read file {}",
+                String::from_utf8_lossy(&name2)
+            )
+            .into_bytes(),
+            Ok(file2) => {
+                let mut line = 1_i64;
+                let mut reason = None;
+                for count in 0..file1.len().max(file2.len()) {
+                    let left = file1.get(count).copied();
+                    let right = file2.get(count).copied();
+                    match (left, right) {
+                        (None, Some(_)) => {
+                            reason = Some(b"first file is shorter".to_vec());
+                            break;
+                        }
+                        (Some(_), None) => {
+                            reason = Some(b"second file is shorter".to_vec());
+                            break;
+                        }
+                        (Some(left), Some(right)) => {
+                            context1.push(left);
+                            context2.push(right);
+                            if left != right {
+                                reason = Some(
+                                    format!(
+                                        "difference at byte {count}, line {line}"
+                                    )
+                                    .into_bytes(),
+                                );
+                                break;
+                            }
+                            if left == b'\n' {
+                                line += 1;
+                                context1.clear();
+                                context2.clear();
+                            } else if context1.len() + 2 == 200 {
+                                context1.drain(..100);
+                                context2.drain(..100);
+                            }
+                        }
+                        (None, None) => break,
+                    }
+                }
+                let Some(reason) = reason else {
+                    return 0;
+                };
+                reason
+            }
+        },
+    };
+
+    let mut gap = prepare_assert_error();
+    if let Some(message) = argvars.get(2)
+        && message.var_type() != crate::eval::typval_defs::VarType::Unknown
+    {
+        gap.extend_from_slice(&unsafe {
+            crate::eval::encode::encode_tv2echo(message)
+        });
+        gap.extend_from_slice(b": ");
+    }
+    gap.extend_from_slice(&reason[..reason.len().min(crate::globals::IOSIZE - 1)]);
+    if !context1.is_empty() {
+        gap.extend_from_slice(b" after \"");
+        gap.extend_from_slice(&context1);
+        if context1 != context2 {
+            gap.extend_from_slice(b"\" vs \"");
+            gap.extend_from_slice(&context2);
+        }
+        gap.push(b'"');
+    }
+    unsafe { assert_error(&gap) };
+    1
+}
+
 /// Common logic for `assert_true()`/`assert_false()` (`assert_bool`).
 ///
 /// # Safety
@@ -421,6 +538,29 @@ mod tests {
 
     fn string(s: &[u8]) -> TypvalT {
         TypvalT { value: TypvalValue::String(Some(s.to_vec())), ..Default::default() }
+    }
+
+    struct TempFiles(Vec<std::path::PathBuf>);
+
+    impl TempFiles {
+        fn pair() -> (Self, std::path::PathBuf, std::path::PathBuf) {
+            let stem = format!(
+                "nero-assert-equalfile-{}-{}",
+                std::process::id(),
+                crate::profile::profile_start()
+            );
+            let first = std::env::temp_dir().join(format!("{stem}-1"));
+            let second = std::env::temp_dir().join(format!("{stem}-2"));
+            (Self(vec![first.clone(), second.clone()]), first, second)
+        }
+    }
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     /// Release whatever `v:errors` currently holds and reset it to
@@ -531,6 +671,104 @@ mod tests {
         reset_v_errors();
         assert_eq!(unsafe { assert_equal_common(&[num(1), num(2), string(b"my custom msg")], AssertType::Equal) }, 1);
         assert_eq!(v_errors(), vec!["my custom msg: Expected 1 but got 2".to_string()]);
+        reset_v_errors();
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows file-open mode used by std::fs::read"
+    )]
+    fn assert_equalfile_accepts_identical_files() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        let (_files, first, second) = TempFiles::pair();
+        std::fs::write(&first, b"same\ncontents\n").unwrap();
+        std::fs::write(&second, b"same\ncontents\n").unwrap();
+        let args = [
+            string(first.to_string_lossy().as_bytes()),
+            string(second.to_string_lossy().as_bytes()),
+        ];
+        assert_eq!(unsafe { assert_equalfile(&args) }, 0);
+        assert!(v_errors().is_empty());
+        reset_v_errors();
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows file-open mode used by std::fs::read"
+    )]
+    fn assert_equalfile_reports_byte_line_context_and_custom_message() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        let (_files, first, second) = TempFiles::pair();
+        std::fs::write(&first, b"abc\n").unwrap();
+        std::fs::write(&second, b"abx\n").unwrap();
+        let args = [
+            string(first.to_string_lossy().as_bytes()),
+            string(second.to_string_lossy().as_bytes()),
+            string(b"files"),
+        ];
+        assert_eq!(unsafe { assert_equalfile(&args) }, 1);
+        assert_eq!(
+            v_errors(),
+            vec![
+                "files: difference at byte 2, line 1 after \"abc\" vs \"abx\""
+                    .to_string()
+            ]
+        );
+        reset_v_errors();
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows file-open mode used by std::fs::read"
+    )]
+    fn assert_equalfile_reports_shorter_and_unreadable_files() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        let (_files, first, second) = TempFiles::pair();
+        std::fs::write(&first, b"ab").unwrap();
+        std::fs::write(&second, b"abc").unwrap();
+        let args = [
+            string(first.to_string_lossy().as_bytes()),
+            string(second.to_string_lossy().as_bytes()),
+        ];
+        assert_eq!(unsafe { assert_equalfile(&args) }, 1);
+        assert_eq!(
+            v_errors(),
+            vec!["first file is shorter after \"ab\"".to_string()]
+        );
+        reset_v_errors();
+
+        std::fs::remove_file(&first).unwrap();
+        assert_eq!(unsafe { assert_equalfile(&args) }, 1);
+        assert_eq!(
+            v_errors(),
+            vec![format!("E485: Can't read file {}", first.display())]
+        );
+        reset_v_errors();
+    }
+
+    #[test]
+    fn assert_equalfile_ignores_non_string_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors();
+        assert_eq!(
+            unsafe {
+                assert_equalfile(&[
+                    TypvalT {
+                        value: TypvalValue::List(std::ptr::null_mut()),
+                        ..Default::default()
+                    },
+                    string(b"file"),
+                ])
+            },
+            0
+        );
+        assert!(v_errors().is_empty());
         reset_v_errors();
     }
 

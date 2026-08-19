@@ -501,6 +501,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"list2blob"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_list2blob });
         m.insert(&b"string"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_string });
         m.insert(&b"assert_equal"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_assert_equal });
+        m.insert(&b"assert_equalfile"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_assert_equalfile });
         m.insert(&b"assert_notequal"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_assert_notequal });
         m.insert(&b"assert_true"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_assert_true });
         m.insert(&b"assert_false"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_assert_false });
@@ -3524,6 +3525,13 @@ unsafe fn f_string(argvars: &[TypvalT], rettv: &mut TypvalT) {
 unsafe fn f_assert_equal(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_equal_common(argvars, crate::testing::AssertType::Equal) });
+}
+
+/// Compare two files and record an assertion failure
+/// (`f_assert_equalfile`, `testing.c`).
+unsafe fn f_assert_equalfile(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value =
+        TypvalValue::Number(unsafe { crate::testing::assert_equalfile(argvars) });
 }
 
 /// `assert_notequal({expected}, {actual}[, {msg}])` - records a
