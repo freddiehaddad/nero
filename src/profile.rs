@@ -1,15 +1,11 @@
-//! Translated from `src/nvim/profile.c` (partial - `src/nvim/profile.h`
-//! has no manually-written content beyond the generated declarations).
+//! Translated from `src/nvim/profile.c` (`src/nvim/profile.h` has no
+//! manually-written content beyond generated declarations).
 //!
-//! Only the self-contained `proftime_T` time-arithmetic API is translated
-//! here: `profile_start`/`profile_end`/`profile_msg`/`profile_setlimit`/
-//! `profile_passed_limit`/`profile_zero`/`profile_divide`/`profile_add`/
-//! `profile_sub`/`profile_self`/`profile_get_wait`/`profile_set_wait`/
-//! `profile_sub_wait`/`profile_equal`/`profile_signed`/`profile_cmp`.
-//!
-//! Per-function/per-script profiling remains mostly deferred, but
-//! [`func_line_exec`]/[`func_line_end`]/[`script_line_exec`] are now
-//! translated because their function/script records have real fields.
+//! The complete timing arithmetic, function/script timing state,
+//! per-line accounting, report formatting/writing, reset logic,
+//! startup-time reporting, and command lifecycle are translated.
+//! [`func_line_exec`]/[`func_line_end`]/[`script_line_exec`] use the
+//! real function/script records.
 //! [`func_do_profile`] initializes and enables per-function timing.
 //! [`script_prof_save`]/[`script_prof_restore`] record nested-child
 //! timing state, and [`prof_child_enter`]/[`prof_child_exit`] perform
@@ -23,13 +19,10 @@
 //! The complete `--startuptime` report lifecycle is translated through
 //! [`time_init`]/[`time_start`]/[`time_msg`]/[`time_finish`].
 //!
-//! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
-//! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
-//! clock - functionally the same contract as `uv_hrtime()`/`os_hrtime()`:
-//! an arbitrary monotonic reference point, used only for taking
-//! differences, never as absolute wall-clock time. This should be
-//! reconciled with (or simply call into) the real `os_hrtime` translation
-//! once `os/time.c` is done.
+//! `:profile file`/`func` remain with `debugger.c`'s untranslated
+//! `ex_breakadd` command parser. Report-open failures are propagated as
+//! `std::io::Result` because the message-display pipeline is not yet
+//! available.
 
 use crate::types_defs::ProftimeT;
 use std::io::Write;
@@ -490,25 +483,16 @@ pub unsafe fn prof_child_exit(tm: &ProftimeT) {
     unsafe { script_prof_restore(tm) };
 }
 
-/// Stands in for `os_hrtime()` until `os/time.c` is translated - see module
-/// docs. Returns nanoseconds since an arbitrary, fixed, monotonic
-/// reference point established on first use.
-fn os_hrtime_stub() -> ProftimeT {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let start = *START.get_or_init(std::time::Instant::now);
-    start.elapsed().as_nanos() as ProftimeT
-}
-
 /// Gets the current time (`profile_start`).
 #[inline]
 pub fn profile_start() -> ProftimeT {
-    os_hrtime_stub()
+    crate::os::time::os_hrtime()
 }
 
 /// Computes the time elapsed since `tm` (`profile_end`).
 #[inline]
 pub fn profile_end(tm: ProftimeT) -> ProftimeT {
-    profile_sub(os_hrtime_stub(), tm)
+    profile_sub(crate::os::time::os_hrtime(), tm)
 }
 
 /// Gets a string representing time `tm`, as `"seconds.microseconds"`
@@ -531,7 +515,7 @@ pub fn profile_setlimit(msec: i64) -> ProftimeT {
     }
     assert!(msec < (i64::MAX / 1_000_000));
     let nsec = (msec as ProftimeT) * 1_000_000;
-    os_hrtime_stub().wrapping_add(nsec)
+    crate::os::time::os_hrtime().wrapping_add(nsec)
 }
 
 /// Checks if the current time has passed `tm` (`profile_passed_limit`).
@@ -543,7 +527,7 @@ pub fn profile_passed_limit(tm: ProftimeT) -> bool {
         // timer was not set
         return false;
     }
-    profile_cmp(os_hrtime_stub(), tm) < 0
+    profile_cmp(crate::os::time::os_hrtime(), tm) < 0
 }
 
 /// Gets the zero time (`profile_zero`).
