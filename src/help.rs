@@ -4,17 +4,15 @@
 //! on tag-file search (`find_tags`) and the Lua help core
 //! (`nlua_call_typval("vim._core.help", ...)`), neither translated.
 //!
-//! Translated: [`check_help_lang`] and [`help_heuristic`] - both pure
-//! functions needing only [`crate::macros_defs`]'s already-translated
-//! ASCII character-class helpers.
+//! Translated: [`check_help_lang`], [`help_heuristic`], and
+//! [`help_compare`] - pure parsing/ranking helpers needing only
+//! already-translated ASCII primitives.
 //!
 //! Deferred: everything else - `find_help_tags` (needs `find_tags`/the
 //! Lua help core), `cleanup_help_tags`/`prepare_help_buffer`/
 //! `get_local_additions` (need help-buffer setup and option mutation),
 //! `ex_help`/`ex_helpclose`/`ex_helptags`/`helptags_one`/`do_helptags`/
-//! `helptags_cb` (the whole help/tagfile pipeline), `help_compare`
-//! (a `qsort()` comparator wrapping [`help_heuristic`] - trivial once
-//! this crate has real sortable tag-match data to apply it to).
+//! `helptags_cb` (the whole help/tagfile pipeline).
 
 use crate::macros_defs::{ascii_isalnum, ascii_isalpha};
 
@@ -88,6 +86,34 @@ pub fn help_heuristic(matched_string: &[u8], mut offset: i32, wrong_case: bool) 
         offset += 100;
     }
     100 * num_letters + matched_string.len() as i32 + offset
+}
+
+/// Compare encoded help-tag matches (`help_compare`).
+///
+/// Each value is `{tagname}\0{six-digit heuristic}\0`. The heuristic
+/// sorts first, with the tag name as a deterministic tie-breaker.
+#[must_use]
+pub fn help_compare(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    fn parts(value: &[u8]) -> (&[u8], &[u8]) {
+        let split = value
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(value.len());
+        let name = &value[..split];
+        let score_start = split.saturating_add(1).min(value.len());
+        let score_rest = &value[score_start..];
+        let score_end = score_rest
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(score_rest.len());
+        (name, &score_rest[..score_end])
+    }
+
+    let (left_name, left_score) = parts(left);
+    let (right_name, right_score) = parts(right);
+    left_score
+        .cmp(right_score)
+        .then_with(|| left_name.cmp(right_name))
 }
 
 /// Strips redundant `"@xx"` language suffixes from help tag matches
@@ -245,6 +271,26 @@ mod tests {
     fn check_help_lang_too_short_is_none() {
         assert_eq!(check_help_lang(b"@e"), None);
         assert_eq!(check_help_lang(b""), None);
+    }
+
+    #[test]
+    fn help_compare_orders_by_heuristic_before_name() {
+        assert_eq!(
+            help_compare(b"zzz\x00000001\x00", b"aaa\x00000010\x00"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn help_compare_uses_name_as_a_tie_breaker() {
+        assert_eq!(
+            help_compare(b"alpha\x00000100\x00", b"beta\x00000100\x00"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            help_compare(b"same\x00000100\x00", b"same\x00000100\x00"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
