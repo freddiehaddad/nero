@@ -408,6 +408,37 @@ pub unsafe fn nvim__invalidate_glyph_cache() {
         crate::drawscreen::UPD_CLEAR;
 }
 
+/// Replace terminal/key codes in a string (`nvim_replace_termcodes`).
+///
+/// # Safety
+/// Forwarded from [`crate::keycodes::replace_termcodes`].
+#[must_use]
+pub unsafe fn nvim_replace_termcodes(
+    string: &NvimString,
+    from_part: Boolean,
+    do_lt: Boolean,
+    special: Boolean,
+) -> NvimString {
+    if string.is_empty() {
+        return Vec::new();
+    }
+    let mut flags = 0;
+    if from_part {
+        flags |= crate::keycodes_defs::repterm::FROM_PART;
+    }
+    if do_lt {
+        flags |= crate::keycodes_defs::repterm::DO_LT;
+    }
+    if !special {
+        flags |= crate::keycodes_defs::repterm::NO_SPECIAL;
+    }
+    let cpo = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_cpo
+        .clone()
+        .unwrap_or_default();
+    unsafe { crate::keycodes::replace_termcodes(string, 0, flags, None, &cpo) }
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1452,6 +1483,20 @@ mod tests {
             drop(Box::from_raw(syn));
             drop(Box::from_raw(buf));
         }
+    }
+
+    #[test]
+    fn nvim_replace_termcodes_maps_public_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { nvim_replace_termcodes(&b"<CR><lt>".to_vec(), true, true, true) },
+            b"\r<"
+        );
+        assert_eq!(
+            unsafe { nvim_replace_termcodes(&b"<CR>".to_vec(), true, true, false) },
+            b"<CR>"
+        );
+        assert!(unsafe { nvim_replace_termcodes(&Vec::new(), true, true, true) }.is_empty());
     }
 
     #[test]
