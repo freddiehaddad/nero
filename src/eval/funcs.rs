@@ -579,6 +579,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"screencol"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_screencol });
         m.insert(&b"screenrow"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_screenrow });
+        m.insert(&b"hlID"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_hl_id });
+        m.insert(&b"hlexists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_hlexists });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
         m.insert(&b"settagstack"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_settagstack });
@@ -6995,6 +6997,22 @@ unsafe fn f_screencol(_argvars: &[TypvalT], rettv: &mut TypvalT) {
 unsafe fn f_screenrow(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value =
         TypvalValue::Number(i64::from(unsafe { crate::ui::ui_current_row() }) + 1);
+}
+
+/// Highlight group ID by name (`hlID()`).
+unsafe fn f_hl_id(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    rettv.value = TypvalValue::Number(i64::from(unsafe {
+        crate::highlight_group::syn_name2id(&name)
+    }));
+}
+
+/// Whether a highlight group exists (`hlexists()`).
+unsafe fn f_hlexists(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    rettv.value = TypvalValue::Number(i64::from(unsafe {
+        crate::highlight_group::highlight_exists(&name)
+    }));
 }
 
 /// `win_gettype([{nr}])` - the type of window `{nr}` (default the
@@ -16549,6 +16567,33 @@ mod tests {
         }
         assert!(matches!(col.value, TypvalValue::Number(value) if value == expected_col));
         assert!(matches!(row.value, TypvalValue::Number(value) if value == expected_row));
+    }
+
+    #[test]
+    fn hl_id_and_hlexists_delegate_to_the_highlight_registry() {
+        let _lock = crate::globals::global_state_test_lock();
+        for name in [b"Normal".as_slice(), b"NeroNoSuchHighlight".as_slice()] {
+            let arg = TypvalT {
+                value: TypvalValue::String(Some(name.to_vec())),
+                ..Default::default()
+            };
+            let expected_id =
+                unsafe { crate::highlight_group::syn_name2id(name) };
+            let expected_exists =
+                unsafe { crate::highlight_group::highlight_exists(name) };
+            let mut id = TypvalT::default();
+            let mut exists = TypvalT::default();
+            unsafe {
+                f_hl_id(std::slice::from_ref(&arg), &mut id);
+                f_hlexists(std::slice::from_ref(&arg), &mut exists);
+            }
+            assert!(
+                matches!(id.value, TypvalValue::Number(value) if value == i64::from(expected_id))
+            );
+            assert!(
+                matches!(exists.value, TypvalValue::Number(value) if value == i64::from(expected_exists))
+            );
+        }
     }
 
     // --- f_win_screenpos ---
