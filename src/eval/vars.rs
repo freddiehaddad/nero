@@ -4763,19 +4763,9 @@ mod eval_one_expr_in_str_tests {
 /// `tp`/`win`/`buf` (whichever are non-null) must be valid, live
 /// pointers; `GLOBALS.curtab`/`curwin`/`curbuf` must be valid.
 ///
-/// # Panics
-/// Panics if a real window/tabpage switch away from the current one
-/// is genuinely needed (`tp != curtab` or `win != curwin`, whenever
-/// `do_change_curbuf` doesn't already sidestep it for `htname ==
-/// b'b'`) - needs the real `ctx_switch` (`context.c`), which itself
-/// needs window/tabpage-switching machinery (`goto_tabpage_tp`,
-/// `use_tabpage`/`unuse_tabpage`) not yet translated. Not reachable
-/// via `getbufvar({buf}, ...)` (any `{buf}`, since `do_change_curbuf`
-/// always sidesteps the switch for `htname == b'b'`) or
-/// `getwinvar(0, ...)`/`gettabvar(tabnr-of-curtab, ...)` (the current
-/// window/tab, the overwhelmingly common invocation shape). The bare
-/// `"&"` (whole window/buffer-local-options-dict) form is now real
-/// too, via `get_winbuf_options` - no longer a panic case.
+/// Cross-window/tabpage reads use the real no-event/no-display context
+/// switch. `getbufvar()` still takes its lower-side-effect direct
+/// `curbuf` swap path.
 #[allow(clippy::too_many_arguments)]
 unsafe fn get_var_from(
     varname: Option<&[u8]>,
@@ -4798,15 +4788,20 @@ unsafe fn get_var_from(
             let need_switch_win =
                 !(std::ptr::eq(tp, g.curtab) && std::ptr::eq(win, g.curwin)) && !do_change_curbuf;
 
-            if need_switch_win {
-                unimplemented!(
-                    "get_var_from: switching to a different window/tabpage needs the real \
-                     ctx_switch (context.c), not yet translated - see this function's own doc \
-                     comment"
-                );
-            }
+            let mut switch = crate::context_defs::CtxSwitch::default();
+            let can_access = !need_switch_win
+                || unsafe {
+                    crate::context::ctx_switch(
+                        &mut switch,
+                        win,
+                        tp,
+                        std::ptr::null_mut(),
+                        crate::context_defs::ctx_switch_flags::NO_EVENTS
+                            | crate::context_defs::ctx_switch_flags::NO_DISPLAY,
+                    )
+                };
 
-            if varname.first() == Some(&b'&') && htname != b't' {
+            if can_access && varname.first() == Some(&b'&') && htname != b't' {
                 // SAFETY: forwarded from this function's own safety doc.
                 let save_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
                 if do_change_curbuf {
@@ -4846,7 +4841,7 @@ unsafe fn get_var_from(
 
                 // SAFETY: forwarded from this function's own safety doc.
                 unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = save_curbuf;
-            } else if varname.is_empty() {
+            } else if can_access && varname.is_empty() {
                 let v: *const ScopeDictDictItem = if htname == b'b' {
                     // SAFETY: forwarded from this function's own safety doc.
                     unsafe { &(*buf).b_bufvar }
@@ -4860,7 +4855,7 @@ unsafe fn get_var_from(
                 // SAFETY: forwarded from this function's own safety doc.
                 unsafe { crate::eval::typval::tv_copy(&(*v).di_tv, rettv) };
                 done = true;
-            } else {
+            } else if can_access {
                 let d: *mut DictT = if htname == b'b' {
                     // SAFETY: forwarded from this function's own safety doc.
                     unsafe { (*buf).b_vars }
@@ -4884,6 +4879,9 @@ unsafe fn get_var_from(
                     unsafe { crate::eval::typval::tv_copy(&*src, rettv) };
                     done = true;
                 }
+            }
+            if need_switch_win {
+                unsafe { crate::context::ctx_restore(&switch) };
             }
         }
 
@@ -5671,18 +5669,113 @@ mod get_var_from_tests {
     }
 
     #[test]
-    #[should_panic(expected = "ctx_switch")]
-    fn get_var_from_a_different_window_panics() {
+    fn get_var_from_reads_a_different_window_through_ctx_switch() {
         let _lock = crate::globals::global_state_test_lock();
-        let mut fx = TestFixture::new();
-        let mut other_win = crate::buffer_defs::WinT::default();
-        let tp = fx.tab_ptr();
-        let other_ptr = &mut other_win as *mut crate::buffer_defs::WinT;
+        let first_buf = Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+        let second_buf = Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+        let first_win = Box::into_raw(Box::new(crate::buffer_defs::WinT {
+            handle: 31,
+            w_buffer: first_buf,
+            ..Default::default()
+        }));
+        let second_win = Box::into_raw(Box::new(crate::buffer_defs::WinT {
+            handle: 32,
+            w_buffer: second_buf,
+            w_prev: first_win,
+            ..Default::default()
+        }));
+        let tab = Box::into_raw(Box::new(crate::buffer_defs::TabpageT {
+            tp_curwin: first_win,
+            tp_firstwin: first_win,
+            tp_lastwin: second_win,
+            ..Default::default()
+        }));
+        unsafe {
+            (*first_win).w_next = second_win;
+            (*first_win).w_vars = crate::eval::typval::tv_dict_alloc();
+            init_var_dict(
+                &mut *(*first_win).w_vars,
+                &mut (*first_win).w_winvar,
+                ScopeType::Scope,
+            );
+            (*second_win).w_vars = crate::eval::typval::tv_dict_alloc();
+            init_var_dict(
+                &mut *(*second_win).w_vars,
+                &mut (*second_win).w_winvar,
+                ScopeType::Scope,
+            );
+            let item = crate::eval::typval::tv_dict_item_alloc(b"myvar");
+            (*item).di_tv.value = TypvalValue::Number(42);
+            crate::eval::typval::tv_dict_add(&mut *(*second_win).w_vars, item);
+        }
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                first_buf,
+            )
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                first_win,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                first_win,
+            )
+        };
+        let _lastwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastwin,
+                second_win,
+            )
+        };
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curtab,
+                tab,
+            )
+        };
+        let _first_tab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.first_tabpage,
+                tab,
+            )
+        };
 
         let mut rettv = TypvalT::default();
         let deftv = TypvalT::default();
         unsafe {
-            get_var_from(Some(b"myvar"), &mut rettv, &deftv, b'w', tp, other_ptr, std::ptr::null_mut());
+            get_var_from(
+                Some(b"myvar"),
+                &mut rettv,
+                &deftv,
+                b'w',
+                tab,
+                second_win,
+                std::ptr::null_mut(),
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.curwin, first_win);
+        assert!(!crate::autocmd::is_autocmd_blocked());
+
+        drop(_first_tab);
+        drop(_curtab);
+        drop(_lastwin);
+        drop(_firstwin);
+        drop(_curwin);
+        drop(_curbuf);
+        unsafe {
+            crate::eval::typval::tv_dict_free((*first_win).w_vars);
+            crate::eval::typval::tv_dict_free((*second_win).w_vars);
+            drop(Box::from_raw(tab));
+            drop(Box::from_raw(second_win));
+            drop(Box::from_raw(first_win));
+            drop(Box::from_raw(second_buf));
+            drop(Box::from_raw(first_buf));
         }
     }
 
