@@ -581,6 +581,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"screenrow"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_screenrow });
         m.insert(&b"hlID"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_hl_id });
         m.insert(&b"hlexists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_hlexists });
+        m.insert(&b"synIDtrans"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_syn_id_trans });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
         m.insert(&b"settagstack"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_settagstack });
@@ -7013,6 +7014,16 @@ unsafe fn f_hlexists(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(unsafe {
         crate::highlight_group::highlight_exists(&name)
     }));
+}
+
+/// Resolve a highlight group through links (`synIDtrans()`).
+unsafe fn f_syn_id_trans(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let id = crate::eval::typval::tv_get_number(&argvars[0]) as i32;
+    rettv.value = TypvalValue::Number(if id > 0 {
+        i64::from(unsafe { crate::highlight_group::syn_get_final_id(id) })
+    } else {
+        0
+    });
 }
 
 /// `win_gettype([{nr}])` - the type of window `{nr}` (default the
@@ -16594,6 +16605,30 @@ mod tests {
                 matches!(exists.value, TypvalValue::Number(value) if value == i64::from(expected_exists))
             );
         }
+    }
+
+    #[test]
+    fn syn_id_trans_delegates_to_the_final_id_resolver() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                win_ptr,
+            )
+        };
+        let expected = unsafe { crate::highlight_group::syn_get_final_id(1) };
+        let mut positive = TypvalT::default();
+        let mut nonpositive = TypvalT::default();
+        unsafe {
+            f_syn_id_trans(&[num(1)], &mut positive);
+            f_syn_id_trans(&[num(-1)], &mut nonpositive);
+        }
+        assert!(
+            matches!(positive.value, TypvalValue::Number(value) if value == i64::from(expected))
+        );
+        assert!(matches!(nonpositive.value, TypvalValue::Number(0)));
     }
 
     // --- f_win_screenpos ---
