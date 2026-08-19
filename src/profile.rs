@@ -1052,6 +1052,37 @@ unsafe fn script_dump_profile() -> Vec<u8> {
     report
 }
 
+/// Write all script and function profiling information (`profile_dump`).
+///
+/// # Safety
+/// Reads the shared script/function registries and profile output name;
+/// none may change during the call.
+pub unsafe fn profile_dump() -> std::io::Result<()> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(name) = unsafe { PROFILE_FNAME.get_mut() }.clone() else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name))
+    };
+    #[cfg(windows)]
+    let path = std::path::PathBuf::from(
+        std::str::from_utf8(&name).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+        })?,
+    );
+
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    // SAFETY: forwarded from this function's own safety doc.
+    writer.write_all(&unsafe { script_dump_profile() })?;
+    // SAFETY: forwarded from this function's own safety doc.
+    writer.write_all(unsafe { func_dump_profile() }.as_bytes())?;
+    writer.flush()
+}
+
 /// Compare two functions by total time, for sorting
 /// (`prof_total_cmp`).
 ///
@@ -1127,6 +1158,22 @@ mod tests {
     struct ProfileExestackGuard(Vec<crate::runtime_defs::EstackT>);
 
     struct StartupReportGuard(std::path::PathBuf);
+
+    struct ProfileFilenameGuard(Option<Vec<u8>>);
+
+    impl ProfileFilenameGuard {
+        fn set(name: Option<Vec<u8>>) -> Self {
+            let previous =
+                std::mem::replace(unsafe { PROFILE_FNAME.get_mut() }, name);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ProfileFilenameGuard {
+        fn drop(&mut self) {
+            *unsafe { PROFILE_FNAME.get_mut() } = self.0.take();
+        }
+    }
 
     impl Drop for StartupReportGuard {
         fn drop(&mut self) {
@@ -1950,6 +1997,65 @@ mod tests {
         crate::runtime::tests_reset_for_test();
         crate::runtime::new_script_item(Some(b"plain.vim".to_vec()));
         assert!(unsafe { script_dump_profile() }.is_empty());
+    }
+
+    #[test]
+    fn profile_dump_is_a_noop_without_an_output_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _name = ProfileFilenameGuard::set(None);
+        unsafe { profile_dump() }.unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot emulate the Windows create/truncate file-open mode"
+    )]
+    fn profile_dump_writes_function_reports_to_the_named_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        crate::eval::userfunc::func_init();
+        let path = std::env::temp_dir().join(format!(
+            "nero-profile-dump-{}-{}.log",
+            std::process::id(),
+            profile_start()
+        ));
+        let _file = StartupReportGuard(path.clone());
+        let _name = ProfileFilenameGuard::set(Some(
+            path.to_string_lossy().into_owned().into_bytes(),
+        ));
+        let function = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: b"Dumped\0".to_vec(),
+                uf_prof_initialized: 1,
+                uf_tm_count: 1,
+                uf_tm_total: 1_000_000_000,
+                uf_tm_self: 500_000_000,
+                uf_lines: vec![Some(b"return 1".to_vec())],
+                uf_tml_count: vec![1],
+                uf_tml_total: vec![1_000_000_000],
+                uf_tml_self: vec![500_000_000],
+                ..Default::default()
+            },
+        ));
+        unsafe {
+            assert_eq!(
+                crate::eval::userfunc::func_hashtab_add(function),
+                crate::vim_defs::OK
+            );
+            profile_dump().unwrap();
+        }
+
+        let report = std::fs::read_to_string(&path).unwrap();
+        assert!(report.starts_with("FUNCTION  Dumped()\n"));
+        assert!(report.contains("Called 1 time\n"));
+        assert!(report.contains("FUNCTIONS SORTED ON TOTAL TIME\n"));
+        assert!(report.contains("FUNCTIONS SORTED ON SELF TIME\n"));
+
+        unsafe {
+            crate::eval::userfunc::func_init();
+            drop(Box::from_raw(function));
+        }
     }
 
     // --- get_profile_name / prof_def_func ---
