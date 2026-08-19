@@ -55,6 +55,19 @@ pub fn handle_ui_client_redraw(
     crate::api::private::defs::Object::Nil
 }
 
+/// Reject the legacy `grid_line` event (`ui_client_event_grid_line`).
+///
+/// The line-grid client receives pre-decoded `raw_line` events instead;
+/// Neovim marks this handler unreachable with `abort()`.
+///
+/// # Panics
+/// Always panics, matching the original's unconditional abort.
+pub fn ui_client_event_grid_line(
+    _args: &crate::api::private::defs::Array,
+) -> ! {
+    panic!("ui_client_event_grid_line is unreachable")
+}
+
 /// Handle the UI client's `error_exit` event
 /// (`ui_client_event_error_exit`).
 ///
@@ -118,6 +131,12 @@ mod tests {
             error.msg.as_deref(),
             Some("'redraw' cannot be sent as a request")
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "ui_client_event_grid_line is unreachable")]
+    fn ui_client_event_grid_line_is_unreachable() {
+        ui_client_event_grid_line(&Vec::new());
     }
 
     #[test]
