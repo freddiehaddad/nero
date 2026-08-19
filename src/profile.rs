@@ -13,6 +13,8 @@
 //! [`script_prof_save`]/[`script_prof_restore`] record nested-child
 //! timing state, and [`prof_child_enter`]/[`prof_child_exit`] perform
 //! the paired function/script child measurement.
+//! `:profile` subcommand completion is translated through
+//! [`set_context_in_profile_cmd`]/[`get_profile_name`].
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -49,14 +51,47 @@ static PEXPAND_WHAT: crate::globals::GlobalCell<PexpandWhat> =
 /// Set what `:profile` completion should offer.
 ///
 /// The original assigns its file-static directly from
-/// `set_context_in_profile_cmd`, which is not translated yet; this
-/// accessor exists so it can drive the flag once it lands.
+/// [`set_context_in_profile_cmd`]; this accessor keeps that mutation
+/// explicit for other callers and tests.
 ///
 /// # Safety
 /// Must not run concurrently with any other access to `PEXPAND_WHAT`.
 pub unsafe fn set_pexpand_what(what: PexpandWhat) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *PEXPAND_WHAT.get_mut() = what };
+}
+
+/// Configure command-line completion for `:profile`
+/// (`set_context_in_profile_cmd`).
+///
+/// # Safety
+/// Mutates the shared `PEXPAND_WHAT` completion state.
+pub unsafe fn set_context_in_profile_cmd(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    argument: &[u8],
+) {
+    xp.xp_context = crate::cmdexpand_defs::ExpandContext::Profile;
+    xp.xp_pattern = Some(argument.to_vec());
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_pexpand_what(PexpandWhat::Subcmd) };
+
+    let end_subcmd = crate::charset::skiptowhite(argument);
+    if end_subcmd == argument.len() {
+        return;
+    }
+
+    let subcmd = &argument[..end_subcmd];
+    let pattern_start =
+        end_subcmd + crate::charset::skipwhite(&argument[end_subcmd..]);
+    if subcmd == b"start" || subcmd == b"file" {
+        xp.xp_context = crate::cmdexpand_defs::ExpandContext::Files;
+        xp.xp_pattern = Some(argument[pattern_start..].to_vec());
+    } else if subcmd == b"func" {
+        xp.xp_context = crate::cmdexpand_defs::ExpandContext::UserFunc;
+        xp.xp_pattern = Some(argument[pattern_start..].to_vec());
+    } else {
+        xp.xp_context = crate::cmdexpand_defs::ExpandContext::Nothing;
+    }
 }
 
 /// The `idx`'th `:profile` completion candidate, or `None` past the
@@ -1105,6 +1140,70 @@ mod tests {
             assert_eq!(get_profile_name(0), None);
 
             set_pexpand_what(prev);
+        }
+    }
+
+    #[test]
+    fn set_context_in_profile_cmd_completes_subcommands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        unsafe { set_context_in_profile_cmd(&mut xp, b"sta") };
+
+        assert_eq!(
+            xp.xp_context,
+            crate::cmdexpand_defs::ExpandContext::Profile
+        );
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"sta".as_slice()));
+        assert_eq!(unsafe { get_profile_name(5) }, Some("start"));
+    }
+
+    #[test]
+    fn set_context_in_profile_cmd_completes_start_and_file_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        for argument in [b"start   log.out".as_slice(), b"file *.vim".as_slice()] {
+            let mut xp = crate::cmdexpand_defs::ExpandT::default();
+            unsafe { set_context_in_profile_cmd(&mut xp, argument) };
+
+            assert_eq!(
+                xp.xp_context,
+                crate::cmdexpand_defs::ExpandContext::Files
+            );
+            assert_eq!(
+                xp.xp_pattern.as_deref(),
+                Some(if argument[0] == b's' {
+                    b"log.out".as_slice()
+                } else {
+                    b"*.vim".as_slice()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn set_context_in_profile_cmd_completes_function_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        unsafe { set_context_in_profile_cmd(&mut xp, b"func   MyFunc") };
+
+        assert_eq!(
+            xp.xp_context,
+            crate::cmdexpand_defs::ExpandContext::UserFunc
+        );
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"MyFunc".as_slice()));
+    }
+
+    #[test]
+    fn set_context_in_profile_cmd_rejects_unknown_or_abbreviated_subcommands() {
+        let _lock = crate::globals::global_state_test_lock();
+        for argument in [b"bogus value".as_slice(), b"sta value".as_slice()] {
+            let mut xp = crate::cmdexpand_defs::ExpandT::default();
+            unsafe { set_context_in_profile_cmd(&mut xp, argument) };
+
+            assert_eq!(
+                xp.xp_context,
+                crate::cmdexpand_defs::ExpandContext::Nothing
+            );
+            assert_eq!(xp.xp_pattern.as_deref(), Some(argument));
         }
     }
 
