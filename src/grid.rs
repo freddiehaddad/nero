@@ -61,8 +61,9 @@ pub static DEFAULT_GRID: std::sync::LazyLock<
 /// The original is a `Set(glyph)` of NUL-terminated strings; here the
 /// keys are plain byte vectors, since a `schar_T`'s own glyph may not
 /// contain embedded NULs anyway.
-pub static GLYPH_CACHE: std::sync::LazyLock<crate::globals::GlobalCell<Set<Vec<u8>>>> =
-    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Set::default()));
+pub static GLYPH_CACHE: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::map_glyph_cache::GlyphSet>,
+> = std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Set::default()));
 
 /// Resolve a view's own row/column offsets against its target grid
 /// (`grid_adjust`).
