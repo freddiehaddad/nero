@@ -104,6 +104,16 @@ pub unsafe fn nvim_get_namespaces() -> Dict {
         .collect()
 }
 
+/// Whether namespace ID `namespace` has been allocated
+/// (`ns_initialized`).
+///
+/// # Safety
+/// Reads the shared namespace allocation counter.
+#[must_use]
+pub unsafe fn ns_initialized(namespace: u32) -> bool {
+    namespace >= 1 && namespace < unsafe { *NEXT_NAMESPACE_ID.get_mut() } as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +193,17 @@ mod tests {
         assert!(!namespaces
             .iter()
             .any(|pair| matches!(pair.value, Object::Integer(id) if id == anonymous)));
+    }
+
+    #[test]
+    fn ns_initialized_tracks_named_and_anonymous_allocations() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!unsafe { ns_initialized(0) });
+        let named = unsafe { nvim_create_namespace(&b"nero-ns-initialized".to_vec()) };
+        let anonymous = unsafe { nvim_create_namespace(&Vec::new()) };
+        assert!(unsafe { ns_initialized(named as u32) });
+        assert!(unsafe { ns_initialized(anonymous as u32) });
+        assert!(!unsafe { ns_initialized(u32::MAX) });
     }
 
     #[test]
