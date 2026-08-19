@@ -778,6 +778,7 @@ pub fn prof_input_end() {
 ///
 /// The original writes directly to a `FILE *`; returning the formatted
 /// bytes lets the eventual Rust profile writer use owned buffered I/O.
+#[allow(dead_code)]
 fn prof_func_line(
     count: i32,
     total: ProftimeT,
@@ -802,6 +803,48 @@ fn prof_func_line(
         line.push(' ');
     }
     line
+}
+
+/// Format one sorted function table (`prof_sort_list`).
+///
+/// The input is already sorted, matching the original's `sorttab`
+/// contract. At most the first 20 entries are printed.
+#[allow(dead_code)]
+fn prof_sort_list(
+    functions: &[&crate::eval::typval_defs::UfuncT],
+    title: &str,
+    prefer_self: bool,
+) -> String {
+    let mut report = format!(
+        "FUNCTIONS SORTED ON {title} TIME\n\
+         count  total (s)   self (s)  function\n"
+    );
+    for function in functions.iter().take(20) {
+        report.push_str(&prof_func_line(
+            function.uf_tm_count,
+            function.uf_tm_total,
+            function.uf_tm_self,
+            prefer_self,
+        ));
+        report.push(' ');
+
+        let mut name = function.uf_name.as_slice();
+        if name.last() == Some(&0) {
+            name = &name[..name.len() - 1];
+        }
+        if name.starts_with(&[
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_EXTRA,
+            crate::keycodes_defs::KE_SNR,
+        ]) {
+            report.push_str("<SNR>");
+            name = &name[3..];
+        }
+        report.push_str(&String::from_utf8_lossy(name));
+        report.push_str("()\n");
+    }
+    report.push('\n');
+    report
 }
 
 /// Compare two functions by total time, for sorting
@@ -1449,6 +1492,59 @@ mod tests {
         let line = prof_func_line(0, 1, 2, false);
         assert_eq!(line, " ".repeat(28));
         assert_eq!(line.len(), 28);
+    }
+
+    #[test]
+    fn prof_sort_list_formats_normal_and_script_local_names() {
+        let normal = crate::eval::typval_defs::UfuncT {
+            uf_name: b"Normal\0".to_vec(),
+            uf_tm_count: 2,
+            uf_tm_total: 1_000_000_000,
+            uf_tm_self: 500_000_000,
+            ..Default::default()
+        };
+        let mut snr_name = vec![
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_EXTRA,
+            crate::keycodes_defs::KE_SNR,
+        ];
+        snr_name.extend_from_slice(b"12_Local\0");
+        let script_local = crate::eval::typval_defs::UfuncT {
+            uf_name: snr_name,
+            uf_tm_count: 1,
+            uf_tm_total: 250_000_000,
+            uf_tm_self: 250_000_000,
+            ..Default::default()
+        };
+
+        let report =
+            prof_sort_list(&[&normal, &script_local], "TOTAL", false);
+
+        assert!(report.starts_with(
+            "FUNCTIONS SORTED ON TOTAL TIME\n\
+             count  total (s)   self (s)  function\n"
+        ));
+        assert!(report.contains(" Normal()\n"));
+        assert!(report.contains(" <SNR>12_Local()\n"));
+        assert!(report.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn prof_sort_list_prints_at_most_twenty_functions() {
+        let functions: Vec<_> = (0..21)
+            .map(|index| crate::eval::typval_defs::UfuncT {
+                uf_name: format!("Function{index}\0").into_bytes(),
+                uf_tm_count: 1,
+                ..Default::default()
+            })
+            .collect();
+        let refs: Vec<_> = functions.iter().collect();
+
+        let report = prof_sort_list(&refs, "SELF", true);
+
+        assert!(report.contains(" Function19()\n"));
+        assert!(!report.contains(" Function20()\n"));
+        assert_eq!(report.matches("()\n").count(), 20);
     }
 
     // --- get_profile_name / prof_def_func ---
