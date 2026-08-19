@@ -545,6 +545,32 @@ unsafe fn aucmd_del(command: &mut crate::autocmd_defs::AutoCmd) {
     unsafe { *AU_NEED_CLEAN.get_mut() = true };
 }
 
+/// Delete one autocmd by API ID (`autocmd_delete_id`).
+///
+/// # Safety
+/// Mutates shared autocmd/callback/pattern state.
+pub unsafe fn autocmd_delete_id(id: i64) -> bool {
+    let found = {
+        let autocmds = unsafe { AUTOCMDS.get_mut() };
+        'events: {
+            for commands in autocmds {
+                if let Some(command) = commands
+                    .iter_mut()
+                    .find(|command| !command.pat.is_null() && command.id == id)
+                {
+                    unsafe { aucmd_del(command) };
+                    break 'events true;
+                }
+            }
+            false
+        }
+    };
+    if found {
+        au_cleanup();
+    }
+    found
+}
+
 /// Cleanup autocommands that have been deleted. This is only done
 /// when not executing autocommands (`au_cleanup`).
 fn au_cleanup() {
@@ -1450,6 +1476,36 @@ mod tests {
         assert_eq!(unsafe { augroup_name(id) }, None);
         assert_eq!(unsafe { augroup_del(b"Missing") }, Err("No such group"));
         reset_augroup_map();
+    }
+
+    #[test]
+    fn autocmd_delete_id_removes_the_matching_command() {
+        let _lock = crate::globals::global_state_test_lock();
+        let pattern = Box::into_raw(Box::new(crate::autocmd_defs::AutoPat {
+            refcount: 1,
+            pat: Some(b"*".to_vec()),
+            reg_prog: std::ptr::null_mut(),
+            group: augroup::DEFAULT,
+            patlen: 1,
+            buflocal_nr: 0,
+            allow_dirs: false,
+        }));
+        {
+            let commands = unsafe { AUTOCMDS.get_mut() };
+            commands[EventT::BufEnter as usize].push(crate::autocmd_defs::AutoCmd {
+                pat: pattern,
+                id: 42,
+                desc: None,
+                handler_cmd: Some(b"echo".to_vec()),
+                handler_fn: Default::default(),
+                script_ctx: Default::default(),
+                once: false,
+                nested: false,
+            });
+        }
+        assert!(unsafe { autocmd_delete_id(42) });
+        assert!(unsafe { AUTOCMDS.get_mut() }[EventT::BufEnter as usize].is_empty());
+        assert!(!unsafe { autocmd_delete_id(42) });
     }
 
     #[test]
