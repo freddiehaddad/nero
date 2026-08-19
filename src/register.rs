@@ -14,6 +14,8 @@
 //! `"="`-register expression-source/result state ([`get_expr_line`]/
 //! [`get_expr_line_src`]/[`set_expr_line`]), [`get_reg_contents`]/
 //! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller),
+//! `put_reedit_in_typebuf`/`put_in_typebuf` (the queue-building core
+//! used when executing a register),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
 //! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
@@ -65,6 +67,103 @@
 //!   exists for any of these yet.
 
 use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
+
+/// Queue a pending Insert-mode restart after any register text
+/// (`put_reedit_in_typebuf`).
+///
+/// # Safety
+/// Touches `GLOBALS.restart_edit` and the shared typeahead buffer.
+#[allow(dead_code)] // do_execreg, the real caller, is not translated yet.
+unsafe fn put_reedit_in_typebuf(silent: bool) {
+    let restart = unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit;
+    if restart == i32::from(crate::ascii_defs::NUL) {
+        return;
+    }
+
+    let mut command = [
+        crate::keycodes_defs::K_SPECIAL,
+        crate::keycodes_defs::KS_EXTRA,
+        crate::keycodes_defs::KE_COMMAND,
+        b's',
+        b't',
+        b'a',
+        b'r',
+        b't',
+        b'i',
+        crate::ascii_defs::CAR,
+    ];
+    command[8] = match restart {
+        value if value == i32::from(b'R') => b'r',
+        value if value == i32::from(b'V') => b'g',
+        value if value == i32::from(b'A') => b'!',
+        _ => b'i',
+    };
+    if crate::input::ins_typebuf(
+        &command,
+        crate::input_defs::RemapValues::None as i32,
+        0,
+        true,
+        silent,
+    ) == crate::vim_defs::OK
+    {
+        unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit = 0;
+    }
+}
+
+/// Queue register text for execution (`put_in_typebuf`).
+///
+/// # Safety
+/// Forwarded from [`put_reedit_in_typebuf`] and
+/// [`crate::input::ins_typebuf`].
+#[allow(dead_code)] // do_execreg, the real caller, is not translated yet.
+unsafe fn put_in_typebuf(
+    text: &[u8],
+    escape: bool,
+    colon: bool,
+    silent: bool,
+) -> i32 {
+    unsafe { put_reedit_in_typebuf(silent) };
+    if colon
+        && crate::input::ins_typebuf(
+            b"\n",
+            crate::input_defs::RemapValues::None as i32,
+            0,
+            true,
+            silent,
+        ) != crate::vim_defs::OK
+    {
+        return crate::vim_defs::FAIL;
+    }
+
+    let escaped;
+    let text = if escape {
+        escaped = crate::keycodes::vim_strsave_escape_ks(text);
+        escaped.as_slice()
+    } else {
+        text
+    };
+    let remap = if escape {
+        crate::input_defs::RemapValues::None as i32
+    } else {
+        crate::input_defs::RemapValues::Yes as i32
+    };
+    if crate::input::ins_typebuf(text, remap, 0, true, silent)
+        != crate::vim_defs::OK
+    {
+        return crate::vim_defs::FAIL;
+    }
+    if colon {
+        crate::input::ins_typebuf(
+            b":",
+            crate::input_defs::RemapValues::None as i32,
+            0,
+            true,
+            silent,
+        )
+    } else {
+        crate::vim_defs::OK
+    }
+}
 
 /// Convert a register name character to its `Y_REGS` index
 /// (`op_reg_index`). Returns `None` for a name with no direct slot
@@ -723,6 +822,119 @@ pub fn format_reg_type(reg_type: Option<crate::normal_defs::MotionType>, reg_wid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TypeaheadGuard(crate::input_defs::TasaveT);
+
+    impl TypeaheadGuard {
+        fn save() -> Self {
+            let mut saved = crate::input_defs::TasaveT::default();
+            crate::input::save_typeahead(&mut saved);
+            Self(saved)
+        }
+    }
+
+    impl Drop for TypeaheadGuard {
+        fn drop(&mut self) {
+            crate::input::restore_typeahead(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn put_reedit_in_typebuf_queues_the_matching_start_command() {
+        let _lock = crate::globals::global_state_test_lock();
+        for (restart, suffix) in [(b'I', b'i'), (b'R', b'r'), (b'V', b'g'), (b'A', b'!')] {
+            let _typeahead = TypeaheadGuard::save();
+            let _restart = unsafe {
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.restart_edit,
+                    i32::from(restart),
+                )
+            };
+
+            unsafe { put_reedit_in_typebuf(false) };
+
+            assert_eq!(
+                crate::input::typebuf_bytes_for_test(),
+                vec![
+                    crate::keycodes_defs::K_SPECIAL,
+                    crate::keycodes_defs::KS_EXTRA,
+                    crate::keycodes_defs::KE_COMMAND,
+                    b's',
+                    b't',
+                    b'a',
+                    b'r',
+                    b't',
+                    suffix,
+                    crate::ascii_defs::CAR,
+                ]
+            );
+            assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, 0);
+        }
+    }
+
+    #[test]
+    fn put_in_typebuf_wraps_colon_commands_in_execution_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                0,
+            )
+        };
+
+        assert_eq!(
+            unsafe { put_in_typebuf(b"echo 1", true, true, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            crate::input::typebuf_bytes_for_test(),
+            b":echo 1\n"
+        );
+        assert!(crate::input::typebuf_remap_for_test()
+            .iter()
+            .all(|&flag| flag == crate::input::RM_NONE as u8));
+    }
+
+    #[test]
+    fn put_in_typebuf_places_pending_reedit_after_register_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let _restart = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.restart_edit,
+                i32::from(b'R'),
+            )
+        };
+        let _silent = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmd_silent,
+                false,
+            )
+        };
+
+        assert_eq!(
+            unsafe { put_in_typebuf(b"text", false, false, true) },
+            crate::vim_defs::OK
+        );
+
+        let mut expected = b"text".to_vec();
+        expected.extend_from_slice(&[
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_EXTRA,
+            crate::keycodes_defs::KE_COMMAND,
+            b's',
+            b't',
+            b'a',
+            b'r',
+            b't',
+            b'r',
+            crate::ascii_defs::CAR,
+        ]);
+        assert_eq!(crate::input::typebuf_bytes_for_test(), expected);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.cmd_silent);
+    }
 
     // --- get_y_register / yank_register_mline ---
 
