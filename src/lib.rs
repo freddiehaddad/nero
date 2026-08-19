@@ -156,6 +156,7 @@ pub mod textformat;
 pub mod textobject;
 pub mod types_defs;
 pub mod ui;
+pub mod ui_client;
 pub mod ui_compositor;
 pub mod undo;
 pub mod undo_defs;
