@@ -5275,6 +5275,63 @@ pub unsafe fn set_option_from_tv(varname: &[u8], value: &TypvalT) {
     }
 }
 
+/// `"settabvar()"` function (`f_settabvar`).
+///
+/// # Safety
+/// The global tabpage/window lists and scope dictionaries must contain
+/// valid, live values; forwarded from [`crate::context::ctx_switch`]
+/// and [`set_var`].
+pub unsafe fn f_settabvar(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let tp = unsafe {
+        crate::window::find_tabpage(
+            crate::eval::typval::tv_get_number_chk(&argvars[0], None)
+                as i32,
+        )
+    };
+    let varname = crate::eval::typval::tv_get_string_chk(&argvars[1]);
+    let Some(varname) = varname else {
+        return;
+    };
+    if tp.is_null() {
+        return;
+    }
+
+    let need_switch =
+        !std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+    let mut switch = crate::context_defs::CtxSwitch::default();
+    let can_set = if need_switch {
+        let win = unsafe { (*tp).tp_curwin };
+        !win.is_null()
+            && unsafe {
+                crate::context::ctx_switch(
+                    &mut switch,
+                    win,
+                    tp,
+                    std::ptr::null_mut(),
+                    crate::context_defs::ctx_switch_flags::NO_EVENTS
+                        | crate::context_defs::ctx_switch_flags::NO_DISPLAY,
+                )
+            }
+    } else {
+        true
+    };
+
+    if can_set {
+        let mut tabvarname = Vec::with_capacity(varname.len() + 2);
+        tabvarname.extend_from_slice(b"t:");
+        tabvarname.extend_from_slice(&varname);
+        let mut value = argvars[2].clone();
+        unsafe { set_var(&tabvarname, &mut value, true) };
+    }
+    if need_switch {
+        unsafe { crate::context::ctx_restore(&switch) };
+    }
+}
+
 /// `"setwinvar()"`/`"settabwinvar()"` functions (`setwinvar`).
 ///
 /// `off == 1` selects `settabwinvar()`'s extra leading `{tabnr}`
@@ -6287,6 +6344,121 @@ mod set_var_tests {
                 false,
             )
         );
+    }
+
+    #[test]
+    fn f_settabvar_sets_the_current_tabs_own_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let tp = fx.tab_ptr();
+        let argvars = [
+            TypvalT {
+                value: TypvalValue::Number(1),
+                ..TypvalT::default()
+            },
+            TypvalT {
+                value: TypvalValue::String(Some(b"answer".to_vec())),
+                ..TypvalT::default()
+            },
+            TypvalT {
+                value: TypvalValue::Number(42),
+                ..TypvalT::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_settabvar(&argvars, &mut rettv) };
+
+        let found =
+            unsafe { find_var_in_ht((*tp).tp_vars, b't', b"answer", false) };
+        let Some(DictitemVariant::Dict(item)) = found else {
+            panic!("expected a Dict item");
+        };
+        assert_eq!(
+            unsafe { (*item).di_tv.value.clone() },
+            TypvalValue::Number(42)
+        );
+    }
+
+    #[test]
+    fn f_settabvar_sets_a_noncurrent_tab_and_restores_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let current_buf = fx.buf_ptr();
+        let current_win = fx.win_ptr();
+        let current_tab = fx.tab_ptr();
+        let target_buf =
+            Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+        let target_win = Box::into_raw(Box::new(crate::buffer_defs::WinT {
+            handle: 22,
+            w_buffer: target_buf,
+            w_s: unsafe { std::ptr::addr_of_mut!((*target_buf).b_s) },
+            ..Default::default()
+        }));
+        let target_tab =
+            Box::into_raw(Box::new(crate::buffer_defs::TabpageT {
+                tp_curwin: target_win,
+                tp_firstwin: target_win,
+                tp_lastwin: target_win,
+                ..Default::default()
+            }));
+        unsafe {
+            (*target_tab).tp_vars = crate::eval::typval::tv_dict_alloc();
+            init_var_dict(
+                &mut *(*target_tab).tp_vars,
+                &mut (*target_tab).tp_winvar,
+                ScopeType::Scope,
+            );
+            (*current_tab).tp_next = target_tab;
+        }
+        let _lastused = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.lastused_tabpage,
+                current_tab,
+            )
+        };
+        let argvars = [
+            TypvalT {
+                value: TypvalValue::Number(2),
+                ..TypvalT::default()
+            },
+            TypvalT {
+                value: TypvalValue::String(Some(b"answer".to_vec())),
+                ..TypvalT::default()
+            },
+            TypvalT {
+                value: TypvalValue::Number(99),
+                ..TypvalT::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_settabvar(&argvars, &mut rettv) };
+
+        let found = unsafe {
+            find_var_in_ht((*target_tab).tp_vars, b't', b"answer", false)
+        };
+        let Some(DictitemVariant::Dict(item)) = found else {
+            panic!("expected a Dict item");
+        };
+        assert_eq!(
+            unsafe { (*item).di_tv.value.clone() },
+            TypvalValue::Number(99)
+        );
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(globals.curbuf, current_buf);
+        assert_eq!(globals.curwin, current_win);
+        assert_eq!(globals.curtab, current_tab);
+        assert_eq!(globals.lastused_tabpage, current_tab);
+
+        drop(_lastused);
+        unsafe {
+            (*current_tab).tp_next = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_free((*target_tab).tp_vars);
+            drop(Box::from_raw(target_tab));
+            drop(Box::from_raw(target_win));
+            drop(Box::from_raw(target_buf));
+        }
     }
 
     #[test]

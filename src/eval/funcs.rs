@@ -532,6 +532,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"gettabvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_gettabvar });
         m.insert(&b"gettabwinvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 4, base_arg: 1, func: crate::eval::vars::f_gettabwinvar });
         m.insert(&b"setbufvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_LAST, func: crate::eval::vars::f_setbufvar });
+        m.insert(&b"settabvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_LAST, func: crate::eval::vars::f_settabvar });
         m.insert(&b"setwinvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_LAST, func: crate::eval::vars::f_setwinvar });
         m.insert(&b"settabwinvar"[..], EvalFuncDefT { min_argc: 4, max_argc: 4, base_arg: BASE_LAST, func: crate::eval::vars::f_settabwinvar });
         m.insert(&b"indent"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::indent::f_indent });
@@ -9062,6 +9063,7 @@ mod tests {
             "gettabvar",
             "gettabwinvar",
             "setbufvar",
+            "settabvar",
             "setwinvar",
             "settabwinvar",
             "indent",
