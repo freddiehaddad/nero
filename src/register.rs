@@ -513,6 +513,49 @@ pub fn prepare_yankreg_from_object(
     Some(yank_type)
 }
 
+/// Finalize register metadata after API lines were populated
+/// (`finish_yankreg_from_object`).
+///
+/// `yank_type` must be the value returned by
+/// [`prepare_yankreg_from_object`] for this register.
+///
+/// # Safety
+/// Forwards [`update_yankreg_width`]'s multibyte-state requirements.
+pub unsafe fn finish_yankreg_from_object(
+    register: &mut YankregT,
+    yank_type: ObjectYankType,
+    clipboard_adjust: bool,
+) {
+    let mut resolved = match yank_type {
+        ObjectYankType::Unknown => None,
+        ObjectYankType::Known(motion) => Some(motion),
+    };
+    let trailing_empty = register
+        .y_array
+        .as_ref()
+        .and_then(|lines| lines.last())
+        .is_some_and(Vec::is_empty);
+
+    if trailing_empty {
+        if resolved != Some(crate::normal_defs::MotionType::CharWise) {
+            if (resolved.is_none() || clipboard_adjust)
+                && let Some(lines) = register.y_array.as_mut()
+            {
+                lines.pop();
+            }
+            if resolved.is_none() {
+                resolved = Some(crate::normal_defs::MotionType::LineWise);
+            }
+        }
+    } else if resolved.is_none() {
+        resolved = Some(crate::normal_defs::MotionType::CharWise);
+    }
+
+    register.y_type =
+        resolved.expect("object register type must be resolved");
+    unsafe { update_yankreg_width(register) };
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -2512,6 +2555,138 @@ mod tests {
                 "regtype {regtype:?}"
             );
         }
+    }
+
+    #[test]
+    fn finish_yankreg_from_object_infers_linewise_and_removes_final_empty_line() {
+        let mut register = YankregT {
+            y_array: Some(vec![b"one".to_vec(), Vec::new()]),
+            ..Default::default()
+        };
+
+        unsafe {
+            finish_yankreg_from_object(
+                &mut register,
+                ObjectYankType::Unknown,
+                false,
+            )
+        };
+
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"one".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn finish_yankreg_from_object_infers_characterwise_without_final_empty_line() {
+        let mut register = YankregT {
+            y_array: Some(vec![b"one".to_vec()]),
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            ..Default::default()
+        };
+
+        unsafe {
+            finish_yankreg_from_object(
+                &mut register,
+                ObjectYankType::Unknown,
+                false,
+            )
+        };
+
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::CharWise
+        );
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"one".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn finish_yankreg_from_object_keeps_known_characterwise_final_empty_line() {
+        let lines = vec![b"one".to_vec(), Vec::new()];
+        let mut register = YankregT {
+            y_array: Some(lines.clone()),
+            ..Default::default()
+        };
+
+        unsafe {
+            finish_yankreg_from_object(
+                &mut register,
+                ObjectYankType::Known(
+                    crate::normal_defs::MotionType::CharWise,
+                ),
+                true,
+            )
+        };
+
+        assert_eq!(register.y_array.as_deref(), Some(lines.as_slice()));
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::CharWise
+        );
+    }
+
+    #[test]
+    fn finish_yankreg_from_object_clipboard_adjusts_known_noncharacterwise_type() {
+        let mut preserved = YankregT {
+            y_array: Some(vec![b"one".to_vec(), Vec::new()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            ..Default::default()
+        };
+        unsafe {
+            finish_yankreg_from_object(
+                &mut preserved,
+                ObjectYankType::Known(
+                    crate::normal_defs::MotionType::LineWise,
+                ),
+                false,
+            )
+        };
+        assert_eq!(preserved.y_array.as_ref().unwrap().len(), 2);
+
+        let mut adjusted = preserved.clone();
+        unsafe {
+            finish_yankreg_from_object(
+                &mut adjusted,
+                ObjectYankType::Known(
+                    crate::normal_defs::MotionType::LineWise,
+                ),
+                true,
+            )
+        };
+        assert_eq!(
+            adjusted.y_array.as_deref(),
+            Some([b"one".to_vec()].as_slice())
+        );
+    }
+
+    #[test]
+    fn finish_yankreg_from_object_updates_block_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut register = YankregT {
+            y_array: Some(vec![b"abc".to_vec(), b"x".to_vec()]),
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            ..Default::default()
+        };
+
+        unsafe {
+            finish_yankreg_from_object(
+                &mut register,
+                ObjectYankType::Known(
+                    crate::normal_defs::MotionType::BlockWise,
+                ),
+                false,
+            )
+        };
+
+        assert_eq!(register.y_width, 2);
     }
 
     #[test]
