@@ -2765,6 +2765,7 @@ mod tests {
 
     #[test]
     fn bounded_cells_returns_one_for_empty_ascii_and_truncated_input() {
+        let _lock = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { utf_ptr2cells_len(b"", 0) }, 1);
         assert_eq!(unsafe { utf_ptr2cells_len(b"A", 1) }, 1);
         assert_eq!(unsafe { utf_ptr2cells_len("€".as_bytes(), 2) }, 1);
@@ -2772,6 +2773,7 @@ mod tests {
 
     #[test]
     fn bounded_cells_reports_illegal_and_wide_characters() {
+        let _lock = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { utf_ptr2cells_len(&[0x80], 1) }, 4);
         assert_eq!(unsafe { utf_ptr2cells_len("一".as_bytes(), 3) }, 2);
     }
