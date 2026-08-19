@@ -19,7 +19,8 @@
 //! queue builder), [`do_record`] (macro recording start/stop), and
 //! [`insert_reg`] (register-to-stuff-buffer
 //! insertion), [`str_to_reg`]/[`write_reg_contents`]/
-//! [`write_reg_contents_ex`] (direct register writes),
+//! [`write_reg_contents_ex`]/[`write_reg_contents_lst`] (direct
+//! register writes),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
 //! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
@@ -283,7 +284,11 @@ pub unsafe fn str_to_reg(
         }
     }
 
-    register.y_array = (!lines.is_empty()).then_some(lines);
+    if lines.is_empty() {
+        register.y_array = None;
+        return;
+    }
+    register.y_array = Some(lines);
     register.y_type = resolved_type;
     register.timestamp = crate::os::time::os_time();
     if resolved_type == crate::normal_defs::MotionType::BlockWise {
@@ -392,6 +397,57 @@ pub unsafe fn write_reg_contents_ex(
 pub unsafe fn write_reg_contents(name: i32, text: &[u8], must_append: bool) {
     unsafe {
         write_reg_contents_ex(name, text, must_append, None, Some(0));
+    }
+}
+
+/// Store an already-separated line list in register `name`
+/// (`write_reg_contents_lst`).
+///
+/// Search, expression, and alternate-file registers accept at most
+/// one line. `yank_type == None` models `kMTUnknown`, and
+/// `block_len == None` models the original's `-1` sentinel.
+///
+/// # Safety
+/// Forwarded from [`write_reg_contents_ex`].
+pub unsafe fn write_reg_contents_lst(
+    name: i32,
+    lines: &[Vec<u8>],
+    must_append: bool,
+    yank_type: Option<crate::normal_defs::MotionType>,
+    block_len: Option<crate::pos_defs::ColnrT>,
+) {
+    if matches!(name, n if n == i32::from(b'/') || n == i32::from(b'=') || n == i32::from(b'#')) {
+        if lines.len() > 1 {
+            return;
+        }
+        let text = lines.first().map_or(&[][..], Vec::as_slice);
+        unsafe {
+            write_reg_contents_ex(
+                name,
+                text,
+                must_append,
+                yank_type,
+                block_len,
+            );
+        }
+        return;
+    }
+
+    if name == i32::from(b'_') {
+        return;
+    }
+
+    let Some((register, previous)) = (unsafe { init_write_reg(name, must_append) }) else {
+        return;
+    };
+    unsafe {
+        str_to_reg(
+            &mut *register,
+            yank_type,
+            RegisterInput::Lines(lines),
+            block_len,
+        );
+        finish_write_reg(name, &*register, previous);
     }
 }
 
@@ -2185,6 +2241,122 @@ mod tests {
             register.y_type,
             crate::normal_defs::MotionType::LineWise
         );
+    }
+
+    #[test]
+    fn write_reg_contents_lst_auto_detects_linewise_input() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'd')).unwrap();
+        let lines = vec![b"one".to_vec(), Vec::new(), b"three".to_vec()];
+
+        unsafe {
+            write_reg_contents_lst(
+                i32::from(b'd'),
+                &lines,
+                false,
+                None,
+                None,
+            );
+        }
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert_eq!(register.y_array.as_deref(), Some(lines.as_slice()));
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::LineWise
+        );
+    }
+
+    #[test]
+    fn write_reg_contents_lst_preserves_explicit_block_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'e')).unwrap();
+
+        unsafe {
+            write_reg_contents_lst(
+                i32::from(b'e'),
+                &[b"abc".to_vec(), b"x".to_vec()],
+                false,
+                Some(crate::normal_defs::MotionType::BlockWise),
+                Some(8),
+            );
+        }
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::BlockWise
+        );
+        assert_eq!(register.y_width, 8);
+    }
+
+    #[test]
+    fn write_reg_contents_lst_empty_input_keeps_empty_register_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'f')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_type: crate::normal_defs::MotionType::BlockWise,
+                y_width: 7,
+                timestamp: 11,
+                ..Default::default()
+            };
+            write_reg_contents_lst(
+                i32::from(b'f'),
+                &[],
+                false,
+                None,
+                None,
+            );
+        }
+
+        let register = &unsafe { Y_REGS.get_mut() }[index];
+        assert!(register.y_array.is_none());
+        assert_eq!(
+            register.y_type,
+            crate::normal_defs::MotionType::BlockWise
+        );
+        assert_eq!(register.y_width, 7);
+        assert_eq!(register.timestamp, 11);
+    }
+
+    #[test]
+    fn write_reg_contents_lst_rejects_multiline_special_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _expression = ExprLineGuard::save();
+        set_expr_line(Some(b"before".to_vec()));
+
+        unsafe {
+            write_reg_contents_lst(
+                i32::from(b'='),
+                &[b"one".to_vec(), b"two".to_vec()],
+                false,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(get_expr_line_src(), Some(b"before".to_vec()));
+    }
+
+    #[test]
+    fn write_reg_contents_lst_empty_special_input_writes_empty_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _expression = ExprLineGuard::save();
+        unsafe {
+            write_reg_contents_lst(
+                i32::from(b'='),
+                &[],
+                false,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(get_expr_line_src(), Some(Vec::new()));
     }
 
     #[test]
