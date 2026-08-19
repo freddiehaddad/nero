@@ -21,6 +21,41 @@ pub const ERR_TOO_MANY_ARGS: &str = "Too many edit arguments";
 pub const ERR_EXTRA_CMD: &str =
     "Too many \"+command\", \"-c command\" or \"--cmd command\" arguments";
 
+const USAGE_TEXT: &str = concat!(
+    "Usage:\n",
+    "  nvim [options] [file ...]\n",
+    "\nOptions:\n",
+    "  --cmd <cmd>           Execute <cmd> before any config\n",
+    "  +<cmd>, -c <cmd>      Execute <cmd> after config and first file\n",
+    "  -l <script> [args...] Execute Lua <script> (with optional args)\n",
+    "  -S <session>          Source <session> after loading the first file\n",
+    "  -s <scriptin>         Read Normal mode commands from <scriptin>\n",
+    "  -u <config>           Use this config file\n",
+    "\n",
+    "  -d                    Diff mode\n",
+    "  -es, -Es              Silent (batch) mode\n",
+    "  -h, --help            Print this help message\n",
+    "  -i <shada>            Use this shada file\n",
+    "  -n                    No swap file, use memory only\n",
+    "  -o[N]                 Open N windows (default: one per file)\n",
+    "  -O[N]                 Open N vertical windows (default: one per file)\n",
+    "  -p[N]                 Open N tab pages (default: one per file)\n",
+    "  -R                    Read-only (view) mode\n",
+    "  -v, --version         Print version information\n",
+    "  -V[N][file]           Verbose [level][file]\n",
+    "\n",
+    "  --                    Only file names after this\n",
+    "  --api-info            Write msgpack-encoded API metadata to stdout\n",
+    "  --clean               \"Factory defaults\" (skip user config and plugins, shada)\n",
+    "  --embed               Use stdin/stdout as a msgpack-rpc channel\n",
+    "  --headless            Don't start a user interface\n",
+    "  --listen <address>    Serve RPC API from this address\n",
+    "  --remote[-subcommand] Execute commands remotely on a server\n",
+    "  --server <address>    Connect to this Nvim server\n",
+    "  --startuptime <file>  Write startup timing messages to <file>\n",
+    "\nSee \":help startup-options\" for all options.\n",
+);
+
 /// Parameters shared by `main()` startup helpers (`mparm_T`).
 #[derive(Debug, Clone, Default)]
 pub struct Mparm {
@@ -81,6 +116,11 @@ pub fn set_window_layout(params: &mut Mparm) {
             WIN_VER
         };
     }
+}
+
+/// Print the command-line help (`usage`).
+pub fn usage() {
+    print!("{USAGE_TEXT}");
 }
 
 /// Parse a decimal number at `argument[*index]` (`get_number_arg`).
@@ -189,5 +229,18 @@ mod tests {
         };
         set_window_layout(&mut explicit);
         assert_eq!(explicit.window_layout, WIN_TABS);
+    }
+
+    #[test]
+    fn usage_text_matches_main_c() {
+        assert!(USAGE_TEXT.starts_with("Usage:\n  nvim [options] [file ...]\n"));
+        assert!(USAGE_TEXT.contains(
+            "  --clean               \"Factory defaults\" (skip user config and plugins, shada)\n"
+        ));
+        assert!(USAGE_TEXT.contains(
+            "  --startuptime <file>  Write startup timing messages to <file>\n"
+        ));
+        assert!(USAGE_TEXT.ends_with("\nSee \":help startup-options\" for all options.\n"));
+        assert_eq!(USAGE_TEXT.lines().count(), 34);
     }
 }
