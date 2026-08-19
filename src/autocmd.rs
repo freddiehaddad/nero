@@ -615,6 +615,7 @@ static MAP_AUGROUP_ID_TO_NAME: LazyLock<GlobalCell<std::collections::HashMap<i32
     LazyLock::new(|| GlobalCell::new(std::collections::HashMap::new()));
 static NEXT_AUGROUP_ID: GlobalCell<i32> = GlobalCell::new(1);
 static CURRENT_AUGROUP: GlobalCell<i32> = GlobalCell::new(augroup::DEFAULT);
+static AUTOCMD_BUFNR: GlobalCell<i32> = GlobalCell::new(0);
 
 /// Add an augroup name or return its existing ID (`augroup_add`).
 ///
@@ -791,6 +792,33 @@ pub fn aupat_is_buflocal(pattern: &[u8]) -> bool {
     pattern.len() >= 8
         && pattern.starts_with(b"<buffer")
         && pattern.last() == Some(&b'>')
+}
+
+/// Resolve a buffer-local autocmd pattern to its buffer number
+/// (`aupat_get_buflocal_nr`).
+///
+/// # Safety
+/// `<buffer>` reads `GLOBALS.curbuf`; `<buffer=abuf>` reads shared
+/// autocmd execution state.
+#[must_use]
+pub unsafe fn aupat_get_buflocal_nr(pattern: &[u8]) -> i32 {
+    debug_assert!(aupat_is_buflocal(pattern));
+    if pattern.len() == 8 {
+        return unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).handle };
+    }
+    if pattern.len() == 13 && pattern.eq_ignore_ascii_case(b"<buffer=abuf>") {
+        return unsafe { *AUTOCMD_BUFNR.get_mut() };
+    }
+    if pattern.len() > 9 && pattern[7] == b'=' {
+        let digits = &pattern[8..pattern.len() - 1];
+        if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+            return std::str::from_utf8(digits)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
 }
 
 /// Validate `'eventignore'` or `'eventignorewin'` (`check_ei`).
@@ -1728,6 +1756,26 @@ mod tests {
         assert!(aupat_is_buflocal(b"<buffer=12>"));
         assert!(!aupat_is_buflocal(b"<Buffer>"));
         assert!(!aupat_is_buflocal(b"<buffer"));
+    }
+
+    #[test]
+    fn aupat_get_buflocal_nr_resolves_current_abuf_and_numeric_forms() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            handle: 17,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf_ptr)
+        };
+        let old_abuf = unsafe { *AUTOCMD_BUFNR.get_mut() };
+        unsafe { *AUTOCMD_BUFNR.get_mut() = 23 };
+        assert_eq!(unsafe { aupat_get_buflocal_nr(b"<buffer>") }, 17);
+        assert_eq!(unsafe { aupat_get_buflocal_nr(b"<buffer=abuf>") }, 23);
+        assert_eq!(unsafe { aupat_get_buflocal_nr(b"<buffer=42>") }, 42);
+        assert_eq!(unsafe { aupat_get_buflocal_nr(b"<buffer=x>") }, 0);
+        unsafe { *AUTOCMD_BUFNR.get_mut() = old_abuf };
     }
 
     #[test]
