@@ -624,9 +624,8 @@ fn au_cleanup() {
     unsafe { *AU_NEED_CLEAN.get_mut() = false };
 }
 
-/// `map_augroup_name_to_id` - augroup name -> ID registry. Always
-/// empty today: nothing yet populates it (`:augroup {name}`'s
-/// definition side isn't translated).
+/// `map_augroup_name_to_id` - augroup name -> ID registry, populated
+/// by [`augroup_add`].
 static MAP_AUGROUP_NAME_TO_ID: LazyLock<GlobalCell<std::collections::HashMap<Vec<u8>, i32>>> =
     LazyLock::new(|| GlobalCell::new(std::collections::HashMap::new()));
 static MAP_AUGROUP_ID_TO_NAME: LazyLock<GlobalCell<std::collections::HashMap<i32, Vec<u8>>>> =
@@ -686,6 +685,18 @@ pub unsafe fn augroup_name(mut group: i32) -> Option<Vec<u8>> {
         return None;
     }
     unsafe { MAP_AUGROUP_ID_TO_NAME.get_mut() }.get(&group).cloned()
+}
+
+/// Return the `idx`th augroup completion candidate
+/// (`expand_get_augroup_name`).
+///
+/// The original's unused `expand_T *xp` parameter is omitted.
+///
+/// # Safety
+/// Forwarded from [`augroup_name`].
+#[must_use]
+pub unsafe fn expand_get_augroup_name(idx: i32) -> Option<Vec<u8>> {
+    unsafe { augroup_name(idx + 1) }
 }
 
 /// Delete every autocmd in one augroup (`aucmd_del_for_event_and_group`
@@ -1719,6 +1730,20 @@ mod tests {
             Some(b"--- DELETED ---".to_vec())
         );
         unsafe { augroup_clear(first) };
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn expand_get_augroup_name_walks_registered_groups() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe {
+            augroup_add(b"First");
+            augroup_add(b"Second");
+            assert_eq!(expand_get_augroup_name(0), Some(b"First".to_vec()));
+            assert_eq!(expand_get_augroup_name(1), Some(b"Second".to_vec()));
+            assert_eq!(expand_get_augroup_name(2), None);
+        }
         reset_augroup_map();
     }
 
