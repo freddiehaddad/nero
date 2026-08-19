@@ -159,6 +159,29 @@ pub unsafe fn op_global_reg_iter(
     op_reg_iter(iter, registers, unnamed)
 }
 
+/// Validate and prepare a register for writing (`init_write_reg`).
+///
+/// Returns the selected register pointer plus the previous unnamed
+/// selection that `finish_write_reg` will later restore.
+///
+/// # Safety
+/// Mutates shared register storage and unnamed selection.
+#[allow(dead_code)] // write_reg_contents_ex is translated next.
+unsafe fn init_write_reg(
+    name: i32,
+    must_append: bool,
+) -> Option<(*mut YankregT, Option<usize>)> {
+    if !valid_yank_reg(name, true) {
+        return None;
+    }
+    let previous = unsafe { *Y_PREVIOUS.get_mut() };
+    let register = unsafe { get_yank_register(name, YregModeT::Yank) };
+    if !is_append_register(name) && !must_append {
+        free_register(unsafe { &mut *register });
+    }
+    Some((register, previous))
+}
+
 /// Return an owned deep copy of register `name` (`copy_register`).
 ///
 /// # Safety
@@ -1515,6 +1538,42 @@ mod tests {
         assert_eq!(item.register.y_array.as_deref(), Some([b"value".to_vec()].as_slice()));
         assert!(item.is_unnamed);
         assert_eq!(item.next, None);
+    }
+
+    #[test]
+    fn init_write_reg_replaces_lowercase_and_preserves_previous_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'a')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index].y_array = Some(vec![b"old".to_vec()]);
+            *Y_PREVIOUS.get_mut() = Some(3);
+        }
+
+        let (register, previous) =
+            unsafe { init_write_reg(i32::from(b'a'), false) }.unwrap();
+
+        assert_eq!(previous, Some(3));
+        assert!(unsafe { (*register).y_array.is_none() });
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(index));
+    }
+
+    #[test]
+    fn init_write_reg_keeps_contents_for_append_and_rejects_invalid_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index].y_array = Some(vec![b"old".to_vec()]);
+        }
+
+        let (register, _) =
+            unsafe { init_write_reg(i32::from(b'B'), false) }.unwrap();
+        assert_eq!(
+            unsafe { (*register).y_array.as_deref() },
+            Some([b"old".to_vec()].as_slice())
+        );
+        assert!(unsafe { init_write_reg(i32::from(b'%'), false) }.is_none());
     }
 
     #[test]
