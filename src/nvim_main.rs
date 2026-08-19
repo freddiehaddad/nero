@@ -14,6 +14,12 @@ pub const EDIT_FILE: i32 = 1;
 pub const EDIT_STDIN: i32 = 2;
 pub const EDIT_TAG: i32 = 3;
 pub const EDIT_QF: i32 = 4;
+pub const ERR_ARG_MISSING: &str = "Argument missing after";
+pub const ERR_OPT_GARBAGE: &str = "Garbage after option argument";
+pub const ERR_OPT_UNKNOWN: &str = "Unknown option argument";
+pub const ERR_TOO_MANY_ARGS: &str = "Too many edit arguments";
+pub const ERR_EXTRA_CMD: &str =
+    "Too many \"+command\", \"-c command\" or \"--cmd command\" arguments";
 
 /// Parameters shared by `main()` startup helpers (`mparm_T`).
 #[derive(Debug, Clone, Default)]
@@ -143,6 +149,10 @@ mod tests {
             "handle_abort=1,handle_sigill=1"
         );
         assert_eq!([EDIT_NONE, EDIT_FILE, EDIT_STDIN, EDIT_TAG, EDIT_QF], [0, 1, 2, 3, 4]);
+        assert_eq!(ERR_ARG_MISSING, "Argument missing after");
+        assert_eq!(ERR_OPT_GARBAGE, "Garbage after option argument");
+        assert_eq!(ERR_OPT_UNKNOWN, "Unknown option argument");
+        assert_eq!(ERR_TOO_MANY_ARGS, "Too many edit arguments");
     }
 
     #[test]
