@@ -1337,6 +1337,66 @@ pub unsafe fn highlight_has_attr(id: i32, flag: u32, modec: u8) -> Option<&'stat
     matched.then_some(b"1".as_slice())
 }
 
+fn coloridx_to_name(index: i32, value: i32) -> Option<Vec<u8>> {
+    match index {
+        index if index >= 0 => COLOR_NAME_TABLE
+            .get(index as usize)
+            .map(|(name, _)| name.to_vec()),
+        COLOR_IDX_NONE => None,
+        COLOR_IDX_FG => Some(b"fg".to_vec()),
+        COLOR_IDX_BG => Some(b"bg".to_vec()),
+        COLOR_IDX_HEX => Some(format!("#{value:06x}").into_bytes()),
+        _ => unreachable!("invalid highlight color index"),
+    }
+}
+
+/// Return one highlight group color (`highlight_color`).
+///
+/// # Safety
+/// Reads the shared highlight registry and UI RGB state.
+#[must_use]
+pub unsafe fn highlight_color(id: i32, what: &[u8], modec: u8) -> Option<Vec<u8>> {
+    let table = unsafe { HL_TABLE.get_mut() };
+    let group = table.items.get((id - 1) as usize)?;
+    let lower = |index: usize| {
+        what.get(index).copied().map(|byte| byte.to_ascii_lowercase())
+    };
+    let fg = lower(0) == Some(b'f') && lower(1) == Some(b'g');
+    let font = lower(0) == Some(b'f')
+        && lower(1) == Some(b'o')
+        && lower(2) == Some(b'n')
+        && lower(3) == Some(b't');
+    let sp = lower(0) == Some(b's') && lower(1) == Some(b'p');
+    if !fg && !font && !sp && !(lower(0) == Some(b'b') && lower(1) == Some(b'g')) {
+        return None;
+    }
+
+    if modec == b'g' {
+        let (index, value) = if fg {
+            (group.sg_rgb_fg_idx, group.sg_rgb_fg)
+        } else if sp {
+            (group.sg_rgb_sp_idx, group.sg_rgb_sp)
+        } else {
+            (group.sg_rgb_bg_idx, group.sg_rgb_bg)
+        };
+        if what.get(2) == Some(&b'#') && unsafe { crate::ui::ui_rgb_attached() } {
+            return (0..=0xff_ffff)
+                .contains(&value)
+                .then(|| format!("#{value:06x}").into_bytes());
+        }
+        return coloridx_to_name(index, value);
+    }
+    if font || sp || modec != b'c' {
+        return None;
+    }
+    let color = if fg {
+        group.sg_cterm_fg - 1
+    } else {
+        group.sg_cterm_bg - 1
+    };
+    (color >= 0).then(|| color.to_string().into_bytes())
+}
+
 /// Reset the `Normal` highlight group's colours to "unset"
 /// (`restore_cterm_colors`).
 ///
@@ -2955,6 +3015,54 @@ mod tests {
         assert_eq!(unsafe { highlight_has_attr(0, HL_BOLD, b'g') }, None);
         assert_eq!(unsafe { highlight_has_attr(2, HL_BOLD, b'g') }, None);
         assert_eq!(unsafe { highlight_has_attr(-1, HL_BOLD, b'g') }, None);
+    }
+
+    #[test]
+    fn highlight_color_formats_gui_named_hex_and_cterm_colors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+        let red = COLOR_NAME_TABLE
+            .iter()
+            .position(|(name, _)| *name == b"Red")
+            .unwrap() as i32;
+        {
+            let group = &mut unsafe { HL_TABLE.get_mut() }.items[0];
+            group.sg_rgb_fg_idx = COLOR_IDX_HEX;
+            group.sg_rgb_fg = 0x12_34_56;
+            group.sg_rgb_bg_idx = red;
+            group.sg_rgb_bg = 0xff_00_00;
+            group.sg_cterm_fg = 6;
+            group.sg_cterm_bg = 3;
+        }
+
+        assert_eq!(
+            unsafe { highlight_color(1, b"fg", b'g') },
+            Some(b"#123456".to_vec())
+        );
+        assert_eq!(
+            unsafe { highlight_color(1, b"BG", b'g') },
+            Some(b"Red".to_vec())
+        );
+        assert_eq!(
+            unsafe { highlight_color(1, b"fg", b'c') },
+            Some(b"5".to_vec())
+        );
+        assert_eq!(
+            unsafe { highlight_color(1, b"bg", b'c') },
+            Some(b"2".to_vec())
+        );
+    }
+
+    #[test]
+    fn highlight_color_rejects_invalid_requests_and_unsupported_modes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+        assert_eq!(unsafe { highlight_color(0, b"fg", b'g') }, None);
+        assert_eq!(unsafe { highlight_color(2, b"fg", b'g') }, None);
+        assert_eq!(unsafe { highlight_color(1, b"bogus", b'g') }, None);
+        assert_eq!(unsafe { highlight_color(1, b"font", b'c') }, None);
+        assert_eq!(unsafe { highlight_color(1, b"sp", b'c') }, None);
+        assert_eq!(unsafe { highlight_color(1, b"fg", b't') }, None);
     }
 
     /// `modec` picks which attribute set is read: `'g'` the GUI one,
