@@ -86,6 +86,21 @@ pub fn is_append_register(regname: i32) -> bool {
     crate::macros_defs::ascii_isupper(regname)
 }
 
+/// Return an owned deep copy of register `name` (`copy_register`).
+///
+/// # Safety
+/// Touches shared register-selection state through
+/// [`get_yank_register`].
+#[must_use]
+pub unsafe fn copy_register(name: i32) -> YankregT {
+    let register = unsafe { get_yank_register(name, YregModeT::Paste) };
+    let mut copy = unsafe { &*register }.clone();
+    if copy.y_array.as_ref().is_some_and(Vec::is_empty) {
+        copy.y_array = None;
+    }
+    copy
+}
+
 /// Queue a pending Insert-mode restart after any register text
 /// (`put_reedit_in_typebuf`).
 ///
@@ -1216,6 +1231,46 @@ mod tests {
             assert!(!is_append_register(i32::from(name)));
         }
         assert!(!is_append_register(-1));
+    }
+
+    #[test]
+    fn copy_register_deep_copies_lines_and_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'a')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"one".to_vec(), b"two".to_vec()]),
+                y_type: crate::normal_defs::MotionType::BlockWise,
+                y_width: 7,
+                timestamp: 11,
+            };
+        }
+
+        let mut copy = unsafe { copy_register(i32::from(b'a')) };
+        copy.y_array.as_mut().unwrap()[0][0] = b'X';
+
+        assert_eq!(copy.y_type, crate::normal_defs::MotionType::BlockWise);
+        assert_eq!(copy.y_width, 7);
+        assert_eq!(copy.timestamp, 11);
+        assert_eq!(
+            unsafe { Y_REGS.get_mut()[index].y_array.as_ref().unwrap()[0].as_slice() },
+            b"one"
+        );
+    }
+
+    #[test]
+    fn copy_register_normalizes_an_empty_allocated_array_to_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index].y_array = Some(Vec::new());
+        }
+
+        assert!(unsafe { copy_register(i32::from(b'b')) }
+            .y_array
+            .is_none());
     }
 
     #[test]
