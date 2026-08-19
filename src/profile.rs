@@ -773,6 +773,37 @@ pub fn prof_input_end() {
     profile_set_wait(profile_add(profile_get_wait(), waited));
 }
 
+/// Format the count and times for one function or source line
+/// (`prof_func_line`).
+///
+/// The original writes directly to a `FILE *`; returning the formatted
+/// bytes lets the eventual Rust profile writer use owned buffered I/O.
+fn prof_func_line(
+    count: i32,
+    total: ProftimeT,
+    self_time: ProftimeT,
+    prefer_self: bool,
+) -> String {
+    if count <= 0 {
+        return " ".repeat(28);
+    }
+
+    let mut line = format!("{count:5} ");
+    if prefer_self && profile_equal(total, self_time) {
+        line.push_str("           ");
+    } else {
+        line.push_str(&profile_msg(total));
+        line.push(' ');
+    }
+    if !prefer_self && profile_equal(total, self_time) {
+        line.push_str("           ");
+    } else {
+        line.push_str(&profile_msg(self_time));
+        line.push(' ');
+    }
+    line
+}
+
 /// Compare two functions by total time, for sorting
 /// (`prof_total_cmp`).
 ///
@@ -1391,6 +1422,33 @@ mod tests {
 
         assert!(prof_self_cmp(&a, &b) > 0, "b has the larger self time");
         assert!(prof_total_cmp(&a, &b) < 0, "but a has the larger total");
+    }
+
+    #[test]
+    fn prof_func_line_formats_count_total_and_self_columns() {
+        assert_eq!(
+            prof_func_line(3, 1_000_000_000, 500_000_000, false),
+            "    3   1.000000   0.500000 "
+        );
+    }
+
+    #[test]
+    fn prof_func_line_suppresses_the_duplicate_preferred_column() {
+        assert_eq!(
+            prof_func_line(2, 1_000_000_000, 1_000_000_000, true),
+            "    2              1.000000 "
+        );
+        assert_eq!(
+            prof_func_line(2, 1_000_000_000, 1_000_000_000, false),
+            "    2   1.000000            "
+        );
+    }
+
+    #[test]
+    fn prof_func_line_uses_a_blank_row_for_zero_count() {
+        let line = prof_func_line(0, 1, 2, false);
+        assert_eq!(line, " ".repeat(28));
+        assert_eq!(line.len(), 28);
     }
 
     // --- get_profile_name / prof_def_func ---
