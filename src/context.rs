@@ -1231,6 +1231,71 @@ mod tests {
     }
 
     #[test]
+    fn option_write_uses_an_autocmd_window_for_an_unshown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _pool = CtxWinPoolGuard::reset();
+        let _g = CurwinGuard::save();
+        let mut current_buf = crate::buffer_defs::BufT::default();
+        let current_buf_ptr = std::ptr::addr_of_mut!(current_buf);
+        let mut target_buf = crate::buffer_defs::BufT {
+            b_p_ts: 8,
+            ..Default::default()
+        };
+        let target_buf_ptr = std::ptr::addr_of_mut!(target_buf);
+        let mut current = crate::buffer_defs::WinT {
+            handle: 61,
+            w_buffer: current_buf_ptr,
+            ..Default::default()
+        };
+        let current_ptr = std::ptr::addr_of_mut!(current);
+        let mut tab = crate::buffer_defs::TabpageT {
+            tp_curwin: current_ptr,
+            tp_firstwin: current_ptr,
+            tp_lastwin: current_ptr,
+            ..Default::default()
+        };
+        let tab_ptr = std::ptr::addr_of_mut!(tab);
+        {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = current_ptr;
+            globals.lastwin = current_ptr;
+            globals.curwin = current_ptr;
+            globals.curbuf = current_buf_ptr;
+            globals.curtab = tab_ptr;
+            globals.first_tabpage = tab_ptr;
+        }
+
+        assert_eq!(
+            unsafe {
+                crate::option::set_option_value_for(
+                    b"tabstop",
+                    crate::option_defs::OptIndex::Tabstop,
+                    crate::option_defs::OptVal::Number(3),
+                    crate::option_defs::opt_set_flags::OPT_LOCAL,
+                    crate::option_defs::OptScope::Buf,
+                    target_buf_ptr.cast(),
+                )
+            },
+            None
+        );
+        assert_eq!(unsafe { (*target_buf_ptr).b_p_ts }, 3);
+        assert_eq!(unsafe { (*target_buf_ptr).b_nwindows }, 0);
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin,
+            current_ptr
+        );
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf,
+            current_buf_ptr
+        );
+        assert!(
+            unsafe { CTX_WIN_VEC.get_mut() }
+                .iter()
+                .all(|entry| !entry.cw_used)
+        );
+    }
+
+    #[test]
     fn ctx_restore_is_a_noop_for_a_default_zeroed_ctx_switch() {
         let cs = CtxSwitch::default();
         unsafe { ctx_restore(&cs) }; // must not panic

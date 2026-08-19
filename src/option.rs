@@ -221,8 +221,6 @@
 //!   [`option_was_set`]'s own doc comment for why).
 //!
 //! Deferred:
-//! - Cross-window/buffer paths in `get_option_value_for`/
-//!   `set_option_value_for` need the real `ctx_switch`.
 //! - Ten remaining did-set/expand callbacks still need their own
 //!   major subsystems (diff, mapping/keymap, syntax regex/highlight,
 //!   paste-mode state, or live statusline layout).
@@ -4090,9 +4088,9 @@ pub unsafe fn set_option_value_give_err(
 /// Set an option value for an explicit scope target
 /// (`set_option_value_for`).
 ///
-/// Global, current-context, cross-window, shown-buffer, and the
-/// non-current-tab `'cmdheight'` paths are complete. An unshown buffer
-/// still needs a temporary autocmd window from `ctx_switch`.
+/// Global, current-context, cross-window, shown-buffer, unshown-buffer
+/// (through a pooled temporary autocmd window), and non-current-tab
+/// `'cmdheight'` targets are complete.
 ///
 /// # Safety
 /// `from` must point to a live value matching `scope`; forwarded from
@@ -4144,7 +4142,7 @@ pub unsafe fn set_option_value_for(
             true
         }
         OptScope::Buf => {
-            unsafe {
+            if !unsafe {
                 crate::context::ctx_switch(
                     &mut context,
                     std::ptr::null_mut(),
@@ -4152,7 +4150,10 @@ pub unsafe fn set_option_value_for(
                     from.cast::<BufT>(),
                     0,
                 )
-            };
+            } {
+                unsafe { crate::context::ctx_restore(&context) };
+                return Some(crate::errors::e_invarg);
+            }
             true
         }
     };
