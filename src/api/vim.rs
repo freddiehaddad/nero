@@ -397,6 +397,17 @@ pub unsafe fn nvim__inspect_cell(
     result
 }
 
+/// Force-clear the glyph cache (`nvim__invalidate_glyph_cache`).
+///
+/// # Safety
+/// Forwarded from [`crate::grid::schar_cache_clear`].
+#[allow(non_snake_case)]
+pub unsafe fn nvim__invalidate_glyph_cache() {
+    unsafe { crate::grid::schar_cache_clear() };
+    unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw =
+        crate::drawscreen::UPD_CLEAR;
+}
+
 /// Delete an uppercase/file mark (`nvim_del_mark`).
 ///
 /// # Safety
@@ -1409,6 +1420,38 @@ mod tests {
         assert!(!err.is_set());
         assert!(unsafe { nvim__inspect_cell(9999, 0, 0, &mut err) }.is_empty());
         assert_eq!(err.msg.as_deref(), Some("Invalid 'grid handle': 9999"));
+    }
+
+    #[test]
+    fn nvim_invalidate_glyph_cache_requests_a_clear_redraw() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf = Box::into_raw(Box::new(BufT::default()));
+        let syn = Box::into_raw(Box::new(crate::buffer_defs::SynblockT::default()));
+        let win = Box::into_raw(Box::new(WinT {
+            w_buffer: buf,
+            w_s: syn,
+            ..Default::default()
+        }));
+        let _curbuf =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, buf) };
+        let _curwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win) };
+        let _firstwin =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win) };
+        let old_redraw = unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw;
+        unsafe { nvim__invalidate_glyph_cache() };
+        let redraw = unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw;
+        unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw = old_redraw;
+        assert_eq!(redraw, crate::drawscreen::UPD_CLEAR);
+        assert!(unsafe { crate::grid::GLYPH_CACHE.get_mut() }.is_empty());
+        drop(_firstwin);
+        drop(_curwin);
+        drop(_curbuf);
+        unsafe {
+            drop(Box::from_raw(win));
+            drop(Box::from_raw(syn));
+            drop(Box::from_raw(buf));
+        }
     }
 
     #[test]
