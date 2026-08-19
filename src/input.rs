@@ -1218,6 +1218,16 @@ pub fn flush_buffers(flush: FlushBuffers) {
     }
 }
 
+/// Flush mapped input before reporting an error (`beep_flush`).
+///
+/// The UI bell itself remains with the message/UI pipeline; the
+/// original's `emsg_silent` guard and typeahead mutation are complete.
+pub fn beep_flush() {
+    if unsafe { crate::globals::GLOBALS.get_mut() }.emsg_silent == 0 {
+        flush_buffers(FlushBuffers::Minimal);
+    }
+}
+
 /// Add byte string `s` to `buf` (`add_buff`). Doesn't add empty
 /// strings. See this module's own doc comment for why the original's
 /// `bh_index`/`bh_space`/`bh_create_newblock` block-management fields
@@ -3310,6 +3320,58 @@ mod tests {
         let _lock = global_state_test_lock();
         let _typebuf = TypebufStateGuard::install(0);
         flush_buffers(FlushBuffers::Input);
+    }
+
+    #[test]
+    fn beep_flush_removes_the_mapped_prefix_when_messages_are_enabled() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _silent = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.emsg_silent,
+                0,
+            )
+        };
+        assert_eq!(
+            ins_typebuf(
+                b"mapped",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                true,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+
+        beep_flush();
+
+        assert_eq!(crate::input::typebuf_len(), 0);
+    }
+
+    #[test]
+    fn beep_flush_is_inert_while_error_messages_are_silent() {
+        let _lock = global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _silent = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.emsg_silent,
+                1,
+            )
+        };
+        assert_eq!(
+            ins_typebuf(
+                b"mapped",
+                crate::input_defs::RemapValues::Yes as i32,
+                0,
+                true,
+                false,
+            ),
+            crate::vim_defs::OK
+        );
+
+        beep_flush();
+
+        assert_eq!(current_typebuf().0, b"mapped");
     }
 
     #[test]
