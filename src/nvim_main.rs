@@ -2,7 +2,10 @@
 //!
 //! Full process startup remains coupled to event-loop, channel, UI,
 //! command, and file-loading subsystems. [`get_number_arg`] is an
-//! independent command-line parser used by that flow.
+//! independent command-line parser used by that flow. [`usage`] and
+//! [`print_mainerr`] provide startup's process-independent text output.
+
+use std::io::Write;
 
 /// Maximum number of `+`/`-c`/`--cmd` commands (`MAX_ARG_CMDS`).
 pub const MAX_ARG_CMDS: usize = 10;
@@ -121,6 +124,43 @@ pub fn set_window_layout(params: &mut Mparm) {
 /// Print the command-line help (`usage`).
 pub fn usage() {
     print!("{USAGE_TEXT}");
+}
+
+fn format_mainerr(
+    program: &[u8],
+    message: &[u8],
+    extra1: Option<&[u8]>,
+    extra2: Option<&[u8]>,
+) -> Vec<u8> {
+    let program = &program[crate::path::path_tail(program)..];
+    let mut output = Vec::new();
+    output.extend_from_slice(program);
+    output.extend_from_slice(b": ");
+    output.extend_from_slice(message);
+    for extra in [extra1, extra2].into_iter().flatten() {
+        output.extend_from_slice(b": \"");
+        output.extend_from_slice(extra);
+        output.push(b'"');
+    }
+    output.extend_from_slice(b"\nMore info with \"");
+    output.extend_from_slice(program);
+    output.extend_from_slice(b" -h\"\n");
+    output
+}
+
+/// Print a fatal startup argument error (`print_mainerr`).
+///
+/// `program` replaces the original file-static `argv0`, letting startup
+/// pass its already-owned argument without introducing another global.
+pub fn print_mainerr(
+    program: &[u8],
+    message: &[u8],
+    extra1: Option<&[u8]>,
+    extra2: Option<&[u8]>,
+) -> std::io::Result<()> {
+    std::io::stderr().write_all(&format_mainerr(
+        program, message, extra1, extra2,
+    ))
 }
 
 /// Parse a decimal number at `argument[*index]` (`get_number_arg`).
@@ -242,5 +282,27 @@ mod tests {
         ));
         assert!(USAGE_TEXT.ends_with("\nSee \":help startup-options\" for all options.\n"));
         assert_eq!(USAGE_TEXT.lines().count(), 34);
+    }
+
+    #[test]
+    fn format_mainerr_uses_the_program_tail_and_optional_details() {
+        assert_eq!(
+            format_mainerr(
+                b"bin/nvim",
+                b"Unknown option argument",
+                Some(b"--bogus"),
+                Some(b"tail"),
+            ),
+            b"nvim: Unknown option argument: \"--bogus\": \"tail\"\n\
+              More info with \"nvim -h\"\n"
+        );
+    }
+
+    #[test]
+    fn format_mainerr_omits_absent_details() {
+        assert_eq!(
+            format_mainerr(b"nvim", b"Too many edit arguments", None, None),
+            b"nvim: Too many edit arguments\nMore info with \"nvim -h\"\n"
+        );
     }
 }
