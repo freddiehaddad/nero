@@ -923,6 +923,25 @@ pub unsafe fn au_event_disable(what: &[u8]) -> Vec<u8> {
     old
 }
 
+/// Restore a value saved by [`au_event_disable`]
+/// (`au_event_restore`).
+///
+/// # Safety
+/// Mutates the global option table.
+pub unsafe fn au_event_restore(old_eventignore: Option<Vec<u8>>) {
+    let Some(old_eventignore) = old_eventignore else {
+        return;
+    };
+    unsafe {
+        crate::option::set_option_direct(
+            crate::option_defs::OptIndex::Eventignore,
+            crate::option_defs::OptVal::String(old_eventignore),
+            0,
+            crate::globals::SID_NONE,
+        )
+    };
+}
+
 /// Whether a pattern uses `<buffer...>` syntax
 /// (`aupat_is_buflocal`).
 #[must_use]
@@ -2012,6 +2031,20 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ei = old;
         assert_eq!(saved, b"BufEnter");
         assert_eq!(current, Some(b"BufEnter,BufLeave".to_vec()));
+    }
+
+    #[test]
+    fn au_event_restore_reinstates_saved_eventignore() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ei.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ei =
+            Some(b"BufLeave".to_vec());
+        unsafe { au_event_restore(Some(b"BufEnter".to_vec())) };
+        let restored = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_ei
+            .clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ei = old;
+        assert_eq!(restored, Some(b"BufEnter".to_vec()));
     }
 
     #[test]
