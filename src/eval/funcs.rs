@@ -582,6 +582,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"hlID"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_hl_id });
         m.insert(&b"hlexists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_hlexists });
         m.insert(&b"synIDtrans"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_syn_id_trans });
+        m.insert(&b"synIDattr"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: BASE_NONE, func: f_syn_id_attr });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
         m.insert(&b"settagstack"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_settagstack });
@@ -7024,6 +7025,159 @@ unsafe fn f_syn_id_trans(argvars: &[TypvalT], rettv: &mut TypvalT) {
     } else {
         0
     });
+}
+
+/// Return one highlight group attribute (`synIDattr()`).
+unsafe fn f_syn_id_attr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let id = crate::eval::typval::tv_get_number(&argvars[0]) as i32;
+    let what = crate::eval::typval::tv_get_string(&argvars[1]);
+    let mode = argvars.get(2).map_or_else(
+        || {
+            if unsafe { crate::ui::ui_rgb_attached() } {
+                b'g'
+            } else {
+                b'c'
+            }
+        },
+        |value| {
+            match crate::eval::typval::tv_get_string(value)
+                .first()
+                .copied()
+                .map(|byte| byte.to_ascii_lowercase())
+            {
+                Some(b'c' | b'g') => crate::eval::typval::tv_get_string(value)[0]
+                    .to_ascii_lowercase(),
+                _ => 0,
+            }
+        },
+    );
+    let lower = |index: usize| {
+        what.get(index).copied().map(|byte| byte.to_ascii_lowercase())
+    };
+    let attr = match lower(0) {
+        Some(b'b') if lower(1) == Some(b'g') => {
+            unsafe { crate::highlight_group::highlight_color(id, &what, mode) }
+        }
+        Some(b'b') if lower(1) == Some(b'l') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_BLINK,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'b') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_BOLD,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'c') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_CONCEALED,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'd') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_DIM,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'o') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_OVERLINE,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'f') => {
+            unsafe { crate::highlight_group::highlight_color(id, &what, mode) }
+        }
+        Some(b'i') if lower(1) == Some(b'n') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_INVERSE,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'i') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_ITALIC,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'n') if lower(1) == Some(b'o') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_NOCOMBINE,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'n') => unsafe {
+            crate::highlight_group::get_highlight_name_ext(id - 1, false)
+        },
+        Some(b'r') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_INVERSE,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b's') if lower(1) == Some(b'p') => {
+            unsafe { crate::highlight_group::highlight_color(id, &what, mode) }
+        }
+        Some(b's') if lower(1) == Some(b't') && lower(2) == Some(b'r') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_STRIKETHROUGH,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b's') => unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_STANDOUT,
+                mode,
+            )
+            .map(<[u8]>::to_vec)
+        },
+        Some(b'u') if what.len() >= 9 => {
+            let flag = if lower(5) == Some(b'l') {
+                crate::highlight_defs::HL_UNDERLINE
+            } else if lower(5) != Some(b'd') {
+                crate::highlight_defs::HL_UNDERCURL
+            } else if lower(6) != Some(b'o') {
+                crate::highlight_defs::HL_UNDERDASHED
+            } else if lower(7) == Some(b'u') {
+                crate::highlight_defs::HL_UNDERDOUBLE
+            } else {
+                crate::highlight_defs::HL_UNDERDOTTED
+            };
+            unsafe {
+                crate::highlight_group::highlight_has_attr(id, flag, mode)
+                    .map(<[u8]>::to_vec)
+            }
+        }
+        Some(b'u') => {
+            unsafe { crate::highlight_group::highlight_color(id, &what, mode) }
+        }
+        _ => None,
+    };
+    rettv.value = TypvalValue::String(attr);
 }
 
 /// `win_gettype([{nr}])` - the type of window `{nr}` (default the
@@ -16629,6 +16783,46 @@ mod tests {
             matches!(positive.value, TypvalValue::Number(value) if value == i64::from(expected))
         );
         assert!(matches!(nonpositive.value, TypvalValue::Number(0)));
+    }
+
+    #[test]
+    fn syn_id_attr_delegates_name_and_attribute_queries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let id = 1;
+        let expected_name =
+            unsafe { crate::highlight_group::get_highlight_name_ext(0, false) };
+        let expected_bold = unsafe {
+            crate::highlight_group::highlight_has_attr(
+                id,
+                crate::highlight_defs::HL_BOLD,
+                b'c',
+            )
+        }
+        .map(<[u8]>::to_vec);
+        let args = |what: &[u8]| {
+            [
+                num(i64::from(id)),
+                TypvalT {
+                    value: TypvalValue::String(Some(what.to_vec())),
+                    ..Default::default()
+                },
+                TypvalT {
+                    value: TypvalValue::String(Some(b"c".to_vec())),
+                    ..Default::default()
+                },
+            ]
+        };
+        let mut name = TypvalT::default();
+        let mut bold = TypvalT::default();
+        let mut invalid = TypvalT::default();
+        unsafe {
+            f_syn_id_attr(&args(b"name"), &mut name);
+            f_syn_id_attr(&args(b"bold"), &mut bold);
+            f_syn_id_attr(&args(b"unknown"), &mut invalid);
+        }
+        assert!(matches!(name.value, TypvalValue::String(value) if value == expected_name));
+        assert!(matches!(bold.value, TypvalValue::String(value) if value == expected_bold));
+        assert!(matches!(invalid.value, TypvalValue::String(None)));
     }
 
     // --- f_win_screenpos ---
