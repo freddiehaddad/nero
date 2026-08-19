@@ -26,7 +26,8 @@
 //! Lua host).
 
 use crate::api::private::defs::{
-    Array, Boolean, Buffer, Error, ErrorType, Integer, NvimString, Object, StringArray,
+    Array, Boolean, Buffer, Dict, Error, ErrorType, Integer, KeyValuePair, NvimString, Object,
+    StringArray,
 };
 use crate::api::private::helpers::find_buffer_by_handle;
 
@@ -419,6 +420,64 @@ pub unsafe fn nvim_buf_del_mark(
     } else {
         false
     }
+}
+
+/// Return internal buffer statistics (`nvim__buf_stats`).
+///
+/// # Safety
+/// Forwarded from [`find_buffer_by_handle`]; reads optional live undo
+/// header state.
+#[must_use]
+#[allow(non_snake_case)]
+pub unsafe fn nvim__buf_stats(buf: Buffer, err: &mut Error) -> Dict {
+    let buf = unsafe { find_buffer_by_handle(buf, err) };
+    if buf.is_null() {
+        return Vec::new();
+    }
+    let buf_ref = unsafe { &*buf };
+    let mut result = vec![
+        KeyValuePair {
+            key: b"flush_count".to_vec(),
+            value: Object::Integer(i64::from(buf_ref.flush_count)),
+        },
+        KeyValuePair {
+            key: b"current_lnum".to_vec(),
+            value: Object::Integer(i64::from(buf_ref.b_ml.ml_line_lnum)),
+        },
+        KeyValuePair {
+            key: b"line_dirty".to_vec(),
+            value: Object::Boolean(
+                buf_ref.b_ml.ml_flags & crate::memline_defs::ML_LINE_DIRTY != 0,
+            ),
+        },
+        KeyValuePair {
+            key: b"dirty_bytes".to_vec(),
+            value: Object::Integer(buf_ref.deleted_bytes as i64),
+        },
+        KeyValuePair {
+            key: b"dirty_bytes2".to_vec(),
+            value: Object::Integer(buf_ref.deleted_bytes2 as i64),
+        },
+        KeyValuePair {
+            key: b"virt_blocks".to_vec(),
+            value: Object::Integer(i64::from(crate::buffer::buf_meta_total(
+                buf_ref,
+                crate::marktree_defs::MetaIndex::Lines,
+            ))),
+        },
+    ];
+    let undo = if !buf_ref.b_u_curhead.is_null() {
+        buf_ref.b_u_curhead
+    } else {
+        buf_ref.b_u_newhead
+    };
+    if !undo.is_null() {
+        result.push(KeyValuePair {
+            key: b"uhp_extmark_size".to_vec(),
+            value: Object::Integer(unsafe { (*undo).uh_extmark.len() } as i64),
+        });
+    }
+    result
 }
 
 /// Get the full/absolute filepath of buffer `buf` (`0` for the
@@ -896,6 +955,37 @@ mod tests {
         });
         assert_eq!(fx.buf_mut().b_namedm[0].mark.lnum, 0);
         assert!(!err.is_set());
+    }
+
+    #[test]
+    fn nvim_buf_stats_reports_memline_dirty_and_undo_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = BufFixture::new(55);
+        fx.buf_mut().flush_count = 4;
+        fx.buf_mut().b_ml.ml_line_lnum = 7;
+        fx.buf_mut().b_ml.ml_flags = crate::memline_defs::ML_LINE_DIRTY;
+        fx.buf_mut().deleted_bytes = 11;
+        fx.buf_mut().deleted_bytes2 = 13;
+        let undo = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        fx.buf_mut().b_u_curhead = undo;
+        let mut err = Error::default();
+        let stats = unsafe { nvim__buf_stats(fx.handle(), &mut err) };
+        let get = |key: &[u8]| {
+            stats
+                .iter()
+                .find(|item| item.key == key)
+                .map(|item| &item.value)
+                .expect("stat key")
+        };
+        assert!(matches!(get(b"flush_count"), Object::Integer(4)));
+        assert!(matches!(get(b"current_lnum"), Object::Integer(7)));
+        assert!(matches!(get(b"line_dirty"), Object::Boolean(true)));
+        assert!(matches!(get(b"dirty_bytes"), Object::Integer(11)));
+        assert!(matches!(get(b"dirty_bytes2"), Object::Integer(13)));
+        assert!(matches!(get(b"uhp_extmark_size"), Object::Integer(0)));
+        assert!(!err.is_set());
+        fx.buf_mut().b_u_curhead = std::ptr::null_mut();
+        unsafe { drop(Box::from_raw(undo)) };
     }
 
     #[test]
