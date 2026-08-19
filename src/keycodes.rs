@@ -361,6 +361,117 @@ pub fn trans_special(
     ))
 }
 
+fn mapping_leader(name: &[u8]) -> Option<Vec<u8>> {
+    let dict = crate::eval::vars::get_globvar_dict();
+    let item = unsafe { crate::eval::typval::tv_dict_find(Some(&mut *dict), name) }?;
+    Some(crate::eval::typval::tv_get_string(unsafe { &(*item).di_tv }))
+}
+
+/// Replace `<...>` key names and mapping escapes with internal key
+/// bytes (`replace_termcodes`).
+///
+/// # Safety
+/// Reads shared script context, `g:mapleader`/
+/// `g:maplocalleader`, and multibyte state.
+#[must_use]
+pub unsafe fn replace_termcodes(
+    from: &[u8],
+    sid_arg: i32,
+    flags: i32,
+    did_simplify: Option<&mut bool>,
+    cpo_value: &[u8],
+) -> Vec<u8> {
+    use crate::keycodes_defs::{KE_FILLER, KE_SNR, K_SPECIAL, KS_EXTRA, KS_SPECIAL};
+    let do_backslash = !cpo_value.contains(&b'B');
+    let do_special = flags & crate::keycodes_defs::repterm::NO_SPECIAL == 0;
+    let mut simplified = false;
+    let mut result = Vec::with_capacity(from.len().saturating_mul(6));
+    let mut src = 0;
+    while src < from.len() {
+        if do_special
+            && (flags & crate::keycodes_defs::repterm::DO_LT != 0
+                || from[src..].len() < 4
+                || !from[src..src + 4].eq_ignore_ascii_case(b"<lt>"))
+        {
+            if from[src..].len() >= 5 && from[src..src + 5].eq_ignore_ascii_case(b"<SID>") {
+                let current_sid =
+                    unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+                if sid_arg > 0 || (sid_arg == 0 && current_sid > 0) {
+                    let sid = if sid_arg != 0 { sid_arg } else { current_sid };
+                    result.extend_from_slice(&[K_SPECIAL, KS_EXTRA, KE_SNR]);
+                    result.extend_from_slice(sid.to_string().as_bytes());
+                    result.push(b'_');
+                    src += 5;
+                    continue;
+                }
+            }
+            let special_flags = crate::keycodes_defs::fsk::KEYCODE
+                | if flags & crate::keycodes_defs::repterm::NO_SIMPLIFY == 0 {
+                    crate::keycodes_defs::fsk::SIMPLIFY
+                } else {
+                    0
+                };
+            if let Some((bytes, consumed, was_simplified)) =
+                trans_special(&from[src..], special_flags, true)
+            {
+                result.extend_from_slice(&bytes);
+                src += consumed;
+                simplified |= was_simplified;
+                continue;
+            }
+        }
+
+        if do_special {
+            let (token_len, leader) = if from[src..].len() >= 8
+                && from[src..src + 8].eq_ignore_ascii_case(b"<Leader>")
+            {
+                (8, mapping_leader(b"mapleader"))
+            } else if from[src..].len() >= 13
+                && from[src..src + 13].eq_ignore_ascii_case(b"<LocalLeader>")
+            {
+                (13, mapping_leader(b"maplocalleader"))
+            } else {
+                (0, None)
+            };
+            if token_len != 0 {
+                let leader = leader
+                    .filter(|value| !value.is_empty() && value.len() <= 48)
+                    .unwrap_or_else(|| vec![b'\\']);
+                result.extend_from_slice(&leader);
+                src += token_len;
+                continue;
+            }
+        }
+
+        let key = from[src];
+        if key == 0x16 || (do_backslash && key == b'\\') {
+            src += 1;
+            if src >= from.len() {
+                if flags & crate::keycodes_defs::repterm::FROM_PART != 0 {
+                    result.push(key);
+                }
+                break;
+            }
+        }
+        let length = unsafe {
+            crate::mbyte::utfc_ptr2len_len(&from[src..], from.len() - src)
+        }
+        .max(1) as usize;
+        for byte in &from[src..(src + length).min(from.len())] {
+            if *byte == K_SPECIAL {
+                result.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]);
+            } else {
+                result.push(*byte);
+            }
+        }
+        src += length;
+    }
+    if let Some(out) = did_simplify {
+        *out = simplified;
+    }
+    result
+}
+
 macro_rules! mouse_entry {
     ($code:ident, $button:ident, $click:literal, $drag:literal) => {
         MouseTableEntry {
@@ -928,6 +1039,54 @@ pub fn extract_modifiers(key: i32, modifiers: &mut i32, simplify: bool, did_simp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_termcodes_translates_special_keys_and_lt() {
+        let mut simplified = false;
+        let result = unsafe {
+            replace_termcodes(
+                b"<CR><lt>",
+                0,
+                crate::keycodes_defs::repterm::DO_LT,
+                Some(&mut simplified),
+                b"",
+            )
+        };
+        assert_eq!(result, b"\r<");
+    }
+
+    #[test]
+    fn replace_termcodes_handles_sid_leader_and_trailing_escape() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_sctx = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = 12;
+        let sid = unsafe { replace_termcodes(b"<SID>Func", 0, 0, None, b"") };
+        let leader = unsafe { replace_termcodes(b"<Leader>x", 0, 0, None, b"") };
+        let trailing = unsafe {
+            replace_termcodes(
+                b"x\\",
+                0,
+                crate::keycodes_defs::repterm::FROM_PART,
+                None,
+                b"",
+            )
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = old_sctx;
+        assert_eq!(
+            sid,
+            [
+                &[
+                    crate::keycodes_defs::K_SPECIAL,
+                    crate::keycodes_defs::KS_EXTRA,
+                    crate::keycodes_defs::KE_SNR,
+                ][..],
+                &b"12_Func"[..],
+            ]
+            .concat()
+        );
+        assert_eq!(leader, b"\\x");
+        assert_eq!(trailing, b"x\\");
+    }
 
     #[test]
     fn get_mouse_button_decodes_click_drag_release_and_unknown() {

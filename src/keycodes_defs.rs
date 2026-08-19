@@ -300,6 +300,14 @@ pub mod fsk {
     pub const IN_STRING: i32 = 0x04;
     pub const SIMPLIFY: i32 = 0x08;
 }
+
+/// Flags for `replace_termcodes`.
+pub mod repterm {
+    pub const FROM_PART: i32 = 1;
+    pub const DO_LT: i32 = 2;
+    pub const NO_SPECIAL: i32 = 4;
+    pub const NO_SIMPLIFY: i32 = 8;
+}
 pub const K_KUP: i32 = termcap2key(b'K', b'u');
 pub const K_KDOWN: i32 = termcap2key(b'K', b'd');
 pub const K_KLEFT: i32 = termcap2key(b'K', b'l');
