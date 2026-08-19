@@ -69,6 +69,15 @@
 
 use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
 
+/// Whether register `regname` is inserted literally
+/// (`is_literal_register`, `register.h`).
+#[must_use]
+pub fn is_literal_register(regname: i32) -> bool {
+    regname == i32::from(b'*')
+        || regname == i32::from(b'+')
+        || crate::macros_defs::ascii_isalnum(regname)
+}
+
 /// Queue a pending Insert-mode restart after any register text
 /// (`put_reedit_in_typebuf`).
 ///
@@ -1082,6 +1091,21 @@ mod tests {
             );
             assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, 0);
         }
+    }
+
+    #[test]
+    fn is_literal_register_accepts_clipboard_and_alphanumeric_names() {
+        for &name in b"*+aZ09" {
+            assert!(is_literal_register(i32::from(name)));
+        }
+    }
+
+    #[test]
+    fn is_literal_register_rejects_other_special_names() {
+        for &name in b"\"-_:=" {
+            assert!(!is_literal_register(i32::from(name)));
+        }
+        assert!(!is_literal_register(-1));
     }
 
     #[test]
