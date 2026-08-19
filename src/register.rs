@@ -16,7 +16,8 @@
 //! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller),
 //! `put_reedit_in_typebuf`/`put_in_typebuf`/
 //! `execreg_line_continuation`/[`do_execreg`] (the register execution
-//! queue builder),
+//! queue builder), and [`insert_reg`] (register-to-stuff-buffer
+//! insertion),
 //! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
 //! (not just its own always-`None`-today fast path) now that
 //! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
@@ -356,6 +357,79 @@ pub unsafe fn do_execreg(
         (*globals).reg_executing =
             if regname == 0 { i32::from(b'"') } else { regname };
         (*globals).pending_end_reg_executing = false;
+    }
+    crate::vim_defs::OK
+}
+
+/// Insert register contents into the stuff buffer (`insert_reg`).
+///
+/// The small-delete register's characterwise editing branch still
+/// needs `do_put`/real buffer mutation and stops exactly there. Every
+/// other named, numbered and special-register path is complete.
+///
+/// # Safety
+/// `reg`, when present, must remain live for the call. Global buffer,
+/// register, interrupt and last-insert state must be valid.
+pub unsafe fn insert_reg(
+    regname: i32,
+    reg: Option<&YankregT>,
+    literally_arg: bool,
+) -> i32 {
+    let literally = literally_arg || is_literal_register(regname);
+    if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+        return crate::vim_defs::FAIL;
+    }
+    if regname != i32::from(crate::ascii_defs::NUL)
+        && !valid_yank_reg(regname, false)
+    {
+        return crate::vim_defs::FAIL;
+    }
+
+    if regname == i32::from(b'.') {
+        return unsafe {
+            crate::insert::stuff_inserted(
+                i32::from(crate::ascii_defs::NUL),
+                1,
+                true,
+            )
+        };
+    }
+    if let Some((value, _allocated)) =
+        unsafe { get_spec_reg(regname, true) }
+    {
+        let Some(value) = value else {
+            return crate::vim_defs::FAIL;
+        };
+        crate::input::stuffescaped(&value, literally);
+        return crate::vim_defs::OK;
+    }
+
+    let owned;
+    let register = if let Some(reg) = reg {
+        reg
+    } else {
+        let pointer =
+            unsafe { get_yank_register(regname, YregModeT::Paste) };
+        owned = unsafe { &*pointer }.clone();
+        &owned
+    };
+    let Some(lines) = register.y_array.as_ref() else {
+        return crate::vim_defs::FAIL;
+    };
+    for (index, line) in lines.iter().enumerate() {
+        if regname == i32::from(b'-')
+            && register.y_type == crate::normal_defs::MotionType::CharWise
+        {
+            unimplemented!(
+                "insert_reg: characterwise small-delete insertion needs do_put"
+            );
+        }
+        crate::input::stuffescaped(line, literally);
+        if register.y_type == crate::normal_defs::MotionType::LineWise
+            || index + 1 < lines.len()
+        {
+            crate::input::stuffchar_readbuff(i32::from(b'\n'));
+        }
     }
     crate::vim_defs::OK
 }
@@ -1019,6 +1093,7 @@ mod tests {
     use super::*;
 
     struct TypeaheadGuard(crate::input_defs::TasaveT);
+    struct LastInsertResetGuard;
 
     impl TypeaheadGuard {
         fn save() -> Self {
@@ -1031,6 +1106,23 @@ mod tests {
     impl Drop for TypeaheadGuard {
         fn drop(&mut self) {
             crate::input::restore_typeahead(&mut self.0);
+        }
+    }
+
+    impl Drop for LastInsertResetGuard {
+        fn drop(&mut self) {
+            unsafe { crate::insert::reset_last_insert_for_test() };
+        }
+    }
+
+    fn stuffed_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = crate::input::read_readbuffers(true);
+            if byte == crate::ascii_defs::NUL {
+                return bytes;
+            }
+            bytes.push(byte);
         }
     }
 
@@ -1578,6 +1670,124 @@ mod tests {
         assert!(unsafe { crate::globals::GLOBALS.get_mut() }
             .new_last_cmdline
             .is_none());
+    }
+
+    #[test]
+    fn insert_reg_stuffs_characterwise_literal_register_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let register = YankregT {
+            y_array: Some(vec![vec![1, b'x']]),
+            y_type: crate::normal_defs::MotionType::CharWise,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { insert_reg(i32::from(b'a'), Some(&register), false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(
+            stuffed_bytes(),
+            vec![crate::ascii_defs::CTRL_V, 1, b'x']
+        );
+    }
+
+    #[test]
+    fn insert_reg_stuffs_linewise_registers_with_newlines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let register = YankregT {
+            y_array: Some(vec![b"one".to_vec(), b"two".to_vec()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { insert_reg(i32::from(b'!'), Some(&register), true) },
+            crate::vim_defs::FAIL,
+            "an invalid register name is rejected before using the supplied value"
+        );
+        assert_eq!(
+            unsafe { insert_reg(i32::from(b'b'), Some(&register), false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(stuffed_bytes(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn insert_reg_stuffs_the_current_buffer_name_special_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let mut buf = crate::buffer_defs::BufT {
+            b_fname: Some(b"file.txt".to_vec()),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+
+        assert_eq!(
+            unsafe { insert_reg(i32::from(b'%'), None, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(stuffed_bytes(), b"file.txt");
+    }
+
+    #[test]
+    fn insert_reg_uses_the_real_last_insert_for_dot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let _last_insert = LastInsertResetGuard;
+        unsafe {
+            crate::insert::reset_last_insert_for_test();
+            crate::insert::set_last_insert(i32::from(b'x'));
+        }
+
+        assert_eq!(
+            unsafe { insert_reg(i32::from(b'.'), None, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(stuffed_bytes(), b"x");
+    }
+
+    #[test]
+    fn insert_reg_stops_on_interrupt_before_touching_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let _interrupt = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.got_int,
+                true,
+            )
+        };
+        let register = YankregT {
+            y_array: Some(vec![b"ignored".to_vec()]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { insert_reg(i32::from(b'a'), Some(&register), false) },
+            crate::vim_defs::FAIL
+        );
+        assert!(stuffed_bytes().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "do_put")]
+    fn insert_reg_small_delete_charwise_needs_real_buffer_editing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typeahead = TypeaheadGuard::save();
+        let register = YankregT {
+            y_array: Some(vec![b"x".to_vec()]),
+            y_type: crate::normal_defs::MotionType::CharWise,
+            ..Default::default()
+        };
+        unsafe { insert_reg(i32::from(b'-'), Some(&register), false) };
     }
 
     #[test]
