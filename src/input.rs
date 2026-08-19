@@ -88,13 +88,15 @@
 //! matching this crate's established "small, simple, mechanically
 //! correct piece ahead of its real caller" precedent.
 //!
+//! [`stuff_readbuff_len`]/[`stuff_readbuff_spec`]/[`stuffescaped`] are
+//! real too. `stuff_readbuff_len` omits only the
+//! `add_last_insert == 1` recording side effect: nothing translated
+//! can set that register.c-owned flag, so the original's own
+//! add-to-readbuf-only path is always taken today.
+//!
 //! Deferred: everything else - `vgetc`/`vgetorpeek` and the whole
-//! typeahead-buffer/mapping-application machinery, `stuffReadbuffLen`/
-//! `stuffReadbuffSpec`/`stuffescaped` (need the `add_last_insert`/
-//! `last_insert_ga` "last insert text" tracking pair, or
-//! `mb_cptr2char_adv`, not yet examined), `ins_typebuf` itself (the
-//! real typeahead-buffer WRITE path - needs `state_no_longer_safe`,
-//! not yet examined).
+//! typeahead-buffer/mapping-application machinery, and `ins_typebuf`
+//! itself (the real typeahead-buffer WRITE path).
 //!
 //! `redobuff`/`old_redobuff` and their `ResetRedobuff`/
 //! `restoreRedobuff`/`AppendToRedobuff`/`AppendCharToRedobuff`/
@@ -1003,6 +1005,49 @@ pub fn stuff_readbuff(s: &[u8]) {
     add_buff(unsafe { READBUF1.get_mut() }, s);
 }
 
+/// Append an explicitly bounded string to the stuff buffer
+/// (`stuffReadbuffLen`).
+///
+/// The Rust slice already carries the original's separate `len`
+/// argument. The `add_last_insert == 1` side effect remains
+/// unreachable; see this module's own doc comment.
+pub fn stuff_readbuff_len(s: &[u8]) {
+    // SAFETY: momentary access.
+    add_buff(unsafe { READBUF1.get_mut() }, s);
+}
+
+/// Stuff text while preserving complete special-key triplets and
+/// replacing CR, NL and ESC with spaces (`stuffReadbuffSpec`).
+pub fn stuff_readbuff_spec(s: &[u8]) {
+    let end = s
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(s.len());
+    let mut offset = 0;
+    while offset < end {
+        if s[offset] == crate::keycodes_defs::K_SPECIAL
+            && offset + 2 < end
+        {
+            stuff_readbuff_len(&s[offset..offset + 3]);
+            offset += 3;
+            continue;
+        }
+
+        let (mut c, consumed) =
+            crate::mbyte::mb_cptr2char_adv(&s[offset..end]);
+        offset += consumed.max(1);
+        if matches!(
+            c,
+            value if value == i32::from(crate::ascii_defs::CAR)
+                || value == i32::from(crate::ascii_defs::NL)
+                || value == i32::from(crate::ascii_defs::ESC)
+        ) {
+            c = i32::from(b' ');
+        }
+        stuffchar_readbuff(c);
+    }
+}
+
 /// Append string `s` to the redo stuff buffer. `K_SPECIAL` must
 /// already have been escaped (`stuffRedoReadbuff`).
 pub fn stuff_redo_readbuff(s: &[u8]) {
@@ -1040,7 +1085,7 @@ pub fn stuffescaped(argument: &[u8], literally: bool) {
             offset += 1;
         }
         if offset > start {
-            stuff_readbuff(&argument[start..offset]);
+            stuff_readbuff_len(&argument[start..offset]);
         }
         if offset < end {
             let c = crate::mbyte::utf_ptr2char(&argument[offset..end]);
@@ -2629,6 +2674,67 @@ mod tests {
         reset_buffers();
         stuff_readbuff(b"");
         assert!(stuff_empty());
+    }
+
+    #[test]
+    fn stuff_readbuff_len_appends_the_bounded_slice() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+
+        stuff_readbuff_len(&b"abcdef"[..3]);
+
+        assert_eq!(
+            buff_bytes(unsafe { READBUF1.get_mut() }),
+            b"abc"
+        );
+        reset_buffers();
+    }
+
+    #[test]
+    fn stuff_readbuff_spec_preserves_special_keys_and_replaces_controls() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        let input = [
+            crate::keycodes_defs::K_SPECIAL,
+            b'k',
+            b'u',
+            crate::ascii_defs::CAR,
+            crate::ascii_defs::NL,
+            crate::ascii_defs::ESC,
+            b'x',
+            crate::ascii_defs::NUL,
+            b'y',
+        ];
+
+        stuff_readbuff_spec(&input);
+
+        assert_eq!(
+            buff_bytes(unsafe { READBUF1.get_mut() }),
+            vec![
+                crate::keycodes_defs::K_SPECIAL,
+                b'k',
+                b'u',
+                b' ',
+                b' ',
+                b' ',
+                b'x',
+            ]
+        );
+        reset_buffers();
+    }
+
+    #[test]
+    fn stuff_readbuff_spec_preserves_multibyte_text() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+
+        stuff_readbuff_spec("é".as_bytes());
+
+        assert_eq!(
+            buff_bytes(unsafe { READBUF1.get_mut() }),
+            "é".as_bytes()
+        );
+        reset_buffers();
     }
 
     #[test]
