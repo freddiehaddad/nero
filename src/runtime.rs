@@ -587,16 +587,6 @@ pub fn script_autoload(name: &[u8], reload: bool) -> bool {
 /// Vimscript/Lua scripts (`f_getscriptinfo`, `runtime.c`), via the
 /// already-existing script-item registry ([`script_item_count`]).
 ///
-/// Since nothing in this crate can currently source a real script
-/// (`:source`/this file's own script-loading pipeline isn't
-/// translated), [`script_item_count`] is always `0` today - the
-/// original's own per-script loop is therefore always zero-iteration
-/// here, matching the "always-real-fast-path" pattern already
-/// established elsewhere in this crate (e.g. `autocmd.rs`'s empty
-/// `AUTOCMDS`). This will start returning real script entries, with
-/// zero changes needed here, the moment a future session translates
-/// `:source`.
-///
 /// `{opts}.sid` is parsed and validated for real, matching the
 /// original exactly (including its own "must be > 0" check, message
 /// display omitted per this crate's established policy). `{opts}.name`
@@ -622,6 +612,7 @@ pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], ret
         return;
     }
 
+    let mut sid = -1i64;
     if let Some(crate::eval::typval_defs::TypvalT { value: TypvalValue::Dict(d), .. }) = argvars.first() {
         let d = *d;
         // SAFETY: `d`, if non-null, is a live Dict owned by the
@@ -632,14 +623,7 @@ pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], ret
             // above as a live item of `d`.
             let sid_tv = unsafe { &(*sid_ptr).di_tv };
             let mut error = false;
-            let sid = tv_get_number_chk(sid_tv, Some(&mut error));
-            // Skips the per-script loop below - a genuine no-op today
-            // (that loop is unconditionally zero-iteration, see this
-            // function's own doc comment), so clippy flags this early
-            // `return` as needless - kept anyway, matching the
-            // original's own real structure, so this stays correct
-            // the moment a future session adds the real loop.
-            #[allow(clippy::needless_return)]
+            sid = tv_get_number_chk(sid_tv, Some(&mut error));
             if error || sid <= 0 {
                 return;
             }
@@ -655,9 +639,99 @@ pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], ret
         }
     }
 
-    // The per-script loop (over script IDs 1..=script_item_count())
-    // is always zero-iteration today - see this function's own doc
-    // comment.
+    let crate::eval::typval_defs::TypvalValue::List(list) = rettv.value
+    else {
+        unreachable!("tv_list_alloc_ret always sets a List");
+    };
+    let mut id = if sid > 0 { sid } else { 1 };
+    while (id == sid || sid <= 0) && id <= i64::from(script_item_count()) {
+        let script = script_item(id as ScidT);
+        let script = unsafe { &mut *script };
+        let Some(name) = script.sn_name.as_deref() else {
+            id += 1;
+            continue;
+        };
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_list_append_dict(list, dict) };
+        crate::eval::typval::tv_dict_add_str(
+            unsafe { &mut *dict },
+            b"name",
+            Some(name),
+        );
+        crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *dict },
+            b"sid",
+            id,
+        );
+        crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *dict },
+            b"version",
+            1,
+        );
+        crate::eval::typval::tv_dict_add_bool(
+            unsafe { &mut *dict },
+            b"autoload",
+            crate::eval::typval_defs::BoolVarValue::False,
+        );
+
+        if sid > 0 {
+            if !script.sn_vars.is_null() {
+                let variables = unsafe {
+                    crate::eval::typval::tv_dict_copy(
+                        std::ptr::null_mut(),
+                        &mut (*script.sn_vars).sv_dict,
+                        true,
+                        crate::eval::eval::get_copy_id(),
+                    )
+                };
+                if !variables.is_null() {
+                    unsafe {
+                        crate::eval::typval::tv_dict_add_dict(
+                            &mut *dict,
+                            b"variables",
+                            variables,
+                        )
+                    };
+                }
+            }
+            let functions = unsafe { get_script_local_funcs(id as ScidT) };
+            unsafe {
+                crate::eval::typval::tv_dict_add_list(
+                    &mut *dict,
+                    b"functions",
+                    functions,
+                )
+            };
+        }
+        id += 1;
+    }
+}
+
+unsafe fn get_script_local_funcs(
+    sid: ScidT,
+) -> *mut crate::eval::typval_defs::ListT {
+    let functions = unsafe { crate::eval::userfunc::func_tbl_values() };
+    let list = crate::eval::typval::tv_list_alloc(functions.len() as isize);
+    for function in functions {
+        if function.is_null()
+            || unsafe { (*function).uf_script_ctx.sc_sid } != sid
+        {
+            continue;
+        }
+        let function = unsafe { &*function };
+        let name = function
+            .uf_name_exp
+            .as_deref()
+            .unwrap_or(&function.uf_name);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                list,
+                Some(name),
+            )
+        };
+    }
+    list
 }
 
 unsafe fn stacktrace_push_item(
@@ -1502,15 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn getscriptinfo_still_empty_even_after_registering_a_script() {
-        // The per-script loop is always zero-iteration TODAY regardless
-        // of script_item_count(), since nothing real ever reaches this
-        // function through a genuine :source - but registering one
-        // directly (as this test does) still shouldn't change the
-        // observable result, since f_getscriptinfo's own loop bound
-        // (script_item_count()) simply becomes non-zero without any
-        // change to its own logic - proving the "always empty" claim
-        // isn't an artifact of script_item_count() staying at 0.
+    fn getscriptinfo_returns_registered_script_metadata() {
         let _lock = global_state_test_lock();
         tests_reset_for_test();
         new_script_item(Some(b"foo.vim".to_vec()));
@@ -1519,7 +1585,35 @@ mod tests {
         unsafe { f_getscriptinfo(&[], &mut rettv) };
 
         let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
-        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1);
+        let dict = unsafe { stacktrace_dict(l, 0) };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_string(
+                    dict.as_mut(),
+                    b"name",
+                )
+            },
+            Some(b"foo.vim".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    dict.as_mut(),
+                    b"sid",
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    dict.as_mut(),
+                    b"version",
+                )
+            },
+            1
+        );
         // SAFETY: `l` is still exclusively owned; nothing else
         // references it.
         unsafe { crate::eval::typval::tv_list_unref(l) };
@@ -1529,6 +1623,7 @@ mod tests {
     fn getscriptinfo_valid_sid_succeeds() {
         let _lock = global_state_test_lock();
         tests_reset_for_test();
+        new_script_item(Some(b"foo.vim".to_vec()));
 
         let opts = crate::eval::typval::tv_dict_alloc();
         // SAFETY: `opts` was just allocated above, exclusively owned.
@@ -1541,7 +1636,22 @@ mod tests {
         unsafe { f_getscriptinfo(std::slice::from_ref(&arg), &mut rettv) };
 
         let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
-        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1);
+        let dict = unsafe { stacktrace_dict(l, 0) };
+        assert!(
+            crate::eval::typval::tv_dict_find(
+                unsafe { dict.as_mut() },
+                b"variables",
+            )
+            .is_some()
+        );
+        assert!(
+            crate::eval::typval::tv_dict_find(
+                unsafe { dict.as_mut() },
+                b"functions",
+            )
+            .is_some()
+        );
         // SAFETY: `l`/`opts` are each still exclusively owned; nothing
         // else references either.
         unsafe {
