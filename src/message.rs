@@ -57,13 +57,13 @@
 //!
 //! `other_sourcing_name`/`get_emsg_source` now consume the real
 //! `SOURCING_NAME`/`estack_sfile` translation in `runtime.rs`.
-//! `get_emsg_lnum`/`msg_source` remain deferred with the display
-//! pipeline.
+//! `get_emsg_lnum` is translated alongside them; `msg_source` remains
+//! deferred with the display pipeline.
 //!
 //! Deferred: everything else - the entire `msg_puts`/`msg_grid_*`/
 //! `msg_scroll_*`/`msg_ext_*` output and routing pipeline,
 //! `message_filtered` (needs `vim_regexec`, the regex engine, not
-//! translated), `get_emsg_lnum`/`msg_source` (see above),
+//! translated), `msg_source`,
 //! `messaging`/`msg_use_printf` (need `char_avail`/`ui_active`,
 //! neither translated).
 
@@ -775,6 +775,25 @@ fn get_emsg_source() -> Option<Vec<u8>> {
     message.extend_from_slice(&display_name);
     message.push(b':');
     Some(message)
+}
+
+/// Get the source line-number header used by an error message
+/// (`get_emsg_lnum`).
+#[allow(dead_code)] // Used by msg_source once display routing lands.
+#[must_use]
+fn get_emsg_lnum() -> Option<Vec<u8>> {
+    let _name = unsafe { crate::runtime::sourcing_name() }?;
+    let lnum = crate::runtime::sourcing_lnum();
+    if lnum == 0 {
+        return None;
+    }
+    if other_sourcing_name()
+        || lnum != unsafe { *LAST_SOURCING_LNUM.get_mut() }
+    {
+        Some(format!("line {lnum:4}:").into_bytes())
+    } else {
+        None
+    }
 }
 
 /// Whether error messages are currently suppressed and should not be
@@ -2400,5 +2419,48 @@ pub(crate) mod tests {
         }
         assert!(!other_sourcing_name());
         assert_eq!(get_emsg_source(), None);
+    }
+
+    #[test]
+    fn source_line_header_tracks_changed_name_or_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut name = b"plugin/demo.vim\0".to_vec();
+        let _state = SourcingStateGuard::empty();
+        crate::runtime::replace_exestack_for_test(vec![
+            crate::runtime_defs::EstackT {
+                es_name: name.as_mut_ptr(),
+                es_type: crate::runtime_defs::EtypeT::Script,
+                es_lnum: 12,
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(get_emsg_lnum(), Some(b"line   12:".to_vec()));
+
+        unsafe {
+            *LAST_SOURCING_NAME.get_mut() =
+                Some(b"plugin/demo.vim".to_vec());
+            *LAST_SOURCING_LNUM.get_mut() = 11;
+        }
+        assert_eq!(get_emsg_lnum(), Some(b"line   12:".to_vec()));
+
+        unsafe { *LAST_SOURCING_LNUM.get_mut() = 12 };
+        assert_eq!(get_emsg_lnum(), None);
+    }
+
+    #[test]
+    fn source_line_header_omits_zero_line_numbers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut name = b"command line\0".to_vec();
+        let _state = SourcingStateGuard::empty();
+        crate::runtime::replace_exestack_for_test(vec![
+            crate::runtime_defs::EstackT {
+                es_name: name.as_mut_ptr(),
+                es_type: crate::runtime_defs::EtypeT::Args,
+                es_lnum: 0,
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(get_emsg_lnum(), None);
     }
 }
