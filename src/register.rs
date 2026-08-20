@@ -1293,10 +1293,10 @@ unsafe fn yank_copy_line(
 
 /// Copy an operator range into a yank register (`op_yank_reg`).
 ///
-/// The linewise path is complete, including the original's
-/// characterwise-at-column-zero promotion, append semantics, and
-/// operation-mark updates. Characterwise and blockwise ranges remain
-/// gated on `charwise_block_prep`/`block_prep`.
+/// The linewise and characterwise paths are complete, including the
+/// original's characterwise-at-column-zero promotion, append
+/// semantics, and operation-mark updates. Blockwise ranges remain
+/// gated on `block_prep`.
 ///
 /// # Safety
 /// Reads the current memline and mutates shared current-buffer state.
@@ -1331,33 +1331,94 @@ pub unsafe fn op_yank_reg(
         yanklines -= 1;
     }
 
-    if yank_type != crate::normal_defs::MotionType::LineWise {
+    if yank_type == crate::normal_defs::MotionType::BlockWise {
         unimplemented!(
-            "op_yank_reg characterwise/blockwise paths need charwise_block_prep/block_prep"
+            "op_yank_reg blockwise path needs block_prep"
         );
     }
 
-    let mut new_lines = Vec::with_capacity(yanklines);
-    for lnum in oap.start.lnum..=yankendlnum {
-        let mut line = unsafe { crate::memline::ml_get(lnum) };
-        let len = usize::try_from(unsafe {
-            crate::memline::ml_get_len(lnum)
-        })
-        .expect("line length is nonnegative");
-        line.truncate(len);
-        new_lines.push(line);
+    let mut staged = YankregT {
+        y_array: Some(vec![Vec::new(); yanklines]),
+        y_type: yank_type,
+        y_width: 0,
+        timestamp: crate::os::time::os_time(),
+    };
+    for (y_idx, lnum) in (oap.start.lnum..=yankendlnum).enumerate() {
+        match yank_type {
+            crate::normal_defs::MotionType::LineWise => {
+                let mut line = unsafe { crate::memline::ml_get(lnum) };
+                let len = usize::try_from(unsafe {
+                    crate::memline::ml_get_len(lnum)
+                })
+                .expect("line length is nonnegative");
+                line.truncate(len);
+                staged.y_array.as_mut().unwrap()[y_idx] = line;
+            }
+            crate::normal_defs::MotionType::CharWise => {
+                let (mut block, line) = unsafe {
+                    crate::ops::charwise_block_prep(
+                        oap.start,
+                        oap.end,
+                        lnum,
+                        oap.inclusive,
+                    )
+                };
+                let offset = usize::try_from(unsafe {
+                    block.textstart.offset_from(line.as_ptr())
+                })
+                .expect("block text starts within its backing line");
+                let available = &line[offset..];
+                let string_len = available
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(available.len());
+                if string_len
+                    < usize::try_from(block.textlen)
+                        .expect("block text length is nonnegative")
+                {
+                    block.textlen = i32::try_from(string_len)
+                        .expect("line length fits i32");
+                }
+                unsafe {
+                    yank_copy_line(&mut staged, &mut block, y_idx, false)
+                };
+            }
+            crate::normal_defs::MotionType::BlockWise => {
+                unreachable!("blockwise path returned above")
+            }
+        }
     }
-    debug_assert_eq!(new_lines.len(), yanklines);
+    debug_assert_eq!(
+        staged.y_array.as_ref().map_or(0, Vec::len),
+        yanklines
+    );
 
     if append && let Some(lines) = register.y_array.as_mut() {
+        let mut new_lines = staged.y_array.take().unwrap();
+        if yank_type == crate::normal_defs::MotionType::LineWise {
+            register.y_type = crate::normal_defs::MotionType::LineWise;
+        }
+        let cpo_regappend = unsafe {
+            (*crate::option_vars::OPTION_VARS.as_ptr())
+                .p_cpo
+                .as_deref()
+                .is_some_and(|value| {
+                    value.contains(&crate::option_vars::CPO_REGAPPEND)
+                })
+        };
+        if register.y_type == crate::normal_defs::MotionType::CharWise
+            && !cpo_regappend
+            && !lines.is_empty()
+            && !new_lines.is_empty()
+        {
+            lines
+                .last_mut()
+                .expect("checked nonempty")
+                .extend_from_slice(&new_lines.remove(0));
+        }
         lines.extend(new_lines);
-        register.y_type = crate::normal_defs::MotionType::LineWise;
     } else {
-        free_register(register);
-        register.y_array = Some(new_lines);
-        register.y_type = crate::normal_defs::MotionType::LineWise;
-        register.y_width = 0;
-        register.timestamp = crate::os::time::os_time();
+        *register = staged;
     }
 
     let globals = crate::globals::GLOBALS.as_ptr();
@@ -1367,8 +1428,12 @@ pub unsafe fn op_yank_reg(
     {
         let mut start = oap.start;
         let mut end = oap.end;
-        start.col = 0;
-        end.col = crate::pos_defs::MAXCOL;
+        if yank_type == crate::normal_defs::MotionType::LineWise {
+            start.col = 0;
+            end.col = crate::pos_defs::MAXCOL;
+        } else if !oap.inclusive {
+            unsafe { crate::memline::decl(&mut end) };
+        }
         let curbuf = unsafe { (*globals).curbuf };
         unsafe {
             (*curbuf).b_op_start = start;
@@ -1380,9 +1445,8 @@ pub unsafe fn op_yank_reg(
 /// Yank an operator range into its requested register (`op_yank`).
 ///
 /// This is complete for every motion type supported by
-/// [`op_yank_reg`] (currently linewise, including its column-zero
-/// promotion). Clipboard publication is inert while no provider is
-/// available.
+/// [`op_yank_reg`] (linewise and characterwise). Clipboard
+/// publication is inert while no provider is available.
 ///
 /// # Safety
 /// Forwarded from [`op_yank_reg`], [`get_yank_register`], and
@@ -4016,6 +4080,12 @@ mod tests {
                 win_ptr,
             )
         };
+        let _virtual_op = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.virtual_op,
+                crate::types_defs::TriState::False,
+            )
+        };
 
         f(buf_ptr)
     }
@@ -4198,7 +4268,198 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "need charwise_block_prep/block_prep")]
+    fn op_yank_reg_copies_an_inclusive_characterwise_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            with_yank_test_buffer(b"hello\0", &[], |buf| {
+                let oap = crate::normal_defs::OpargT {
+                    motion_type:
+                        crate::normal_defs::MotionType::CharWise,
+                    start: crate::pos_defs::PosT {
+                        lnum: 1,
+                        col: 1,
+                        ..Default::default()
+                    },
+                    end: crate::pos_defs::PosT {
+                        lnum: 1,
+                        col: 3,
+                        ..Default::default()
+                    },
+                    line_count: 1,
+                    inclusive: true,
+                    ..Default::default()
+                };
+                let mut register = YankregT::default();
+
+                op_yank_reg(&oap, false, &mut register, false);
+
+                assert_eq!(
+                    register.y_array.as_deref(),
+                    Some([b"ell".to_vec()].as_slice())
+                );
+                assert_eq!(
+                    register.y_type,
+                    crate::normal_defs::MotionType::CharWise
+                );
+                assert_eq!((*buf).b_op_start, oap.start);
+                assert_eq!((*buf).b_op_end, oap.end);
+            });
+        }
+    }
+
+    #[test]
+    fn op_yank_reg_copies_a_multiline_exclusive_characterwise_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            with_yank_test_buffer(
+                b"first\0",
+                &[b"middle\0", b"last\0"],
+                |buf| {
+                    let oap = crate::normal_defs::OpargT {
+                        motion_type:
+                            crate::normal_defs::MotionType::CharWise,
+                        start: crate::pos_defs::PosT {
+                            lnum: 1,
+                            col: 2,
+                            ..Default::default()
+                        },
+                        end: crate::pos_defs::PosT {
+                            lnum: 3,
+                            col: 2,
+                            ..Default::default()
+                        },
+                        line_count: 3,
+                        inclusive: false,
+                        ..Default::default()
+                    };
+                    let mut register = YankregT::default();
+
+                    op_yank_reg(&oap, false, &mut register, false);
+
+                    assert_eq!(
+                        register.y_array.as_deref(),
+                        Some(
+                            [
+                                b"rst".to_vec(),
+                                b"middle".to_vec(),
+                                b"la".to_vec(),
+                            ]
+                            .as_slice()
+                        )
+                    );
+                    assert_eq!((*buf).b_op_start, oap.start);
+                    assert_eq!((*buf).b_op_end.lnum, 3);
+                    assert_eq!((*buf).b_op_end.col, 1);
+                },
+            );
+        }
+    }
+
+    struct CpoGuard(Option<Vec<u8>>);
+
+    impl CpoGuard {
+        fn set(value: Option<Vec<u8>>) -> Self {
+            Self(std::mem::replace(
+                &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                    .p_cpo,
+                value,
+            ))
+        }
+    }
+
+    impl Drop for CpoGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo =
+                self.0.take();
+        }
+    }
+
+    #[test]
+    fn op_yank_reg_characterwise_append_joins_boundary_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(Some(Vec::new()));
+        unsafe {
+            with_yank_test_buffer(b"new\0", &[], |_| {
+                let oap = crate::normal_defs::OpargT {
+                    motion_type:
+                        crate::normal_defs::MotionType::CharWise,
+                    start: crate::pos_defs::PosT {
+                        lnum: 1,
+                        col: 0,
+                        ..Default::default()
+                    },
+                    end: crate::pos_defs::PosT {
+                        lnum: 1,
+                        col: 2,
+                        ..Default::default()
+                    },
+                    line_count: 1,
+                    inclusive: true,
+                    ..Default::default()
+                };
+                let mut register = YankregT {
+                    y_array: Some(vec![b"old".to_vec()]),
+                    y_type: crate::normal_defs::MotionType::CharWise,
+                    timestamp: 77,
+                    ..Default::default()
+                };
+
+                op_yank_reg(&oap, false, &mut register, true);
+
+                assert_eq!(
+                    register.y_array.as_deref(),
+                    Some([b"oldnew".to_vec()].as_slice())
+                );
+                assert_eq!(register.timestamp, 77);
+            });
+        }
+    }
+
+    #[test]
+    fn op_yank_reg_cpo_regappend_keeps_boundary_lines_separate() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(Some(vec![
+            crate::option_vars::CPO_REGAPPEND,
+        ]));
+        unsafe {
+            with_yank_test_buffer(b"new\0", &[], |_| {
+                let oap = crate::normal_defs::OpargT {
+                    motion_type:
+                        crate::normal_defs::MotionType::CharWise,
+                    start: crate::pos_defs::PosT {
+                        lnum: 1,
+                        col: 0,
+                        ..Default::default()
+                    },
+                    end: crate::pos_defs::PosT {
+                        lnum: 1,
+                        col: 2,
+                        ..Default::default()
+                    },
+                    line_count: 1,
+                    inclusive: true,
+                    ..Default::default()
+                };
+                let mut register = YankregT {
+                    y_array: Some(vec![b"old".to_vec()]),
+                    y_type: crate::normal_defs::MotionType::CharWise,
+                    ..Default::default()
+                };
+
+                op_yank_reg(&oap, false, &mut register, true);
+
+                assert_eq!(
+                    register.y_array.as_deref(),
+                    Some(
+                        [b"old".to_vec(), b"new".to_vec()].as_slice()
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "needs block_prep")]
     fn op_yank_reg_non_linewise_paths_are_deferred() {
         unsafe {
             op_yank_reg(
