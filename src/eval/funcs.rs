@@ -345,6 +345,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"nr2char"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_nr2char });
         m.insert(&b"str2float"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_str2float });
         m.insert(&b"strftime"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strftime });
+        m.insert(&b"strptime"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_strptime });
         m.insert(&b"str2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_str2nr });
         m.insert(&b"str2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_str2list });
         m.insert(&b"list2str"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_list2str });
@@ -1066,6 +1067,17 @@ fn f_strftime(argvars: &[TypvalT], rettv: &mut TypvalT) {
         crate::os::time::os_strftime(&format, seconds)
             .unwrap_or_else(|| b"(Invalid)".to_vec()),
     ));
+}
+
+/// `strptime({format}, {timestring})` - parse local time
+/// (`f_strptime`, `funcs.c`).
+fn f_strptime(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let format = crate::eval::typval::tv_get_string(&argvars[0]);
+    let input = crate::eval::typval::tv_get_string(&argvars[1]);
+    let timestamp = crate::os::time::os_strptime(&input, &format)
+        .and_then(|mut parsed| crate::os::time::os_mktime(&mut parsed))
+        .unwrap_or(0);
+    rettv.value = TypvalValue::Number(timestamp);
 }
 
 /// `str2nr({string} [, {base} [, {quoted}]])` - convert `{string}` to
@@ -8998,6 +9010,31 @@ mod tests {
         );
     }
 
+    // --- f_strptime ---
+
+    #[test]
+    #[cfg_attr(
+        all(miri, unix),
+        ignore = "Miri cannot call strptime/mktime FFI"
+    )]
+    fn strptime_parses_supported_platforms_and_rejects_invalid_input() {
+        let mut rettv = TypvalT::default();
+        f_strptime(
+            &[string(b"%Y-%m-%d"), string(b"2000-01-02")],
+            &mut rettv,
+        );
+        #[cfg(unix)]
+        assert!(matches!(rettv.value, TypvalValue::Number(value) if value > 0));
+        #[cfg(windows)]
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        f_strptime(
+            &[string(b"%Y-%m-%d"), string(b"not-a-date")],
+            &mut rettv,
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
     // --- f_str2nr ---
 
     #[test]
@@ -9287,6 +9324,7 @@ mod tests {
             "nr2char",
             "str2float",
             "strftime",
+            "strptime",
             "str2nr",
             "str2list",
             "list2str",
