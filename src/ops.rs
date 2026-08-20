@@ -65,9 +65,13 @@
 //! possibly composing-character) character it currently points into,
 //! needing only already-real `crate::memline::ml_get`/
 //! `crate::mbyte::utf_head_off`/`utfc_ptr2len`. Its own real callers
-//! (`op_delete`/`op_yank`/etc., none translated) remain blocked -
-//! translated ahead of them, matching the established "translate
-//! ahead of a real caller" precedent.
+//! (`op_delete` and the non-linewise branches of `op_yank`) remain
+//! blocked; linewise `op_yank` is real.
+//!
+//! Also translated: [`charwise_block_prep`] - prepares a
+//! characterwise slice for yank/delete operations. It returns the
+//! owned backing line alongside `BlockDefT`, keeping `textstart`
+//! valid without a self-referential borrow.
 //!
 //! Also translated: `line_count_info` (word/char/byte counting for one
 //! line, used by `cursor_pos_info`'s "g CTRL-G" word/char/byte-count
@@ -629,6 +633,119 @@ pub unsafe fn mb_adjust_opend(oap: &mut crate::normal_defs::OpargT) {
         let char_len = unsafe { crate::mbyte::utfc_ptr2len(&line[new_start..]) };
         oap.end.col = new_start as crate::pos_defs::ColnrT + char_len - 1;
     }
+}
+
+/// Get block text from `start` to `end` (`charwise_block_prep`).
+///
+/// The returned `Vec<u8>` owns the allocation addressed by
+/// `BlockDefT::textstart` and must remain alive while that pointer is
+/// used.
+///
+/// # Safety
+/// Reads the current memline and virtual-column/window state.
+pub unsafe fn charwise_block_prep(
+    start: crate::pos_defs::PosT,
+    end: crate::pos_defs::PosT,
+    lnum: crate::pos_defs::LinenrT,
+    inclusive: bool,
+) -> (crate::register_defs::BlockDefT, Vec<u8>) {
+    let mut startcol = 0;
+    let mut endcol = crate::pos_defs::MAXCOL;
+    let mut line = unsafe { crate::memline::ml_get(lnum) };
+    let plen = unsafe { crate::memline::ml_get_len(lnum) };
+    let mut block = crate::register_defs::BlockDefT::default();
+    let virtual_op = unsafe {
+        (*crate::globals::GLOBALS.as_ptr()).virtual_op
+            != crate::types_defs::TriState::False
+    };
+
+    if lnum == start.lnum {
+        startcol = start.col;
+        if virtual_op {
+            let mut cs = 0;
+            let mut ce = 0;
+            let mut pos = start;
+            let curwin =
+                unsafe { (*crate::globals::GLOBALS.as_ptr()).curwin };
+            unsafe {
+                crate::plines::getvcol(
+                    curwin,
+                    &mut pos,
+                    Some(&mut cs),
+                    None,
+                    Some(&mut ce),
+                    0,
+                )
+            };
+            if ce != cs && start.coladd > 0 {
+                block.start_char_vcols = ce - cs + 1;
+                block.startspaces =
+                    (block.start_char_vcols - start.coladd).max(0);
+                startcol += 1;
+            }
+        }
+    }
+
+    if lnum == end.lnum {
+        endcol = end.col;
+        if virtual_op {
+            let mut cs = 0;
+            let mut ce = 0;
+            let mut pos = end;
+            let curwin =
+                unsafe { (*crate::globals::GLOBALS.as_ptr()).curwin };
+            unsafe {
+                crate::plines::getvcol(
+                    curwin,
+                    &mut pos,
+                    Some(&mut cs),
+                    None,
+                    Some(&mut ce),
+                    0,
+                )
+            };
+            let end_index = usize::try_from(endcol)
+                .expect("end column is nonnegative");
+            if line.get(end_index).copied().unwrap_or_default() == 0
+                || (cs + end.coladd < ce
+                    && unsafe {
+                        crate::mbyte::utf_head_off(&line, end_index)
+                    } == 0)
+            {
+                if start.lnum == end.lnum && start.col == end.col {
+                    block.is_one_char = 1;
+                    block.startspaces =
+                        end.coladd - start.coladd + i32::from(inclusive);
+                    endcol = startcol;
+                } else {
+                    block.endspaces =
+                        end.coladd + i32::from(inclusive);
+                    endcol -= i32::from(inclusive);
+                }
+            }
+        }
+    }
+
+    if endcol == crate::pos_defs::MAXCOL {
+        endcol = plen;
+    }
+    block.textlen = if startcol > endcol || block.is_one_char != 0 {
+        0
+    } else {
+        endcol - startcol + i32::from(inclusive)
+    };
+    block.textcol = startcol;
+    block.textstart = if startcol <= plen {
+        unsafe {
+            line.as_mut_ptr().add(
+                usize::try_from(startcol)
+                    .expect("start column is nonnegative"),
+            )
+        }
+    } else {
+        line.as_mut_ptr()
+    };
+    (block, line)
 }
 
 /// Compute a block-wise operator's virtual-column extent and convert
@@ -2663,6 +2780,153 @@ mod tests {
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn charwise_block_prep_selects_an_inclusive_same_line_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"hello\0", &[]);
+            let buf_ptr = std::ptr::addr_of_mut!(buf);
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: buf_ptr,
+                ..Default::default()
+            };
+            let win_ptr = std::ptr::addr_of_mut!(win);
+            let _curbuf = CurbufGuard::set(buf_ptr);
+            let _curwin = CurwinGuard::set(win_ptr);
+            let _virtual_op =
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.virtual_op,
+                    crate::types_defs::TriState::False,
+                );
+
+            let (block, line) = charwise_block_prep(
+                crate::pos_defs::PosT {
+                    lnum: 1,
+                    col: 1,
+                    ..Default::default()
+                },
+                crate::pos_defs::PosT {
+                    lnum: 1,
+                    col: 3,
+                    ..Default::default()
+                },
+                1,
+                true,
+            );
+
+            assert_eq!(block.textcol, 1);
+            assert_eq!(block.textlen, 3);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    block.textstart,
+                    block.textlen as usize,
+                ),
+                b"ell"
+            );
+            assert_eq!(line, b"hello\0");
+
+            drop(_virtual_op);
+            drop(_curwin);
+            drop(_curbuf);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn charwise_block_prep_uses_whole_middle_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf =
+                buf_with_lines(b"first\0", &[b"middle\0", b"last\0"]);
+            let buf_ptr = std::ptr::addr_of_mut!(buf);
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: buf_ptr,
+                ..Default::default()
+            };
+            let win_ptr = std::ptr::addr_of_mut!(win);
+            let _curbuf = CurbufGuard::set(buf_ptr);
+            let _curwin = CurwinGuard::set(win_ptr);
+            let _virtual_op =
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.virtual_op,
+                    crate::types_defs::TriState::False,
+                );
+
+            let (block, line) = charwise_block_prep(
+                crate::pos_defs::PosT {
+                    lnum: 1,
+                    col: 2,
+                    ..Default::default()
+                },
+                crate::pos_defs::PosT {
+                    lnum: 3,
+                    col: 1,
+                    ..Default::default()
+                },
+                2,
+                false,
+            );
+
+            assert_eq!(block.textcol, 0);
+            assert_eq!(block.textlen, 6);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    block.textstart,
+                    block.textlen as usize,
+                ),
+                b"middle"
+            );
+            assert_eq!(line, b"middle\0");
+
+            drop(_virtual_op);
+            drop(_curwin);
+            drop(_curbuf);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn charwise_block_prep_handles_virtual_selection_inside_one_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"\t\0", &[]);
+            let buf_ptr = std::ptr::addr_of_mut!(buf);
+            (*buf_ptr).b_p_ts = 8;
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: buf_ptr,
+                w_view_width: 80,
+                ..Default::default()
+            };
+            let win_ptr = std::ptr::addr_of_mut!(win);
+            let _curbuf = CurbufGuard::set(buf_ptr);
+            let _curwin = CurwinGuard::set(win_ptr);
+            let _virtual_op =
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.virtual_op,
+                    crate::types_defs::TriState::True,
+                );
+            let start = crate::pos_defs::PosT {
+                lnum: 1,
+                col: 0,
+                coladd: 1,
+            };
+
+            let (block, line) =
+                charwise_block_prep(start, start, 1, true);
+
+            assert_eq!(block.is_one_char, 1);
+            assert_eq!(block.startspaces, 1);
+            assert_eq!(block.textlen, 0);
+            assert_eq!(block.textcol, 1);
+            assert_eq!(line, b"\t\0");
+
+            drop(_virtual_op);
+            drop(_curwin);
+            drop(_curbuf);
+            close_buf(buf);
         }
     }
 
