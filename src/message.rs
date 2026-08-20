@@ -36,9 +36,7 @@
 //! both are pure state resets over globals that already exist, save
 //! for `last_sourcing_name`/`last_sourcing_lnum`, which are file
 //! statics in the original and so live here rather than in
-//! `globals.rs`. Note that adding them does NOT unblock
-//! `other_sourcing_name`'s remaining body, which still needs
-//! `SOURCING_NAME`.
+//! `globals.rs`.
 //!
 //! Also [`messagesopt_changed`] - parsing and applying the
 //! `'messagesopt'` flags and numeric limits. Trimming an existing
@@ -57,23 +55,10 @@
 //! (`keycodes_defs.rs`, ahead of `keycodes.c`) and `shape_table`
 //! (`cursor_shape.rs`, ahead of the rest of `cursor_shape.c`).
 //!
-//! `other_sourcing_name`/`get_emsg_source` both correctly, always
-//! take their own early-return path today
-//! (`crate::runtime::have_sourcing_info()` is always `false` -
-//! `runtime.rs`'s own `EXESTACK` is always empty, matching its own
-//! documented `AUTOCMDS`-style "genuinely, provably always-empty
-//! registry" precedent) - their own remaining bodies (needing
-//! `estack_sfile`-adjacent `SOURCING_NAME` access, not yet translated)
-//! are `unimplemented!()`, unreachable in practice today given the
-//! above. `get_emsg_lnum`/`msg_source` are NOT translated: unlike
-//! these two, both directly evaluate `SOURCING_NAME` WITHOUT first
-//! checking `HAVE_SOURCING_INFO` (relying on real neovim's own
-//! invariant that `exestack` is never actually empty in a live
-//! session, since something always pushes an initial frame at
-//! startup) - translating them here would mean indexing this crate's
-//! own always-empty `EXESTACK` directly, a genuine panic risk with no
-//! real guard, unlike every other "always-empty registry" case in
-//! this crate.
+//! `other_sourcing_name`/`get_emsg_source` now consume the real
+//! `SOURCING_NAME`/`estack_sfile` translation in `runtime.rs`.
+//! `get_emsg_lnum`/`msg_source` remain deferred with the display
+//! pipeline.
 //!
 //! Deferred: everything else - the entire `msg_puts`/`msg_grid_*`/
 //! `msg_scroll_*`/`msg_ext_*` output and routing pipeline,
@@ -752,18 +737,15 @@ pub unsafe fn msg_strtrunc(s: &[u8], force: bool) -> Option<Vec<u8>> {
 #[allow(dead_code)]
 #[must_use]
 fn other_sourcing_name() -> bool {
-    if crate::runtime::have_sourcing_info() {
-        // SOURCING_NAME != NULL && (compare against the last-displayed
-        // source name) - needs SOURCING_NAME access (estack_sfile-
-        // adjacent), not yet translated.
-        unimplemented!(
-            "message::other_sourcing_name: needs SOURCING_NAME access (estack_sfile-adjacent), \
-             not yet translated - unreachable in practice today since \
-             crate::runtime::have_sourcing_info() is always false, see this module's own doc \
-             comment"
-        );
+    if !crate::runtime::have_sourcing_info() {
+        return false;
     }
-    false
+    let Some(name) = (unsafe { crate::runtime::sourcing_name() }) else {
+        return false;
+    };
+    unsafe { LAST_SOURCING_NAME.get_mut() }
+        .as_ref()
+        .is_none_or(|last| last != &name)
 }
 
 /// Get the message about the source, as used for an error message
@@ -778,18 +760,21 @@ fn other_sourcing_name() -> bool {
 #[allow(dead_code)]
 #[must_use]
 fn get_emsg_source() -> Option<Vec<u8>> {
-    if crate::runtime::have_sourcing_info() {
-        // SOURCING_NAME != NULL && other_sourcing_name() - needs
-        // SOURCING_NAME access (estack_sfile-adjacent), not yet
-        // translated.
-        unimplemented!(
-            "message::get_emsg_source: needs SOURCING_NAME access (estack_sfile-adjacent), not \
-             yet translated - unreachable in practice today since \
-             crate::runtime::have_sourcing_info() is always false, see this module's own doc \
-             comment"
-        );
+    if !crate::runtime::have_sourcing_info() || !other_sourcing_name() {
+        return None;
     }
-    None
+    let sourcing_name = unsafe { crate::runtime::sourcing_name() }?;
+    let display_name = unsafe {
+        crate::runtime::estack_sfile(
+            crate::runtime_defs::EstackArgT::None,
+        )
+    }
+    .unwrap_or(sourcing_name);
+    let mut message = Vec::with_capacity(display_name.len() + 10);
+    message.extend_from_slice(b"Error in ");
+    message.extend_from_slice(&display_name);
+    message.push(b':');
+    Some(message)
 }
 
 /// Whether error messages are currently suppressed and should not be
@@ -2340,12 +2325,43 @@ pub(crate) mod tests {
 
     // --- other_sourcing_name / get_emsg_source ---
 
+    struct SourcingStateGuard {
+        stack: Option<Vec<crate::runtime_defs::EstackT>>,
+        name: Option<Vec<u8>>,
+        lnum: crate::pos_defs::LinenrT,
+    }
+
+    impl SourcingStateGuard {
+        fn empty() -> Self {
+            Self {
+                stack: Some(
+                    crate::runtime::replace_exestack_for_test(Vec::new()),
+                ),
+                name: unsafe { LAST_SOURCING_NAME.get_mut() }.take(),
+                lnum: std::mem::replace(
+                    unsafe { LAST_SOURCING_LNUM.get_mut() },
+                    0,
+                ),
+            }
+        }
+    }
+
+    impl Drop for SourcingStateGuard {
+        fn drop(&mut self) {
+            crate::runtime::replace_exestack_for_test(
+                self.stack.take().expect("saved execution stack"),
+            );
+            unsafe {
+                *LAST_SOURCING_NAME.get_mut() = self.name.take();
+                *LAST_SOURCING_LNUM.get_mut() = self.lnum;
+            }
+        }
+    }
+
     #[test]
     fn other_sourcing_name_is_false_when_there_is_no_sourcing_info() {
         let _lock = crate::globals::global_state_test_lock();
-        // EXESTACK is always empty in this crate today, so
-        // have_sourcing_info() is always false - a real, always-taken
-        // early return, not a hardcoded stub.
+        let _state = SourcingStateGuard::empty();
         assert!(!crate::runtime::have_sourcing_info());
         assert!(!other_sourcing_name());
     }
@@ -2353,7 +2369,36 @@ pub(crate) mod tests {
     #[test]
     fn get_emsg_source_is_none_when_there_is_no_sourcing_info() {
         let _lock = crate::globals::global_state_test_lock();
+        let _state = SourcingStateGuard::empty();
         assert!(!crate::runtime::have_sourcing_info());
+        assert_eq!(get_emsg_source(), None);
+    }
+
+    #[test]
+    fn source_header_uses_current_execution_stack_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut name = b"plugin/demo.vim\0".to_vec();
+        let _state = SourcingStateGuard::empty();
+        crate::runtime::replace_exestack_for_test(vec![
+            crate::runtime_defs::EstackT {
+                es_name: name.as_mut_ptr(),
+                es_type: crate::runtime_defs::EtypeT::Script,
+                es_lnum: 4,
+                ..Default::default()
+            },
+        ]);
+
+        assert!(other_sourcing_name());
+        assert_eq!(
+            get_emsg_source(),
+            Some(b"Error in plugin/demo.vim:".to_vec())
+        );
+
+        unsafe {
+            *LAST_SOURCING_NAME.get_mut() =
+                Some(b"plugin/demo.vim".to_vec());
+        }
+        assert!(!other_sourcing_name());
         assert_eq!(get_emsg_source(), None);
     }
 }
