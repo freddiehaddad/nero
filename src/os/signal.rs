@@ -58,6 +58,8 @@ pub fn signal_name(signum: i32) -> &'static str {
     // are Unix-only, matching the original's per-signal #ifdefs (MSVC
     // defines none of them).
     match signum {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        libc::SIGPWR => "SIGPWR",
         libc::SIGTERM => "SIGTERM",
         libc::SIGINT => "SIGINT",
         #[cfg(unix)]
@@ -96,6 +98,12 @@ mod tests {
         assert_eq!(signal_name(libc::SIGUSR1), "SIGUSR1");
         assert_eq!(signal_name(libc::SIGPIPE), "SIGPIPE");
         assert_eq!(signal_name(libc::SIGTSTP), "SIGTSTP");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn signal_name_reports_sigpwr_when_the_platform_defines_it() {
+        assert_eq!(signal_name(libc::SIGPWR), "SIGPWR");
     }
 
     #[test]
