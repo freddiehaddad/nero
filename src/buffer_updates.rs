@@ -17,9 +17,9 @@
 //! vector teardown is `Vec::clear`, while Lua unref is inert until a
 //! Lua host can create such references.
 //!
-//! Deferred: everything else in the file - `buf_updates_register`/
-//! `_send_end`/`_changedtick(_single)`/`_unload` all need the
-//! channel/Lua callback-dispatch machinery above.
+//! Deferred notification tails (`_send_end`/
+//! `_changedtick(_single)`/`_unload`) still need the channel/Lua
+//! callback-dispatch machinery above.
 //! [`buf_updates_send_splice`] and [`buf_updates_unregister`] are
 //! translated only as far as their own guards reach: those guards are
 //! real, and the dispatch behind them is `unimplemented!()` since
@@ -44,6 +44,43 @@ pub fn buf_free_callbacks(buf: &mut BufT) {
     for callback in buf.update_callbacks.drain(..) {
         buffer_update_callbacks_free(callback);
     }
+}
+
+/// Register a buffer update channel or Lua callback
+/// (`buf_updates_register`).
+///
+/// The unloaded-buffer, Lua-callback, and duplicate-channel paths are
+/// complete. Sending the initial buffer/changedtick event for a newly
+/// registered RPC channel remains gated on `rpc_send_event`.
+#[must_use]
+pub fn buf_updates_register(
+    buf: &mut BufT,
+    channel_id: u64,
+    callback: crate::buffer_defs::BufUpdateCallbacks,
+    send_buffer: bool,
+) -> bool {
+    if buf.b_ml.ml_mfp.is_null() {
+        return false;
+    }
+    if channel_id == crate::api::private::defs::LUA_INTERNAL_CALL {
+        buf.update_callbacks.push(callback);
+        if callback.utf_sizes {
+            buf.update_need_codepoints = true;
+        }
+        return true;
+    }
+    if buf.update_channels.contains(&channel_id) {
+        return true;
+    }
+    buf.update_channels.push(channel_id);
+    let mode = if send_buffer {
+        "initial lines"
+    } else {
+        "changedtick"
+    };
+    unimplemented!(
+        "buf_updates_register: sending the {mode} RPC event needs rpc_send_event"
+    );
 }
 
 /// Whether `buf` has any live update subscribers, either RPC channels
@@ -288,5 +325,53 @@ mod tests {
         assert!(buf.update_channels.is_empty());
         assert!(buf.update_callbacks.is_empty());
         assert!(!buf_updates_active(&buf));
+    }
+
+    fn loaded_buffer() -> BufT {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_mfp = std::ptr::NonNull::dangling().as_ptr();
+        buf
+    }
+
+    #[test]
+    fn buf_updates_register_rejects_unloaded_buffers() {
+        assert!(!buf_updates_register(
+            &mut BufT::default(),
+            7,
+            BufUpdateCallbacks::default(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn buf_updates_register_adds_lua_callbacks_and_utf_requirement() {
+        let mut buf = loaded_buffer();
+        let callback = BufUpdateCallbacks {
+            utf_sizes: true,
+            ..Default::default()
+        };
+
+        assert!(buf_updates_register(
+            &mut buf,
+            crate::api::private::defs::LUA_INTERNAL_CALL,
+            callback,
+            false,
+        ));
+        assert_eq!(buf.update_callbacks.len(), 1);
+        assert!(buf.update_need_codepoints);
+    }
+
+    #[test]
+    fn buf_updates_register_accepts_an_existing_channel_without_dispatch() {
+        let mut buf = loaded_buffer();
+        buf.update_channels.push(9);
+
+        assert!(buf_updates_register(
+            &mut buf,
+            9,
+            BufUpdateCallbacks::default(),
+            true,
+        ));
+        assert_eq!(buf.update_channels, vec![9]);
     }
 }
