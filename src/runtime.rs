@@ -288,9 +288,19 @@ pub unsafe fn estack_sfile(
                     }
                 }
                 crate::runtime_defs::EtypeT::Aucmd => {
-                    unimplemented!(
-                        "estack_sfile(ESTACK_SCRIPT) needs AutoPatCmd script_ctx"
-                    );
+                    let crate::runtime_defs::EsInfo::Aucmd(autocmd) =
+                        entry.es_info
+                    else {
+                        continue;
+                    };
+                    if autocmd.is_null() {
+                        continue;
+                    }
+                    let sid = unsafe { (*autocmd).script_ctx.sc_sid };
+                    if sid > 0 {
+                        let script = script_item(sid);
+                        return unsafe { &*script }.sn_name.clone();
+                    }
                 }
                 crate::runtime_defs::EtypeT::Script => {
                     return unsafe { estack_entry_name(entry) };
@@ -968,6 +978,7 @@ mod tests {
                 3,
             );
         }
+
         let mut function = test_ufunc(b"demo#Run", None);
         unsafe {
             estack_push_ufunc(std::ptr::from_mut(&mut *function), 9);
@@ -992,6 +1003,48 @@ mod tests {
         assert_eq!(
             unsafe { sourcing_name() },
             Some(b"demo#Run".to_vec())
+        );
+    }
+
+    #[test]
+    fn estack_sfile_handles_autocmd_frames_without_a_script_id() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        let mut autocmd = crate::autocmd_defs::AutoPatCmd {
+            lastpat: std::ptr::null_mut(),
+            auidx: 0,
+            ausize: 0,
+            afile_orig: None,
+            fname: None,
+            sfname: None,
+            tail: None,
+            group: 0,
+            event: crate::autocmd_defs::EventT::BufEnter,
+            script_ctx: crate::eval::typval_defs::SctxT::default(),
+            arg_bufnr: 0,
+            data: std::ptr::null_mut(),
+            next: std::ptr::null_mut(),
+        };
+        unsafe { estack_init() };
+        let index = unsafe {
+            estack_push(
+                crate::runtime_defs::EtypeT::Aucmd,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        unsafe {
+            EXESTACK.get_mut()[index].es_info =
+                crate::runtime_defs::EsInfo::Aucmd(
+                    std::ptr::from_mut(&mut autocmd),
+                );
+        }
+
+        assert_eq!(
+            unsafe {
+                estack_sfile(crate::runtime_defs::EstackArgT::Script)
+            },
+            None
         );
     }
 
