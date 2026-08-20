@@ -3674,8 +3674,9 @@ unsafe fn f_sha256(argvars: &[TypvalT], rettv: &mut TypvalT) {
 ///
 /// `*func` is real for builtins and already-resolved user functions,
 /// `##event` uses the translated autocmd event table, and single-`#`
-/// forms use [`crate::autocmd::au_exists`]. `*v:lua.*` still needs
-/// the Lua host and `:cmd` needs `cmd_exists`.
+/// forms use [`crate::autocmd::au_exists`]. `:cmd` uses
+/// [`crate::ex_docmd::cmd_exists`]. Only `*v:lua.*` still needs the
+/// Lua host.
 ///
 /// # Safety
 /// Forwards [`crate::eval::vars::var_exists`]'s own safety doc for the
@@ -3729,7 +3730,7 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
             }
         }
         Some(b':') => {
-            unimplemented!("exists(): ':cmd' branch needs cmd_exists, not yet translated");
+            unsafe { crate::ex_docmd::cmd_exists(&p[1..]) != 0 }
         }
         Some(b'#') => {
             if p.get(1) == Some(&b'#') {
@@ -12957,12 +12958,21 @@ mod tests {
     }
 
     #[test]
-    fn exists_command_branch_is_unimplemented() {
+    fn exists_command_branch_checks_builtin_commands() {
         let mut rettv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f_exists(&[string(b":Foo")], &mut rettv);
-        }));
-        assert!(result.is_err(), "expected a panic (cmd_exists not yet translated)");
+        unsafe { f_exists(&[string(b":write")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { f_exists(&[string(b":sil")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe {
+            f_exists(
+                &[string(b":NeroDefinitelyMissingCommand")],
+                &mut rettv,
+            )
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 
     struct AutocmdGroupGuard(Vec<u8>);
