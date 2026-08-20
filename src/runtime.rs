@@ -660,15 +660,53 @@ pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], ret
     // comment.
 }
 
+unsafe fn stacktrace_push_item(
+    list: *mut crate::eval::typval_defs::ListT,
+    function: Option<*mut crate::eval::typval_defs::UfuncT>,
+    event: Option<&[u8]>,
+    lnum: crate::pos_defs::LinenrT,
+    filepath: &[u8],
+) {
+    let dict = crate::eval::typval::tv_dict_alloc_lock(
+        crate::eval::typval_defs::VarLockStatus::Fixed,
+    );
+    let mut value = crate::eval::typval_defs::TypvalT {
+        v_lock: crate::eval::typval_defs::VarLockStatus::Locked,
+        value: crate::eval::typval_defs::TypvalValue::Dict(dict),
+    };
+    if let Some(function) = function {
+        unsafe {
+            crate::eval::typval::tv_dict_add_func(
+                &mut *dict,
+                b"funcref",
+                function,
+            )
+        };
+    }
+    if let Some(event) = event {
+        crate::eval::typval::tv_dict_add_str(
+            unsafe { &mut *dict },
+            b"event",
+            Some(event),
+        );
+    }
+    crate::eval::typval::tv_dict_add_nr(
+        unsafe { &mut *dict },
+        b"lnum",
+        i64::from(lnum),
+    );
+    crate::eval::typval::tv_dict_add_str(
+        unsafe { &mut *dict },
+        b"filepath",
+        Some(filepath),
+    );
+    unsafe { crate::eval::typval::tv_list_append_tv(list, &value) };
+    value.value = crate::eval::typval_defs::TypvalValue::Unknown;
+}
+
 /// Build the `List` `getstacktrace()` returns (`stacktrace_create`,
-/// `runtime.c`): one entry per `EXESTACK` frame, each built via
-/// `stacktrace_push_item` in the original. Since `EXESTACK` is always
-/// empty today (see its own doc comment), this loop is always
-/// zero-iteration, so `stacktrace_push_item` itself (which would need
-/// `ETYPE_UFUNC`'s `ufunc_T.uf_script_ctx`/`get_scriptname` and
-/// `ETYPE_AUCMD`'s `AutoCmd.script_ctx`, neither wired up for this
-/// purpose yet) never needs to exist here either. This is a real,
-/// always-taken early return, not a hardcoded shortcut.
+/// `runtime.c`): one fixed dictionary per script, function, or
+/// autocommand frame.
 ///
 /// # Safety
 /// `rettv` must be freshly default-initialized by the caller (no
@@ -676,22 +714,90 @@ pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], ret
 /// forwarded from [`crate::eval::typval::tv_list_alloc_ret`]'s own
 /// safety doc.
 pub unsafe fn stacktrace_create(rettv: &mut crate::eval::typval_defs::TypvalT) {
-    // SAFETY: forwarded from this function's own safety doc; the
-    // `&Vec` this briefly, implicitly creates (to call `.len()`) is
-    // used and discarded immediately, matching `eval/vars.rs`'s own
-    // `VIMVARS.as_ptr()` precedent for this exact idiom.
-    let exestack_len = unsafe { (*EXESTACK.as_ptr()).len() };
-    // SAFETY: forwarded from this function's own safety doc.
-    let _ = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, exestack_len as isize) };
-    // The per-frame loop is always zero-iteration - see this
-    // function's own doc comment.
+    let stack = unsafe { &*EXESTACK.as_ptr() };
+    let list = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(
+            rettv,
+            stack.len() as isize,
+        )
+    };
+    for entry in stack {
+        let mut lnum = entry.es_lnum;
+        match entry.es_type {
+            crate::runtime_defs::EtypeT::Script => {
+                let filepath =
+                    unsafe { estack_entry_name(entry) }.unwrap_or_default();
+                unsafe {
+                    stacktrace_push_item(
+                        list,
+                        None,
+                        None,
+                        lnum,
+                        &filepath,
+                    )
+                };
+            }
+            crate::runtime_defs::EtypeT::Ufunc => {
+                let crate::runtime_defs::EsInfo::Ufunc(function) =
+                    entry.es_info
+                else {
+                    continue;
+                };
+                if function.is_null() {
+                    continue;
+                }
+                let script_ctx = unsafe { (*function).uf_script_ctx };
+                let filepath = if script_ctx.sc_sid > 0 {
+                    unsafe { get_scriptname(script_ctx) }
+                } else {
+                    Vec::new()
+                };
+                lnum += script_ctx.sc_lnum;
+                unsafe {
+                    stacktrace_push_item(
+                        list,
+                        Some(function),
+                        None,
+                        lnum,
+                        &filepath,
+                    )
+                };
+            }
+            crate::runtime_defs::EtypeT::Aucmd => {
+                let crate::runtime_defs::EsInfo::Aucmd(autocmd) =
+                    entry.es_info
+                else {
+                    continue;
+                };
+                if autocmd.is_null() {
+                    continue;
+                }
+                let script_ctx = unsafe { (*autocmd).script_ctx };
+                let filepath = if script_ctx.sc_sid > 0 {
+                    unsafe { get_scriptname(script_ctx) }
+                } else {
+                    Vec::new()
+                };
+                let event =
+                    unsafe { estack_entry_name(entry) }.unwrap_or_default();
+                lnum += script_ctx.sc_lnum;
+                unsafe {
+                    stacktrace_push_item(
+                        list,
+                        None,
+                        Some(&event),
+                        lnum,
+                        &filepath,
+                    )
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `getstacktrace()` - the current call stack as a `List` of
 /// `{filename, lnum, funcname}` dicts (`f_getstacktrace`, `runtime.c`).
-/// Always an empty `List` today, since [`stacktrace_create`]'s own
-/// loop is always zero-iteration.
-///
 /// # Safety
 /// Forwarded from [`stacktrace_create`]'s own safety doc.
 pub unsafe fn f_getstacktrace(
@@ -1571,6 +1677,165 @@ mod tests {
         unsafe { crate::eval::typval::tv_list_unref(l) };
     }
 
+    unsafe fn stacktrace_dict(
+        list: *mut crate::eval::typval_defs::ListT,
+        index: i32,
+    ) -> *mut crate::eval::typval_defs::DictT {
+        let item = unsafe {
+            crate::eval::typval::tv_list_find(list, index)
+        };
+        assert!(!item.is_null());
+        let crate::eval::typval_defs::TypvalValue::Dict(dict) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            panic!("expected stacktrace Dict");
+        };
+        *dict
+    }
+
+    #[test]
+    fn stacktrace_create_builds_a_script_frame_dictionary() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+        let mut name = b"plugin/demo.vim\0".to_vec();
+        unsafe {
+            estack_push(
+                crate::runtime_defs::EtypeT::Script,
+                name.as_mut_ptr(),
+                7,
+            );
+        }
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        unsafe { stacktrace_create(&mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(list) =
+            rettv.value
+        else {
+            panic!("expected a List");
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 1);
+        let dict = unsafe { stacktrace_dict(list, 0) };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_string(
+                    dict.as_mut(),
+                    b"filepath",
+                )
+            },
+            Some(b"plugin/demo.vim".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    dict.as_mut(),
+                    b"lnum",
+                )
+            },
+            7
+        );
+        assert!(
+            crate::eval::typval::tv_dict_find(
+                unsafe { dict.as_mut() },
+                b"event",
+            )
+            .is_none()
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn stacktrace_create_builds_function_and_autocmd_frames() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+        let mut function = test_ufunc(b"Demo", None);
+        function.uf_script_ctx.sc_lnum = 10;
+        unsafe {
+            estack_push_ufunc(std::ptr::from_mut(&mut *function), 2);
+        }
+        let mut event = b"BufEnter\0".to_vec();
+        let mut autocmd = crate::autocmd_defs::AutoPatCmd {
+            lastpat: std::ptr::null_mut(),
+            auidx: 0,
+            ausize: 0,
+            afile_orig: None,
+            fname: None,
+            sfname: None,
+            tail: None,
+            group: 0,
+            event: crate::autocmd_defs::EventT::BufEnter,
+            script_ctx: crate::eval::typval_defs::SctxT {
+                sc_lnum: 20,
+                ..Default::default()
+            },
+            arg_bufnr: 0,
+            data: std::ptr::null_mut(),
+            next: std::ptr::null_mut(),
+        };
+        let index = unsafe {
+            estack_push(
+                crate::runtime_defs::EtypeT::Aucmd,
+                event.as_mut_ptr(),
+                3,
+            )
+        };
+        unsafe {
+            EXESTACK.get_mut()[index].es_info =
+                crate::runtime_defs::EsInfo::Aucmd(
+                    std::ptr::from_mut(&mut autocmd),
+                );
+        }
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        unsafe { stacktrace_create(&mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(list) =
+            rettv.value
+        else {
+            panic!("expected a List");
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 2);
+        let function_dict = unsafe { stacktrace_dict(list, 0) };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    function_dict.as_mut(),
+                    b"lnum",
+                )
+            },
+            12
+        );
+        assert!(
+            crate::eval::typval::tv_dict_find(
+                unsafe { function_dict.as_mut() },
+                b"funcref",
+            )
+            .is_some()
+        );
+        let autocmd_dict = unsafe { stacktrace_dict(list, 1) };
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_string(
+                    autocmd_dict.as_mut(),
+                    b"event",
+                )
+            },
+            Some(b"BufEnter".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    autocmd_dict.as_mut(),
+                    b"lnum",
+                )
+            },
+            23
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
     #[test]
     fn stacktrace_create_tracks_exestacks_own_length() {
         let _lock = global_state_test_lock();
@@ -1590,9 +1855,7 @@ mod tests {
         unsafe { stacktrace_create(&mut rettv) };
 
         let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
-        // The per-frame loop is still zero-iteration (nothing calls
-        // stacktrace_push_item), so the list is empty even though
-        // tv_list_alloc_ret was asked to pre-size for 2 entries.
+        // Top frames do not produce stacktrace dictionaries.
         assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
         // SAFETY: `l` is still exclusively owned; nothing else
         // references it.
