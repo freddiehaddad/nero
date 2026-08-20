@@ -13,16 +13,9 @@
 //! `BufT.update_channels`/`update_callbacks`, both already real
 //! `Vec` fields).
 //!
-//! `buf_free_callbacks` needs NO Rust equivalent at all: it just
-//! releases `update_channels`/`update_callbacks`' own backing storage
-//! (`kv_destroy`) plus, per callback, `buffer_update_callbacks_free`'s
-//! own Lua-ref-unreffing - but `BufUpdateCallbacks` is a plain `Copy`
-//! struct of `LuaRef` handles here (no Lua host exists to unref
-//! against), so Rust's own automatic `Vec`/struct drop already does
-//! everything this function's translated behavior would need, the
-//! same "Rust's ownership model already does the C free dance
-//! automatically" pattern already established elsewhere in this
-//! crate (e.g. `stl_clear_click_defs`).
+//! `buf_free_callbacks`/`buffer_update_callbacks_free` are translated:
+//! vector teardown is `Vec::clear`, while Lua unref is inert until a
+//! Lua host can create such references.
 //!
 //! Deferred: everything else in the file - `buf_updates_register`/
 //! `_send_end`/`_changedtick(_single)`/`_unload` all need the
@@ -33,6 +26,25 @@
 //! nothing can subscribe yet.
 
 use crate::buffer_defs::BufT;
+
+/// Release Lua references held by one callback record
+/// (`buffer_update_callbacks_free`).
+///
+/// No Lua host exists to create live references, so this is currently
+/// the original's real no-reference path.
+pub fn buffer_update_callbacks_free(
+    _callback: crate::buffer_defs::BufUpdateCallbacks,
+) {
+}
+
+/// Release every buffer-update channel and callback
+/// (`buf_free_callbacks`).
+pub fn buf_free_callbacks(buf: &mut BufT) {
+    buf.update_channels.clear();
+    for callback in buf.update_callbacks.drain(..) {
+        buffer_update_callbacks_free(callback);
+    }
+}
 
 /// Whether `buf` has any live update subscribers, either RPC channels
 /// or Lua callbacks (`buf_updates_active`).
@@ -258,5 +270,23 @@ mod tests {
         buf.update_channels.push(7);
         buf.update_callbacks.push(BufUpdateCallbacks::default());
         assert!(buf_updates_active(&buf));
+    }
+
+    #[test]
+    fn buf_free_callbacks_clears_channels_and_callbacks() {
+        let mut buf = BufT {
+            update_channels: vec![2, 7],
+            update_callbacks: vec![
+                BufUpdateCallbacks::default(),
+                BufUpdateCallbacks::default(),
+            ],
+            ..Default::default()
+        };
+
+        buf_free_callbacks(&mut buf);
+
+        assert!(buf.update_channels.is_empty());
+        assert!(buf.update_callbacks.is_empty());
+        assert!(!buf_updates_active(&buf));
     }
 }
