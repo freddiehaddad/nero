@@ -47,6 +47,7 @@ pub mod drawline;
 pub mod drawscreen;
 pub mod errors;
 pub mod eval;
+pub mod event;
 pub mod ex_cmds;
 pub mod ex_cmds2;
 pub mod ex_cmds_defs;
