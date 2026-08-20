@@ -1101,6 +1101,153 @@ pub fn modifier_len(cmd: &[u8]) -> usize {
     0
 }
 
+/// Whether an Ex command or command modifier exists (`cmd_exists`).
+///
+/// Returns `2` for an exact match, `1` for an abbreviation, `3` for
+/// an ambiguous user-command abbreviation, and `0` for no match.
+///
+/// # Safety
+/// User-command lookup reads the current window's buffer-local command
+/// registry when a current window exists.
+#[must_use]
+pub unsafe fn cmd_exists(name: &[u8]) -> i32 {
+    for modifier in CMDMODS {
+        if name.len() >= modifier.minlen
+            && modifier.name.starts_with(name)
+        {
+            return if name.len() == modifier.name.len() {
+                2
+            } else {
+                1
+            };
+        }
+    }
+
+    let (command, had_match_count) =
+        if matches!(name.first(), Some(b'2' | b'3')) {
+            (&name[1..], true)
+        } else {
+            (name, false)
+        };
+    let (consumed, builtin_index, full) =
+        if let Some(index) = one_letter_cmd(command) {
+            (1, Some(index as usize), true)
+        } else {
+            let mut consumed = command
+                .iter()
+                .take_while(|&&byte| {
+                    crate::macros_defs::ascii_isalpha(i32::from(byte))
+                })
+                .count();
+            if command.starts_with(b"py") {
+                consumed = command
+                    .iter()
+                    .take_while(|&&byte| {
+                        crate::macros_defs::ascii_isalnum(i32::from(byte))
+                    })
+                    .count();
+            }
+            if consumed == 0
+                && command
+                    .first()
+                    .is_some_and(|byte| b"@!=><&~#".contains(byte))
+            {
+                consumed = 1;
+            }
+            let mut lookup_len = consumed;
+            if command.first() == Some(&b'd')
+                && matches!(
+                    command.get(consumed.saturating_sub(1)),
+                    Some(b'l' | b'p')
+                )
+            {
+                let delete = b"delete";
+                let matched = command[..consumed]
+                    .iter()
+                    .zip(delete)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if matched + 1 == consumed {
+                    lookup_len -= 1;
+                }
+            }
+            let typed = &command[..lookup_len];
+            let found = if lookup_len == 0 || typed == b"def" {
+                None
+            } else {
+                crate::ex_cmds_defs::CMDNAMES
+                    .iter()
+                    .position(|candidate| candidate.starts_with(typed))
+            };
+            let full = found.is_some_and(|index| {
+                crate::ex_cmds_defs::CMDNAMES[index].len() == lookup_len
+            });
+            (consumed, found, full)
+        };
+
+    let rest = &command[consumed.min(command.len())..];
+    let rest = &rest[crate::charset::skipwhite(rest)..];
+    if !rest.is_empty() {
+        return 0;
+    }
+    if let Some(index) = builtin_index {
+        if had_match_count
+            && index != crate::ex_cmds_defs::CmdIdxT::r#match as usize
+        {
+            return 0;
+        }
+        if index == crate::ex_cmds_defs::CmdIdxT::horizontal as usize
+            && consumed == 2
+        {
+            return 0;
+        }
+        return if full { 2 } else { 1 };
+    }
+
+    if command
+        .first()
+        .is_none_or(|byte| !byte.is_ascii_uppercase())
+    {
+        return 0;
+    }
+    let typed_len = command
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric())
+        .count();
+    let typed = &command[..typed_len];
+    let mut partials = 0usize;
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    if !curwin.is_null() && !unsafe { (*curwin).w_buffer }.is_null() {
+        for user_command in unsafe { &*(*curwin).w_buffer }
+            .b_ucmds
+            .items
+            .iter()
+        {
+            let candidate = user_command.uc_name.as_deref().unwrap_or(&[]);
+            if candidate == typed {
+                return 2;
+            }
+            if candidate.starts_with(typed) {
+                partials += 1;
+            }
+        }
+    }
+    for user_command in unsafe { crate::usercmd::UCMDS.get_mut() }.items.iter() {
+        let candidate = user_command.uc_name.as_deref().unwrap_or(&[]);
+        if candidate == typed {
+            return 2;
+        }
+        if candidate.starts_with(typed) {
+            partials += 1;
+        }
+    }
+    match partials {
+        0 => 0,
+        1 => 1,
+        _ => 3,
+    }
+}
+
 /// Returns the window number of `win` within the current tab page, or
 /// the total number of windows if `win` is null (`current_win_nr`).
 ///
@@ -2871,6 +3018,76 @@ mod tests {
     fn modifier_len_two_word_modifier_names() {
         assert_eq!(modifier_len(b"belowright split"), 10);
         assert_eq!(modifier_len(b"rightbelow split"), 10);
+    }
+
+    #[test]
+    fn cmd_exists_matches_reference_modifier_and_builtin_results() {
+        let _lock = crate::globals::global_state_test_lock();
+        for (name, expected) in [
+            (&b"silent"[..], 2),
+            (&b"sil"[..], 1),
+            (&b"ho"[..], 0),
+            (&b"hor"[..], 1),
+            (&b"write"[..], 2),
+            (&b"w"[..], 1),
+            (&b"def"[..], 0),
+            (&b"2match"[..], 2),
+            (&b"2write"[..], 0),
+            (&b"k"[..], 2),
+            (&b"sc"[..], 0),
+            (&b"sre"[..], 1),
+            (&b"s"[..], 1),
+            (&b"d"[..], 1),
+            (&b"dl"[..], 1),
+            (&b"dp"[..], 1),
+            (&b"py3"[..], 2),
+            (&b"Next"[..], 2),
+            (&b"N"[..], 1),
+            (&b"@"[..], 2),
+            (&b""[..], 0),
+        ] {
+            assert_eq!(unsafe { cmd_exists(name) }, expected, "{name:?}");
+        }
+    }
+
+    struct UserCommandsGuard(
+        Option<crate::garray_defs::TypedGarrayT<crate::usercmd::UcmdT>>,
+    );
+
+    impl UserCommandsGuard {
+        fn empty() -> Self {
+            Self(Some(std::mem::take(
+                unsafe { crate::usercmd::UCMDS.get_mut() },
+            )))
+        }
+    }
+
+    impl Drop for UserCommandsGuard {
+        fn drop(&mut self) {
+            *unsafe { crate::usercmd::UCMDS.get_mut() } =
+                self.0.take().expect("saved user commands");
+        }
+    }
+
+    #[test]
+    fn cmd_exists_reports_exact_partial_and_ambiguous_user_commands() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _commands = UserCommandsGuard::empty();
+        unsafe { crate::usercmd::UCMDS.get_mut() }.items.extend([
+            crate::usercmd::UcmdT {
+                uc_name: Some(b"NeroFirst".to_vec()),
+                ..Default::default()
+            },
+            crate::usercmd::UcmdT {
+                uc_name: Some(b"NeroSecond".to_vec()),
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(unsafe { cmd_exists(b"NeroFirst") }, 2);
+        assert_eq!(unsafe { cmd_exists(b"NeroF") }, 1);
+        assert_eq!(unsafe { cmd_exists(b"Nero") }, 3);
+        assert_eq!(unsafe { cmd_exists(b"NeroMissing") }, 0);
     }
 
     // --- current_win_nr / current_tab_nr ---
