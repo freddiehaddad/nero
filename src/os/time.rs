@@ -17,7 +17,6 @@
 //!   contract is "the loop's cached time", not a fresh OS query).
 //! - `os_delay`: needs `LOOP_PROCESS_EVENTS_UNTIL` (the event loop,
 //!   phase 11) and `os_input_ready` (`os/input.c`).
-//! - `os_ctime_r`/`os_ctime`: need localized `strftime` formatting.
 //! - `os_strptime`: needs POSIX `strptime` (unavailable on Windows in
 //!   the original too - `HAVE_STRPTIME`-gated) or an equivalent parser;
 //!   same "needs a real dependency decision" blocker as the above.
@@ -144,6 +143,82 @@ pub fn os_localtime() -> Option<libc::tm> {
     os_localtime_r(os_time() as i64)
 }
 
+fn invalid_time_string(result_len: usize) -> Vec<u8> {
+    let max = result_len.saturating_sub(2);
+    b"(Invalid)"[..b"(Invalid)".len().min(max)].to_vec()
+}
+
+#[cfg(unix)]
+unsafe fn system_strftime(
+    buffer: *mut libc::c_char,
+    size: usize,
+    format: *const libc::c_char,
+    time: *const libc::tm,
+) -> usize {
+    unsafe { libc::strftime(buffer, size, format, time) }
+}
+
+#[cfg(windows)]
+unsafe fn system_strftime(
+    buffer: *mut libc::c_char,
+    size: usize,
+    format: *const libc::c_char,
+    time: *const libc::tm,
+) -> usize {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn strftime(
+            buffer: *mut libc::c_char,
+            size: usize,
+            format: *const libc::c_char,
+            time: *const libc::tm,
+        ) -> usize;
+    }
+    unsafe { strftime(buffer, size, format, time) }
+}
+
+/// Format `clock` in local time (`os_ctime_r`).
+#[must_use]
+pub fn os_ctime_r(
+    clock: i64,
+    result_len: usize,
+    add_newline: bool,
+) -> Vec<u8> {
+    if result_len < 2 {
+        return Vec::new();
+    }
+    let mut output = if let Some(local) = os_localtime_r(clock) {
+        let mut buffer = vec![0u8; result_len];
+        let format = b"%a %b %d %H:%M:%S %Y\0";
+        let len = unsafe {
+            system_strftime(
+                buffer.as_mut_ptr().cast(),
+                result_len - 1,
+                format.as_ptr().cast(),
+                &local,
+            )
+        };
+        if len == 0 {
+            invalid_time_string(result_len)
+        } else {
+            buffer.truncate(len);
+            buffer
+        }
+    } else {
+        invalid_time_string(result_len)
+    };
+    if add_newline && output.len() + 1 < result_len {
+        output.push(b'\n');
+    }
+    output
+}
+
+/// Format the current local time (`os_ctime`).
+#[must_use]
+pub fn os_ctime(result_len: usize, add_newline: bool) -> Vec<u8> {
+    os_ctime_r(os_time() as i64, result_len, add_newline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +272,24 @@ mod tests {
     fn os_localtime_r_converts_the_unix_epoch() {
         let local = os_localtime_r(0).expect("epoch converts");
         assert!(matches!(local.tm_year, 69 | 70));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime/strftime FFI")]
+    fn os_ctime_formats_current_time_and_optional_newline() {
+        let without = os_ctime(128, false);
+        assert!(!without.is_empty());
+        assert!(!without.ends_with(b"\n"));
+
+        let with = os_ctime(128, true);
+        assert!(with.ends_with(b"\n"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime/strftime FFI")]
+    fn os_ctime_r_honors_small_buffer_bounds() {
+        let formatted = os_ctime_r(0, 8, true);
+        assert!(formatted.len() < 8);
+        assert!(formatted == b"(Inval" || formatted == b"(Inval\n");
     }
 }
