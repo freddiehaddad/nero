@@ -118,6 +118,29 @@ pub fn buf_updates_unload(buf: &mut BufT, can_reload: bool) {
     buf.update_callbacks = retained;
 }
 
+/// Notify subscribers that only `b:changedtick` changed
+/// (`buf_updates_changedtick`).
+///
+/// Empty/default callback traversal is complete. Live channel and Lua
+/// callback dispatch remains gated on their respective runtimes.
+pub fn buf_updates_changedtick(buf: &mut BufT) {
+    if !buf.update_channels.is_empty() {
+        unimplemented!(
+            "buf_updates_changedtick: channel events need rpc_send_event"
+        );
+    }
+    let mut retained = Vec::with_capacity(buf.update_callbacks.len());
+    for callback in buf.update_callbacks.drain(..) {
+        if callback.on_changedtick != -1 {
+            unimplemented!(
+                "buf_updates_changedtick: Lua callbacks need nlua_call_ref"
+            );
+        }
+        retained.push(callback);
+    }
+    buf.update_callbacks = retained;
+}
+
 /// Whether `buf` has any live update subscribers, either RPC channels
 /// or Lua callbacks (`buf_updates_active`).
 #[must_use]
@@ -430,6 +453,26 @@ mod tests {
     fn buf_updates_unload_is_a_noop_without_subscribers() {
         let mut buf = BufT::default();
         buf_updates_unload(&mut buf, false);
+        assert!(!buf_updates_active(&buf));
+    }
+
+    #[test]
+    fn buf_updates_changedtick_keeps_callbacks_without_handlers() {
+        let mut buf = BufT {
+            update_callbacks: vec![BufUpdateCallbacks::default()],
+            ..Default::default()
+        };
+
+        buf_updates_changedtick(&mut buf);
+
+        assert_eq!(buf.update_callbacks.len(), 1);
+        assert!(buf_updates_active(&buf));
+    }
+
+    #[test]
+    fn buf_updates_changedtick_is_a_noop_without_subscribers() {
+        let mut buf = BufT::default();
+        buf_updates_changedtick(&mut buf);
         assert!(!buf_updates_active(&buf));
     }
 }
