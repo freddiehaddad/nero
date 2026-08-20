@@ -513,6 +513,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"test_write_list_log"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_test_write_list_log });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
+        m.insert(&b"fullcommand"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fullcommand });
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
         m.insert(&b"getwinposx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getwinposx });
         m.insert(&b"getwinposy"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getwinposy });
@@ -3745,6 +3746,18 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
     };
     rettv.value = TypvalValue::Number(i64::from(n));
+}
+
+/// `fullcommand({name})` - expand an abbreviated Ex command name
+/// (`f_fullcommand`, `ex_docmd.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::ex_docmd::fullcommand_name`].
+unsafe fn f_fullcommand(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    rettv.value = TypvalValue::String(unsafe {
+        crate::ex_docmd::fullcommand_name(&name)
+    });
 }
 
 /// `getwinpos([{timeout}])` - the `[x, y]` screen position of the
@@ -9358,6 +9371,7 @@ mod tests {
             "isnan",
             "sha256",
             "exists",
+            "fullcommand",
             "getwinpos",
             "getwinposx",
             "getwinposy",
@@ -13017,6 +13031,30 @@ mod tests {
             )
         };
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn fullcommand_expands_builtins_and_ranges() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_fullcommand(&[string(b"w")], &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"write".to_vec()))
+        );
+
+        unsafe { f_fullcommand(&[string(b":3,5sc")], &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"substitute".to_vec()))
+        );
+
+        unsafe {
+            f_fullcommand(
+                &[string(b"NeroDefinitelyMissingCommand")],
+                &mut rettv,
+            )
+        };
+        assert_eq!(rettv.value, TypvalValue::String(None));
     }
 
     // --- f_getwinpos / f_getwinposx / f_getwinposy ---
