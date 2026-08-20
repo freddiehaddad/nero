@@ -294,6 +294,25 @@ pub fn do_termresponse_autocmd(sequence: &[u8], channel_id: u64) {
     unsafe { *TERMRESPONSE_CHAN_ID.get_mut() = channel_id };
 }
 
+/// Replace deferred termresponse state for cross-module tests.
+///
+/// # Safety
+/// The caller must hold `global_state_test_lock()`.
+#[cfg(test)]
+pub(crate) unsafe fn replace_termresponse_state_for_test(
+    changed: bool,
+    channel_id: u64,
+) -> (bool, u64) {
+    let previous = unsafe {
+        (*TERMRESPONSE_CHANGED.get_mut(), *TERMRESPONSE_CHAN_ID.get_mut())
+    };
+    unsafe {
+        *TERMRESPONSE_CHANGED.get_mut() = changed;
+        *TERMRESPONSE_CHAN_ID.get_mut() = channel_id;
+    }
+    previous
+}
+
 /// Undo the effect of [`block_autocmds`] (`unblock_autocmds`).
 ///
 /// The original's "trigger the deferred termresponse autocmd now"

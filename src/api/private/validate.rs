@@ -9,7 +9,9 @@ fn set_validation_error(err: &mut Error, message: String) {
     err.msg = Some(message);
 }
 
-fn api_typename(object_type: ObjectType) -> &'static str {
+/// The public API name for an object type (`api_typename`).
+#[must_use]
+pub fn api_typename(object_type: ObjectType) -> &'static str {
     match object_type {
         ObjectType::Nil => "nil",
         ObjectType::Boolean => "Boolean",

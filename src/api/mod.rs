@@ -4,6 +4,7 @@
 pub mod autocmd;
 pub mod buffer;
 pub mod deprecated;
+pub mod events;
 pub mod extmark;
 pub mod options;
 pub mod private;
