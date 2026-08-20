@@ -4,6 +4,7 @@
 //! exactly the `os/*.h` it needs).
 
 pub mod env;
+pub mod fileio;
 pub mod fs;
 pub mod fs_defs;
 pub mod input;
