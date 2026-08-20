@@ -3672,14 +3672,10 @@ unsafe fn f_sha256(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// deliberately over panicking, since `exists()` is overwhelmingly
 /// used defensively in real scripts specifically to AVOID errors.
 ///
-/// `*func` (needs `function_exists`/`nlua_func_exists`), `:cmd`
-/// (needs `cmd_exists`), and `#autocmd`/`##event` (needs `au_exists`/
-/// `autocmd_supported`) each need a substantial not-yet-translated
-/// subsystem and panic via `unimplemented!()` if actually reached -
-/// matching this crate's established "translate the common path,
-/// panic loudly on a genuinely untranslated-but-reached path"
-/// convention (unlike `$env` above, none of these have an existing,
-/// already-tractable fast path to fall back on).
+/// `*func` is real for builtins and already-resolved user functions;
+/// `*v:lua.*` still needs the Lua host. `:cmd` needs `cmd_exists`, and
+/// `#autocmd` needs `au_exists`; those remaining branches still panic
+/// when reached.
 ///
 /// # Safety
 /// Forwards [`crate::eval::vars::var_exists`]'s own safety doc for the
@@ -3697,7 +3693,40 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
             status == crate::vim_defs::OK && rest[ws..].is_empty()
         }
         Some(b'*') => {
-            unimplemented!("exists(): '*func' branch needs function_exists/nlua_func_exists, not yet translated");
+            let mut name = &p[1..];
+            if name.starts_with(b"v:lua.") {
+                unimplemented!(
+                    "exists(): '*v:lua.' needs nlua_func_exists"
+                );
+            }
+            let end = name
+                .iter()
+                .position(|&byte| {
+                    crate::ascii_defs::ascii_iswhite(i32::from(byte))
+                        || byte == b'('
+                })
+                .unwrap_or(name.len());
+            let tail = &name[end..];
+            let tail = &tail[crate::charset::skipwhite(tail)..];
+            if !tail.is_empty() && tail.first() != Some(&b'(') {
+                false
+            } else {
+                name = &name[..end];
+                let resolved = if let Some(global) = name.strip_prefix(b"g:") {
+                    Some(global.to_vec())
+                } else if name.starts_with(b"s:")
+                    || name.starts_with(b"<SID>")
+                {
+                    crate::eval::userfunc::fname_trans_sid(name).ok()
+                } else {
+                    Some(name.to_vec())
+                };
+                resolved.is_some_and(|name| {
+                    crate::eval::userfunc::translated_function_exists(
+                        &name,
+                    )
+                })
+            }
         }
         Some(b':') => {
             unimplemented!("exists(): ':cmd' branch needs cmd_exists, not yet translated");
@@ -12903,12 +12932,24 @@ mod tests {
     }
 
     #[test]
-    fn exists_function_branch_is_unimplemented() {
+    fn exists_function_branch_checks_builtins_and_unknown_names() {
         let mut rettv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f_exists(&[string(b"*Foo")], &mut rettv);
-        }));
-        assert!(result.is_err(), "expected a panic (function_exists not yet translated)");
+        unsafe { f_exists(&[string(b"*len")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe {
+            f_exists(
+                &[string(b"*NeroDefinitelyMissingFunction")],
+                &mut rettv,
+            )
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { f_exists(&[string(b"*len garbage")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { f_exists(&[string(b"*len(")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
     }
 
     #[test]
