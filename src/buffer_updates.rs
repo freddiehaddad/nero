@@ -199,11 +199,8 @@ pub fn buf_updates_unregister(buf: &mut BufT, channelid: u64) {
 /// and is translated as such: the deleted-byte counters are reset on
 /// every call regardless of whether anything is listening.
 ///
-/// The notification itself is `unimplemented!()`. Its guard,
-/// [`buf_updates_active`], is genuinely always `false` today because
-/// nothing translated can register an RPC channel or Lua callback
-/// yet, which is the same real, always-taken early return
-/// [`buf_updates_send_splice`] relies on.
+/// The notification itself remains gated on channel/Lua dispatch when
+/// subscribers are active.
 pub fn buf_updates_send_changes(
     buf: &mut BufT,
     firstline: crate::pos_defs::LinenrT,
@@ -227,42 +224,40 @@ pub fn buf_updates_send_changes(
 /// Notify live update subscribers of a byte-level splice
 /// (`buf_updates_send_splice`).
 ///
-/// Always returns without notifying anything in this crate today.
-/// That is the original's own first, real check
-/// (`if (!buf_updates_active(buf) || (old_byte == 0 && new_byte == 0))
-/// return;`), not a shortcut: nothing translated can register an RPC
-/// channel or Lua callback yet, so [`buf_updates_active`] is
-/// genuinely always `false` and the notification loop is unreachable.
-/// This matches this crate's established "translate the real,
-/// always-taken early-return path" precedent (`quickfix.rs`'s
-/// `qf_mark_adjust`, `fold.rs`'s `checkupdate`).
-///
-/// The second half of that condition IS reachable and is translated
-/// too: a splice that moves no bytes at all notifies nobody even with
-/// subscribers attached.
+/// The inactive/zero-byte guards and callback preview filtering/
+/// retention are complete. Invoking a live `on_bytes` Lua callback
+/// remains gated on `nlua_call_ref`.
 #[allow(clippy::too_many_arguments)]
 pub fn buf_updates_send_splice(
-    buf: &BufT,
-    _start_row: i32,
-    _start_col: crate::pos_defs::ColnrT,
-    _start_byte: crate::extmark_defs::BcountT,
-    _old_row: i32,
-    _old_col: crate::pos_defs::ColnrT,
+    buf: &mut BufT,
+    start_row: i32,
+    start_col: crate::pos_defs::ColnrT,
+    start_byte: crate::extmark_defs::BcountT,
+    old_row: i32,
+    old_col: crate::pos_defs::ColnrT,
     old_byte: crate::extmark_defs::BcountT,
-    _new_row: i32,
-    _new_col: crate::pos_defs::ColnrT,
+    new_row: i32,
+    new_col: crate::pos_defs::ColnrT,
     new_byte: crate::extmark_defs::BcountT,
 ) {
     if !buf_updates_active(buf) || (old_byte == 0 && new_byte == 0) {
         return;
     }
-    // The real per-callback dispatch loop needs `nlua_call_ref`/
-    // `rpc_send_event`, neither translated - see this module's own doc
-    // comment. Unreachable today for the reason given above.
-    unimplemented!(
-        "buf_updates_send_splice: the notification dispatch needs the Lua/RPC callback layer, \
-         not yet translated - unreachable today since buf_updates_active() is always false"
-    );
+    let cmdpreview = unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview;
+    let mut retained = Vec::with_capacity(buf.update_callbacks.len());
+    for callback in buf.update_callbacks.drain(..) {
+        if callback.on_bytes != -1 && (callback.preview || !cmdpreview) {
+            let _args = (
+                start_row, start_col, start_byte, old_row, old_col,
+                old_byte, new_row, new_col, new_byte,
+            );
+            unimplemented!(
+                "buf_updates_send_splice: Lua byte callbacks need nlua_call_ref"
+            );
+        }
+        retained.push(callback);
+    }
+    buf.update_callbacks = retained;
 }
 
 #[cfg(test)]
@@ -274,8 +269,8 @@ mod tests {
     fn send_splice_returns_quietly_without_subscribers() {
         // Nothing translated can register a channel or callback yet, so
         // this is the always-taken path.
-        let buf = BufT::default();
-        buf_updates_send_splice(&buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+        let mut buf = BufT::default();
+        buf_updates_send_splice(&mut buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
     }
 
     #[test]
@@ -285,17 +280,54 @@ mod tests {
         let mut buf = BufT::default();
         buf.update_callbacks.push(BufUpdateCallbacks::default());
         assert!(buf_updates_active(&buf));
-        buf_updates_send_splice(&buf, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        buf_updates_send_splice(&mut buf, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     #[test]
-    #[should_panic(expected = "not yet translated")]
-    fn send_splice_with_subscribers_and_real_bytes_is_unimplemented() {
-        // Documents the boundary: this is only reachable once buffer
-        // updates can actually be registered.
+    fn send_splice_keeps_callbacks_without_byte_handlers() {
         let mut buf = BufT::default();
         buf.update_callbacks.push(BufUpdateCallbacks::default());
-        buf_updates_send_splice(&buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+        buf_updates_send_splice(&mut buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+        assert_eq!(buf.update_callbacks.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "nlua_call_ref")]
+    fn send_splice_live_byte_handler_reaches_lua_boundary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _preview = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmdpreview,
+                false,
+            )
+        };
+        let mut buf = BufT::default();
+        buf.update_callbacks.push(BufUpdateCallbacks {
+            on_bytes: 42,
+            ..Default::default()
+        });
+        buf_updates_send_splice(&mut buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+    }
+
+    #[test]
+    fn send_splice_suppresses_nonpreview_callbacks_during_preview() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _preview = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmdpreview,
+                true,
+            )
+        };
+        let mut buf = BufT::default();
+        buf.update_callbacks.push(BufUpdateCallbacks {
+            on_bytes: 42,
+            preview: false,
+            ..Default::default()
+        });
+
+        buf_updates_send_splice(&mut buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+
+        assert_eq!(buf.update_callbacks.len(), 1);
     }
 
     #[test]
