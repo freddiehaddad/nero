@@ -1248,6 +1248,134 @@ pub unsafe fn cmd_exists(name: &[u8]) -> i32 {
     }
 }
 
+/// Resolve an abbreviated Ex command to its full name
+/// (`f_fullcommand`'s command lookup).
+///
+/// # Safety
+/// User-command lookup reads the current window's buffer-local command
+/// registry when a current window exists.
+#[must_use]
+pub unsafe fn fullcommand_name(command_line: &[u8]) -> Option<Vec<u8>> {
+    let mut start = 0usize;
+    while command_line.get(start) == Some(&b':') {
+        start += 1;
+    }
+    let (range, _) = skip_range(&command_line[start..]);
+    start += range;
+    let command = &command_line[start.min(command_line.len())..];
+    let command =
+        if matches!(command.first(), Some(b'2' | b'3')) {
+            &command[1..]
+        } else {
+            command
+        };
+
+    if let Some(index) = one_letter_cmd(command) {
+        return crate::ex_cmds_defs::cmdname(index).map(<[u8]>::to_vec);
+    }
+
+    let mut consumed = command
+        .iter()
+        .take_while(|&&byte| {
+            crate::macros_defs::ascii_isalpha(i32::from(byte))
+        })
+        .count();
+    if command.starts_with(b"py") {
+        consumed = command
+            .iter()
+            .take_while(|&&byte| {
+                crate::macros_defs::ascii_isalnum(i32::from(byte))
+            })
+            .count();
+    }
+    if consumed == 0
+        && command
+            .first()
+            .is_some_and(|byte| b"@!=><&~#".contains(byte))
+    {
+        consumed = 1;
+    }
+    let mut lookup_len = consumed;
+    if command.first() == Some(&b'd')
+        && matches!(
+            command.get(consumed.saturating_sub(1)),
+            Some(b'l' | b'p')
+        )
+    {
+        let matched = command[..consumed]
+            .iter()
+            .zip(b"delete")
+            .take_while(|(left, right)| left == right)
+            .count();
+        if matched + 1 == consumed {
+            lookup_len -= 1;
+        }
+    }
+    if lookup_len == 0 || &command[..lookup_len] == b"def" {
+        return None;
+    }
+    let typed = &command[..lookup_len];
+    if let Some(index) = crate::ex_cmds_defs::CMDNAMES
+        .iter()
+        .position(|candidate| candidate.starts_with(typed))
+    {
+        if index == crate::ex_cmds_defs::CmdIdxT::horizontal as usize
+            && consumed == 2
+        {
+            return None;
+        }
+        return Some(crate::ex_cmds_defs::CMDNAMES[index].to_vec());
+    }
+
+    if command
+        .first()
+        .is_none_or(|byte| !byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let typed_len = command
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric())
+        .count();
+    let typed = &command[..typed_len];
+    let mut partial: Option<Vec<u8>> = None;
+    let mut ambiguous = false;
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    if !curwin.is_null() && !unsafe { (*curwin).w_buffer }.is_null() {
+        for user_command in unsafe { &*(*curwin).w_buffer }
+            .b_ucmds
+            .items
+            .iter()
+        {
+            let candidate = user_command.uc_name.as_deref().unwrap_or(&[]);
+            if candidate == typed {
+                return Some(candidate.to_vec());
+            }
+            if candidate.starts_with(typed) {
+                if partial.is_some() {
+                    ambiguous = true;
+                } else {
+                    partial = Some(candidate.to_vec());
+                }
+            }
+        }
+    }
+    for user_command in unsafe { crate::usercmd::UCMDS.get_mut() }.items.iter() {
+        let candidate = user_command.uc_name.as_deref().unwrap_or(&[]);
+        if candidate == typed {
+            return Some(candidate.to_vec());
+        }
+        if candidate.starts_with(typed) {
+            if partial.is_some() {
+                ambiguous = true;
+            } else {
+                partial = Some(candidate.to_vec());
+            }
+        }
+    }
+    (!ambiguous).then_some(partial).flatten()
+}
+
 /// Returns the window number of `win` within the current tab page, or
 /// the total number of windows if `win` is null (`current_win_nr`).
 ///
@@ -3088,6 +3216,55 @@ mod tests {
         assert_eq!(unsafe { cmd_exists(b"NeroF") }, 1);
         assert_eq!(unsafe { cmd_exists(b"Nero") }, 3);
         assert_eq!(unsafe { cmd_exists(b"NeroMissing") }, 0);
+    }
+
+    #[test]
+    fn fullcommand_name_matches_reference_builtin_resolution() {
+        let _lock = crate::globals::global_state_test_lock();
+        for (name, expected) in [
+            (&b"sil"[..], Some(&b"silent"[..])),
+            (&b"hor"[..], Some(&b"horizontal"[..])),
+            (&b"ho"[..], None),
+            (&b"w"[..], Some(&b"write"[..])),
+            (&b"s"[..], Some(&b"substitute"[..])),
+            (&b"sc"[..], Some(&b"substitute"[..])),
+            (&b"2match"[..], Some(&b"match"[..])),
+            (&b"N"[..], Some(&b"Next"[..])),
+            (&b"NeroMissing"[..], None),
+            (&b":3,5w"[..], Some(&b"write"[..])),
+        ] {
+            assert_eq!(
+                unsafe { fullcommand_name(name) }.as_deref(),
+                expected,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fullcommand_name_resolves_unique_user_command_abbreviations() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _commands = UserCommandsGuard::empty();
+        unsafe { crate::usercmd::UCMDS.get_mut() }.items.extend([
+            crate::usercmd::UcmdT {
+                uc_name: Some(b"NeroFirst".to_vec()),
+                ..Default::default()
+            },
+            crate::usercmd::UcmdT {
+                uc_name: Some(b"NeroSecond".to_vec()),
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(
+            unsafe { fullcommand_name(b"NeroF") },
+            Some(b"NeroFirst".to_vec())
+        );
+        assert_eq!(unsafe { fullcommand_name(b"Nero") }, None);
+        assert_eq!(
+            unsafe { fullcommand_name(b"NeroSecond") },
+            Some(b"NeroSecond".to_vec())
+        );
     }
 
     // --- current_win_nr / current_tab_nr ---
