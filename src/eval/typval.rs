@@ -209,6 +209,7 @@ use crate::eval::typval_defs::{
     dict_item_flags, Callback, DictT, DictitemT, ListLenSpecials, PartialT, ScopeType, TypvalT, TypvalValue,
     VarLockStatus, VarType, VarnumberT,
 };
+use crate::eval::gc::{GC_FIRST_DICT, GC_FIRST_LIST};
 use crate::globals::GlobalCell;
 use crate::vim_defs::{FAIL, OK};
 
@@ -216,12 +217,6 @@ use crate::vim_defs::{FAIL, OK};
 /// `lua_table_ref` is always this value until the Lua host (phase 13)
 /// exists.
 const LUA_NOREF: crate::types_defs::LuaRef = -1;
-
-/// `gc_first_dict`: head of the linked list of all live dictionaries
-/// (via `dv_used_next`/`dv_used_prev`), maintained for a future
-/// `:garbagecollect` implementation - see this module's own doc
-/// comment.
-static GC_FIRST_DICT: GlobalCell<*mut DictT> = GlobalCell::new(std::ptr::null_mut());
 
 /// Test-only accessor: `true` if no `Dict` is currently linked into
 /// the shared `GC_FIRST_DICT` registry - lets tests in OTHER modules
@@ -2750,13 +2745,6 @@ pub unsafe fn tv_blob_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
         (*b).bv_ga.ga_len -= cnt as i32;
     }
 }
-
-/// `gc_first_list`: head of the linked list of all live lists (via
-/// `lv_used_next`/`lv_used_prev`), maintained for a future
-/// `:garbagecollect` implementation - same reasoning as
-/// [`GC_FIRST_DICT`].
-static GC_FIRST_LIST: GlobalCell<*mut crate::eval::typval_defs::ListT> =
-    GlobalCell::new(std::ptr::null_mut());
 
 /// Test-only accessor: `true` if no `List` is currently linked into
 /// the shared `GC_FIRST_LIST` registry - see

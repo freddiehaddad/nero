@@ -16,6 +16,7 @@ pub mod deprecated;
 pub mod encode;
 pub mod fs;
 pub mod funcs;
+pub mod gc;
 pub mod typval;
 pub mod typval_defs;
 pub mod userfunc;
