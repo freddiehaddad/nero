@@ -17,12 +17,7 @@
 //!   contract is "the loop's cached time", not a fresh OS query).
 //! - `os_delay`: needs `LOOP_PROCESS_EVENTS_UNTIL` (the event loop,
 //!   phase 11) and `os_input_ready` (`os/input.c`).
-//! - `os_localtime_r`/`os_localtime`/`os_ctime_r`/`os_ctime`: need a
-//!   portable local-timezone conversion. Rust's std has no built-in
-//!   equivalent to POSIX `localtime_r`/Windows `localtime` (unlike the
-//!   four functions above, this genuinely needs either raw libc/Win32
-//!   FFI or a new crate dependency like `time`/`chrono` - a real,
-//!   undecided scope question, not a trivial std-library swap).
+//! - `os_ctime_r`/`os_ctime`: need localized `strftime` formatting.
 //! - `os_strptime`: needs POSIX `strptime` (unavailable on Windows in
 //!   the original too - `HAVE_STRPTIME`-gated) or an equivalent parser;
 //!   same "needs a real dependency decision" blocker as the above.
@@ -36,6 +31,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// `os_hrtime`'s epoch is arbitrary and only differences between calls
 /// are meaningful.
 static HRTIME_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static LOCALTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+static TZ_CACHE: std::sync::Mutex<Option<std::ffi::OsString>> =
+    std::sync::Mutex::new(None);
 
 /// Obtains the current Unix timestamp (`os_time`).
 ///
@@ -87,6 +87,63 @@ pub fn os_sleep(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
+/// Portable local-time conversion (`os_localtime_r`).
+#[must_use]
+pub fn os_localtime_r(clock: i64) -> Option<libc::tm> {
+    let _lock = LOCALTIME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    #[cfg(unix)]
+    {
+        let timezone = std::env::var_os("TZ");
+        let mut cache = TZ_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cache != timezone {
+            unsafe extern "C" {
+                fn tzset();
+            }
+            unsafe { tzset() };
+            *cache = timezone;
+        }
+
+        let raw = clock as libc::time_t;
+        let mut result = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let converted =
+            unsafe { libc::localtime_r(&raw, result.as_mut_ptr()) };
+        if converted.is_null() {
+            None
+        } else {
+            Some(unsafe { result.assume_init() })
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        #[link(name = "ucrt")]
+        unsafe extern "C" {
+            fn _localtime64_s(
+                result: *mut libc::tm,
+                clock: *const i64,
+            ) -> i32;
+        }
+        let raw = clock;
+        let mut result = std::mem::MaybeUninit::<libc::tm>::uninit();
+        if unsafe { _localtime64_s(result.as_mut_ptr(), &raw) } != 0 {
+            None
+        } else {
+            Some(unsafe { result.assume_init() })
+        }
+    }
+}
+
+/// Convert the current Unix timestamp to local time (`os_localtime`).
+#[must_use]
+pub fn os_localtime() -> Option<libc::tm> {
+    os_localtime_r(os_time() as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +179,23 @@ mod tests {
         let start = Instant::now();
         os_sleep(10);
         assert!(start.elapsed() >= std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime_r/localtime")]
+    fn os_localtime_returns_valid_calendar_fields() {
+        let local = os_localtime().expect("current time converts");
+        assert!((0..=11).contains(&local.tm_mon));
+        assert!((1..=31).contains(&local.tm_mday));
+        assert!((0..=23).contains(&local.tm_hour));
+        assert!((0..=59).contains(&local.tm_min));
+        assert!((0..=60).contains(&local.tm_sec));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime_r/localtime")]
+    fn os_localtime_r_converts_the_unix_epoch() {
+        let local = os_localtime_r(0).expect("epoch converts");
+        assert!(matches!(local.tm_year, 69 | 70));
     }
 }
