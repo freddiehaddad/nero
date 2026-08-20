@@ -3672,10 +3672,10 @@ unsafe fn f_sha256(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// deliberately over panicking, since `exists()` is overwhelmingly
 /// used defensively in real scripts specifically to AVOID errors.
 ///
-/// `*func` is real for builtins and already-resolved user functions;
-/// `*v:lua.*` still needs the Lua host. `:cmd` needs `cmd_exists`, and
-/// `#autocmd` needs `au_exists`; those remaining branches still panic
-/// when reached.
+/// `*func` is real for builtins and already-resolved user functions,
+/// and `##event` uses the translated autocmd event table.
+/// `*v:lua.*` still needs the Lua host, `:cmd` needs `cmd_exists`, and
+/// single-`#` autocmd lookup needs `au_exists`.
 ///
 /// # Safety
 /// Forwards [`crate::eval::vars::var_exists`]'s own safety doc for the
@@ -3732,7 +3732,13 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
             unimplemented!("exists(): ':cmd' branch needs cmd_exists, not yet translated");
         }
         Some(b'#') => {
-            unimplemented!("exists(): '#autocmd'/'##event' branch needs au_exists/autocmd_supported, not yet translated");
+            if p.get(1) == Some(&b'#') {
+                crate::autocmd::autocmd_supported(&p[2..])
+            } else {
+                unimplemented!(
+                    "exists(): '#autocmd' branch needs au_exists"
+                );
+            }
         }
         _ => {
             // SAFETY: forwarded from this function's own safety doc.
@@ -12968,6 +12974,21 @@ mod tests {
             f_exists(&[string(b"#BufEnter")], &mut rettv);
         }));
         assert!(result.is_err(), "expected a panic (au_exists not yet translated)");
+    }
+
+    #[test]
+    fn exists_double_hash_checks_supported_autocmd_events() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"##BufEnter")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe {
+            f_exists(
+                &[string(b"##NeroDefinitelyMissingEvent")],
+                &mut rettv,
+            )
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 
     // --- f_getwinpos / f_getwinposx / f_getwinposy ---
