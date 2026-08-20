@@ -208,17 +208,34 @@ pub fn buf_updates_send_changes(
     num_removed: i64,
 ) {
     // Unconditional in the original, ahead of the subscriber check.
-    let _deleted = crate::memline::ml_flush_deleted_bytes(buf);
+    let deleted = crate::memline::ml_flush_deleted_bytes(buf);
 
     if !buf_updates_active(buf) {
         return;
     }
-
-    let _ = (firstline, num_added, num_removed);
-    unimplemented!(
-        "buffer-update dispatch needs the channel/Lua callback machinery, not yet \
-         translated; unreachable while nothing can subscribe"
-    );
+    if !buf.update_channels.is_empty() {
+        unimplemented!(
+            "buf_updates_send_changes: line events need rpc_send_event"
+        );
+    }
+    let cmdpreview = unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview;
+    let mut retained = Vec::with_capacity(buf.update_callbacks.len());
+    for callback in buf.update_callbacks.drain(..) {
+        if callback.on_lines != -1 && (callback.preview || !cmdpreview) {
+            let _args = (
+                firstline,
+                num_added,
+                num_removed,
+                deleted.0,
+                callback.utf_sizes.then_some((deleted.1, deleted.2)),
+            );
+            unimplemented!(
+                "buf_updates_send_changes: Lua line callbacks need nlua_call_ref"
+            );
+        }
+        retained.push(callback);
+    }
+    buf.update_callbacks = retained;
 }
 
 /// Notify live update subscribers of a byte-level splice
@@ -328,6 +345,75 @@ mod tests {
         buf_updates_send_splice(&mut buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
 
         assert_eq!(buf.update_callbacks.len(), 1);
+    }
+
+    #[test]
+    fn send_changes_flushes_deleted_counts_without_subscribers() {
+        let mut buf = BufT {
+            deleted_bytes: 7,
+            deleted_codepoints: 5,
+            deleted_codeunits: 6,
+            ..Default::default()
+        };
+
+        buf_updates_send_changes(&mut buf, 1, 0, 1);
+
+        assert_eq!(buf.deleted_bytes, 0);
+        assert_eq!(buf.deleted_codepoints, 0);
+        assert_eq!(buf.deleted_codeunits, 0);
+    }
+
+    #[test]
+    fn send_changes_keeps_callbacks_without_line_handlers() {
+        let mut buf = BufT {
+            update_callbacks: vec![BufUpdateCallbacks::default()],
+            ..Default::default()
+        };
+        buf_updates_send_changes(&mut buf, 1, 1, 0);
+        assert_eq!(buf.update_callbacks.len(), 1);
+    }
+
+    #[test]
+    fn send_changes_suppresses_nonpreview_callbacks_during_preview() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _preview = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmdpreview,
+                true,
+            )
+        };
+        let mut buf = BufT {
+            update_callbacks: vec![BufUpdateCallbacks {
+                on_lines: 42,
+                preview: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        buf_updates_send_changes(&mut buf, 1, 1, 0);
+
+        assert_eq!(buf.update_callbacks.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "nlua_call_ref")]
+    fn send_changes_live_line_handler_reaches_lua_boundary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _preview = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.cmdpreview,
+                false,
+            )
+        };
+        let mut buf = BufT {
+            update_callbacks: vec![BufUpdateCallbacks {
+                on_lines: 42,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        buf_updates_send_changes(&mut buf, 1, 1, 0);
     }
 
     #[test]
