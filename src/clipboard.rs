@@ -128,6 +128,51 @@ pub unsafe fn adjust_clipboard_name(
     None
 }
 
+/// Read a clipboard register through the configured provider
+/// (`get_clipboard`).
+///
+/// Without a Lua clipboard provider, [`adjust_clipboard_name`] returns
+/// no target and this faithfully reports `false`.
+///
+/// # Safety
+/// Forwards [`adjust_clipboard_name`]'s shared option-state access.
+pub unsafe fn get_clipboard(
+    name: i32,
+    _target: Option<&mut *mut crate::register_defs::YankregT>,
+    quiet: bool,
+) -> bool {
+    let mut adjusted = name;
+    let Some(_register) =
+        (unsafe { adjust_clipboard_name(&mut adjusted, quiet, false) })
+    else {
+        return false;
+    };
+    unimplemented!(
+        "get_clipboard: provider results need eval_call_provider"
+    );
+}
+
+/// Publish a register through the configured clipboard provider
+/// (`set_clipboard`).
+///
+/// Without a Lua clipboard provider, this is the original's no-op
+/// path.
+///
+/// # Safety
+/// Forwards [`adjust_clipboard_name`]'s shared option-state access.
+pub unsafe fn set_clipboard(
+    name: i32,
+    _register: &crate::register_defs::YankregT,
+) {
+    let mut adjusted = name;
+    let Some(_target) =
+        (unsafe { adjust_clipboard_name(&mut adjusted, false, true) })
+    else {
+        return;
+    };
+    unimplemented!("set_clipboard: provider calls need eval_call_provider");
+}
+
 /// Whether the default register (used for an unnamed paste) should be
 /// a clipboard register (`get_default_register_name`). Always `0`
 /// (`NUL`) today - see [`adjust_clipboard_name`]'s own doc comment.
@@ -337,6 +382,27 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = 0;
 
         assert_eq!(unsafe { get_default_register_name() }, 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
+    }
+
+    #[test]
+    fn get_and_set_clipboard_take_no_provider_fallbacks() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags =
+            crate::option_vars::opt_cb_flag::UNNAMED;
+        let register = crate::register_defs::YankregT {
+            y_array: Some(vec![b"value".to_vec()]),
+            ..Default::default()
+        };
+
+        assert!(!unsafe { get_clipboard(0, None, true) });
+        unsafe { set_clipboard(0, &register) };
+        assert_eq!(
+            register.y_array.as_deref(),
+            Some([b"value".to_vec()].as_slice())
+        );
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
     }

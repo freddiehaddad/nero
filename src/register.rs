@@ -1109,8 +1109,8 @@ pub fn valid_yank_reg(regname: i32, writing: bool) -> bool {
 /// does for "no provider available", so this is a faithful, not a
 /// merely convenient, default for today's reality.
 #[must_use]
-fn get_clipboard(_regname: i32) -> bool {
-    false
+fn get_clipboard(regname: i32) -> bool {
+    unsafe { crate::clipboard::get_clipboard(regname, None, true) }
 }
 
 /// Clipboard-backed default register, or NUL when no provider is
