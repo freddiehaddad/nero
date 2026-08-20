@@ -3673,9 +3673,9 @@ unsafe fn f_sha256(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// used defensively in real scripts specifically to AVOID errors.
 ///
 /// `*func` is real for builtins and already-resolved user functions,
-/// and `##event` uses the translated autocmd event table.
-/// `*v:lua.*` still needs the Lua host, `:cmd` needs `cmd_exists`, and
-/// single-`#` autocmd lookup needs `au_exists`.
+/// `##event` uses the translated autocmd event table, and single-`#`
+/// forms use [`crate::autocmd::au_exists`]. `*v:lua.*` still needs
+/// the Lua host and `:cmd` needs `cmd_exists`.
 ///
 /// # Safety
 /// Forwards [`crate::eval::vars::var_exists`]'s own safety doc for the
@@ -3735,9 +3735,7 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
             if p.get(1) == Some(&b'#') {
                 crate::autocmd::autocmd_supported(&p[2..])
             } else {
-                unimplemented!(
-                    "exists(): '#autocmd' branch needs au_exists"
-                );
+                unsafe { crate::autocmd::au_exists(&p[1..]) }
             }
         }
         _ => {
@@ -12967,13 +12965,33 @@ mod tests {
         assert!(result.is_err(), "expected a panic (cmd_exists not yet translated)");
     }
 
+    struct AutocmdGroupGuard(Vec<u8>);
+
+    impl AutocmdGroupGuard {
+        fn add(name: &[u8]) -> Self {
+            unsafe { crate::autocmd::augroup_add(name) };
+            Self(name.to_vec())
+        }
+    }
+
+    impl Drop for AutocmdGroupGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { crate::autocmd::augroup_del(&self.0) };
+        }
+    }
+
     #[test]
-    fn exists_autocmd_branch_is_unimplemented() {
+    fn exists_autocmd_branch_checks_groups_and_missing_events() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut rettv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f_exists(&[string(b"#BufEnter")], &mut rettv);
-        }));
-        assert!(result.is_err(), "expected a panic (au_exists not yet translated)");
+        unsafe { f_exists(&[string(b"#BufEnter")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let _group = AutocmdGroupGuard::add(b"NeroExistsGroup");
+        unsafe {
+            f_exists(&[string(b"#NeroExistsGroup")], &mut rettv)
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
     }
 
     #[test]
