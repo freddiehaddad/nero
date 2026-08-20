@@ -156,6 +156,7 @@ pub mod terminal;
 pub mod testing;
 pub mod textformat;
 pub mod textobject;
+pub mod tui;
 pub mod types_defs;
 pub mod ui;
 pub mod ui_client;
