@@ -17,9 +17,6 @@
 //!   contract is "the loop's cached time", not a fresh OS query).
 //! - `os_delay`: needs `LOOP_PROCESS_EVENTS_UNTIL` (the event loop,
 //!   phase 11) and `os_input_ready` (`os/input.c`).
-//! - `os_strptime`: needs POSIX `strptime` (unavailable on Windows in
-//!   the original too - `HAVE_STRPTIME`-gated) or an equivalent parser;
-//!   same "needs a real dependency decision" blocker as the above.
 
 use super::time_defs::Timestamp;
 use std::sync::LazyLock;
@@ -249,6 +246,72 @@ pub fn os_strftime(format: &[u8], clock: i64) -> Option<Vec<u8>> {
     }
 }
 
+/// Parse local broken-down time using POSIX `strptime`
+/// (`os_strptime`).
+///
+/// Returns `None` on Windows, matching the original's
+/// `HAVE_STRPTIME`-gated fallback.
+#[must_use]
+pub fn os_strptime(input: &[u8], format: &[u8]) -> Option<libc::tm> {
+    #[cfg(windows)]
+    {
+        let _ = (input, format);
+        None
+    }
+    #[cfg(unix)]
+    {
+        let _lock = LOCALTIME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let input_end =
+            input.iter().position(|&byte| byte == 0).unwrap_or(input.len());
+        let format_end = format
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(format.len());
+        let input = std::ffi::CString::new(&input[..input_end]).ok()?;
+        let format = std::ffi::CString::new(&format[..format_end]).ok()?;
+        let mut parsed = std::mem::MaybeUninit::<libc::tm>::zeroed();
+        unsafe { (*parsed.as_mut_ptr()).tm_isdst = -1 };
+        let remainder = unsafe {
+            libc::strptime(
+                input.as_ptr(),
+                format.as_ptr(),
+                parsed.as_mut_ptr(),
+            )
+        };
+        if remainder.is_null() {
+            None
+        } else {
+            Some(unsafe { parsed.assume_init() })
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe fn system_mktime(time: *mut libc::tm) -> i64 {
+    unsafe { libc::mktime(time) as i64 }
+}
+
+#[cfg(windows)]
+unsafe fn system_mktime(time: *mut libc::tm) -> i64 {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _mktime64(time: *mut libc::tm) -> i64;
+    }
+    unsafe { _mktime64(time) }
+}
+
+/// Convert local broken-down time to a Unix timestamp (`mktime`).
+#[must_use]
+pub fn os_mktime(time: &mut libc::tm) -> Option<i64> {
+    let _lock = LOCALTIME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let timestamp = unsafe { system_mktime(time) };
+    (timestamp != -1).then_some(timestamp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +399,26 @@ mod tests {
     fn os_strftime_returns_empty_when_output_exceeds_fixed_buffer() {
         let format = vec![b'x'; 300];
         assert_eq!(os_strftime(&format, 0), Some(Vec::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call strptime/mktime FFI")]
+    fn os_strptime_and_mktime_parse_local_calendar_time() {
+        let mut parsed = os_strptime(
+            b"1970-01-02 03:04:05 trailing",
+            b"%Y-%m-%d %H:%M:%S",
+        )
+        .expect("valid local time parses");
+        assert_eq!(parsed.tm_year, 70);
+        assert_eq!(parsed.tm_mon, 0);
+        assert_eq!(parsed.tm_mday, 2);
+        assert!(os_mktime(&mut parsed).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_strptime_is_unavailable_on_windows() {
+        assert!(os_strptime(b"1970", b"%Y").is_none());
     }
 }
