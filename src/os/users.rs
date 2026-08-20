@@ -1,17 +1,20 @@
-//! Translated from `src/nvim/os/users.c` (tractable core only).
+//! Translated from `src/nvim/os/users.c` in full, except the original's
+//! `EXITFREE`-only cache teardown (Rust's process-lifetime `LazyLock`
+//! owns the cache).
 //!
-//! Translated: `os_get_username`, `os_get_uname`, `os_get_userdir`.
-//!
-//! Deferred:
-//! - `os_get_usernames`: enumerates ALL system user names for `~user`
-//!   shell-style completion - needs `setpwent()`/`getpwent()`/
-//!   `endpwent()` (Unix) or `NetUserEnum` FFI (Windows), a
-//!   significantly bigger surface than the single-user lookup this
-//!   pass covers, plus the still-deferred `GarrayT`-backed
-//!   `expand_T`/`ExpandGeneric` completion machinery that would
-//!   actually consume it.
-//! - `add_user`/`init_users`/`get_users`/`match_user`/`free_users`:
-//!   all build on the deferred `os_get_usernames`'s cached `garray_T`.
+//! Translated: `os_get_username`, `os_get_uname`, `os_get_userdir`,
+//! `os_get_usernames`, `init_users`/`get_users`, and `match_user`.
+
+#[cfg(unix)]
+static USER_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+fn user_db_lock() -> std::sync::MutexGuard<'static, ()> {
+    USER_DB_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+static USERS: std::sync::LazyLock<Vec<Vec<u8>>> =
+    std::sync::LazyLock::new(os_get_usernames);
 
 /// Gets the username associated with `uid` (`os_get_uname`).
 ///
@@ -24,6 +27,7 @@
 pub fn os_get_uname(uid: u32) -> Result<Vec<u8>, Vec<u8>> {
     #[cfg(unix)]
     {
+        let _lock = user_db_lock();
         // SAFETY: getpwuid is documented to return either a valid
         // pointer to a (non-reentrant, statically-owned) passwd
         // struct or NULL; the returned pointer, if non-null, is only
@@ -78,6 +82,145 @@ pub fn os_get_username() -> Result<Vec<u8>, Vec<u8>> {
     }
 }
 
+/// Enumerate all system usernames (`os_get_usernames`).
+#[must_use]
+pub fn os_get_usernames() -> Vec<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        let _lock = user_db_lock();
+        let mut users = Vec::new();
+        unsafe { libc::setpwent() };
+        loop {
+            let passwd = unsafe { libc::getpwent() };
+            if passwd.is_null() {
+                break;
+            }
+            let name = unsafe { (*passwd).pw_name };
+            if name.is_null() {
+                continue;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+            if !name.is_empty() {
+                users.push(name.to_vec());
+            }
+        }
+        unsafe { libc::endpwent() };
+
+        if let Some(user) = crate::os::env::os_getenv(b"USER")
+            && !user.is_empty()
+            && !users.iter().any(|name| name == &user)
+            && let Ok(cuser) = std::ffi::CString::new(user.as_slice())
+        {
+            let passwd = unsafe { libc::getpwnam(cuser.as_ptr()) };
+            if !passwd.is_null() {
+                let name = unsafe { (*passwd).pw_name };
+                if !name.is_null() {
+                    let name =
+                        unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+                    if !name.is_empty() {
+                        users.push(name.to_vec());
+                    }
+                }
+            }
+        }
+        users
+    }
+
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct UserInfo0 {
+            name: *mut u16,
+        }
+
+        #[link(name = "netapi32")]
+        unsafe extern "system" {
+            fn NetUserEnum(
+                server_name: *const u16,
+                level: u32,
+                filter: u32,
+                buffer: *mut *mut u8,
+                preferred_max_len: u32,
+                entries_read: *mut u32,
+                total_entries: *mut u32,
+                resume_handle: *mut u32,
+            ) -> u32;
+            fn NetApiBufferFree(buffer: *mut std::ffi::c_void) -> u32;
+        }
+
+        let mut buffer = std::ptr::null_mut();
+        let mut entries_read = 0u32;
+        let mut total_entries = 0u32;
+        let status = unsafe {
+            NetUserEnum(
+                std::ptr::null(),
+                0,
+                0,
+                &mut buffer,
+                u32::MAX,
+                &mut entries_read,
+                &mut total_entries,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut users = Vec::new();
+        if status == 0 && !buffer.is_null() {
+            let entries = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.cast::<UserInfo0>(),
+                    entries_read as usize,
+                )
+            };
+            for entry in entries {
+                if entry.name.is_null() {
+                    continue;
+                }
+                let mut len = 0usize;
+                while unsafe { *entry.name.add(len) } != 0 {
+                    len += 1;
+                }
+                let name =
+                    unsafe { std::slice::from_raw_parts(entry.name, len) };
+                if !name.is_empty() {
+                    users.push(
+                        String::from_utf16_lossy(name).into_bytes(),
+                    );
+                }
+            }
+            unsafe { NetApiBufferFree(buffer.cast()) };
+        }
+        users
+    }
+}
+
+/// Return cached username `idx` for shell completion (`get_users`).
+#[must_use]
+pub fn get_users(idx: i32) -> Option<&'static [u8]> {
+    usize::try_from(idx)
+        .ok()
+        .and_then(|idx| USERS.get(idx))
+        .map(Vec::as_slice)
+}
+
+fn match_user_in(users: &[Vec<u8>], name: &[u8]) -> i32 {
+    let mut result = 0;
+    for user in users {
+        if user == name {
+            return 2;
+        }
+        if user.starts_with(name) {
+            result = 1;
+        }
+    }
+    result
+}
+
+/// Match `name` against cached system usernames (`match_user`).
+#[must_use]
+pub fn match_user(name: &[u8]) -> i32 {
+    match_user_in(&USERS, name)
+}
+
 /// Gets the home directory of the user named `name`, or `None`
 /// (`os_get_userdir`).
 ///
@@ -94,6 +237,7 @@ pub fn os_get_userdir(name: &[u8]) -> Option<Vec<u8>> {
     }
     #[cfg(unix)]
     {
+        let _lock = user_db_lock();
         // getpwnam takes a NUL-terminated C string; an interior NUL
         // would silently truncate the lookup, so reject it outright
         // rather than looking up a different user than asked for.
@@ -204,5 +348,24 @@ mod tests {
         };
         assert!(!dir.is_empty());
         assert_eq!(dir[0], b'/');
+    }
+
+    #[test]
+    fn match_user_distinguishes_none_partial_and_full_matches() {
+        let users = vec![b"alice".to_vec(), b"bob".to_vec()];
+        assert_eq!(match_user_in(&users, b"carol"), 0);
+        assert_eq!(match_user_in(&users, b"ali"), 1);
+        assert_eq!(match_user_in(&users, b"alice"), 2);
+        assert_eq!(match_user_in(&users, b""), 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call passwd/NetUserEnum FFI")]
+    fn username_cache_and_index_accessor_agree() {
+        for (index, expected) in USERS.iter().enumerate() {
+            assert_eq!(get_users(index as i32), Some(expected.as_slice()));
+        }
+        assert_eq!(get_users(-1), None);
+        assert_eq!(get_users(i32::MAX), None);
     }
 }
