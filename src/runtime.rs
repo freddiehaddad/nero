@@ -215,6 +215,130 @@ pub unsafe fn estack_pop() {
     }
 }
 
+unsafe fn estack_entry_name(
+    entry: &crate::runtime_defs::EstackT,
+) -> Option<Vec<u8>> {
+    if entry.es_name.is_null() {
+        return None;
+    }
+    if let crate::runtime_defs::EsInfo::Ufunc(function) = entry.es_info
+        && !function.is_null()
+    {
+        let function = unsafe { &*function };
+        if let Some(expanded) = function.uf_name_exp.as_ref()
+            && expanded.as_ptr() == entry.es_name
+        {
+            return Some(expanded.clone());
+        }
+        if function.uf_name.as_ptr() == entry.es_name {
+            return Some(function.uf_name.clone());
+        }
+    }
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(entry.es_name.cast()) }
+            .to_bytes()
+            .to_vec(),
+    )
+}
+
+/// Current execution-stack source name (`SOURCING_NAME`).
+///
+/// # Safety
+/// Any non-null frame name must remain valid according to
+/// [`estack_push`]'s contract.
+#[must_use]
+pub unsafe fn sourcing_name() -> Option<Vec<u8>> {
+    let entry = unsafe { (*EXESTACK.as_ptr()).last() }?;
+    unsafe { estack_entry_name(entry) }
+}
+
+/// Build the current `<sfile>`, `<stack>`, or `<script>` value
+/// (`estack_sfile`).
+///
+/// # Safety
+/// All frame name and payload pointers must remain valid.
+#[must_use]
+pub unsafe fn estack_sfile(
+    which: crate::runtime_defs::EstackArgT,
+) -> Option<Vec<u8>> {
+    let stack = unsafe { &*EXESTACK.as_ptr() };
+    let top = stack.last()?;
+    if which == crate::runtime_defs::EstackArgT::Sfile
+        && top.es_type != crate::runtime_defs::EtypeT::Ufunc
+    {
+        return unsafe { estack_entry_name(top) };
+    }
+
+    if which == crate::runtime_defs::EstackArgT::Script {
+        for entry in stack.iter().rev() {
+            match entry.es_type {
+                crate::runtime_defs::EtypeT::Ufunc => {
+                    let crate::runtime_defs::EsInfo::Ufunc(function) =
+                        entry.es_info
+                    else {
+                        continue;
+                    };
+                    if function.is_null() {
+                        continue;
+                    }
+                    let sid = unsafe { (*function).uf_script_ctx.sc_sid };
+                    if sid > 0 {
+                        let script = script_item(sid);
+                        return unsafe { &*script }.sn_name.clone();
+                    }
+                }
+                crate::runtime_defs::EtypeT::Aucmd => {
+                    unimplemented!(
+                        "estack_sfile(ESTACK_SCRIPT) needs AutoPatCmd script_ctx"
+                    );
+                }
+                crate::runtime_defs::EtypeT::Script => {
+                    return unsafe { estack_entry_name(entry) };
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+
+    let mut output = Vec::new();
+    let mut last_type = crate::runtime_defs::EtypeT::Script;
+    for (index, entry) in stack.iter().enumerate() {
+        let Some(name) = (unsafe { estack_entry_name(entry) }) else {
+            continue;
+        };
+        if entry.es_type != last_type {
+            match entry.es_type {
+                crate::runtime_defs::EtypeT::Script => {
+                    output.extend_from_slice(b"script ");
+                }
+                crate::runtime_defs::EtypeT::Ufunc => {
+                    output.extend_from_slice(b"function ");
+                }
+                _ => {}
+            }
+            last_type = entry.es_type;
+        }
+        output.extend_from_slice(&name);
+        let lnum = if index + 1 == stack.len() {
+            if which == crate::runtime_defs::EstackArgT::Stack {
+                sourcing_lnum()
+            } else {
+                0
+            }
+        } else {
+            entry.es_lnum
+        };
+        if lnum != 0 {
+            output.extend_from_slice(format!("[{lnum}]").as_bytes());
+        }
+        if index + 1 != stack.len() {
+            output.extend_from_slice(b"..");
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
 /// Look up the script item for script ID `id` (`SCRIPT_ITEM(id)`).
 ///
 /// # Panics
@@ -791,6 +915,84 @@ mod tests {
 
         unsafe { estack_pop() };
         assert!(unsafe { EXESTACK.get_mut() }.is_empty());
+    }
+
+    #[test]
+    fn sourcing_name_and_sfile_read_the_top_script_frame() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+        let mut name = b"plugin/demo.vim\0".to_vec();
+        unsafe {
+            estack_push(
+                crate::runtime_defs::EtypeT::Script,
+                name.as_mut_ptr(),
+                7,
+            );
+        }
+
+        assert_eq!(
+            unsafe { sourcing_name() },
+            Some(b"plugin/demo.vim".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                estack_sfile(crate::runtime_defs::EstackArgT::None)
+            },
+            Some(b"plugin/demo.vim".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                estack_sfile(crate::runtime_defs::EstackArgT::Stack)
+            },
+            Some(b"plugin/demo.vim[7]".to_vec())
+        );
+        assert_eq!(
+            unsafe {
+                estack_sfile(crate::runtime_defs::EstackArgT::Sfile)
+            },
+            Some(b"plugin/demo.vim".to_vec())
+        );
+    }
+
+    #[test]
+    fn estack_sfile_composes_script_and_function_frames() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+        let mut script = b"autoload/demo.vim\0".to_vec();
+        unsafe {
+            estack_push(
+                crate::runtime_defs::EtypeT::Script,
+                script.as_mut_ptr(),
+                3,
+            );
+        }
+        let mut function = test_ufunc(b"demo#Run", None);
+        unsafe {
+            estack_push_ufunc(std::ptr::from_mut(&mut *function), 9);
+        }
+
+        assert_eq!(
+            unsafe {
+                estack_sfile(crate::runtime_defs::EstackArgT::None)
+            },
+            Some(
+                b"autoload/demo.vim[3]..function demo#Run".to_vec()
+            )
+        );
+        assert_eq!(
+            unsafe {
+                estack_sfile(crate::runtime_defs::EstackArgT::Stack)
+            },
+            Some(
+                b"autoload/demo.vim[3]..function demo#Run[9]".to_vec()
+            )
+        );
+        assert_eq!(
+            unsafe { sourcing_name() },
+            Some(b"demo#Run".to_vec())
+        );
     }
 
     #[test]
