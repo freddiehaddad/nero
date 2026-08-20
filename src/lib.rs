@@ -165,6 +165,7 @@ pub mod undo_defs;
 pub mod usercmd;
 pub mod version;
 pub mod vim_defs;
+pub mod viml;
 pub mod vterm;
 pub mod vterm_defs;
 pub mod window;
