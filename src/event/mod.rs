@@ -2,3 +2,4 @@
 
 pub mod defs;
 pub mod multiqueue;
+pub mod wstream;

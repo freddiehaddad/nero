@@ -48,6 +48,22 @@ pub type PutCallback = unsafe fn(
     data: *mut std::ffi::c_void,
 );
 
+/// Write-buffer data finalizer (`wbuffer_data_finalizer`).
+pub type WbufferDataFinalizer =
+    unsafe fn(data: *mut std::ffi::c_void);
+
+/// Reference-counted write buffer (`WBuffer`).
+pub struct WBuffer {
+    /// Data byte count.
+    pub size: usize,
+    /// Number of outstanding stream references.
+    pub refcount: usize,
+    /// Caller-owned data.
+    pub data: *mut u8,
+    /// Optional data finalizer.
+    pub callback: Option<WbufferDataFinalizer>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
