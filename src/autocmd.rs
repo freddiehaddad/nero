@@ -891,6 +891,82 @@ pub fn autocmd_supported(event: &[u8]) -> bool {
     event_name2nr(event).0.is_some()
 }
 
+/// Whether an autocommand exists for an optional group, event, and
+/// pattern (`au_exists`).
+///
+/// Accepted forms are `Group`, `Group#Event`,
+/// `Group#Event#pattern`, `Event`, and `Event#pattern`.
+///
+/// # Safety
+/// A `<buffer>` pattern reads the current buffer pointer; ordinary
+/// pattern comparison forwards [`crate::path::path_fnamecmp`]'s
+/// global option-state requirements.
+#[must_use]
+pub unsafe fn au_exists(argument: &[u8]) -> bool {
+    let first_hash = argument.iter().position(|&byte| byte == b'#');
+    let first = &argument[..first_hash.unwrap_or(argument.len())];
+    let mut remainder =
+        first_hash.map(|index| &argument[index + 1..]);
+    let mut group = augroup_find(first);
+    let event_name;
+
+    if group == augroup::ERROR {
+        group = augroup::ALL;
+        event_name = first;
+    } else {
+        let Some(group_remainder) = remainder else {
+            return true;
+        };
+        if let Some(hash) =
+            group_remainder.iter().position(|&byte| byte == b'#')
+        {
+            event_name = &group_remainder[..hash];
+            remainder = Some(&group_remainder[hash + 1..]);
+        } else {
+            event_name = group_remainder;
+            remainder = None;
+        }
+    }
+
+    let Some(event) = event_name2nr_str(event_name) else {
+        return false;
+    };
+    let commands = &unsafe { AUTOCMDS.get_mut() }[event as usize];
+    if commands.is_empty() {
+        return false;
+    }
+
+    let current_buffer = if remainder
+        .is_some_and(|pattern| pattern.eq_ignore_ascii_case(b"<buffer>"))
+    {
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf
+    } else {
+        std::ptr::null_mut()
+    };
+
+    commands.iter().any(|command| {
+        if command.pat.is_null() {
+            return false;
+        }
+        let pattern = unsafe { &*command.pat };
+        if group != augroup::ALL && pattern.group != group {
+            return false;
+        }
+        let Some(requested) = remainder else {
+            return true;
+        };
+        if !current_buffer.is_null() {
+            return pattern.buflocal_nr
+                == unsafe { (*current_buffer).handle };
+        }
+        pattern.pat.as_deref().is_some_and(|registered| {
+            (unsafe {
+                crate::path::path_fnamecmp(registered, requested)
+            }) == 0
+        })
+    })
+}
+
 /// Whether an event is included in `'eventignore'` or
 /// `'eventignorewin'` (`event_ignored`).
 #[must_use]
@@ -2063,6 +2139,145 @@ mod tests {
         assert!(autocmd_supported(b"BufEnter"));
         assert!(autocmd_supported(b"BufCreate"));
         assert!(!autocmd_supported(b"NeroMissingEvent"));
+    }
+
+    struct AuExistsGuard {
+        event: EventT,
+        previous: Option<AutoCmdVec>,
+        pattern: *mut crate::autocmd_defs::AutoPat,
+    }
+
+    impl AuExistsGuard {
+        fn set(
+            event: EventT,
+            pattern: &[u8],
+            group: i32,
+            buflocal_nr: i32,
+        ) -> Self {
+            let commands =
+                &mut unsafe { AUTOCMDS.get_mut() }[event as usize];
+            let previous = Some(std::mem::take(commands));
+            let pattern_ptr =
+                Box::into_raw(Box::new(crate::autocmd_defs::AutoPat {
+                    refcount: 1,
+                    pat: Some(pattern.to_vec()),
+                    reg_prog: std::ptr::null_mut(),
+                    group,
+                    patlen: pattern.len() as i32,
+                    buflocal_nr,
+                    allow_dirs: false,
+                }));
+            commands.push(crate::autocmd_defs::AutoCmd {
+                pat: pattern_ptr,
+                id: 1,
+                desc: None,
+                handler_cmd: None,
+                handler_fn:
+                    crate::eval::typval_defs::Callback::default(),
+                script_ctx:
+                    crate::eval::typval_defs::SctxT::default(),
+                once: false,
+                nested: false,
+            });
+            Self {
+                event,
+                previous,
+                pattern: pattern_ptr,
+            }
+        }
+    }
+
+    impl Drop for AuExistsGuard {
+        fn drop(&mut self) {
+            let commands =
+                &mut unsafe { AUTOCMDS.get_mut() }[self.event as usize];
+            commands.clear();
+            *commands = self.previous.take().expect("saved autocmds");
+            unsafe { drop(Box::from_raw(self.pattern)) };
+        }
+    }
+
+    struct GroupMappingGuard {
+        name: Vec<u8>,
+        previous: Option<i32>,
+    }
+
+    impl GroupMappingGuard {
+        fn set(name: &[u8], id: i32) -> Self {
+            let previous = unsafe {
+                MAP_AUGROUP_NAME_TO_ID
+                    .get_mut()
+                    .insert(name.to_vec(), id)
+            };
+            Self {
+                name: name.to_vec(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for GroupMappingGuard {
+        fn drop(&mut self) {
+            let groups = unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() };
+            if let Some(previous) = self.previous {
+                groups.insert(self.name.clone(), previous);
+            } else {
+                groups.remove(&self.name);
+            }
+        }
+    }
+
+    #[test]
+    fn au_exists_matches_event_and_optional_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _autocmd =
+            AuExistsGuard::set(EventT::BufEnter, b"*.rs", 0, 0);
+
+        assert!(unsafe { au_exists(b"BufEnter") });
+        assert!(unsafe { au_exists(b"BufEnter#*.rs") });
+        assert!(!unsafe { au_exists(b"BufEnter#*.c") });
+        assert!(!unsafe { au_exists(b"NeroMissingEvent") });
+    }
+
+    #[test]
+    fn au_exists_resolves_the_current_buffer_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _autocmd = AuExistsGuard::set(
+            EventT::BufEnter,
+            b"<buffer=42>",
+            0,
+            42,
+        );
+        let mut buffer = BufT {
+            handle: 42,
+            ..Default::default()
+        };
+        let buffer_ptr = std::ptr::addr_of_mut!(buffer);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buffer_ptr,
+            )
+        };
+
+        assert!(unsafe { au_exists(b"BufEnter#<buffer>") });
+    }
+
+    #[test]
+    fn au_exists_filters_by_optional_group_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _group = GroupMappingGuard::set(b"NeroTestGroup", 7);
+        let _autocmd =
+            AuExistsGuard::set(EventT::BufEnter, b"*.rs", 7, 0);
+
+        assert!(unsafe { au_exists(b"NeroTestGroup") });
+        assert!(unsafe { au_exists(b"NeroTestGroup#BufEnter") });
+        assert!(unsafe {
+            au_exists(b"NeroTestGroup#BufEnter#*.rs")
+        });
+        assert!(!unsafe {
+            au_exists(b"NeroTestGroup#BufEnter#*.c")
+        });
     }
 
     #[test]
