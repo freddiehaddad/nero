@@ -58,15 +58,6 @@ pub fn start_batch_changes() {
 }
 
 /// Counterpart to [`start_batch_changes`] (`end_batch_changes`).
-///
-/// # Panics
-/// If ending the outermost batch reveals a deferred clipboard update
-/// is pending (`clipboard_needs_update` was set `true`) - this would
-/// need the real yank-register + Lua-provider clipboard machinery
-/// (`set_clipboard`/`get_y_previous`), neither translated. This is
-/// unreachable today: nothing currently translated can ever set
-/// `clipboard_needs_update` to `true` (see this module's own doc
-/// comment).
 pub fn end_batch_changes() {
     // SAFETY: forwarded from this function's own safety doc.
     let count = unsafe { BATCH_CHANGE_COUNT.get_mut() };
@@ -83,14 +74,10 @@ pub fn end_batch_changes() {
         // start/end_batch_changes recursively
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { *CLIPBOARD_NEEDS_UPDATE.get_mut() = false };
-        // unnamed ("implicit" clipboard)
-        unimplemented!(
-            "end_batch_changes: flushing a deferred clipboard update needs \
-             set_clipboard/get_y_previous (register.c's real yank-register \
-             storage plus the Lua clipboard-provider machinery), neither \
-             translated - unreachable today since nothing can set \
-             CLIPBOARD_NEEDS_UPDATE true yet"
-        );
+        let previous = unsafe { crate::register::get_y_previous() };
+        if !previous.is_null() {
+            unsafe { set_clipboard(0, &*previous) };
+        }
     }
 }
 
@@ -259,28 +246,16 @@ mod tests {
     }
 
     #[test]
-    fn end_batch_changes_panics_if_an_update_is_pending() {
+    fn end_batch_changes_flushes_and_clears_a_pending_update() {
         let _lock = global_state_test_lock();
         reset();
         start_batch_changes();
-        // Simulates the "unnamed register, deferred write" branch
-        // `adjust_clipboard_name` would take if it ever reached its
-        // own genuinely-unreachable-today body (see this module's own
-        // doc comment) - directly exercised here since no currently
-        // possible call sequence can reach it for real.
         unsafe { *CLIPBOARD_NEEDS_UPDATE.get_mut() = true };
-        let result = std::panic::catch_unwind(end_batch_changes);
+        end_batch_changes();
+        assert!(!unsafe { *CLIPBOARD_NEEDS_UPDATE.get_mut() });
+        assert!(!unsafe { *CLIPBOARD_DELAY_UPDATE.get_mut() });
+        assert_eq!(unsafe { *BATCH_CHANGE_COUNT.get_mut() }, 0);
         reset();
-        let err = result.expect_err("end_batch_changes should have panicked");
-        let msg = err
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| err.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or_default();
-        assert!(
-            msg.contains("flushing a deferred clipboard update"),
-            "unexpected panic message: {msg}"
-        );
     }
 
     // --- adjust_clipboard_name / get_default_register_name ---
