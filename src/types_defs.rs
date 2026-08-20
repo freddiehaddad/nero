@@ -314,11 +314,6 @@ impl Default for MapblockT {
         }
     }
 }
-/// Placeholder for `AutoPatCmd` (`struct AutoPatCmd_S`) - see
-/// `src/nvim/autocmd_defs.h` (phase 6).
-pub struct AutoPatCmdT {
-    _private: (),
-}
 /// Placeholder for `regmatch_T` (`struct regmatch`) - see
 /// `src/nvim/regexp_defs.h` (phase 7). Derives `Default` (a trivial
 /// zero-sized value for now) since `cmdmod_T.cmod_filter_regmatch`

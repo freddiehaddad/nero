@@ -24,7 +24,7 @@
 use crate::eval::typval_defs::{DictT, ScopeDictDictItem, SctxT, UfuncT};
 use crate::ex_eval_defs::ExceptT;
 use crate::pos_defs::LinenrT;
-use crate::types_defs::{AutoPatCmdT, ProftimeT};
+use crate::types_defs::ProftimeT;
 
 /// Per-line script profiling counters (`sn_prl_T`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -95,7 +95,7 @@ pub enum EsInfo {
     /// function info
     Ufunc(*mut UfuncT),
     /// autocommand info
-    Aucmd(*mut AutoPatCmdT),
+    Aucmd(*mut crate::autocmd_defs::AutoPatCmd),
     /// exception info
     Except(*mut ExceptT),
 }
