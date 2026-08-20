@@ -83,6 +83,41 @@ pub fn buf_updates_register(
     );
 }
 
+/// Notify and remove buffer update subscribers during unload
+/// (`buf_updates_unload`).
+///
+/// Empty/default callback cleanup is complete. Live RPC channels or
+/// Lua reload/detach handlers remain gated on their dispatch layers.
+pub fn buf_updates_unload(buf: &mut BufT, can_reload: bool) {
+    if !buf.update_channels.is_empty() {
+        unimplemented!(
+            "buf_updates_unload: channel detach events need rpc_send_event"
+        );
+    }
+
+    let mut retained = Vec::new();
+    for callback in buf.update_callbacks.drain(..) {
+        let handler = if can_reload && callback.on_reload != -1 {
+            Some(("reload", callback.on_reload))
+        } else if callback.on_detach != -1 {
+            Some(("detach", callback.on_detach))
+        } else {
+            None
+        };
+        if let Some((kind, _reference)) = handler {
+            unimplemented!(
+                "buf_updates_unload: Lua {kind} callbacks need nlua_call_ref"
+            );
+        }
+        if can_reload && callback.on_reload != -1 {
+            retained.push(callback);
+        } else {
+            buffer_update_callbacks_free(callback);
+        }
+    }
+    buf.update_callbacks = retained;
+}
+
 /// Whether `buf` has any live update subscribers, either RPC channels
 /// or Lua callbacks (`buf_updates_active`).
 #[must_use]
@@ -373,5 +408,28 @@ mod tests {
             true,
         ));
         assert_eq!(buf.update_channels, vec![9]);
+    }
+
+    #[test]
+    fn buf_updates_unload_removes_callbacks_without_handlers() {
+        let mut buf = BufT {
+            update_callbacks: vec![
+                BufUpdateCallbacks::default(),
+                BufUpdateCallbacks::default(),
+            ],
+            ..Default::default()
+        };
+
+        buf_updates_unload(&mut buf, true);
+
+        assert!(buf.update_callbacks.is_empty());
+        assert!(!buf_updates_active(&buf));
+    }
+
+    #[test]
+    fn buf_updates_unload_is_a_noop_without_subscribers() {
+        let mut buf = BufT::default();
+        buf_updates_unload(&mut buf, false);
+        assert!(!buf_updates_active(&buf));
     }
 }
