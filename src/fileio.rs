@@ -1132,6 +1132,7 @@ mod tests {
     /// is then nothing to prepend a dot to.
     #[test]
     fn modname_without_a_name_uses_the_current_directory() {
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
         let got = modname(None, b".swp", true).expect("cwd must be available");
         assert!(got.ends_with(b".swp"));
         let tail = crate::path::path_tail(&got);
@@ -1140,6 +1141,7 @@ mod tests {
 
     #[test]
     fn modname_treats_an_empty_name_like_none() {
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
         let from_empty = modname(Some(b""), b".swp", false);
         let from_none = modname(None, b".swp", false);
         assert_eq!(from_empty, from_none);

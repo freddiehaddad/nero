@@ -1473,6 +1473,7 @@ mod tests {
 
     #[test]
     fn aubuflocal_remove_is_a_noop_with_empty_autocmds_and_apc_list() {
+        let _lock = crate::globals::global_state_test_lock();
         let buf = BufT { handle: 42, ..Default::default() };
         unsafe { aubuflocal_remove(&buf) };
         // No panic, no observable change - both loops are genuinely
