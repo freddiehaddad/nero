@@ -1,5 +1,4 @@
-//! Translated from `src/nvim/event/multiqueue.c`, excluding the
-//! multicast one-shot wrapper translated separately.
+//! Translated from `src/nvim/event/multiqueue.c` in full.
 
 use std::collections::VecDeque;
 
@@ -271,6 +270,56 @@ pub unsafe fn multiqueue_size(queue: *const MultiQueue) -> usize {
     unsafe { (*queue).size }
 }
 
+struct MulticastEvent {
+    event: Event,
+    fired: bool,
+    refcount: i32,
+}
+
+unsafe fn multiqueue_oneshot_event(
+    argv: *mut *mut std::ffi::c_void,
+) {
+    let data = unsafe { *argv }.cast::<MulticastEvent>();
+    let event = {
+        let data = unsafe { &mut *data };
+        if data.fired {
+            None
+        } else {
+            data.fired = true;
+            Some(data.event)
+        }
+    };
+    if let Some(mut event) = event
+        && let Some(handler) = event.handler
+    {
+        unsafe { handler(event.argv.as_mut_ptr()) };
+    }
+    let should_free = {
+        let data = unsafe { &mut *data };
+        data.refcount -= 1;
+        data.refcount == 0
+    };
+    if should_free {
+        unsafe { drop(Box::from_raw(data)) };
+    }
+}
+
+/// Create an event that may be queued `count` times but fires once
+/// (`event_create_oneshot`).
+#[must_use]
+pub fn event_create_oneshot(event: Event, count: i32) -> Event {
+    assert!(count > 0);
+    let data = Box::into_raw(Box::new(MulticastEvent {
+        event,
+        fired: false,
+        refcount: count,
+    }));
+    crate::event::defs::event_create(
+        multiqueue_oneshot_event,
+        &[data.cast()],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +506,49 @@ mod tests {
             assert!(event.handler.is_none());
             multiqueue_free(queue);
             multiqueue_free(parent);
+        }
+    }
+
+    #[test]
+    fn oneshot_event_fires_once_across_multiple_queues() {
+        let queue1 = multiqueue_new(None, std::ptr::null_mut());
+        let queue2 = multiqueue_new(None, std::ptr::null_mut());
+        let queue3 = multiqueue_new(None, std::ptr::null_mut());
+        let mut output = Vec::new();
+        let output_ptr = std::ptr::addr_of_mut!(output);
+        let mut value = 42usize;
+        let value_ptr = std::ptr::addr_of_mut!(value);
+        let oneshot = event_create_oneshot(
+            event(output_ptr, value_ptr),
+            3,
+        );
+
+        unsafe {
+            multiqueue_put_event(queue1, oneshot);
+            multiqueue_put_event(queue2, oneshot);
+            multiqueue_put_event(queue3, oneshot);
+            multiqueue_process_events(queue2);
+            multiqueue_process_events(queue1);
+            multiqueue_process_events(queue3);
+            multiqueue_free(queue1);
+            multiqueue_free(queue2);
+            multiqueue_free(queue3);
+        }
+        assert_eq!(output, vec![42]);
+    }
+
+    #[test]
+    fn oneshot_nil_event_still_cleans_up_after_all_copies() {
+        let queue1 = multiqueue_new(None, std::ptr::null_mut());
+        let queue2 = multiqueue_new(None, std::ptr::null_mut());
+        let oneshot = event_create_oneshot(Event::default(), 2);
+        unsafe {
+            multiqueue_put_event(queue1, oneshot);
+            multiqueue_put_event(queue2, oneshot);
+            multiqueue_process_events(queue1);
+            multiqueue_process_events(queue2);
+            multiqueue_free(queue1);
+            multiqueue_free(queue2);
         }
     }
 }
