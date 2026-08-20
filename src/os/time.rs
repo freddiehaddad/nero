@@ -219,6 +219,36 @@ pub fn os_ctime(result_len: usize, add_newline: bool) -> Vec<u8> {
     os_ctime_r(os_time() as i64, result_len, add_newline)
 }
 
+/// Format one local timestamp with a caller-provided `strftime`
+/// format.
+///
+/// Returns `None` when local-time conversion fails and `Some(empty)`
+/// when `strftime` cannot fit or interpret the result, matching
+/// `f_strftime`'s two distinct outcomes.
+#[must_use]
+pub fn os_strftime(format: &[u8], clock: i64) -> Option<Vec<u8>> {
+    let local = os_localtime_r(clock)?;
+    let format_end =
+        format.iter().position(|&byte| byte == 0).unwrap_or(format.len());
+    let mut format_string = Vec::with_capacity(format_end + 1);
+    format_string.extend_from_slice(&format[..format_end]);
+    format_string.push(0);
+    let mut result = [0u8; 256];
+    let len = unsafe {
+        system_strftime(
+            result.as_mut_ptr().cast(),
+            result.len(),
+            format_string.as_ptr().cast(),
+            &local,
+        )
+    };
+    if len == 0 {
+        Some(Vec::new())
+    } else {
+        Some(result[..len].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +321,20 @@ mod tests {
         let formatted = os_ctime_r(0, 8, true);
         assert!(formatted.len() < 8);
         assert!(formatted == b"(Inval" || formatted == b"(Inval\n");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime/strftime FFI")]
+    fn os_strftime_formats_year_and_honors_embedded_nul() {
+        let year = os_strftime(b"%Y\0ignored", 0)
+            .expect("epoch converts");
+        assert!(year == b"1969" || year == b"1970");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime/strftime FFI")]
+    fn os_strftime_returns_empty_when_output_exceeds_fixed_buffer() {
+        let format = vec![b'x'; 300];
+        assert_eq!(os_strftime(&format, 0), Some(Vec::new()));
     }
 }
