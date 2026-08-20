@@ -72,6 +72,8 @@
 //! characterwise slice for yank/delete operations. It returns the
 //! owned backing line alongside `BlockDefT`, keeping `textstart`
 //! valid without a self-referential borrow.
+//! [`block_prep`] provides the corresponding full virtual-column scan
+//! for blockwise operations.
 //!
 //! Also translated: `line_count_info` (word/char/byte counting for one
 //! line, used by `cursor_pos_info`'s "g CTRL-G" word/char/byte-count
@@ -745,6 +747,173 @@ pub unsafe fn charwise_block_prep(
     } else {
         line.as_mut_ptr()
     };
+    (block, line)
+}
+
+/// Prepare one line for a blockwise operation (`block_prep`).
+///
+/// The returned `Vec<u8>` owns the allocation addressed by
+/// `BlockDefT::textstart` and must remain alive while that pointer is
+/// used.
+///
+/// # Safety
+/// Reads and temporarily changes current-window linebreak state.
+pub unsafe fn block_prep(
+    oap: &crate::normal_defs::OpargT,
+    lnum: crate::pos_defs::LinenrT,
+    is_del: bool,
+) -> (crate::register_defs::BlockDefT, Vec<u8>) {
+    let mut incr = 0;
+    let lbr_saved = unsafe { reset_lbr() };
+    let mut block = crate::register_defs::BlockDefT::default();
+    let mut line = unsafe { crate::memline::ml_get(lnum) };
+    let mut prev_pstart = 0usize;
+    let curwin = unsafe { (*crate::globals::GLOBALS.as_ptr()).curwin };
+    let (mut csarg, mut cstype) =
+        unsafe { crate::plines::init_charsize_arg(curwin, lnum, &line) };
+    let mut ci = crate::mbyte::utf_ptr2str_char_info(&line);
+    let mut vcol = block.start_vcol;
+
+    while vcol < oap.start_vcol
+        && line.get(ci.pos).copied().unwrap_or_default() != 0
+    {
+        incr = unsafe {
+            crate::plines::win_charsize(
+                cstype,
+                vcol,
+                &line[ci.pos..],
+                i32::try_from(ci.pos).expect("line offset fits i32"),
+                ci.chr.value,
+                &mut csarg,
+            )
+        }
+        .width;
+        vcol += incr;
+        if crate::ascii_defs::ascii_iswhite(ci.chr.value) {
+            block.pre_whitesp += incr;
+            block.pre_whitesp_c += 1;
+        } else {
+            block.pre_whitesp = 0;
+            block.pre_whitesp_c = 0;
+        }
+        prev_pstart = ci.pos;
+        ci = unsafe { crate::mbyte::utfc_next(&line, ci) };
+    }
+    block.start_vcol = vcol;
+    let mut pstart = ci.pos;
+    block.start_char_vcols = incr;
+
+    if block.start_vcol < oap.start_vcol {
+        block.end_vcol = block.start_vcol;
+        block.is_short = 1;
+        if !is_del || oap.op_type == crate::ops_defs::OpType::Append as i32 {
+            block.endspaces = oap.end_vcol - oap.start_vcol + 1;
+        }
+    } else {
+        block.startspaces = block.start_vcol - oap.start_vcol;
+        if is_del && block.startspaces != 0 {
+            block.startspaces =
+                block.start_char_vcols - block.startspaces;
+        }
+        let mut pend = pstart;
+        block.end_vcol = block.start_vcol;
+        if block.end_vcol > oap.end_vcol {
+            block.is_one_char = 1;
+            if oap.op_type == crate::ops_defs::OpType::Insert as i32 {
+                block.endspaces =
+                    block.start_char_vcols - block.startspaces;
+            } else if oap.op_type
+                == crate::ops_defs::OpType::Append as i32
+            {
+                block.startspaces +=
+                    oap.end_vcol - oap.start_vcol + 1;
+                block.endspaces =
+                    block.start_char_vcols - block.startspaces;
+            } else {
+                block.startspaces =
+                    oap.end_vcol - oap.start_vcol + 1;
+                if is_del
+                    && oap.op_type
+                        != crate::ops_defs::OpType::Lshift as i32
+                {
+                    block.startspaces = block.start_char_vcols
+                        - (block.start_vcol - oap.start_vcol);
+                    block.endspaces =
+                        block.end_vcol - oap.end_vcol - 1;
+                }
+            }
+        } else {
+            (csarg, cstype) = unsafe {
+                crate::plines::init_charsize_arg(curwin, lnum, &line)
+            };
+            ci = crate::mbyte::utf_ptr2str_char_info(&line[pend..]);
+            ci.pos += pend;
+            vcol = block.end_vcol;
+            let mut prev_pend = pend;
+            while vcol <= oap.end_vcol
+                && line.get(ci.pos).copied().unwrap_or_default() != 0
+            {
+                prev_pend = ci.pos;
+                incr = unsafe {
+                    crate::plines::win_charsize(
+                        cstype,
+                        vcol,
+                        &line[ci.pos..],
+                        i32::try_from(ci.pos)
+                            .expect("line offset fits i32"),
+                        ci.chr.value,
+                        &mut csarg,
+                    )
+                }
+                .width;
+                vcol += incr;
+                ci = unsafe { crate::mbyte::utfc_next(&line, ci) };
+            }
+            block.end_vcol = vcol;
+            pend = ci.pos;
+
+            if block.end_vcol <= oap.end_vcol
+                && (!is_del
+                    || oap.op_type
+                        == crate::ops_defs::OpType::Append as i32
+                    || oap.op_type
+                        == crate::ops_defs::OpType::Replace as i32)
+            {
+                block.is_short = 1;
+                let virtual_op = unsafe {
+                    (*crate::globals::GLOBALS.as_ptr()).virtual_op
+                        != crate::types_defs::TriState::False
+                };
+                if oap.op_type
+                    == crate::ops_defs::OpType::Append as i32
+                    || virtual_op
+                {
+                    block.endspaces =
+                        oap.end_vcol - block.end_vcol
+                            + i32::from(oap.inclusive);
+                }
+            } else if block.end_vcol > oap.end_vcol {
+                block.endspaces =
+                    block.end_vcol - oap.end_vcol - 1;
+                if !is_del && block.endspaces != 0 {
+                    block.endspaces = incr - block.endspaces;
+                    if pend != pstart {
+                        pend = prev_pend;
+                    }
+                }
+            }
+        }
+        block.end_char_vcols = incr;
+        if is_del && block.startspaces != 0 {
+            pstart = prev_pstart;
+        }
+        block.textlen = i32::try_from(pend - pstart)
+            .expect("block byte length fits i32");
+    }
+    block.textcol =
+        i32::try_from(pstart).expect("block byte column fits i32");
+    block.textstart = unsafe { line.as_mut_ptr().add(pstart) };
+    unsafe { restore_lbr(lbr_saved) };
     (block, line)
 }
 
@@ -2922,6 +3091,146 @@ mod tests {
             assert_eq!(block.textlen, 0);
             assert_eq!(block.textcol, 1);
             assert_eq!(line, b"\t\0");
+
+            drop(_virtual_op);
+            drop(_curwin);
+            drop(_curbuf);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn block_prep_selects_an_ascii_virtual_column_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"hello\0", &[]);
+            let buf_ptr = std::ptr::addr_of_mut!(buf);
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: buf_ptr,
+                w_view_width: 80,
+                ..Default::default()
+            };
+            let win_ptr = std::ptr::addr_of_mut!(win);
+            let _curbuf = CurbufGuard::set(buf_ptr);
+            let _curwin = CurwinGuard::set(win_ptr);
+            let _virtual_op =
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.virtual_op,
+                    crate::types_defs::TriState::False,
+                );
+            let oap = crate::normal_defs::OpargT {
+                op_type: crate::ops_defs::OpType::Yank as i32,
+                start_vcol: 1,
+                end_vcol: 3,
+                inclusive: true,
+                ..Default::default()
+            };
+
+            let (block, line) = block_prep(&oap, 1, false);
+
+            assert_eq!(block.start_vcol, 1);
+            assert_eq!(block.end_vcol, 4);
+            assert_eq!(block.startspaces, 0);
+            assert_eq!(block.endspaces, 0);
+            assert_eq!(block.textcol, 1);
+            assert_eq!(block.textlen, 3);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    block.textstart,
+                    block.textlen as usize,
+                ),
+                b"ell"
+            );
+            assert_eq!(line, b"hello\0");
+
+            drop(_virtual_op);
+            drop(_curwin);
+            drop(_curbuf);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn block_prep_converts_a_partial_tab_selection_to_spaces() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"\tab\0", &[]);
+            let buf_ptr = std::ptr::addr_of_mut!(buf);
+            (*buf_ptr).b_p_ts = 8;
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: buf_ptr,
+                w_view_width: 80,
+                ..Default::default()
+            };
+            let win_ptr = std::ptr::addr_of_mut!(win);
+            let _curbuf = CurbufGuard::set(buf_ptr);
+            let _curwin = CurwinGuard::set(win_ptr);
+            let _virtual_op =
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.virtual_op,
+                    crate::types_defs::TriState::False,
+                );
+            let oap = crate::normal_defs::OpargT {
+                op_type: crate::ops_defs::OpType::Yank as i32,
+                start_vcol: 2,
+                end_vcol: 4,
+                inclusive: true,
+                ..Default::default()
+            };
+
+            let (block, line) = block_prep(&oap, 1, false);
+
+            assert_eq!(block.is_one_char, 1);
+            assert_eq!(block.startspaces, 3);
+            assert_eq!(block.textlen, 0);
+            assert_eq!(block.textcol, 1);
+            assert_eq!(line, b"\tab\0");
+
+            drop(_virtual_op);
+            drop(_curwin);
+            drop(_curbuf);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn block_prep_marks_a_short_line_and_fills_the_block_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"a\0", &[]);
+            let buf_ptr = std::ptr::addr_of_mut!(buf);
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: buf_ptr,
+                w_view_width: 80,
+                ..Default::default()
+            };
+            win.w_onebuf_opt.wo_lbr = 1;
+            let win_ptr = std::ptr::addr_of_mut!(win);
+            let _curbuf = CurbufGuard::set(buf_ptr);
+            let _curwin = CurwinGuard::set(win_ptr);
+            let _virtual_op =
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.virtual_op,
+                    crate::types_defs::TriState::False,
+                );
+            let oap = crate::normal_defs::OpargT {
+                op_type: crate::ops_defs::OpType::Yank as i32,
+                start_vcol: 2,
+                end_vcol: 4,
+                inclusive: true,
+                ..Default::default()
+            };
+
+            let (block, line) = block_prep(&oap, 1, false);
+
+            assert_eq!(block.is_short, 1);
+            assert_eq!(block.start_vcol, 1);
+            assert_eq!(block.end_vcol, 1);
+            assert_eq!(block.endspaces, 3);
+            assert_eq!(block.textlen, 0);
+            assert_eq!(block.textcol, 1);
+            assert_eq!(line, b"a\0");
+            assert_eq!((*win_ptr).w_onebuf_opt.wo_lbr, 1);
 
             drop(_virtual_op);
             drop(_curwin);
