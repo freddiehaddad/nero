@@ -21,13 +21,9 @@
 //! [`dict_set_var`] performs the matching checked write/delete.
 //! [`set_mark`] validates and delegates API mark writes.
 //!
-//! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
-//! generic, variadic/printf-style message formatters; this crate uses
-//! Rust's own `format!` directly at each real call site instead of
-//! translating the general mechanism, matching the established
-//! `fmt_g`-style "a narrow, purpose-built helper for one call site,
-//! not a general `vim_snprintf`" precedent - if/when a second real
-//! caller needs this, revisit whether a shared helper is worthwhile).
+//! Shared non-variadic API validation formatting now lives in
+//! `api/private/validate.rs`; this file's existing direct `format!`
+//! call sites remain observably equivalent.
 
 use crate::api::private::defs::{Buffer, Error, ErrorType, Object, Tabpage, Window};
 use crate::buffer_defs::{BufT, TabpageT, WinT};

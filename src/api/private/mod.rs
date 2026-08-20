@@ -4,3 +4,4 @@
 pub mod converter;
 pub mod defs;
 pub mod helpers;
+pub mod validate;
