@@ -1377,6 +1377,42 @@ pub unsafe fn op_yank_reg(
     }
 }
 
+/// Yank an operator range into its requested register (`op_yank`).
+///
+/// This is complete for every motion type supported by
+/// [`op_yank_reg`] (currently linewise, including its column-zero
+/// promotion). Clipboard publication is inert while no provider is
+/// available.
+///
+/// # Safety
+/// Forwarded from [`op_yank_reg`], [`get_yank_register`], and
+/// [`do_autocmd_textyankpost`].
+pub unsafe fn op_yank(
+    oap: &crate::normal_defs::OpargT,
+    message: bool,
+) -> bool {
+    if oap.regname != 0 && !valid_yank_reg(oap.regname, true) {
+        crate::input::beep_flush();
+        return false;
+    }
+    if oap.regname == i32::from(b'_') {
+        return true;
+    }
+
+    let register =
+        unsafe { get_yank_register(oap.regname, YregModeT::Yank) };
+    unsafe {
+        op_yank_reg(
+            oap,
+            message,
+            &mut *register,
+            is_append_register(oap.regname),
+        );
+        do_autocmd_textyankpost(oap, &*register);
+    }
+    true
+}
+
 /// Updates a blockwise register's width from its contents
 /// (`update_yankreg_width`).
 ///
@@ -4177,6 +4213,100 @@ mod tests {
                 false,
             )
         };
+    }
+
+    #[test]
+    fn op_yank_writes_the_requested_linewise_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe {
+            with_yank_test_buffer(b"one\0", &[b"two\0"], |_| {
+                let oap = crate::normal_defs::OpargT {
+                    regname: i32::from(b'a'),
+                    motion_type:
+                        crate::normal_defs::MotionType::LineWise,
+                    start: crate::pos_defs::PosT {
+                        lnum: 1,
+                        ..Default::default()
+                    },
+                    end: crate::pos_defs::PosT {
+                        lnum: 2,
+                        ..Default::default()
+                    },
+                    line_count: 2,
+                    ..Default::default()
+                };
+
+                assert!(op_yank(&oap, false));
+
+                let index = op_reg_index(i32::from(b'a')).unwrap();
+                assert_eq!(
+                    Y_REGS.get_mut()[index].y_array.as_deref(),
+                    Some(
+                        [b"one".to_vec(), b"two".to_vec()].as_slice()
+                    )
+                );
+                assert_eq!(*Y_PREVIOUS.get_mut(), Some(index));
+            });
+        }
+    }
+
+    #[test]
+    fn op_yank_uppercase_register_appends() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        let index = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            Y_REGS.get_mut()[index] = YankregT {
+                y_array: Some(vec![b"old".to_vec()]),
+                y_type: crate::normal_defs::MotionType::LineWise,
+                ..Default::default()
+            };
+            with_yank_test_buffer(b"new\0", &[], |_| {
+                let oap = crate::normal_defs::OpargT {
+                    regname: i32::from(b'B'),
+                    motion_type:
+                        crate::normal_defs::MotionType::LineWise,
+                    start: crate::pos_defs::PosT {
+                        lnum: 1,
+                        ..Default::default()
+                    },
+                    end: crate::pos_defs::PosT {
+                        lnum: 1,
+                        ..Default::default()
+                    },
+                    line_count: 1,
+                    ..Default::default()
+                };
+
+                assert!(op_yank(&oap, false));
+            });
+
+            assert_eq!(
+                Y_REGS.get_mut()[index].y_array.as_deref(),
+                Some([b"old".to_vec(), b"new".to_vec()].as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn op_yank_black_hole_succeeds_without_touching_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _registers = RegisterStateGuard::save();
+        unsafe {
+            Y_REGS.get_mut()[0].y_array = Some(vec![b"before".to_vec()]);
+            assert!(op_yank(
+                &crate::normal_defs::OpargT {
+                    regname: i32::from(b'_'),
+                    ..Default::default()
+                },
+                false,
+            ));
+            assert_eq!(
+                Y_REGS.get_mut()[0].y_array.as_deref(),
+                Some([b"before".to_vec()].as_slice())
+            );
+        }
     }
 
     #[test]
