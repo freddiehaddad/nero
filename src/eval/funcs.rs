@@ -344,6 +344,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"char2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_char2nr });
         m.insert(&b"nr2char"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_nr2char });
         m.insert(&b"str2float"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_str2float });
+        m.insert(&b"strftime"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strftime });
         m.insert(&b"str2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_str2nr });
         m.insert(&b"str2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_str2list });
         m.insert(&b"list2str"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_list2str });
@@ -1051,6 +1052,20 @@ fn f_str2float(argvars: &[TypvalT], rettv: &mut TypvalT) {
         value *= -1.0;
     }
     rettv.value = TypvalValue::Float(value);
+}
+
+/// `strftime({format} [, {time}])` - format local time
+/// (`f_strftime`, `funcs.c`).
+fn f_strftime(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let format = crate::eval::typval::tv_get_string(&argvars[0]);
+    let seconds = argvars.get(1).map_or_else(
+        || crate::os::time::os_time() as i64,
+        crate::eval::typval::tv_get_number,
+    );
+    rettv.value = TypvalValue::String(Some(
+        crate::os::time::os_strftime(&format, seconds)
+            .unwrap_or_else(|| b"(Invalid)".to_vec()),
+    ));
 }
 
 /// `str2nr({string} [, {base} [, {quoted}]])` - convert `{string}` to
@@ -8949,6 +8964,40 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Float(2.5));
     }
 
+    // --- f_strftime ---
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime/strftime FFI")]
+    fn strftime_formats_explicit_and_current_times() {
+        let mut rettv = TypvalT::default();
+        f_strftime(&[string(b"%Y"), num(0)], &mut rettv);
+        assert!(matches!(
+            rettv.value,
+            TypvalValue::String(Some(ref year))
+                if year == b"1969" || year == b"1970"
+        ));
+
+        f_strftime(&[string(b"%Y")], &mut rettv);
+        assert!(matches!(
+            rettv.value,
+            TypvalValue::String(Some(ref year))
+                if year.len() == 4
+                    && year.iter().all(u8::is_ascii_digit)
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call localtime/strftime FFI")]
+    fn strftime_returns_empty_string_when_result_exceeds_buffer() {
+        let format = vec![b'x'; 300];
+        let mut rettv = TypvalT::default();
+        f_strftime(&[string(&format), num(0)], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(Vec::new()))
+        );
+    }
+
     // --- f_str2nr ---
 
     #[test]
@@ -9237,6 +9286,7 @@ mod tests {
             "char2nr",
             "nr2char",
             "str2float",
+            "strftime",
             "str2nr",
             "str2list",
             "list2str",
