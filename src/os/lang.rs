@@ -20,17 +20,47 @@
 //! established "idiomatic Rust equivalent, not the exact C
 //! representation" convention used throughout this crate.
 //!
-//! Deferred: everything else in the file - `init_locale`/`ex_language`/
-//! `free_locales`/`get_lang_arg`/`get_locales`/`lang_init` all need
-//! real `setlocale`-with-a-non-NULL-value calls (actually CHANGING the
-//! process locale) plus `exarg_T`-driven Ex-command parsing/expansion-
-//! context machinery, a genuinely larger undertaking than this
-//! query-only slice.
+//! Also translated: locale discovery/cache (`find_locales`/
+//! `init_locales`) and `get_lang_arg`/`get_locales` completion.
+//! `free_locales` needs no Rust equivalent because the `LazyLock`
+//! owns its process-lifetime vectors.
+//!
+//! Deferred: `init_locale`/`ex_language`/`lang_init`, which actually
+//! change process locale state and need Ex-command parsing or macOS
+//! platform integration.
 
 #[cfg(windows)]
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::vars::{set_vim_var_string, VimVarIndex};
 use crate::macros_defs::ascii_isalpha;
+
+static LOCALES: std::sync::LazyLock<Option<Vec<Vec<u8>>>> =
+    std::sync::LazyLock::new(find_locales);
+
+fn find_locales() -> Option<Vec<Vec<u8>>> {
+    #[cfg(windows)]
+    {
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("locale")
+            .arg("-a")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            output
+                .stdout
+                .split(|&byte| byte == b'\n')
+                .filter(|locale| !locale.is_empty())
+                .map(|locale| locale.strip_suffix(b"\r").unwrap_or(locale).to_vec())
+                .collect(),
+        )
+    }
+}
 
 /// Obtain the locale value from the libraries for category `what`
 /// (one of the `libc::LC_*` constants), without changing it
@@ -139,6 +169,30 @@ pub unsafe fn set_lang_var() {
     unsafe { set_vim_var_string(VimVarIndex::Collate, loc.as_deref()) };
 }
 
+/// Completion argument for `:language` (`get_lang_arg`).
+#[must_use]
+pub fn get_lang_arg(idx: i32) -> Option<&'static [u8]> {
+    match idx {
+        0 => Some(b"messages"),
+        1 => Some(b"ctype"),
+        2 => Some(b"time"),
+        3 => Some(b"collate"),
+        _ => usize::try_from(idx - 4)
+            .ok()
+            .and_then(|idx| LOCALES.as_ref()?.get(idx))
+            .map(Vec::as_slice),
+    }
+}
+
+/// Available locale name for completion (`get_locales`).
+#[must_use]
+pub fn get_locales(idx: i32) -> Option<&'static [u8]> {
+    usize::try_from(idx)
+        .ok()
+        .and_then(|idx| LOCALES.as_ref()?.get(idx))
+        .map(Vec::as_slice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +260,26 @@ mod tests {
         let _ = unsafe { crate::eval::vars::get_vim_var_str(VimVarIndex::Lang) };
         let _ = unsafe { crate::eval::vars::get_vim_var_str(VimVarIndex::LcTime) };
         let _ = unsafe { crate::eval::vars::get_vim_var_str(VimVarIndex::Collate) };
+    }
+
+    #[test]
+    fn get_lang_arg_starts_with_the_four_fixed_categories() {
+        assert_eq!(get_lang_arg(0), Some(b"messages".as_slice()));
+        assert_eq!(get_lang_arg(1), Some(b"ctype".as_slice()));
+        assert_eq!(get_lang_arg(2), Some(b"time".as_slice()));
+        assert_eq!(get_lang_arg(3), Some(b"collate".as_slice()));
+        assert_eq!(get_lang_arg(-1), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn `locale -a`")]
+    fn locale_completion_accessors_share_the_same_cache() {
+        for index in 0..LOCALES.as_ref().map_or(0, Vec::len) {
+            let locale = get_locales(index as i32).unwrap();
+            assert_eq!(get_lang_arg(index as i32 + 4), Some(locale));
+            assert!(!locale.is_empty());
+        }
+        assert_eq!(get_locales(-1), None);
+        assert_eq!(get_locales(i32::MAX), None);
     }
 }
