@@ -117,6 +117,26 @@ pub fn vim_env_iter(
     }
 }
 
+/// Return the next component of a delimited environment value in
+/// reverse order (`vim_env_iter_rev`).
+///
+/// `iter` is the prefix length returned by the previous call. The
+/// returned component borrows `val`; the optional prefix length ends
+/// immediately before the delimiter for the next call.
+#[must_use]
+pub fn vim_env_iter_rev(
+    delim: u8,
+    val: &[u8],
+    iter: Option<usize>,
+) -> (&[u8], Option<usize>) {
+    let end = iter.unwrap_or(val.len());
+    let prefix = &val[..end];
+    match prefix.iter().rposition(|&byte| byte == delim) {
+        Some(offset) => (&val[offset + 1..end], Some(offset)),
+        None => (prefix, None),
+    }
+}
+
 /// Derive the installation prefix from `v:progpath`
 /// (`vim_get_prefix_from_exepath`).
 ///
@@ -1201,6 +1221,37 @@ pub(crate) mod tests {
     #[test]
     fn vim_env_iter_handles_an_empty_value() {
         assert_eq!(vim_env_iter(b';', b"", None), (&b""[..], None));
+    }
+
+    #[test]
+    fn vim_env_iter_rev_walks_components_in_reverse_order() {
+        let value = b"one;two;three";
+        let (three, next) = vim_env_iter_rev(b';', value, None);
+        let (two, next) = vim_env_iter_rev(b';', value, next);
+        let (one, next) = vim_env_iter_rev(b';', value, next);
+
+        assert_eq!(three, b"three");
+        assert_eq!(two, b"two");
+        assert_eq!(one, b"one");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn vim_env_iter_rev_preserves_empty_components() {
+        let value = b";one;";
+        let (trailing, next) = vim_env_iter_rev(b';', value, None);
+        let (one, next) = vim_env_iter_rev(b';', value, next);
+        let (leading, next) = vim_env_iter_rev(b';', value, next);
+
+        assert_eq!(trailing, b"");
+        assert_eq!(one, b"one");
+        assert_eq!(leading, b"");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn vim_env_iter_rev_handles_an_empty_value() {
+        assert_eq!(vim_env_iter_rev(b';', b"", None), (&b""[..], None));
     }
 
     #[test]
