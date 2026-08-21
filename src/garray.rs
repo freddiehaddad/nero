@@ -15,12 +15,9 @@
 //! now that both real dependencies (`path.c`'s `path_fnamecmp`,
 //! `strings.c`'s `sort_strings`) exist.
 //!
-//! `ga_clear_strings`/`GA_DEEP_CLEAR`/`GA_DEEP_CLEAR_PTR` need NO Rust
-//! equivalent at all for the same reason `optval_free`/`tv_dict_clear`
-//! don't (see `option.rs`'s/`eval/typval.rs`'s own module docs): a
-//! `Vec<Vec<u8>>`'s own `Drop` (or a plain `.clear()`) already
-//! individually releases every owned string, exactly matching what the
-//! original's manual per-string `xfree` loop achieves by hand.
+//! [`ga_clear_strings`] preserves the original teardown boundary for a
+//! string-list-shaped growarray. Rust's own `Vec` assignment performs the
+//! original's manual per-string and backing-allocation frees.
 //!
 //! - `WLOG(...)` calls now use `crate::log::logmsg` directly (`log.c` is
 //!   translated as of this revision).
@@ -224,6 +221,12 @@ pub unsafe fn ga_remove_duplicate_strings(names: &mut Vec<Vec<u8>>) {
     }
 }
 
+/// Clear a growing array that contains a list of strings
+/// (`ga_clear_strings`).
+pub fn ga_clear_strings(strings: &mut Vec<Vec<u8>>) {
+    *strings = Vec::new();
+}
+
 /// For a list of strings: concatenate all of them with `sep` as
 /// separator (`ga_concat_strings`). Modeled as a plain `&[Vec<u8>]`-
 /// taking function rather than a `GarrayT` method, per this module's
@@ -374,6 +377,18 @@ mod tests {
         let mut names: Vec<Vec<u8>> = vec![b"a.txt".to_vec()];
         unsafe { ga_remove_duplicate_strings(&mut names) };
         assert_eq!(names, vec![b"a.txt".to_vec()]);
+    }
+
+    #[test]
+    fn ga_clear_strings_releases_items_and_backing_storage() {
+        let mut strings = Vec::with_capacity(32);
+        strings.push(b"one".to_vec());
+        strings.push(b"two".to_vec());
+
+        ga_clear_strings(&mut strings);
+
+        assert!(strings.is_empty());
+        assert_eq!(strings.capacity(), 0);
     }
 
     #[test]
