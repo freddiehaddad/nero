@@ -961,6 +961,12 @@ pub fn os_fileinfo_link(path: &Path) -> Option<FileInfoT> {
     std::fs::symlink_metadata(path).ok().map(|metadata| FileInfoT { metadata })
 }
 
+/// Get information about an open file (`os_fileinfo_fd`).
+#[must_use]
+pub fn os_fileinfo_fd(file: &std::fs::File) -> Option<FileInfoT> {
+    file.metadata().ok().map(|metadata| FileInfoT { metadata })
+}
+
 /// Whether two [`crate::os::fs_defs::FileID`]s refer to the same file
 /// (`os_fileid_equal`).
 ///
@@ -3133,6 +3139,21 @@ mod tests {
     fn os_fileinfo_returns_none_for_a_missing_path() {
         let scratch = TempScratch::new("fileinfo_missing");
         assert!(os_fileinfo(&scratch.path.join("nope.txt")).is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_fileinfo_fd_reads_metadata_from_an_open_file() {
+        let scratch = TempScratch::new("fileinfo_fd");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"metadata").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let info = os_fileinfo_fd(&file).expect("open file metadata");
+        assert_eq!(os_fileinfo_size(&info), 8);
+        assert_eq!(
+            os_fileinfo_id(&info),
+            os_fileinfo_id(&os_fileinfo(&path).unwrap())
+        );
     }
 
     #[test]
