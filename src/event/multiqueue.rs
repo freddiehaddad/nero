@@ -25,7 +25,7 @@ pub struct MultiQueue {
     next_link_id: u64,
 }
 
-fn new_queue(
+fn _multiqueue_new(
     parent: *mut MultiQueue,
     on_put: Option<PutCallback>,
     data: *mut std::ffi::c_void,
@@ -46,7 +46,7 @@ pub fn multiqueue_new(
     on_put: Option<PutCallback>,
     data: *mut std::ffi::c_void,
 ) -> *mut MultiQueue {
-    new_queue(std::ptr::null_mut(), on_put, data)
+    _multiqueue_new(std::ptr::null_mut(), on_put, data)
 }
 
 /// Create a child queue (`multiqueue_new_child`).
@@ -60,7 +60,7 @@ pub unsafe fn multiqueue_new_child(
     assert!(!parent.is_null());
     assert!(unsafe { (*parent).parent }.is_null());
     unsafe { (*parent).size += 1 };
-    new_queue(parent, None, std::ptr::null_mut())
+    _multiqueue_new(parent, None, std::ptr::null_mut())
 }
 
 /// Free a queue and detach its pending child links
@@ -346,6 +346,24 @@ mod tests {
                 value.cast(),
             ],
         )
+    }
+
+    #[test]
+    fn internal_constructor_initializes_every_queue_field() {
+        let mut callback_count = 0usize;
+        let data = std::ptr::addr_of_mut!(callback_count).cast();
+        let queue = _multiqueue_new(std::ptr::null_mut(), Some(count_put), data);
+
+        unsafe {
+            assert!((*queue).parent.is_null());
+            assert!((*queue).items.is_empty());
+            assert_eq!((*queue).data, data);
+            assert_eq!((*queue).size, 0);
+            assert_eq!((*queue).next_link_id, 0);
+            (*queue).on_put.unwrap()(queue, data);
+            assert_eq!(callback_count, 1);
+            multiqueue_free(queue);
+        }
     }
 
     #[test]
