@@ -95,16 +95,32 @@ pub unsafe fn multiqueue_free(queue: *mut MultiQueue) {
 }
 
 fn multiqueue_remove(queue: &mut MultiQueue) -> Event {
-    let item = queue.items.pop_front().expect("queue is nonempty");
-    let event = match item {
+    let mut item = queue.items.pop_front().expect("queue is nonempty");
+    let event = multiqueueitem_get_event(&mut item, queue.parent, true);
+    queue.size = queue.size.wrapping_sub(1);
+    event
+}
+
+/// Return the event represented by one queue item
+/// (`multiqueueitem_get_event`).
+///
+/// When `remove` is false all queue links remain intact, matching the source's
+/// peek path.
+fn multiqueueitem_get_event(
+    item: &mut MultiQueueItem,
+    owner_parent: *mut MultiQueue,
+    remove: bool,
+) -> Event {
+    match item {
         MultiQueueItem::Event {
             event,
             parent_link_id,
         } => {
-            if let Some(id) = parent_link_id
-                && !queue.parent.is_null()
+            if remove
+                && let Some(id) = parent_link_id
+                && !owner_parent.is_null()
             {
-                let parent = unsafe { &mut *queue.parent };
+                let parent = unsafe { &mut *owner_parent };
                 let position = parent
                     .items
                     .iter()
@@ -114,16 +130,16 @@ fn multiqueue_remove(queue: &mut MultiQueue) -> Event {
                             MultiQueueItem::Link {
                                 id: candidate,
                                 ..
-                            } if *candidate == id
+                            } if *candidate == *id
                         )
                     })
                     .expect("child event has a parent link");
                 parent.items.remove(position);
             }
-            event
+            *event
         }
         MultiQueueItem::Link { child, id } => {
-            let child = unsafe { &mut *child };
+            let child = unsafe { &mut **child };
             let position = child
                 .items
                 .iter()
@@ -133,20 +149,26 @@ fn multiqueue_remove(queue: &mut MultiQueue) -> Event {
                         MultiQueueItem::Event {
                             parent_link_id: Some(candidate),
                             ..
-                        } if *candidate == id
+                        } if *candidate == *id
                     )
                 })
                 .expect("parent link has a child event");
-            let MultiQueueItem::Event { event, .. } =
-                child.items.remove(position).unwrap()
-            else {
-                unreachable!()
-            };
-            event
+            if remove {
+                let MultiQueueItem::Event { event, .. } =
+                    child.items.remove(position).unwrap()
+                else {
+                    unreachable!()
+                };
+                event
+            } else {
+                let MultiQueueItem::Event { event, .. } = &child.items[position]
+                else {
+                    unreachable!()
+                };
+                *event
+            }
         }
-    };
-    queue.size = queue.size.wrapping_sub(1);
-    event
+    }
 }
 
 /// Remove and return the next event (`multiqueue_get`).
@@ -414,6 +436,24 @@ mod tests {
             multiqueue_purge_events(child);
             multiqueue_free(child);
             multiqueue_free(parent);
+        }
+    }
+
+    #[test]
+    fn item_get_event_can_peek_without_removing_links() {
+        let queue = multiqueue_new(None, std::ptr::null_mut());
+        unsafe {
+            multiqueue_put_event(queue, Event::default());
+            let parent = (*queue).parent;
+            let item = (*queue).items.front_mut().unwrap();
+
+            let event = multiqueueitem_get_event(item, parent, false);
+
+            assert!(event.handler.is_none());
+            assert!(!multiqueue_empty(queue));
+            assert_eq!(multiqueue_size(queue), 1);
+            multiqueue_purge_events(queue);
+            multiqueue_free(queue);
         }
     }
 
