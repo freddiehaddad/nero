@@ -53,6 +53,15 @@ pub unsafe fn win_id2wp_tp(
     std::ptr::null_mut()
 }
 
+/// Return the window with handle `id` (`win_id2wp`).
+///
+/// # Safety
+/// Forwards [`win_id2wp_tp`]'s linked-list requirements.
+#[must_use]
+pub unsafe fn win_id2wp(id: i32) -> *mut crate::buffer_defs::WinT {
+    unsafe { win_id2wp_tp(id, None) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +191,28 @@ mod tests {
         let mut output = std::ptr::dangling_mut();
         assert!(unsafe { win_id2wp_tp(99, Some(&mut output)) }.is_null());
         assert_eq!(output, std::ptr::dangling_mut());
+    }
+
+    #[test]
+    fn win_id2wp_wraps_cross_tab_lookup() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut window = crate::buffer_defs::WinT {
+            handle: 77,
+            ..Default::default()
+        };
+        let window_ptr = std::ptr::addr_of_mut!(window);
+        let mut tab = crate::buffer_defs::TabpageT {
+            tp_firstwin: window_ptr,
+            ..Default::default()
+        };
+        let tab_ptr = std::ptr::addr_of_mut!(tab);
+        let _tabs = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.first_tabpage,
+                tab_ptr,
+            )
+        };
+        assert_eq!(unsafe { win_id2wp(77) }, window_ptr);
+        assert!(unsafe { win_id2wp(78) }.is_null());
     }
 }
