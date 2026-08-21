@@ -1,9 +1,10 @@
-//! Translated from `src/nvim/os/stdpaths.c` (tractable core only).
+//! Translated from `src/nvim/os/stdpaths.c` in full.
 //!
 //! Translated: `get_appname`, `appname_is_valid`; `XDGVarType`/
 //! `xdg_env_vars`/`xdg_defaults`/`xdg_defaults_env_vars`,
 //! `stdpaths_get_xdg_var`/`get_xdg_home` (now tractable now that
-//! `os/env.rs`'s `expand_env_save` is real).
+//! `os/env.rs`'s `expand_env_save` is real), and all four
+//! `stdpaths_user_*_subpath` wrappers.
 //!
 //! `get_appname`'s simplification: the original also writes its result
 //! into the shared `NameBuff` scratch buffer (`crate::globals::GLOBALS`)
@@ -18,8 +19,6 @@
 //! `"$NVIM_APPNAME[-data]"` before joining) is likewise replaced with
 //! a plain local `Vec<u8>`, matching the same established preference.
 //!
-//! Deferred: `stdpaths_user_state_subpath`.
-
 use crate::memory::memchrsub;
 use crate::os::env::os_getenv;
 use crate::path::{path_is_absolute, path_to_slash};
@@ -269,6 +268,41 @@ pub unsafe fn stdpaths_user_data_subpath(fname: &[u8]) -> Vec<u8> {
     concat_fnames(home, fname)
 }
 
+/// Return `$XDG_STATE_HOME/$NVIM_APPNAME[-data]/{fname}`, optionally
+/// escaping commas and adding trailing separators
+/// (`stdpaths_user_state_subpath`).
+///
+/// # Safety
+/// Forwarded from [`get_xdg_home`]'s own safety doc.
+#[must_use]
+pub unsafe fn stdpaths_user_state_subpath(
+    fname: &[u8],
+    trailing_pathseps: usize,
+    escape_commas: bool,
+) -> Vec<u8> {
+    let home = unsafe { get_xdg_home(XdgVarType::StateHome) }
+        .expect("state home always has a platform default");
+    let path = concat_fnames(home, fname);
+    let commas = if escape_commas {
+        path.iter().filter(|&&byte| byte == b',').count()
+    } else {
+        0
+    };
+    let mut result =
+        Vec::with_capacity(path.len() + commas + trailing_pathseps);
+    for byte in path {
+        if escape_commas && byte == b',' {
+            result.push(b'\\');
+        }
+        result.push(byte);
+    }
+    result.extend(std::iter::repeat_n(
+        crate::ascii_defs::PATHSEP,
+        trailing_pathseps,
+    ));
+    result
+}
+
 /// Gets the value of `$NVIM_APPNAME`, or `"nvim"` if not set
 /// (`get_appname`).
 ///
@@ -505,12 +539,11 @@ pub(crate) mod tests {
     #[test]
     fn cache_subpath_appends_appname_and_file_name() {
         let _lock = xdg_test_lock();
-        let _guard = XdgEnvGuard::set(&[
-            ("XDG_CACHE_HOME", Some("/cache")),
-            ("NVIM_APPNAME", Some("nero-test")),
-        ]);
+        let _guard =
+            XdgEnvGuard::set(&[("XDG_CACHE_HOME", Some("/cache"))]);
+        let appname = get_appname(false);
         let expected = concat_fnames(
-            concat_fnames(b"/cache".to_vec(), b"nero-test"),
+            concat_fnames(b"/cache".to_vec(), &appname),
             b"luacache",
         );
         assert_eq!(
@@ -522,12 +555,11 @@ pub(crate) mod tests {
     #[test]
     fn config_subpath_appends_appname_and_file_name() {
         let _lock = xdg_test_lock();
-        let _guard = XdgEnvGuard::set(&[
-            ("XDG_CONFIG_HOME", Some("/config")),
-            ("NVIM_APPNAME", Some("nero-test")),
-        ]);
+        let _guard =
+            XdgEnvGuard::set(&[("XDG_CONFIG_HOME", Some("/config"))]);
+        let appname = get_appname(false);
         let expected = concat_fnames(
-            concat_fnames(b"/config".to_vec(), b"nero-test"),
+            concat_fnames(b"/config".to_vec(), &appname),
             b"init.lua",
         );
         assert_eq!(
@@ -539,21 +571,76 @@ pub(crate) mod tests {
     #[test]
     fn data_subpath_appends_platform_appname_and_file_name() {
         let _lock = xdg_test_lock();
-        let _guard = XdgEnvGuard::set(&[
-            ("XDG_DATA_HOME", Some("/data")),
-            ("NVIM_APPNAME", Some("nero-test")),
-        ]);
-        let appname: &[u8] = if cfg!(windows) {
-            b"nero-test-data"
-        } else {
-            b"nero-test"
-        };
+        let _guard =
+            XdgEnvGuard::set(&[("XDG_DATA_HOME", Some("/data"))]);
+        let mut appname = get_appname(false);
+        if cfg!(windows) {
+            appname.extend_from_slice(b"-data");
+        }
         let expected = concat_fnames(
-            concat_fnames(b"/data".to_vec(), appname),
+            concat_fnames(b"/data".to_vec(), &appname),
             b"site",
         );
         assert_eq!(
             unsafe { stdpaths_user_data_subpath(b"site") },
+            expected
+        );
+    }
+
+    #[test]
+    fn state_subpath_escapes_commas_and_adds_trailing_separators() {
+        let _lock = xdg_test_lock();
+        let _guard =
+            XdgEnvGuard::set(&[("XDG_STATE_HOME", Some("/state"))]);
+        let mut appname = get_appname(false);
+        if cfg!(windows) {
+            appname.extend_from_slice(b"-data");
+        }
+        let mut expected = concat_fnames(
+            concat_fnames(b"/state".to_vec(), &appname),
+            b"shada/main,one",
+        );
+        let comma = expected.iter().position(|&byte| byte == b',').unwrap();
+        expected.insert(comma, b'\\');
+        expected.extend([
+            crate::ascii_defs::PATHSEP,
+            crate::ascii_defs::PATHSEP,
+        ]);
+
+        assert_eq!(
+            unsafe {
+                stdpaths_user_state_subpath(
+                    b"shada/main,one",
+                    2,
+                    true,
+                )
+            },
+            expected
+        );
+    }
+
+    #[test]
+    fn state_subpath_can_leave_commas_and_trailing_separators_unchanged() {
+        let _lock = xdg_test_lock();
+        let _guard =
+            XdgEnvGuard::set(&[("XDG_STATE_HOME", Some("/state"))]);
+        let mut appname = get_appname(false);
+        if cfg!(windows) {
+            appname.extend_from_slice(b"-data");
+        }
+        let expected = concat_fnames(
+            concat_fnames(b"/state".to_vec(), &appname),
+            b"shada/main,one",
+        );
+
+        assert_eq!(
+            unsafe {
+                stdpaths_user_state_subpath(
+                    b"shada/main,one",
+                    0,
+                    false,
+                )
+            },
             expected
         );
     }
