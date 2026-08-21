@@ -47,6 +47,18 @@ pub unsafe fn input_available() -> usize {
     input.write_pos - input.read_pos
 }
 
+/// Remaining writable capacity at the tail of the raw input buffer
+/// (`input_space`).
+///
+/// # Safety
+/// Reads shared raw-input state.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn input_space() -> usize {
+    let input = unsafe { INPUT_BUFFER.get_mut() };
+    INPUT_BUFFER_SIZE - input.write_pos
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -92,6 +104,19 @@ mod tests {
             input.write_pos = 9;
         }
         assert_eq!(unsafe { input_available() }, 6);
+    }
+
+    #[test]
+    fn input_space_reports_tail_capacity() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        assert_eq!(unsafe { input_space() }, INPUT_BUFFER_SIZE);
+
+        {
+            let input = unsafe { INPUT_BUFFER.get_mut() };
+            input.write_pos = 100;
+        }
+        assert_eq!(unsafe { input_space() }, INPUT_BUFFER_SIZE - 100);
     }
 
     #[test]
