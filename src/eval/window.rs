@@ -62,6 +62,34 @@ pub unsafe fn win_id2wp(id: i32) -> *mut crate::buffer_defs::WinT {
     unsafe { win_id2wp_tp(id, None) }
 }
 
+/// Return the current tab's window number for handle `id`
+/// (`win_id2win`).
+///
+/// Hidden/nonfocusable windows do not consume a number unless they
+/// are the current window.
+///
+/// # Safety
+/// The current tab's window list must contain valid live pointers.
+#[must_use]
+pub unsafe fn win_id2win(id: i32) -> i32 {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    let tab = unsafe { (*globals).curtab };
+    if tab.is_null() {
+        return 0;
+    }
+    let mut number = 1;
+    let mut window = unsafe { (*tab).tp_firstwin };
+    while !window.is_null() {
+        let has_number = unsafe { win_has_winnr(window, tab) };
+        if unsafe { (*window).handle } == id {
+            return if has_number { number } else { 0 };
+        }
+        number += i32::from(has_number);
+        window = unsafe { (*window).w_next };
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +242,55 @@ mod tests {
         };
         assert_eq!(unsafe { win_id2wp(77) }, window_ptr);
         assert!(unsafe { win_id2wp(78) }.is_null());
+    }
+
+    #[test]
+    fn win_id2win_counts_only_numbered_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = crate::buffer_defs::WinT {
+            handle: 33,
+            ..Default::default()
+        };
+        let third_ptr = std::ptr::addr_of_mut!(third);
+        let mut second = crate::buffer_defs::WinT {
+            handle: 22,
+            w_next: third_ptr,
+            ..Default::default()
+        };
+        second.w_config.hide = true;
+        second.w_config.focusable = false;
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = crate::buffer_defs::WinT {
+            handle: 11,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let mut tab = crate::buffer_defs::TabpageT {
+            tp_firstwin: first_ptr,
+            tp_curwin: first_ptr,
+            ..Default::default()
+        };
+        let tab_ptr = std::ptr::addr_of_mut!(tab);
+        let _curtab = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curtab,
+                tab_ptr,
+            )
+        };
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curwin,
+                first_ptr,
+            )
+        };
+
+        assert_eq!(unsafe { win_id2win(11) }, 1);
+        assert_eq!(unsafe { win_id2win(22) }, 0);
+        assert_eq!(unsafe { win_id2win(33) }, 2);
+        assert_eq!(unsafe { win_id2win(44) }, 0);
+
+        unsafe { (*crate::globals::GLOBALS.as_ptr()).curwin = second_ptr };
+        assert_eq!(unsafe { win_id2win(22) }, 2);
     }
 }
