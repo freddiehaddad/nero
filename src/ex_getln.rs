@@ -1149,6 +1149,33 @@ pub unsafe fn text_locked() -> bool {
         || unsafe { crate::globals::GLOBALS.get_mut() }.textlock != 0
 }
 
+/// Whether all buffer mutation is locked (`allbuf_locked`).
+#[must_use]
+pub fn allbuf_locked() -> bool {
+    unsafe { crate::globals::GLOBALS.get_mut() }.allbuf_lock > 0
+}
+
+/// Whether the current buffer or all buffers are locked
+/// (`curbuf_locked`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer.
+#[must_use]
+pub unsafe fn curbuf_locked() -> bool {
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    (unsafe { (*curbuf).b_ro_locked }) > 0 || allbuf_locked()
+}
+
+/// Whether text or current-buffer mutation is locked
+/// (`text_or_buf_locked`).
+///
+/// # Safety
+/// Forwarded from [`text_locked`] and [`curbuf_locked`].
+#[must_use]
+pub unsafe fn text_or_buf_locked() -> bool {
+    (unsafe { text_locked() }) || unsafe { curbuf_locked() }
+}
+
 /// Guesses whether a partially typed pattern currently matches
 /// everything (`empty_pattern_magic`).
 #[must_use]
@@ -1315,6 +1342,72 @@ mod tests {
             !unsafe { text_locked() },
             "dummy buffers are exempt from expr_map_lock"
         );
+    }
+
+    #[test]
+    fn current_and_all_buffer_locks_are_reported() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                buf_ptr,
+            )
+        };
+        let _all = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.allbuf_lock,
+                0,
+            )
+        };
+
+        assert!(!allbuf_locked());
+        assert!(!unsafe { curbuf_locked() });
+        unsafe { (*buf_ptr).b_ro_locked = 1 };
+        assert!(unsafe { curbuf_locked() });
+        unsafe { (*buf_ptr).b_ro_locked = 0 };
+        unsafe { crate::globals::GLOBALS.get_mut() }.allbuf_lock = 1;
+        assert!(allbuf_locked());
+        assert!(unsafe { curbuf_locked() });
+    }
+
+    #[test]
+    fn text_or_buf_locked_combines_both_sources() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                buf_ptr,
+            )
+        };
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.textlock,
+                0,
+            )
+        };
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.expr_map_lock,
+                0,
+            )
+        };
+        let _all = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.allbuf_lock,
+                0,
+            )
+        };
+
+        assert!(!unsafe { text_or_buf_locked() });
+        unsafe { crate::globals::GLOBALS.get_mut() }.textlock = 1;
+        assert!(unsafe { text_or_buf_locked() });
+        unsafe { crate::globals::GLOBALS.get_mut() }.textlock = 0;
+        unsafe { (*buf_ptr).b_ro_locked = 1 };
+        assert!(unsafe { text_or_buf_locked() });
     }
 
     #[test]
