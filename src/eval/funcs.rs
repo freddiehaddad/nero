@@ -5478,13 +5478,6 @@ fn f_getcmdwintype(_argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// character-column (`getcharpos`/`getcursorcharpos`) vs. byte-column
 /// (`getpos`/`getcurpos`) variants.
 ///
-/// The original's own `ret_fnum` out-parameter (`fnum`) is only ever
-/// set inside `var2fpos`'s own `'m`-mark branch, which is not yet
-/// translated there (panics if reached) - every path this function
-/// can actually complete leaves it at its own initial `-1`, so this
-/// translation just uses a fixed `-1` rather than threading a mutable
-/// out-parameter through.
-///
 /// # Safety
 /// `GLOBALS.curwin` must be a valid, live `WinT` whose `w_buffer` is
 /// also valid and live.
@@ -5492,7 +5485,7 @@ unsafe fn getpos_both(argvars: &[TypvalT], rettv: &mut TypvalT, getcurpos: bool,
     let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     let mut wp = curwin;
     let mut fp: Option<crate::pos_defs::PosT> = None;
-    let fnum: i64 = -1;
+    let mut fnum: i32 = -1;
 
     if getcurpos {
         if argvars.first().is_some_and(|tv| !matches!(tv.value, TypvalValue::Unknown)) {
@@ -5516,7 +5509,15 @@ unsafe fn getpos_both(argvars: &[TypvalT], rettv: &mut TypvalT, getcurpos: bool,
         }
     } else {
         // SAFETY: forwarded from this function's own safety doc.
-        fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, charcol, curwin) };
+        fp = unsafe {
+            crate::eval::eval::var2fpos(
+                &argvars[0],
+                true,
+                Some(&mut fnum),
+                charcol,
+                curwin,
+            )
+        };
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -5524,7 +5525,12 @@ unsafe fn getpos_both(argvars: &[TypvalT], rettv: &mut TypvalT, getcurpos: bool,
         crate::eval::typval::tv_list_alloc_ret(rettv, 4 + isize::from(getcurpos))
     };
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { crate::eval::typval::tv_list_append_number(l, if fnum != -1 { fnum } else { 0 }) };
+    unsafe {
+        crate::eval::typval::tv_list_append_number(
+            l,
+            i64::from(if fnum != -1 { fnum } else { 0 }),
+        )
+    };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::typval::tv_list_append_number(l, fp.map_or(0, |p| i64::from(p.lnum))) };
     // SAFETY: forwarded from this function's own safety doc.
@@ -6928,7 +6934,15 @@ unsafe fn f_line(argvars: &[TypvalT], rettv: &mut TypvalT) {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { crate::cursor::check_cursor(wp) };
             // SAFETY: forwarded from this function's own safety doc.
-            fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, false, wp) };
+            fp = unsafe {
+                crate::eval::eval::var2fpos(
+                    &argvars[0],
+                    true,
+                    None,
+                    false,
+                    wp,
+                )
+            };
             unsafe { crate::globals::GLOBALS.get_mut() }.skip_update_topline = false;
         }
     } else {
@@ -6936,7 +6950,15 @@ unsafe fn f_line(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
         // SAFETY: forwarded from this function's own safety doc.
-        fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, false, curwin) };
+        fp = unsafe {
+            crate::eval::eval::var2fpos(
+                &argvars[0],
+                true,
+                None,
+                false,
+                curwin,
+            )
+        };
     }
     rettv.value = TypvalValue::Number(i64::from(fp.map_or(0, |p| p.lnum)));
 }
@@ -6990,7 +7012,15 @@ unsafe fn get_col(argvars: &[TypvalT], rettv: &mut TypvalT, charcol: bool) {
     let mut col: crate::pos_defs::ColnrT = 0;
     let fnum = bp.handle;
     // SAFETY: forwarded from this function's own safety doc.
-    let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], false, charcol, wp) };
+    let fp = unsafe {
+        crate::eval::eval::var2fpos(
+            &argvars[0],
+            false,
+            None,
+            charcol,
+            wp,
+        )
+    };
     if let Some(fp) = fp
         && fnum == bp.handle
     {
@@ -7093,7 +7123,15 @@ unsafe fn f_virtcol(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         let bp: *mut crate::buffer_defs::BufT = unsafe { (*wp).w_buffer };
         // SAFETY: forwarded from this function's own safety doc.
-        let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], false, false, wp) };
+        let fp = unsafe {
+            crate::eval::eval::var2fpos(
+                &argvars[0],
+                false,
+                None,
+                false,
+                wp,
+            )
+        };
         let Some(mut fp) = fp else { break 'theend };
         // SAFETY: forwarded from this function's own safety doc.
         if fp.lnum > unsafe { &*bp }.b_ml.ml_line_count {

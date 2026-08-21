@@ -428,7 +428,9 @@ pub unsafe fn tv_get_lnum(tv: &TypvalT) -> crate::pos_defs::LinenrT {
         // SAFETY: forwarded from this function's own safety doc.
         let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
         // SAFETY: forwarded from this function's own safety doc.
-        if let Some(fp) = unsafe { crate::eval::eval::var2fpos(tv, true, false, curwin) } {
+        if let Some(fp) = unsafe {
+            crate::eval::eval::var2fpos(tv, true, None, false, curwin)
+        } {
             lnum = fp.lnum;
         }
     }

@@ -5067,11 +5067,8 @@ pub unsafe fn buf_charidx_to_byteidx(
 /// Supports the `[lnum, col, coladd]` `List` form and the `.`
 /// (cursor)/`v` (Visual start)/`$` (last line or column, depending on
 /// `dollar_lnum`)/`w$` (last VISIBLE line, via `move.c`'s now-real
-/// `validate_botline_win`) special strings. The `'x` mark form needs
-/// `mark_get` (`mark.c`, not yet translated) and `w0` (first visible
-/// line) needs `update_topline` (`move.c`'s own window-scrolling
-/// machinery, not yet translated) - both `unimplemented!()` if
-/// actually reached.
+/// `validate_botline_win`) special strings, plus local/global marks.
+/// `w0` (first visible line) still needs `update_topline`.
 ///
 /// # Safety
 /// `wp` must point to a valid, live `WinT` whose `w_buffer` is also
@@ -5081,6 +5078,7 @@ pub unsafe fn buf_charidx_to_byteidx(
 pub unsafe fn var2fpos(
     tv: &TypvalT,
     dollar_lnum: bool,
+    ret_fnum: Option<&mut i32>,
     charcol: bool,
     wp: *mut crate::buffer_defs::WinT,
 ) -> Option<crate::pos_defs::PosT> {
@@ -5157,9 +5155,26 @@ pub unsafe fn var2fpos(
         let g = unsafe { crate::globals::GLOBALS.get_mut() };
         pos = if g.Visual.active && std::ptr::eq(wp, g.curwin) { g.Visual.start } else { w.w_cursor };
     } else if name.first() == Some(&b'\'') {
-        unimplemented!(
-            "var2fpos: mark ({name:?}) needs mark_get (mark.c), not yet translated",
-        );
+        let mark_name = i32::from(name.get(1).copied().unwrap_or(0));
+        let mark = unsafe {
+            crate::mark::mark_get(
+                bp,
+                wp,
+                None,
+                crate::mark_defs::MarkGet::All,
+                mark_name,
+            )
+        };
+        if mark.is_null() || unsafe { (*mark).mark.lnum } <= 0 {
+            return None;
+        }
+        pos = unsafe { (*mark).mark };
+        if (crate::macros_defs::ascii_isupper(mark_name)
+            || crate::ascii_defs::ascii_isdigit(mark_name))
+            && let Some(ret_fnum) = ret_fnum
+        {
+            *ret_fnum = unsafe { (*mark).fnum };
+        }
     }
 
     if pos.lnum != 0 {
@@ -11362,6 +11377,120 @@ mod tests {
 
     // --- var2fpos ---
 
+    struct GlobalMarkGuard {
+        name: u8,
+        saved: Option<crate::mark_defs::XfmarkT>,
+    }
+
+    impl GlobalMarkGuard {
+        unsafe fn install(
+            name: u8,
+            mark: crate::mark_defs::XfmarkT,
+        ) -> Self {
+            let saved = unsafe {
+                (*crate::mark::mark_get_global(false, i32::from(name)))
+                    .clone()
+            };
+            assert!(unsafe { crate::mark::mark_set_global(name, mark, false) });
+            Self {
+                name,
+                saved: Some(saved),
+            }
+        }
+    }
+
+    impl Drop for GlobalMarkGuard {
+        fn drop(&mut self) {
+            let saved = self.saved.take().expect("saved global mark");
+            unsafe {
+                crate::mark::mark_set_global(self.name, saved, false);
+            }
+        }
+    }
+
+    #[test]
+    fn var2fpos_resolves_local_marks_without_reporting_a_file_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            handle: 3,
+            ..Default::default()
+        };
+        buf.b_namedm[0].mark = crate::pos_defs::PosT {
+            lnum: 4,
+            col: 2,
+            coladd: 1,
+        };
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            ..Default::default()
+        };
+        let tv = TypvalT {
+            value: TypvalValue::String(Some(b"'a".to_vec())),
+            ..Default::default()
+        };
+        let mut fnum = -1;
+
+        let pos = unsafe {
+            var2fpos(&tv, true, Some(&mut fnum), false, &mut win)
+        };
+
+        assert_eq!(
+            pos,
+            Some(crate::pos_defs::PosT {
+                lnum: 4,
+                col: 2,
+                coladd: 1,
+            })
+        );
+        assert_eq!(fnum, -1);
+    }
+
+    #[test]
+    fn var2fpos_resolves_global_marks_and_reports_the_file_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _mark = unsafe {
+            GlobalMarkGuard::install(
+                b'A',
+                crate::mark_defs::XfmarkT {
+                    fmark: crate::mark_defs::FmarkT {
+                        mark: crate::pos_defs::PosT {
+                            lnum: 8,
+                            col: 5,
+                            coladd: 0,
+                        },
+                        fnum: 17,
+                        ..Default::default()
+                    },
+                    fname: None,
+                },
+            )
+        };
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            ..Default::default()
+        };
+        let tv = TypvalT {
+            value: TypvalValue::String(Some(b"'A".to_vec())),
+            ..Default::default()
+        };
+        let mut fnum = -1;
+
+        let pos = unsafe {
+            var2fpos(&tv, true, Some(&mut fnum), false, &mut win)
+        };
+
+        assert_eq!(
+            pos,
+            Some(crate::pos_defs::PosT {
+                lnum: 8,
+                col: 5,
+                coladd: 0,
+            })
+        );
+        assert_eq!(fnum, 17);
+    }
+
     #[test]
     fn var2fpos_w_dollar_returns_the_last_visible_line_when_the_whole_buffer_fits() {
         let _lock = crate::globals::global_state_test_lock();
@@ -11384,7 +11513,7 @@ mod tests {
         globals.curtab = &mut tp as *mut crate::buffer_defs::TabpageT;
 
         let tv = TypvalT { value: TypvalValue::String(Some(b"w$".to_vec())), ..Default::default() };
-        let pos = unsafe { var2fpos(&tv, true, false, &mut win as *mut crate::buffer_defs::WinT) };
+        let pos = unsafe { var2fpos(&tv, true, None, false, &mut win as *mut crate::buffer_defs::WinT) };
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
 
@@ -11413,7 +11542,7 @@ mod tests {
         let mut win =
             crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..Default::default() };
         let tv = TypvalT { value: TypvalValue::String(Some(b"w0".to_vec())), ..Default::default() };
-        let _ = unsafe { var2fpos(&tv, true, false, &mut win as *mut crate::buffer_defs::WinT) };
+        let _ = unsafe { var2fpos(&tv, true, None, false, &mut win as *mut crate::buffer_defs::WinT) };
     }
 
     #[test]
@@ -11428,7 +11557,7 @@ mod tests {
         let mut win =
             crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..Default::default() };
         let tv = TypvalT { value: TypvalValue::String(Some(b"wx".to_vec())), ..Default::default() };
-        let pos = unsafe { var2fpos(&tv, true, false, &mut win as *mut crate::buffer_defs::WinT) };
+        let pos = unsafe { var2fpos(&tv, true, None, false, &mut win as *mut crate::buffer_defs::WinT) };
         assert_eq!(pos, None);
     }
 
