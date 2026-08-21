@@ -164,6 +164,40 @@ fn hash_color_key(key: crate::highlight_defs::ColorKey) -> u32 {
     hash
 }
 
+/// Hash a highlight entry's exact C field bytes (`hash_HlEntry`).
+#[allow(dead_code)]
+#[must_use]
+fn hash_hl_entry(entry: crate::highlight_defs::HlEntry) -> u32 {
+    let attrs = entry.attr;
+    let fields = [
+        attrs.rgb_ae_attr,
+        attrs.cterm_ae_attr,
+        attrs.rgb_fg_color,
+        attrs.rgb_bg_color,
+        attrs.rgb_sp_color,
+    ];
+    let tail = [
+        attrs.hl_blend,
+        attrs.url,
+        attrs.font,
+        entry.kind as i32,
+        entry.id1,
+        entry.id2,
+        entry.winid,
+    ];
+    let mut hash = 0u32;
+    for byte in fields
+        .into_iter()
+        .flat_map(i32::to_ne_bytes)
+        .chain(attrs.cterm_fg_color.to_ne_bytes())
+        .chain(attrs.cterm_bg_color.to_ne_bytes())
+        .chain(tail.into_iter().flat_map(i32::to_ne_bytes))
+    {
+        hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    hash
+}
+
 /// A hash set with insertion-order-preserving compact storage
 /// (`Set(T)`/`MH_DECLS`/`KEY_DECLS`).
 ///
@@ -597,6 +631,27 @@ mod tests {
             hash_color_key(key),
             hash_color_key(crate::highlight_defs::ColorKey::new(1, 3))
         );
+    }
+
+    #[test]
+    fn hash_hl_entry_hashes_all_c_fields_in_order() {
+        let entry = crate::highlight_defs::HlEntry {
+            attr: crate::highlight_defs::HlAttrs::default(),
+            kind: crate::highlight_defs::HlKind::Blend,
+            id1: 1,
+            id2: 2,
+            winid: 3,
+        };
+        let mut changed = entry;
+        changed.attr.cterm_fg_color = 7;
+
+        assert_ne!(hash_hl_entry(entry), hash_hl_entry(changed));
+        changed = entry;
+        changed.kind = crate::highlight_defs::HlKind::Syntax;
+        assert_ne!(hash_hl_entry(entry), hash_hl_entry(changed));
+        changed = entry;
+        changed.winid = 4;
+        assert_ne!(hash_hl_entry(entry), hash_hl_entry(changed));
     }
 
     #[test]
