@@ -1,7 +1,5 @@
-//! Buffered file I/O from `src/nvim/os/fileio.c`.
-//!
-//! This first slice covers `fileio_defs.h` and the complete in-memory
-//! descriptor path used by `file_open_buffer`.
+//! Translated from `src/nvim/os/fileio.c`, `fileio.h`, and
+//! `fileio_defs.h`.
 
 /// File-open flags (`FileOpenFlags`).
 pub mod file_open_flags {
@@ -141,6 +139,38 @@ fn system_close(fd: i32) -> i32 {
         -std::io::Error::last_os_error()
             .raw_os_error()
             .unwrap_or(libc::EIO)
+    }
+}
+
+#[cfg(unix)]
+fn system_dup_stdin() -> i32 {
+    let descriptor = unsafe { libc::dup(0) };
+    if descriptor < 0 {
+        return -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+    }
+    unsafe {
+        libc::fcntl(
+            descriptor,
+            libc::F_SETFD,
+            libc::FD_CLOEXEC,
+        );
+    }
+    descriptor
+}
+
+#[cfg(windows)]
+fn system_dup_stdin() -> i32 {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _dup(fd: i32) -> i32;
+    }
+    let descriptor = unsafe { _dup(0) };
+    if descriptor < 0 {
+        -1
+    } else {
+        descriptor
     }
 }
 
@@ -345,6 +375,19 @@ pub fn file_open(
         return fd;
     }
     file_open_fd(descriptor, fd, flags)
+}
+
+/// Open a duplicated standard-input descriptor (`file_open_stdin`).
+pub fn file_open_stdin(descriptor: &mut FileDescriptor) -> i32 {
+    let fd = system_dup_stdin();
+    if fd < 0 {
+        return fd;
+    }
+    file_open_fd(
+        descriptor,
+        fd,
+        file_open_flags::READ_ONLY | file_open_flags::NON_BLOCKING,
+    )
 }
 
 /// Close a read descriptor (`file_close`'s dependency-free path).
@@ -792,6 +835,17 @@ mod tests {
         assert_eq!(file_read(&mut descriptor, &mut output), 5);
         assert_eq!(&output, b"tents");
         assert_eq!(descriptor.bytes_read, 8);
+        assert_eq!(file_close(&mut descriptor, false), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot duplicate/close stdin FFI")]
+    fn file_open_stdin_wraps_a_nonblocking_duplicate() {
+        let mut descriptor = FileDescriptor::default();
+        assert_eq!(file_open_stdin(&mut descriptor), 0);
+        assert!(file_fd(&descriptor) >= 0);
+        assert!(!descriptor.write);
+        assert!(descriptor.non_blocking);
         assert_eq!(file_close(&mut descriptor, false), 0);
     }
 }
