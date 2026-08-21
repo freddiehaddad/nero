@@ -1050,15 +1050,40 @@ pub unsafe fn did_set_encoding(
 pub fn expand_set_encoding(
     args: &mut crate::option_defs::OptexpandT,
 ) -> Option<Vec<Vec<u8>>> {
-    if !args.oe_regmatch.is_null() {
-        unimplemented!("expand_set_encoding: regex filtering needs the regexp engine");
-    }
-    Some(
+    expand_set_opt_generic(args, |idx| {
         crate::mbyte::ENC_CANON_TABLE
-            .iter()
+            .get(idx)
             .map(|entry| entry.name.as_bytes().to_vec())
-            .collect(),
-    )
+    })
+}
+
+/// Expand an option through an indexed candidate callback
+/// (`expand_set_opt_generic`).
+fn expand_set_opt_generic(
+    args: &crate::option_defs::OptexpandT,
+    mut getter: impl FnMut(usize) -> Option<Vec<u8>>,
+) -> Option<Vec<Vec<u8>>> {
+    if !args.oe_regmatch.is_null() {
+        unimplemented!(
+            "expand_set_opt_generic: regex filtering needs the regexp engine"
+        );
+    }
+
+    let mut matches = Vec::new();
+    if args.oe_include_orig_val
+        && let Some(value) =
+            args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
+    {
+        matches.push(value.to_vec());
+    }
+    let mut idx = 0;
+    while let Some(candidate) = getter(idx) {
+        if !candidate.is_empty() {
+            matches.push(candidate);
+        }
+        idx += 1;
+    }
+    (!matches.is_empty()).then_some(matches)
 }
 
 /// Expand an option's fixed string-value list
@@ -1186,39 +1211,25 @@ pub fn expand_set_whichwrap(
 pub fn expand_set_eventignore(
     args: &mut crate::option_defs::OptexpandT,
 ) -> Option<Vec<Vec<u8>>> {
-    if !args.oe_regmatch.is_null() {
-        unimplemented!("expand_set_eventignore: regex filtering needs the regexp engine");
-    }
-
     // SAFETY: the option-expansion callback contract requires
     // `oe_xp`, when non-null, to point to a live expansion context.
     let subtract = unsafe { args.oe_xp.as_ref() }
         .and_then(|xp| xp.xp_pattern.as_deref())
         .is_some_and(|pattern| pattern.first() == Some(&b'-'));
     let win = args.oe_idx == crate::option_defs::OptIndex::Eventignorewin;
-    let mut matches = Vec::new();
-
-    if args.oe_include_orig_val
-        && let Some(value) = args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
-    {
-        matches.push(value.to_vec());
-    }
-    if !subtract {
-        matches.push(b"all".to_vec());
-    }
-
-    let mut idx = 0;
-    while let Some(name) = crate::autocmd::get_event_name_no_group(idx, win) {
+    expand_set_opt_generic(args, |idx| {
+        if !subtract && idx == 0 {
+            return Some(b"all".to_vec());
+        }
+        let event_idx = idx as i32 - i32::from(!subtract);
+        let name = crate::autocmd::get_event_name_no_group(event_idx, win)?;
         let mut value = Vec::with_capacity(name.len() + usize::from(subtract));
         if subtract {
             value.push(b'-');
         }
         value.extend_from_slice(name);
-        matches.push(value);
-        idx += 1;
-    }
-
-    (!matches.is_empty()).then_some(matches)
+        Some(value)
+    })
 }
 
 /// Expand `'fillchars'` or `'listchars'` field names
@@ -1228,28 +1239,14 @@ pub fn expand_set_eventignore(
 pub fn expand_set_chars_option(
     args: &mut crate::option_defs::OptexpandT,
 ) -> Option<Vec<Vec<u8>>> {
-    if !args.oe_regmatch.is_null() {
-        unimplemented!("expand_set_chars_option: regex filtering needs the regexp engine");
-    }
-
     let getter: fn(i32) -> Option<&'static str> = match args.oe_idx {
         crate::option_defs::OptIndex::Fillchars => get_fillchars_name,
         crate::option_defs::OptIndex::Listchars => get_listchars_name,
         _ => return None,
     };
-    let mut matches = Vec::new();
-    if args.oe_include_orig_val
-        && let Some(value) = args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
-    {
-        matches.push(value.to_vec());
-    }
-
-    let mut idx = 0;
-    while let Some(name) = getter(idx) {
-        matches.push(name.as_bytes().to_vec());
-        idx += 1;
-    }
-    (!matches.is_empty()).then_some(matches)
+    expand_set_opt_generic(args, |idx| {
+        getter(i32::try_from(idx).ok()?).map(|name| name.as_bytes().to_vec())
+    })
 }
 
 /// Whether completion is currently inside the named colon suboption
@@ -1310,25 +1307,13 @@ pub fn expand_set_diffopt(
 pub fn expand_set_winhighlight(
     args: &mut crate::option_defs::OptexpandT,
 ) -> Option<Vec<Vec<u8>>> {
-    if !args.oe_regmatch.is_null() {
-        unimplemented!("expand_set_winhighlight: regex filtering needs the regexp engine");
-    }
-
-    let mut matches = Vec::new();
-    if args.oe_include_orig_val
-        && let Some(value) = args.oe_opt_value.as_deref().filter(|value| !value.is_empty())
-    {
-        matches.push(value.to_vec());
-    }
-
-    let mut idx = 0;
-    while let Some(name) = unsafe { crate::highlight_group::get_highlight_name(idx) } {
-        if !name.is_empty() {
-            matches.push(name);
+    expand_set_opt_generic(args, |idx| {
+        unsafe {
+            crate::highlight_group::get_highlight_name(
+                i32::try_from(idx).ok()?,
+            )
         }
-        idx += 1;
-    }
-    (!matches.is_empty()).then_some(matches)
+    })
 }
 
 /// Process an updated `'messagesopt'` value
