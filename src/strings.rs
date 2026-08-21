@@ -550,6 +550,46 @@ fn format_typename(type_spec: &[u8]) -> &'static str {
     }
 }
 
+/// Record and validate the type used for one positional formatter argument
+/// (`adjust_types`).
+///
+/// The vector length replaces the original's separate `num_posarg`
+/// allocation-size field, and owned byte vectors replace borrowed pointers
+/// into the format string.
+#[allow(dead_code)]
+fn adjust_types(
+    argument_types: &mut Vec<Option<Vec<u8>>>,
+    argument: usize,
+    type_spec: &[u8],
+) -> i32 {
+    if argument == 0 {
+        return crate::vim_defs::FAIL;
+    }
+    if argument_types.len() < argument {
+        argument_types.resize(argument, None);
+    }
+
+    if let Some(previous) = &argument_types[argument - 1] {
+        if previous.first() == Some(&b'*') || type_spec.first() == Some(&b'*') {
+            let check = if type_spec.first() == Some(&b'*') {
+                previous.as_slice()
+            } else {
+                type_spec
+            };
+            if check.first() != Some(&b'*')
+                && !matches!(check.first(), Some(b'd' | b'i'))
+            {
+                return crate::vim_defs::FAIL;
+            }
+        } else if format_typeof(type_spec) != format_typeof(previous) {
+            return crate::vim_defs::FAIL;
+        }
+    }
+
+    argument_types[argument - 1] = Some(type_spec.to_vec());
+    crate::vim_defs::OK
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1324,6 +1364,36 @@ mod tests {
         ] {
             assert_eq!(format_typename(spec), expected, "{spec:?}");
         }
+    }
+
+    #[test]
+    fn adjust_types_grows_and_records_positional_arguments() {
+        let mut types = Vec::new();
+
+        assert_eq!(adjust_types(&mut types, 3, b"ld"), crate::vim_defs::OK);
+        assert_eq!(types, vec![None, None, Some(b"ld".to_vec())]);
+        assert_eq!(adjust_types(&mut types, 0, b"d"), crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn adjust_types_accepts_compatible_reuse_and_rejects_mismatches() {
+        let mut types = vec![Some(b"d".to_vec())];
+
+        assert_eq!(adjust_types(&mut types, 1, b"i"), crate::vim_defs::OK);
+        assert_eq!(types[0], Some(b"i".to_vec()));
+        assert_eq!(adjust_types(&mut types, 1, b"s"), crate::vim_defs::FAIL);
+        assert_eq!(types[0], Some(b"i".to_vec()));
+    }
+
+    #[test]
+    fn adjust_types_validates_star_field_width_reuse() {
+        let mut types = vec![Some(b"*".to_vec())];
+        assert_eq!(adjust_types(&mut types, 1, b"d"), crate::vim_defs::OK);
+        assert_eq!(adjust_types(&mut types, 1, b"*"), crate::vim_defs::OK);
+
+        let mut invalid = vec![Some(b"*".to_vec())];
+        assert_eq!(adjust_types(&mut invalid, 1, b"s"), crate::vim_defs::FAIL);
+        assert_eq!(invalid[0], Some(b"*".to_vec()));
     }
 
     #[test]
