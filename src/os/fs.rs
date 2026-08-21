@@ -38,20 +38,9 @@
 //! returns `Option<std::fs::File>` directly (the opened resource, not
 //! a raw fd/error code) - see its own doc comment.
 //!
-//! Also translated: `os_fileinfo`/`os_fileinfo_link`/
-//! `os_fileinfo_size`/`os_fileinfo_mtime`/`os_fileinfo_type_str` (see
-//! [`FileInfoT`]) - but only a narrow subset of the original's own
-//! `FileInfo`/`uv_stat_t` (size, modification time, file type), all
-//! backed directly by `std::fs::Metadata` rather than a full `stat`
-//! translation. In particular, NO raw Unix-style mode/permission bits
-//! are modeled (the same still-deferred decision as `os_getperm`
-//! below) - `getfperm()`/`eval/fs.c`'s own caller of those bits
-//! remains deferred. `os_fileinfo_hardlinks`/`os_fileinfo_blksize`/
-//! `os_fileinfo_id`/`os_fileinfo_inode`/`os_fileid` remain deferred
-//! too (no real caller yet needing the fields `std::fs::Metadata`
-//! doesn't portably expose). [`os_fileid_equal`] IS translated: it is
-//! a pure comparison over the already-existing `FileID` struct, so it
-//! does not depend on those raw fields at all.
+//! `FileInfoT` is backed by `std::fs::Metadata`; its translated
+//! accessors cover size, timestamps, type, mode, hardlinks, blocksize,
+//! inode/device identity, path lookup, symlink lookup, and open files.
 //!
 //! `os_set_cloexec` is intentionally NOT translated (not merely
 //! deferred): `std::fs::File`/`OpenOptions` already open every file
@@ -974,15 +963,20 @@ pub fn os_fileinfo_fd(file: &std::fs::File) -> Option<FileInfoT> {
 /// unique within one filesystem, so two files on different devices can
 /// legitimately share one.
 ///
-/// This is independent of `os_fileid` itself, which stays deferred -
-/// it needs raw `stat` fields `std::fs::Metadata` does not portably
-/// expose (see this module's own doc comment).
 #[must_use]
 pub fn os_fileid_equal(
     file_id_1: &crate::os::fs_defs::FileID,
     file_id_2: &crate::os::fs_defs::FileID,
 ) -> bool {
     file_id_1.inode == file_id_2.inode && file_id_1.device_id == file_id_2.device_id
+}
+
+/// Get the filesystem identity for a path (`os_fileid`).
+#[must_use]
+pub fn os_fileid(
+    path: &Path,
+) -> Option<crate::os::fs_defs::FileID> {
+    os_fileinfo(path).map(|info| os_fileinfo_id(&info))
 }
 
 /// Get the file size from a `FileInfoT` (`os_fileinfo_size`).
@@ -2978,6 +2972,19 @@ mod tests {
         assert_eq!(id.device_id, os_fileinfo_device_id(&info));
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_fileid_reads_identity_and_rejects_missing_paths() {
+        let scratch = TempScratch::new("fileid");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(
+            os_fileid(&path),
+            Some(os_fileinfo_id(&os_fileinfo(&path).unwrap()))
+        );
+        assert_eq!(os_fileid(&scratch.path.join("missing")), None);
     }
 
     // --- os_copy ---
