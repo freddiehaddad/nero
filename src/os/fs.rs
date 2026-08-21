@@ -62,21 +62,9 @@
 //! opens; adding an explicit `fcntl(F_SETFD, FD_CLOEXEC)` call on top
 //! would be redundant, not a missing translation.
 //!
-//! Deferred (each needs either the `FileInfo`-vs-`std::fs::Metadata`
-//! representation decision, or real byte-level I/O, neither settled
-//! yet):
-//! - `os_setperm`/`os_getperm`: real Unix-style mode bits, reported
-//!   via [`os_fileinfo_mode`] (which synthesizes them on Windows,
-//!   exactly as libuv itself does for compatibility).
+//! Deferred:
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_readv`/
-//!   `os_copy`: real byte-level file I/O with the raw-fd calling
-//!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
-//!   which need this exact shape of I/O, instead go directly through
-//!   `std::io::{Read, Write, Seek}` on
-//!   `MemfileT.mf_fd: Option<std::fs::File>`, sidestepping the need
-//!   for these raw-fd wrappers entirely for that specific caller).
 //! - `os_can_exe`/`is_executable_ext`: executable-SEARCH
 //!   logic tied to `'path'`-searching semantics (`path.c`) and, on
 //!   Windows, `$PATHEXT` extension probing. The underlying
@@ -315,6 +303,54 @@ pub fn os_read(
         }
     }
     (read as isize, eof)
+}
+
+/// Read into multiple buffers in order (`os_readv`).
+///
+/// Returns `(bytes_read, eof)` and preserves the same retry and
+/// nonblocking behavior as [`os_read`].
+#[must_use]
+pub fn os_readv(
+    file: &mut std::fs::File,
+    buffers: &mut [&mut [u8]],
+    non_blocking: bool,
+) -> (isize, bool) {
+    use std::io::Read;
+    let mut total = 0usize;
+    let mut eof = false;
+
+    'buffers: for buffer in buffers {
+        let mut offset = 0usize;
+        while offset < buffer.len() {
+            match file.read(&mut buffer[offset..]) {
+                Ok(0) => {
+                    eof = true;
+                    break 'buffers;
+                }
+                Ok(count) => {
+                    offset += count;
+                    total += count;
+                }
+                Err(error)
+                    if error.kind()
+                        == std::io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Err(error)
+                    if error.kind()
+                        == std::io::ErrorKind::WouldBlock =>
+                {
+                    if non_blocking {
+                        break 'buffers;
+                    }
+                    continue;
+                }
+                Err(_) => return (-1, false),
+            }
+        }
+    }
+    (total as isize, eof)
 }
 
 /// Write the complete byte slice to a file (`os_write`).
@@ -1968,6 +2004,58 @@ mod tests {
         std::fs::write(&path, b"abc").unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
         assert_eq!(os_read(&mut file, &mut [], false), (0, false));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_readv_fills_buffers_in_order() {
+        let scratch = TempScratch::new("readv_exact");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abcde").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut first = [0u8; 2];
+        let mut second = [0u8; 3];
+        {
+            let mut buffers: [&mut [u8]; 2] =
+                [&mut first, &mut second];
+            assert_eq!(
+                os_readv(&mut file, &mut buffers, false),
+                (5, false)
+            );
+        }
+        assert_eq!(&first, b"ab");
+        assert_eq!(&second, b"cde");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_readv_reports_eof_after_partial_buffers() {
+        let scratch = TempScratch::new("readv_eof");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut first = [0u8; 2];
+        let mut second = [0u8; 3];
+        {
+            let mut buffers: [&mut [u8]; 2] =
+                [&mut first, &mut second];
+            assert_eq!(
+                os_readv(&mut file, &mut buffers, false),
+                (3, true)
+            );
+        }
+        assert_eq!(&first, b"ab");
+        assert_eq!(second[0], b'c');
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_readv_of_no_buffers_is_not_eof() {
+        let scratch = TempScratch::new("readv_empty");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(os_readv(&mut file, &mut [], false), (0, false));
     }
 
     #[test]
