@@ -18,12 +18,8 @@
 //! `"$NVIM_APPNAME[-data]"` before joining) is likewise replaced with
 //! a plain local `Vec<u8>`, matching the same established preference.
 //!
-//! Deferred (each needs a not-yet-translated subsystem):
-//! - `stdpaths_user_cache_subpath`/`stdpaths_user_conf_subpath`/
-//!   `stdpaths_user_data_subpath`/`stdpaths_user_state_subpath`: thin
-//!   wrappers over [`get_xdg_home`] + `concat_fnames_realloc` - no real
-//!   caller among currently-translated code yet, not translated ahead
-//!   of one.
+//! Deferred: `stdpaths_user_conf_subpath`/
+//! `stdpaths_user_data_subpath`/`stdpaths_user_state_subpath`.
 
 use crate::memory::memchrsub;
 use crate::os::env::os_getenv;
@@ -236,6 +232,18 @@ pub unsafe fn get_xdg_home(idx: XdgVarType) -> Option<Vec<u8>> {
         appname.extend_from_slice(b"-data");
     }
     Some(concat_fnames(dir, &appname))
+}
+
+/// Return `$XDG_CACHE_HOME/$NVIM_APPNAME/{fname}`
+/// (`stdpaths_user_cache_subpath`).
+///
+/// # Safety
+/// Forwarded from [`get_xdg_home`]'s own safety doc.
+#[must_use]
+pub unsafe fn stdpaths_user_cache_subpath(fname: &[u8]) -> Vec<u8> {
+    let home = unsafe { get_xdg_home(XdgVarType::CacheHome) }
+        .expect("cache home always has a platform default");
+    concat_fnames(home, fname)
 }
 
 /// Gets the value of `$NVIM_APPNAME`, or `"nvim"` if not set
@@ -469,6 +477,23 @@ pub(crate) mod tests {
         let mut expected = b"/custom/data/".to_vec();
         expected.extend_from_slice(&appname);
         assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn cache_subpath_appends_appname_and_file_name() {
+        let _lock = xdg_test_lock();
+        let _guard = XdgEnvGuard::set(&[
+            ("XDG_CACHE_HOME", Some("/cache")),
+            ("NVIM_APPNAME", Some("nero-test")),
+        ]);
+        let expected = concat_fnames(
+            concat_fnames(b"/cache".to_vec(), b"nero-test"),
+            b"luacache",
+        );
+        assert_eq!(
+            unsafe { stdpaths_user_cache_subpath(b"luacache") },
+            expected
+        );
     }
 
     #[test]
