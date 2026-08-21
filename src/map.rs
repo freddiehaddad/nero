@@ -26,10 +26,8 @@
 //! tracks its own length/capacity, so there is nothing left to
 //! independently track.
 //!
-//! Deferred: `equal_path_t` (Windows drive-letter/backslash folding +
-//! case-insensitive comparison) and `pmap_del2` (needs the
-//! `cstr_t`/`ptr_t` ownership-freeing convention of callers not yet
-//! translated).
+//! Deferred: `pmap_del2` (needs the `cstr_t`/`ptr_t` ownership-freeing
+//! convention of callers not yet translated).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -100,6 +98,33 @@ pub unsafe fn hash_path_t(path: &[u8]) -> u32 {
     #[cfg(not(windows))]
     {
         hash_cstr_t(path)
+    }
+}
+
+/// Compare nullable NUL-terminated path keys (`equal_path_t`).
+///
+/// # Safety
+/// On Windows this forwards the shared-state requirements of
+/// [`crate::path::path_fnamencmp`].
+#[must_use]
+pub unsafe fn equal_path_t(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return a.is_none() && b.is_none();
+    };
+    let a_len = a.iter().position(|&byte| byte == 0).unwrap_or(a.len());
+    let b_len = b.iter().position(|&byte| byte == 0).unwrap_or(b.len());
+    let a = &a[..a_len];
+    let b = &b[..b_len];
+
+    #[cfg(windows)]
+    {
+        // SAFETY: forwarded from this function's own safety contract.
+        unsafe { crate::path::path_fnamencmp(a, b, a.len().max(b.len())) == 0 }
+    }
+
+    #[cfg(not(windows))]
+    {
+        a == b
     }
 }
 
@@ -463,6 +488,26 @@ mod tests {
         {
             assert_eq!(unsafe { hash_path_t(b"foo\0ignored") }, hash_cstr_t(b"foo"));
             assert_ne!(unsafe { hash_path_t(b"Foo") }, unsafe { hash_path_t(b"foo") });
+        }
+    }
+
+    #[test]
+    fn equal_path_t_handles_null_and_platform_filename_rules() {
+        #[cfg(windows)]
+        let _lock = crate::globals::global_state_test_lock();
+
+        assert!(unsafe { equal_path_t(None, None) });
+        assert!(!unsafe { equal_path_t(Some(b"path"), None) });
+        assert!(unsafe { equal_path_t(Some(b"path\0ignored"), Some(b"path")) });
+
+        #[cfg(windows)]
+        {
+            assert!(unsafe { equal_path_t(Some(b"Foo\\Bar"), Some(b"Foo/Bar")) });
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(!unsafe { equal_path_t(Some(b"Foo/Bar"), Some(b"foo/bar")) });
         }
     }
 
