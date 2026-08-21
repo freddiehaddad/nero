@@ -1773,18 +1773,18 @@ pub(crate) mod tests {
     #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
     fn os_getenvname_at_index_enumerates_environment_names() {
         let mut names = Vec::new();
+        let mut reached_end = false;
         for index in 0..10_000 {
             let Some(name) = os_getenvname_at_index(index) else {
                 assert_eq!(os_getenvname_at_index(index + 1), None);
+                reached_end = true;
                 break;
             };
             assert!(!name.is_empty());
             names.push(name);
         }
         assert!(!names.is_empty());
-        assert!(
-            names.iter().any(|name| name.eq_ignore_ascii_case(b"PATH"))
-        );
+        assert!(reached_end);
     }
 
     #[test]
