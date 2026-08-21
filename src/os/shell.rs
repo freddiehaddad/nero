@@ -9,7 +9,9 @@
 //! Translated: the two small argument-vector predicates
 //! ([`have_wildcard`]/[`have_dollars`]) that `os_expand_wildcards`
 //! consults before deciding it needs a shell at all, and
-//! [`shell_argv_to_str`], which only formats.
+//! [`shell_argv_to_str`], which only formats. The quote-aware
+//! `word_length`/`tokenize` parser chain is translated independently
+//! of process spawning.
 //!
 //! `shell_free_argv` has no equivalent: this crate models an argument
 //! vector as an owned `Vec<Vec<u8>>`, so dropping it frees both the
@@ -29,6 +31,29 @@ pub fn have_dollars(files: &[Vec<u8>]) -> bool {
     files
         .iter()
         .any(|f| crate::strings::vim_strchr(f, i32::from(b'$')).is_some())
+}
+
+/// Return the byte length of one shell word (`word_length`).
+#[allow(dead_code)]
+#[must_use]
+fn word_length(string: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut inquote = false;
+    while pos < string.len()
+        && (inquote || !matches!(string[pos], b' ' | b'\t'))
+    {
+        if string[pos] == b'"' {
+            inquote = !inquote;
+        } else if string[pos] == b'\\'
+            && inquote
+            && pos + 1 < string.len()
+        {
+            pos += 2;
+            continue;
+        }
+        pos += 1;
+    }
+    pos
 }
 
 /// The size of the buffer `shell_argv_to_str` formats into, including
@@ -92,6 +117,33 @@ mod tests {
         assert!(!have_dollars(&[b"plain".to_vec(), b"also_plain".to_vec()]));
         assert!(have_dollars(&[b"plain".to_vec(), b"$HOME".to_vec()]));
         assert!(!have_dollars(&[]));
+    }
+
+    #[test]
+    fn word_length_stops_at_unquoted_whitespace() {
+        assert_eq!(word_length(b"shell -c"), 5);
+        assert_eq!(word_length(b"word\tanother"), 4);
+    }
+
+    #[test]
+    fn word_length_includes_quoted_whitespace() {
+        let input = br#""C:\Program Files\shell" -c"#;
+        assert_eq!(
+            word_length(input),
+            br#""C:\Program Files\shell""#.len()
+        );
+    }
+
+    #[test]
+    fn word_length_skips_an_escaped_character_inside_quotes() {
+        let input = br#""a\" b" tail"#;
+        assert_eq!(word_length(input), br#""a\" b""#.len());
+    }
+
+    #[test]
+    fn word_length_consumes_unterminated_quotes_and_empty_input() {
+        assert_eq!(word_length(br#""unterminated word"#), 18);
+        assert_eq!(word_length(b""), 0);
     }
 
     #[test]
