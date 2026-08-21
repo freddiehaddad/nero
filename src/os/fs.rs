@@ -70,7 +70,8 @@
 //!   exactly as libuv itself does for compatibility).
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/`os_dup*`/
+//! - `os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/
+//!   `os_dup_cloexec`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
 //!   which need this exact shape of I/O, instead go directly through
@@ -195,6 +196,25 @@ pub fn os_fsync(file: &std::fs::File) -> i32 {
         0
     } else {
         -1
+    }
+}
+
+/// Duplicate an open file resource (`os_dup`).
+///
+/// Rust's [`std::fs::File::try_clone`] duplicates the underlying OS
+/// descriptor/handle and preserves its shared cursor semantics.
+#[must_use]
+pub fn os_dup(file: &std::fs::File) -> Option<std::fs::File> {
+    loop {
+        match file.try_clone() {
+            Ok(duplicate) => return Some(duplicate),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(_) => return None,
+        }
     }
 }
 
@@ -1417,7 +1437,7 @@ pub(crate) fn cwd_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     #[test]
     fn os_fileid_equal_requires_both_fields_to_match() {
@@ -1582,6 +1602,23 @@ mod tests {
         let file = os_open(&path, libc::O_RDWR | libc::O_TRUNC, 0).expect("file exists");
         drop(file);
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_dup_duplicates_the_handle_and_shared_cursor() {
+        let scratch = TempScratch::new("dup");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut duplicate = os_dup(&file).expect("dup succeeds");
+
+        let mut first = [0u8; 1];
+        let mut second = [0u8; 1];
+        file.read_exact(&mut first).unwrap();
+        duplicate.read_exact(&mut second).unwrap();
+        assert_eq!(first, [b'a']);
+        assert_eq!(second, [b'b']);
     }
 
     #[cfg(unix)]
