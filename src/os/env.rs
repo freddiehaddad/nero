@@ -9,9 +9,8 @@
 //! `std::process` already provide the same portable primitives
 //! natively (same reasoning as `os/time.rs`), so they're translated now
 //! rather than waiting on the still-open libuv FFI-vs-Rust-runtime
-//! decision (phase 11). Also `os_homedir`/`init_homedir` (+ its own
-//! `os_uv_homedir` file-static, only partially implemented - see its
-//! own doc comment), and `os_get_hostname` (hand-written Win32 FFI on
+//! decision (phase 11). Also `os_homedir`/`init_homedir`/
+//! `os_uv_homedir`, and `os_get_hostname` (hand-written Win32 FFI on
 //! Windows/`libc::uname` on Unix - same "small, self-contained OS
 //! wrapper" treatment as `os/proc.c`'s `os_proc_running` and
 //! `os/users.c`'s `os_get_username`; Unix-only code additionally
@@ -716,18 +715,85 @@ pub unsafe fn home_replace_save(
 
 /// Queries the OS for the current user's home directory
 /// (`os_uv_homedir`, `static` in the original).
-///
-/// **Not yet implemented** (always returns `None`): the original wraps
-/// `uv_os_homedir()`, which on Windows calls `GetUserProfileDirectoryW`
-/// (a Win32 API needing an FFI decision not yet made) and on Unix reads
-/// `getpwuid()` (needs the same `libc`-FFI decision noted in
-/// `os/users.c`'s investigation). [`init_homedir`] still produces a
-/// correct result in the overwhelmingly common case where `$HOME` (or,
-/// on Windows, `$HOMEDRIVE`+`$HOMEPATH`) is set, which covers virtually
-/// every real login session - this is only a fallback for the rarer
-/// case where none of those are set.
 fn os_uv_homedir() -> Option<Vec<u8>> {
-    None
+    #[cfg(unix)]
+    {
+        let username = crate::os::users::os_get_username().ok()?;
+        crate::os::users::os_get_userdir(&username)
+    }
+
+    #[cfg(windows)]
+    {
+        type Handle = *mut std::ffi::c_void;
+        const TOKEN_QUERY: u32 = 0x0008;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> Handle;
+            fn CloseHandle(handle: Handle) -> i32;
+        }
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn OpenProcessToken(
+                process: Handle,
+                desired_access: u32,
+                token: *mut Handle,
+            ) -> i32;
+        }
+        #[link(name = "userenv")]
+        unsafe extern "system" {
+            fn GetUserProfileDirectoryW(
+                token: Handle,
+                profile_dir: *mut u16,
+                size: *mut u32,
+            ) -> i32;
+        }
+
+        let mut token = std::ptr::null_mut();
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY,
+                &mut token,
+            )
+        } == 0
+        {
+            return None;
+        }
+
+        let mut size = 0u32;
+        unsafe {
+            GetUserProfileDirectoryW(
+                token,
+                std::ptr::null_mut(),
+                &mut size,
+            );
+        }
+        if size == 0 {
+            unsafe { CloseHandle(token) };
+            return None;
+        }
+        let mut profile = vec![0u16; size as usize];
+        let success = unsafe {
+            GetUserProfileDirectoryW(
+                token,
+                profile.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        unsafe { CloseHandle(token) };
+        if success == 0 {
+            return None;
+        }
+        let len =
+            profile.iter().position(|&unit| unit == 0).unwrap_or(profile.len());
+        Some(String::from_utf16_lossy(&profile[..len]).into_bytes())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 /// Sets the resolved user home directory (`HOMEDIR`, read via
@@ -737,12 +803,12 @@ fn os_uv_homedir() -> Option<Vec<u8>> {
 ///
 /// For Windows:
 ///  1. assemble homedir using `$HOMEDRIVE` and `$HOMEPATH`
-///  2. try `os_uv_homedir` (not yet implemented, see its own doc)
+///  2. try `os_uv_homedir`
 ///  3. resolve a direct reference to another system variable
 ///  4. guess `C:/`
 ///
 /// For Unix:
-///  1. try `os_uv_homedir` (not yet implemented, see its own doc)
+///  1. try `os_uv_homedir`
 ///  2. resolve it with `os_realpath` (this also works with mounts and
 ///     links)
 ///  3. fall back to the current working directory as a last resort
@@ -1386,6 +1452,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri cannot call passwd/Windows profile FFI"
+    )]
+    fn os_uv_homedir_returns_the_current_profile_directory() {
+        let home = os_uv_homedir().expect("current profile directory");
+        assert!(!home.is_empty());
+    }
+
+    #[test]
     #[cfg(windows)]
     fn init_homedir_falls_back_to_homedrive_homepath() {
         let _lock = homedir_test_lock();
@@ -1402,12 +1478,16 @@ pub(crate) mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn init_homedir_falls_back_to_c_drive_when_nothing_set() {
+    #[cfg_attr(miri, ignore = "Miri cannot call Windows profile FFI")]
+    fn init_homedir_falls_back_to_the_windows_profile() {
         let _lock = homedir_test_lock();
         let _guard = EnvVarGuard::set(&[("HOME", None), ("HOMEDRIVE", None), ("HOMEPATH", None)]);
+        let mut expected =
+            os_uv_homedir().unwrap_or_else(|| b"C:/".to_vec());
+        crate::path::path_to_slash(&mut expected);
         unsafe {
             init_homedir();
-            assert_eq!(os_homedir(), Some(b"C:/".to_vec()));
+            assert_eq!(os_homedir(), Some(expected));
         }
     }
 
