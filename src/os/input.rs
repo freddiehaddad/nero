@@ -75,7 +75,6 @@ pub unsafe fn input_available() -> usize {
 ///
 /// # Safety
 /// Reads shared raw-input state.
-#[allow(dead_code)]
 #[must_use]
 unsafe fn input_space() -> usize {
     let input = unsafe { INPUT_BUFFER.get_mut() };
@@ -139,7 +138,6 @@ pub unsafe fn push_event_key(buf: &mut [u8]) -> usize {
 ///
 /// # Safety
 /// Mutates shared raw-input and global interrupt state.
-#[allow(dead_code)]
 unsafe fn process_ctrl_c() {
     let globals = crate::globals::GLOBALS.as_ptr();
     if !unsafe { (*globals).ctrl_c_interrupts } {
@@ -423,7 +421,6 @@ fn parse_mouse_coordinates(input: &[u8]) -> Option<(i32, i32, usize)> {
 ///
 /// # Safety
 /// Mutates shared mouse coordinates and multi-click state.
-#[allow(dead_code)]
 unsafe fn handle_mouse_event(
     input: &[u8],
     buf: &mut [u8],
@@ -509,6 +506,94 @@ unsafe fn handle_mouse_event(
         }
     }
     (consumed, output_size)
+}
+
+/// Translate and enqueue input bytes from one UI channel
+/// (`input_enqueue`).
+///
+/// Returns the number of source bytes consumed.
+///
+/// # Safety
+/// Mutates shared input, UI, mouse, interrupt, option, and `v:`
+/// variable state.
+pub unsafe fn input_enqueue(chan_id: u64, keys: &[u8]) -> usize {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    unsafe { (*globals).current_ui = chan_id };
+
+    {
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        if input.read_pos == input.write_pos {
+            input.read_pos = 0;
+            input.write_pos = 0;
+        }
+    }
+
+    if !keys.is_empty() {
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Useractive,
+                crate::os::time::os_realtime(),
+            );
+        }
+    }
+
+    const FSK_KEYCODE: i32 = 0x01;
+    let mut pos = 0;
+    while unsafe { input_space() } >= 19 && pos < keys.len() {
+        if let Some((translated, consumed, _)) =
+            crate::keycodes::trans_special(
+                &keys[pos..],
+                FSK_KEYCODE,
+                true,
+            )
+        {
+            assert!(translated.len() <= 19);
+            let mut buf = [0u8; 19];
+            buf[..translated.len()].copy_from_slice(&translated);
+            let (mouse_consumed, output_size) = unsafe {
+                handle_mouse_event(
+                    &keys[pos + consumed..],
+                    &mut buf,
+                    translated.len(),
+                )
+            };
+            pos += consumed + mouse_consumed;
+            if output_size != 0 {
+                unsafe { input_enqueue_raw(&buf[..output_size]) };
+            }
+            continue;
+        }
+
+        if keys[pos] == b'<' {
+            let old_pos = pos;
+            pos += 1;
+            while pos < keys.len() && keys[pos] != b'>' {
+                pos += 1;
+            }
+            if pos == keys.len() {
+                pos = old_pos;
+                break;
+            }
+            pos += 1;
+            continue;
+        }
+
+        if keys[pos] == crate::keycodes_defs::K_SPECIAL {
+            unsafe {
+                input_enqueue_raw(&[
+                    crate::keycodes_defs::K_SPECIAL,
+                    crate::keycodes_defs::KS_SPECIAL,
+                    crate::keycodes_defs::KE_FILLER,
+                ])
+            };
+        } else {
+            unsafe { input_enqueue_raw(&keys[pos..pos + 1]) };
+        }
+        pos += 1;
+    }
+
+    unsafe { process_ctrl_c() };
+    pos
 }
 
 /// Whether the main loop is blocked waiting for input
@@ -691,6 +776,36 @@ mod tests {
                     )
                 },
             }
+        }
+    }
+
+    struct UserActiveGuard(crate::eval::typval_defs::VarnumberT);
+
+    impl UserActiveGuard {
+        unsafe fn reset() -> Self {
+            let previous = unsafe {
+                crate::eval::vars::get_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Useractive,
+                )
+            };
+            unsafe {
+                crate::eval::vars::set_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Useractive,
+                    0,
+                )
+            };
+            Self(previous)
+        }
+    }
+
+    impl Drop for UserActiveGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::eval::vars::set_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Useractive,
+                    self.0,
+                )
+            };
         }
     }
 
@@ -1377,6 +1492,127 @@ mod tests {
             unsafe { handle_mouse_event(b"", &mut buf, 3) },
             (0, 0)
         );
+    }
+
+    #[test]
+    fn input_enqueue_records_channel_and_plain_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _channel = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.current_ui,
+                0,
+            )
+        };
+        let _got_int = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.got_int,
+                false,
+            )
+        };
+        let _active = unsafe { UserActiveGuard::reset() };
+
+        assert_eq!(unsafe { input_enqueue(42, b"abc") }, 3);
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(&input.data[..3], b"abc");
+        assert_eq!(
+            unsafe { (*crate::globals::GLOBALS.as_ptr()).current_ui },
+            42
+        );
+        assert!(
+            unsafe {
+                crate::eval::vars::get_vim_var_nr(
+                    crate::eval::vars::VimVarIndex::Useractive,
+                )
+            } > 0
+        );
+    }
+
+    #[test]
+    fn input_enqueue_escapes_a_literal_k_special() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _channel = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.current_ui,
+                0,
+            )
+        };
+        let _active = unsafe { UserActiveGuard::reset() };
+
+        assert_eq!(
+            unsafe {
+                input_enqueue(
+                    1,
+                    &[crate::keycodes_defs::K_SPECIAL],
+                )
+            },
+            1
+        );
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(
+            &input.data[..3],
+            &[
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+            ]
+        );
+    }
+
+    #[test]
+    fn input_enqueue_skips_invalid_complete_key_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _channel = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.current_ui,
+                0,
+            )
+        };
+        let _active = unsafe { UserActiveGuard::reset() };
+        let keys = b"<DefinitelyNotAKey>";
+        assert_eq!(unsafe { input_enqueue(1, keys) }, keys.len());
+        assert_eq!(unsafe { input_available() }, 0);
+    }
+
+    #[test]
+    fn input_enqueue_leaves_an_incomplete_key_name_unconsumed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _channel = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.current_ui,
+                0,
+            )
+        };
+        let _active = unsafe { UserActiveGuard::reset() };
+        assert_eq!(unsafe { input_enqueue(1, b"<Esc") }, 0);
+        assert_eq!(unsafe { input_available() }, 0);
+    }
+
+    #[test]
+    fn input_enqueue_rewinds_a_fully_drained_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _channel = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.current_ui,
+                0,
+            )
+        };
+        let _active = unsafe { UserActiveGuard::reset() };
+        {
+            let input = unsafe { INPUT_BUFFER.get_mut() };
+            input.read_pos = INPUT_BUFFER_SIZE - 1;
+            input.write_pos = INPUT_BUFFER_SIZE - 1;
+        }
+
+        assert_eq!(unsafe { input_enqueue(1, b"x") }, 1);
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(input.read_pos, 0);
+        assert_eq!(input.write_pos, 1);
+        assert_eq!(input.data[0], b'x');
     }
 
     #[test]
