@@ -1,6 +1,5 @@
-//! Translated from `src/nvim/context_defs.h` (partial: struct/enum
-//! shapes only - see `src/context.rs`'s own module doc for the actual
-//! functions).
+//! Translated from `src/nvim/context_defs.h`; see `src/context.rs` for
+//! the corresponding operations.
 //!
 //! `Context`/`ContextVec` (the `:mkview`/`context`-API snapshot format:
 //! registers/jumplist/buffer-list/global-variables/functions, each as

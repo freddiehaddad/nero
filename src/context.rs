@@ -19,13 +19,8 @@
 //! a `CtxSwitch`), both reachable now that
 //! `crate::window::win_find_by_handle` is real.
 //!
-//! `ctx_free` (frees a `Context`'s own `regs`/`jumps`/`bufs`/`gvars`/
-//! `funcs` fields) needs NO Rust equivalent at all: `context_defs.rs`'s
-//! `Context` already models every one of those fields as an owned
-//! `Option<Vec<u8>>`/`Vec<Object>`, so Rust's own `Drop` impl already
-//! performs the exact same cleanup automatically - the same reasoning
-//! already established for `optval_free`/`ga_clear_strings` elsewhere
-//! in this crate.
+//! `ctx_free` is preserved as a consuming function; Rust's own `Drop`
+//! performs the original's manual per-field cleanup.
 
 use crate::context_defs::{CtxSwitch, CtxSwitchMode, CtxWin};
 
@@ -37,6 +32,11 @@ pub(crate) static CTX_WIN_VEC: std::sync::LazyLock<crate::globals::GlobalCell<Ve
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Vec::new()));
 static NEXT_CTX_WIN_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
     crate::globals::GlobalCell::new(1_000_000_000);
+
+/// Free resources used by a Context object (`ctx_free`).
+pub fn ctx_free(context: crate::context_defs::Context) {
+    drop(context);
+}
 
 /// Convert a readfile-style API Array into serialized bytes
 /// (`array_to_string`).
@@ -137,6 +137,26 @@ pub fn ctx_to_dict(
         value,
     })
     .collect()
+}
+
+#[cfg(test)]
+mod ctx_free_tests {
+    use super::*;
+
+    #[test]
+    fn ctx_free_consumes_every_owned_field() {
+        let context = crate::context_defs::Context {
+            regs: Some(b"regs".to_vec()),
+            jumps: Some(b"jumps".to_vec()),
+            bufs: Some(b"bufs".to_vec()),
+            gvars: Some(b"gvars".to_vec()),
+            funcs: vec![crate::api::private::defs::Object::String(
+                b"func".to_vec(),
+            )],
+        };
+
+        ctx_free(context);
+    }
 }
 
 /// Populate a Context snapshot from its API Dict representation
