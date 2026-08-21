@@ -94,7 +94,7 @@ pub unsafe fn multiqueue_free(queue: *mut MultiQueue) {
     queue.items.clear();
 }
 
-fn remove(queue: &mut MultiQueue) -> Event {
+fn multiqueue_remove(queue: &mut MultiQueue) -> Event {
     let item = queue.items.pop_front().expect("queue is nonempty");
     let event = match item {
         MultiQueueItem::Event {
@@ -159,7 +159,7 @@ pub unsafe fn multiqueue_get(queue: *mut MultiQueue) -> Event {
     if queue.items.is_empty() {
         Event::default()
     } else {
-        remove(queue)
+        multiqueue_remove(queue)
     }
 }
 
@@ -362,6 +362,22 @@ mod tests {
             assert_eq!((*queue).next_link_id, 0);
             (*queue).on_put.unwrap()(queue, data);
             assert_eq!(callback_count, 1);
+            multiqueue_free(queue);
+        }
+    }
+
+    #[test]
+    fn internal_remove_returns_the_event_and_decrements_size() {
+        let queue = multiqueue_new(None, std::ptr::null_mut());
+        unsafe {
+            multiqueue_put_event(queue, Event::default());
+            assert_eq!(multiqueue_size(queue), 1);
+
+            let event = multiqueue_remove(&mut *queue);
+
+            assert!(event.handler.is_none());
+            assert!(multiqueue_empty(queue));
+            assert_eq!(multiqueue_size(queue), 0);
             multiqueue_free(queue);
         }
     }
