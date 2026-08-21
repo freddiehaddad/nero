@@ -25,9 +25,8 @@
 //! case (`os_homedir`). Its OWN fallback - discovering `$VIM`/
 //! `$VIMRUNTIME` by locating the nvim executable itself when neither
 //! is set as a real environment variable - `unimplemented!()`s when
-//! actually reached (needs `vim_runtime_dir`/
-//! `vim_get_prefix_from_exepath`, real runtime-path auto-discovery,
-//! not yet translated).
+//! actually reached (the helpers are translated, but the complete
+//! runtime-path auto-discovery chain is not yet assembled).
 //!
 //! Also translated: `restore_env_var` (`#ifdef MSWIN`-only in the
 //! original, matched here via `#[cfg(windows)]`), `os_shell_is_cmdexe`
@@ -60,8 +59,6 @@
 //!   manipulation functions (`home_replace*`) or a much larger slice of
 //!   them plus `` `=expr` `` Vimscript-expression substitution
 //!   (`expand_env*`) than `vim_getenv` alone needed.
-//! - `vim_runtime_dir`: only called by `vim_getenv`'s own still-
-//!   deferred `$VIM`/`$VIMRUNTIME` auto-discovery fallback.
 //! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
 
 use super::os::NVIM_TESTING;
@@ -134,6 +131,25 @@ pub fn vim_env_iter_rev(
         Some(offset) => (&val[offset + 1..end], Some(offset)),
         None => (prefix, None),
     }
+}
+
+/// Return `vimdir/runtime` when that directory exists
+/// (`vim_runtime_dir`).
+#[allow(dead_code)]
+#[must_use]
+fn vim_runtime_dir(vimdir: Option<&[u8]>) -> Option<Vec<u8>> {
+    let vimdir = vimdir?;
+    if vimdir.is_empty() {
+        return None;
+    }
+    let path = crate::path::concat_fnames(
+        vimdir,
+        crate::vim_defs::RUNTIME_DIRNAME.as_bytes(),
+        true,
+    );
+    let path_text = std::str::from_utf8(&path).ok()?;
+    crate::os::fs::os_isdir(std::path::Path::new(path_text))
+        .then_some(path)
 }
 
 /// Include `dirname` in a suffix when it immediately precedes that
@@ -983,6 +999,38 @@ pub unsafe fn expand_env(src: &[u8]) -> Vec<u8> {
 pub(crate) mod tests {
     use super::*;
 
+    struct RuntimeDirScratch(std::path::PathBuf);
+
+    impl RuntimeDirScratch {
+        fn new() -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let sequence = COUNTER.fetch_add(
+                1,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let root = std::env::temp_dir().join(format!(
+                "nero-vim-runtime-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(
+                root.join(crate::vim_defs::RUNTIME_DIRNAME),
+            )
+            .unwrap();
+            Self(root)
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.0.to_string_lossy().into_owned().into_bytes()
+        }
+    }
+
+    impl Drop for RuntimeDirScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     // --- vim_get_prefix_from_exepath ---
 
     #[test]
@@ -1284,6 +1332,36 @@ pub(crate) mod tests {
     #[test]
     fn vim_env_iter_rev_handles_an_empty_value() {
         assert_eq!(vim_env_iter_rev(b';', b"", None), (&b""[..], None));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn vim_runtime_dir_returns_an_existing_runtime_directory() {
+        let scratch = RuntimeDirScratch::new();
+        let root = scratch.bytes();
+        assert_eq!(
+            vim_runtime_dir(Some(&root)),
+            Some(crate::path::concat_fnames(
+                &root,
+                crate::vim_defs::RUNTIME_DIRNAME.as_bytes(),
+                true,
+            ))
+        );
+    }
+
+    #[test]
+    fn vim_runtime_dir_rejects_none_and_empty_roots() {
+        assert_eq!(vim_runtime_dir(None), None);
+        assert_eq!(vim_runtime_dir(Some(b"")), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn vim_runtime_dir_rejects_a_missing_root() {
+        assert_eq!(
+            vim_runtime_dir(Some(b"nero-runtime-root-does-not-exist")),
+            None
+        );
     }
 
     #[test]
