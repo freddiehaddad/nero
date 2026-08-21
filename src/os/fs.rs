@@ -77,7 +77,7 @@
 //!   `std::io::{Read, Write, Seek}` on
 //!   `MemfileT.mf_fd: Option<std::fs::File>`, sidestepping the need
 //!   for these raw-fd wrappers entirely for that specific caller).
-//! - `os_exepath`/`os_can_exe`/`is_executable_ext`: executable-SEARCH
+//! - `os_can_exe`/`is_executable_ext`: executable-SEARCH
 //!   logic tied to `'path'`-searching semantics (`path.c`) and, on
 //!   Windows, `$PATHEXT` extension probing. The underlying
 //!   [`is_executable`] permission check itself IS translated.
@@ -577,6 +577,30 @@ pub fn os_nodetype(name: &Path) -> i32 {
         let _ = name;
         NODE_NORMAL
     }
+}
+
+/// Return the absolute path of the running executable (`os_exepath`).
+#[must_use]
+pub fn os_exepath() -> Option<Vec<u8>> {
+    let path = std::env::current_exe().ok()?;
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let mut bytes =
+        path.to_string_lossy().into_owned().into_bytes();
+    #[cfg(not(any(unix, windows)))]
+    let bytes =
+        path.to_string_lossy().into_owned().into_bytes();
+
+    #[cfg(windows)]
+    {
+        strip_windows_verbatim_prefix(&mut bytes);
+        crate::path::path_to_slash(&mut bytes);
+    }
+    Some(bytes)
 }
 
 /// Check if the given path is a directory and not a symlink to a
@@ -1630,6 +1654,19 @@ mod tests {
             os_nodetype(Path::new(r"\\.\con")),
             crate::os::fs_defs::NODE_WRITABLE
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot query the host executable")]
+    fn os_exepath_returns_the_running_executable() {
+        let path = os_exepath().expect("current executable");
+        let path_text = std::str::from_utf8(&path).expect("test path");
+        assert!(Path::new(path_text).is_absolute());
+        assert!(Path::new(path_text).is_file());
+        if cfg!(windows) {
+            assert!(!path.contains(&b'\\'));
+            assert!(!path.starts_with(br"\\?\"));
+        }
     }
 
     #[test]
