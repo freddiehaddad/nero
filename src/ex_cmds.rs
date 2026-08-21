@@ -149,23 +149,44 @@ static SORT_IC: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::n
 /// Returns a negative/zero/positive `i32`, matching `qsort`'s own
 /// convention and this crate's established comparator shape.
 ///
-/// # Panics
-/// If `SORT_LC` is ever `true`. That branch is `strcoll`, whose
-/// locale-aware collation has no counterpart in this crate; it is
-/// unreachable today because only `ex_sort`, not translated, can set
-/// the flag - the same treatment as `popupmenu::pum_get_height`'s own
-/// external-UI branch.
-///
 /// # Safety
 /// Reads the `SORT_LC`/`SORT_IC` file-statics.
 #[must_use]
 pub unsafe fn string_compare(s1: &[u8], s2: &[u8]) -> i32 {
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { *SORT_LC.get_mut() } {
-        unimplemented!(
-            "string_compare: the locale-collation branch needs strcoll, which has no \
-             counterpart in this crate - unreachable until ex_sort is translated"
-        );
+        let first_end =
+            s1.iter().position(|&byte| byte == 0).unwrap_or(s1.len());
+        let second_end =
+            s2.iter().position(|&byte| byte == 0).unwrap_or(s2.len());
+        let first = std::ffi::CString::new(&s1[..first_end])
+            .expect("slice was truncated before NUL");
+        let second = std::ffi::CString::new(&s2[..second_end])
+            .expect("slice was truncated before NUL");
+        return unsafe { system_strcoll(first.as_ptr(), second.as_ptr()) };
+    }
+
+    #[cfg(unix)]
+    unsafe fn system_strcoll(
+        first: *const std::ffi::c_char,
+        second: *const std::ffi::c_char,
+    ) -> i32 {
+        unsafe { libc::strcoll(first, second) }
+    }
+
+    #[cfg(windows)]
+    unsafe fn system_strcoll(
+        first: *const std::ffi::c_char,
+        second: *const std::ffi::c_char,
+    ) -> i32 {
+        #[link(name = "ucrt")]
+        unsafe extern "C" {
+            fn strcoll(
+                first: *const std::ffi::c_char,
+                second: *const std::ffi::c_char,
+            ) -> i32;
+        }
+        unsafe { strcoll(first, second) }
     }
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { *SORT_IC.get_mut() } {
@@ -440,11 +461,16 @@ mod tests {
     /// Locale collation is checked FIRST, so it wins even when the
     /// ignore-case flag is also set (`:sort il`).
     #[test]
-    #[should_panic(expected = "locale-collation branch")]
+    #[cfg_attr(miri, ignore = "Miri cannot call strcoll FFI")]
     fn string_compare_prefers_locale_collation_over_ignore_case() {
         let _guard = globals_test_lock();
         let _g = SortFlagsGuard::set(true, true);
-        let _ = unsafe { string_compare(b"abc", b"abc") };
+        assert_eq!(unsafe { string_compare(b"abc", b"abc") }, 0);
+        assert_ne!(
+            unsafe { string_compare(b"ABC", b"abc") },
+            0,
+            "locale collation wins over ignore-case equality"
+        );
     }
 
     // ---- linelen ----
