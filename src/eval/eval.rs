@@ -5211,6 +5211,52 @@ unsafe fn typval2string(tv: &TypvalT, join_list: bool) -> Vec<u8> {
     crate::eval::typval::tv_get_string(tv)
 }
 
+/// Evaluate a top-level expression and return its string value, or
+/// only parse it when `skip` is true (`eval_to_string_skip`).
+///
+/// Unlike [`eval_to_string_eap`], this uses the ordinary
+/// [`crate::eval::typval::tv_get_string`] conversion rather than
+/// Vimscript container encoding.
+///
+/// # Safety
+/// Forwarded from [`eval0`] and
+/// [`crate::eval::typval::tv_clear_simple`]. Callers must serialize
+/// access to `GLOBALS.emsg_skip`.
+#[must_use]
+pub unsafe fn eval_to_string_skip(
+    arg: &[u8],
+    mut eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+    skip: bool,
+) -> Option<Vec<u8>> {
+    let mut evalarg = EvalargT::default();
+    fill_evalarg_from_eap(&mut evalarg, eap.as_deref(), skip);
+    // SAFETY: forwarded from this function's own safety doc.
+    let emsg_skip = unsafe { EmsgSkipGuard::new(skip) };
+
+    let mut tv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe {
+        eval0(
+            arg,
+            &mut tv,
+            eap.as_deref_mut(),
+            Some(&mut evalarg),
+        )
+    };
+    let retval = if result == FAIL || skip {
+        None
+    } else {
+        let value = crate::eval::typval::tv_get_string(&tv);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+        Some(value)
+    };
+
+    drop(emsg_skip);
+    clear_evalarg(Some(&mut evalarg), eap);
+    retval
+}
+
 /// Top level evaluation function, returning a string, with an
 /// optional `exarg_T` for multi-line-`:source` context
 /// (`eval_to_string_eap`).
@@ -11930,7 +11976,70 @@ mod tests {
         assert_eq!(evalarg.eval_flags, EVAL_EVALUATE);
     }
 
-    // --- eval_to_string / typval2string ---
+    // --- eval_to_string_skip / eval_to_string / typval2string ---
+
+    #[test]
+    fn eval_to_string_skip_returns_scalar_text() {
+        assert_eq!(
+            unsafe { eval_to_string_skip(b"6 * 7", None, false) },
+            Some(b"42".to_vec())
+        );
+        assert_eq!(
+            unsafe { eval_to_string_skip(b"\"hello\"", None, false) },
+            Some(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn eval_to_string_skip_returns_none_for_a_failure() {
+        assert_eq!(
+            unsafe { eval_to_string_skip(b")", None, false) },
+            None
+        );
+    }
+
+    #[test]
+    fn eval_to_string_skip_parse_only_returns_none_and_restores_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = unsafe { crate::globals::GLOBALS.get_mut().emsg_skip };
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_skip = 3 };
+
+        assert_eq!(
+            unsafe { eval_to_string_skip(b"1 + 2", None, true) },
+            None
+        );
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().emsg_skip }, 3);
+
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_skip = old };
+    }
+
+    #[test]
+    fn eval_to_string_skip_updates_exarg_nextcmd() {
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        assert_eq!(
+            unsafe {
+                eval_to_string_skip(
+                    b"9 | echo",
+                    Some(&mut eap),
+                    false,
+                )
+            },
+            Some(b"9".to_vec())
+        );
+        assert_eq!(eap.nextcmd, Some(b" echo".to_vec()));
+    }
+
+    #[test]
+    fn eval_to_string_skip_releases_a_non_stringish_list_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        assert_eq!(
+            unsafe { eval_to_string_skip(b"[1]", None, false) },
+            Some(Vec::new())
+        );
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
 
     #[test]
     fn eval_to_string_number() {
