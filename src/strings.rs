@@ -305,15 +305,20 @@ pub fn sort_strings(files: &mut [Vec<u8>]) {
     files.sort_unstable();
 }
 
-/// Returns true if `s` contains a non-ASCII byte (128 or higher)
-/// (`has_non_ascii`/`has_non_ascii_len` - unified, since `&[u8]` always
-/// carries its own length; `None`/absent input returns false like the
-/// original's `NULL` case).
+/// Returns true if the NUL-terminated `s` contains a non-ASCII byte
+/// (`has_non_ascii`).
 pub fn has_non_ascii(s: Option<&[u8]>) -> bool {
-    match s {
-        Some(s) => s.iter().any(|&b| b >= 128),
-        None => false,
-    }
+    let Some(s) = s else {
+        return false;
+    };
+    let len = s.iter().position(|&byte| byte == 0).unwrap_or(s.len());
+    has_non_ascii_len(Some(&s[..len]))
+}
+
+/// Length-bounded variant of [`has_non_ascii`] (`has_non_ascii_len`).
+#[must_use]
+pub fn has_non_ascii_len(s: Option<&[u8]>) -> bool {
+    s.is_some_and(|s| s.iter().any(|&byte| byte >= 128))
 }
 
 /// Return the length of `s` with trailing whitespace removed, unless
@@ -940,6 +945,14 @@ mod tests {
         assert!(!has_non_ascii(Some(b"hello")));
         assert!(has_non_ascii(Some(&[b'h', 200, b'i'])));
         assert!(!has_non_ascii(None));
+    }
+
+    #[test]
+    fn has_non_ascii_distinguishes_nul_terminated_and_bounded_inputs() {
+        let input = [b'a', 0, 0x80];
+        assert!(!has_non_ascii(Some(&input)));
+        assert!(has_non_ascii_len(Some(&input)));
+        assert!(!has_non_ascii_len(None));
     }
 
     #[test]
