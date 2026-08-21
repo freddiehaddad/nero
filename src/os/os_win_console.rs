@@ -8,6 +8,10 @@ type WindowHandle = *mut std::ffi::c_void;
 static ORIGINAL_TITLE: GlobalCell<[u8; 256]> = GlobalCell::new([0; 256]);
 static WINDOW: GlobalCell<WindowHandle> =
     GlobalCell::new(std::ptr::null_mut());
+static ORIGINAL_ICON_SMALL: GlobalCell<WindowHandle> =
+    GlobalCell::new(std::ptr::null_mut());
+static ORIGINAL_ICON: GlobalCell<WindowHandle> =
+    GlobalCell::new(std::ptr::null_mut());
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -17,7 +21,6 @@ unsafe extern "system" {
     ) -> i32;
     fn GetConsoleTitleA(title: *mut u8, size: u32) -> u32;
     fn SetConsoleTitleA(title: *const u8) -> i32;
-    #[cfg(test)]
     fn GetConsoleWindow() -> WindowHandle;
     fn CreateFileA(
         filename: *const u8,
@@ -30,6 +33,24 @@ unsafe extern "system" {
     ) -> WindowHandle;
     fn GetConsoleMode(handle: WindowHandle, mode: *mut u32) -> i32;
     fn SetConsoleMode(handle: WindowHandle, mode: u32) -> i32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn LoadImageA(
+        instance: WindowHandle,
+        name: *const u8,
+        type_: u32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) -> WindowHandle;
+    fn SendMessageA(
+        window: WindowHandle,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize;
 }
 
 #[link(name = "ucrt")]
@@ -47,6 +68,97 @@ pub fn os_enable_ctrl_c() {
 /// Forget the cached console window (`os_clear_hwnd`).
 pub fn os_clear_hwnd() {
     unsafe { *WINDOW.get_mut() = std::ptr::null_mut() };
+}
+
+/// Restore the original console icons (`os_icon_reset`).
+pub fn os_icon_reset() {
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    let window = unsafe { *WINDOW.get_mut() };
+    if window.is_null() {
+        return;
+    }
+    let small = unsafe { *ORIGINAL_ICON_SMALL.get_mut() };
+    if !small.is_null() {
+        unsafe {
+            SendMessageA(
+                window,
+                WM_SETICON,
+                ICON_SMALL,
+                small as isize,
+            )
+        };
+    }
+    let large = unsafe { *ORIGINAL_ICON.get_mut() };
+    if !large.is_null() {
+        unsafe {
+            SendMessageA(
+                window,
+                WM_SETICON,
+                ICON_BIG,
+                large as isize,
+            )
+        };
+    }
+}
+
+/// Load Neovim's console icon and preserve the originals
+/// (`os_icon_init`).
+pub fn os_icon_init() {
+    const IMAGE_ICON: u32 = 1;
+    const LR_LOADFROMFILE: u32 = 0x0010;
+    const LR_LOADMAP3DCOLORS: u32 = 0x1000;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    let window = unsafe { GetConsoleWindow() };
+    unsafe { *WINDOW.get_mut() = window };
+    if window.is_null() {
+        return;
+    }
+    let Some(runtime) = crate::os::env::os_getenv(b"VIMRUNTIME") else {
+        return;
+    };
+    let mut path = runtime;
+    if !path.ends_with(b"/") && !path.ends_with(b"\\") {
+        path.push(b'/');
+    }
+    path.extend_from_slice(b"neovim.ico");
+    let Ok(path_string) = std::ffi::CString::new(path) else {
+        return;
+    };
+    let path_text = String::from_utf8_lossy(path_string.as_bytes());
+    if !std::path::Path::new(path_text.as_ref()).exists() {
+        return;
+    }
+    let icon = unsafe {
+        LoadImageA(
+            std::ptr::null_mut(),
+            path_string.as_ptr().cast(),
+            IMAGE_ICON,
+            64,
+            64,
+            LR_LOADFROMFILE | LR_LOADMAP3DCOLORS,
+        )
+    };
+    if icon.is_null() {
+        return;
+    }
+    unsafe {
+        *ORIGINAL_ICON_SMALL.get_mut() = SendMessageA(
+            window,
+            WM_SETICON,
+            ICON_SMALL,
+            icon as isize,
+        ) as WindowHandle;
+        *ORIGINAL_ICON.get_mut() = SendMessageA(
+            window,
+            WM_SETICON,
+            ICON_BIG,
+            icon as isize,
+        ) as WindowHandle;
+    }
 }
 
 /// Open the current console input as a CRT descriptor
@@ -179,6 +291,16 @@ mod tests {
         };
         os_clear_hwnd();
         assert!(unsafe { *WINDOW.get_mut() }.is_null());
+        unsafe { *WINDOW.get_mut() = previous };
+    }
+
+    #[test]
+    fn icon_reset_is_a_noop_without_a_cached_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous = unsafe {
+            std::mem::replace(WINDOW.get_mut(), std::ptr::null_mut())
+        };
+        os_icon_reset();
         unsafe { *WINDOW.get_mut() = previous };
     }
 
