@@ -272,9 +272,7 @@
 //!
 //! Also `visualmode([{expr}])` (via the already-real
 //! `BufT.b_visual_mode_eval`), `wildmenumode()` (via the already-real
-//! `GLOBALS.wild_menu_showing`, short-circuiting away its own
-//! `MODE_CMDLINE`-dependent second operand exactly like the original
-//! does, since nothing can currently set that `State` bit), and
+//! `GLOBALS.wild_menu_showing` and command-line popup state), and
 //! `windowsversion()` (via the already-real
 //! `GLOBALS.windowsVersion`, zero-initialized/empty until `main.c`'s
 //! own version-detection code runs - not yet translated, so this
@@ -6322,23 +6320,16 @@ unsafe fn f_visualmode(argvars: &[TypvalT], rettv: &mut TypvalT) {
 
 /// `wildmenumode()` - whether the wildmenu is currently active
 /// (`f_wildmenumode`, `funcs.c`), via the already-real
-/// `GLOBALS.wild_menu_showing`. The original's own second OR operand
-/// (`(State & MODE_CMDLINE) && cmdline_pum_active()`, `ex_getln.c`,
-/// not translated) is short-circuited away exactly like it is in the
-/// original: nothing in this crate can currently set the `MODE_CMDLINE`
-/// bit on `State` at all, so it's never actually reached.
+/// `GLOBALS.wild_menu_showing` and [`crate::cmdexpand::cmdline_pum_active`].
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS`.
-#[allow(clippy::diverging_sub_expression)]
 unsafe fn f_wildmenumode(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     let g = unsafe { crate::globals::GLOBALS.get_mut() };
     let active = g.wild_menu_showing != 0
         || (g.State & crate::state_defs::mode::CMDLINE as i32 != 0
-            && unimplemented!(
-                "wildmenumode: MODE_CMDLINE's pum-active state needs ex_getln.c's cmdline_pum_active, not yet translated"
-            ));
+            && unsafe { crate::cmdexpand::cmdline_pum_active() });
     if active {
         rettv.value = TypvalValue::Number(1);
     }
@@ -16460,6 +16451,7 @@ mod tests {
     fn wildmenumode_reflects_wild_menu_showing() {
         let _guard = crate::globals::global_state_test_lock();
         let saved = unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing;
+        let saved_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
 
         unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing = 0;
         let mut rettv = TypvalT::default();
@@ -16471,7 +16463,21 @@ mod tests {
         unsafe { f_wildmenumode(&[], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(1));
 
+        unsafe {
+            crate::globals::GLOBALS.get_mut().wild_menu_showing = 0;
+            crate::globals::GLOBALS.get_mut().State =
+                crate::state_defs::mode::CMDLINE as i32;
+        }
+        let _pum =
+            crate::popupmenu::tests::PumVisibleGuard::set(true);
+        let mut rettv = TypvalT::default();
+        unsafe { f_wildmenumode(&[], &mut rettv) };
+        // A visible Insert-mode popup without a cmdline match array is not
+        // command-line wildmenu state.
+        assert_eq!(rettv.value, TypvalValue::default());
+
         unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing = saved;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = saved_state;
     }
 
     // --- f_windowsversion ---
