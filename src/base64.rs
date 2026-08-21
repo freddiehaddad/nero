@@ -1,13 +1,8 @@
 //! Translated from `src/nvim/base64.c`/`base64.h`.
 //!
-//! The original reads 8 (or 4) input bytes at a time into a `uint64_t`
-//! (`uint32_t`), byte-swaps to big-endian, then extracts 6-bit groups via
-//! shifts - a word-at-a-time optimization of standard base64 encoding, and
-//! the reason for the `htobe64`/`vim_htobe64` endian-conversion helpers.
-//! This translation produces the identical output using the plain
-//! byte-at-a-time algorithm directly (`chunks_exact(3)`), while retaining
-//! `vim_htobe64`/`vim_htobe32` as direct `to_be` counterparts to the
-//! original's conditional portability helpers.
+//! The encoder preserves the original's word-at-a-time fast paths: read
+//! 8 input bytes to encode 6, then 4 input bytes to encode 3, convert each
+//! word to big endian, and extract 6-bit groups by shifting.
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -41,18 +36,42 @@ fn char_to_index(c: u8) -> Option<u8> {
 pub fn base64_encode(src: &[u8]) -> std::string::String {
     let out_len = src.len().div_ceil(3) * 4;
     let mut dest = vec![0u8; out_len];
+    let mut src_i = 0;
     let mut out_i = 0;
 
-    let mut chunks = src.chunks_exact(3);
-    for chunk in &mut chunks {
-        dest[out_i] = ALPHABET[(chunk[0] >> 2) as usize];
-        dest[out_i + 1] = ALPHABET[(((chunk[0] & 0x3) << 4) | (chunk[1] >> 4)) as usize];
-        dest[out_i + 2] = ALPHABET[(((chunk[1] & 0xF) << 2) | (chunk[2] >> 6)) as usize];
-        dest[out_i + 3] = ALPHABET[(chunk[2] & 0x3F) as usize];
+    while src_i + 7 < src.len() {
+        let bits_h = u64::from_ne_bytes(src[src_i..src_i + 8].try_into().unwrap());
+        let bits_be = vim_htobe64(bits_h);
+        dest[out_i] = ALPHABET[((bits_be >> 58) & 0x3f) as usize];
+        dest[out_i + 1] = ALPHABET[((bits_be >> 52) & 0x3f) as usize];
+        dest[out_i + 2] = ALPHABET[((bits_be >> 46) & 0x3f) as usize];
+        dest[out_i + 3] = ALPHABET[((bits_be >> 40) & 0x3f) as usize];
+        dest[out_i + 4] = ALPHABET[((bits_be >> 34) & 0x3f) as usize];
+        dest[out_i + 5] = ALPHABET[((bits_be >> 28) & 0x3f) as usize];
+        dest[out_i + 6] = ALPHABET[((bits_be >> 22) & 0x3f) as usize];
+        dest[out_i + 7] = ALPHABET[((bits_be >> 16) & 0x3f) as usize];
+        src_i += 6;
+        out_i += 8;
+    }
+
+    while src_i + 3 < src.len() {
+        let bits_h = u32::from_ne_bytes(src[src_i..src_i + 4].try_into().unwrap());
+        let bits_be = vim_htobe32(bits_h);
+        dest[out_i] = ALPHABET[((bits_be >> 26) & 0x3f) as usize];
+        dest[out_i + 1] = ALPHABET[((bits_be >> 20) & 0x3f) as usize];
+        dest[out_i + 2] = ALPHABET[((bits_be >> 14) & 0x3f) as usize];
+        dest[out_i + 3] = ALPHABET[((bits_be >> 8) & 0x3f) as usize];
+        src_i += 3;
         out_i += 4;
     }
 
-    match chunks.remainder() {
+    match &src[src_i..] {
+        [b0, b1, b2] => {
+            dest[out_i] = ALPHABET[(b0 >> 2) as usize];
+            dest[out_i + 1] = ALPHABET[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize];
+            dest[out_i + 2] = ALPHABET[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize];
+            dest[out_i + 3] = ALPHABET[(b2 & 0x3f) as usize];
+        }
         [b0, b1] => {
             dest[out_i] = ALPHABET[(b0 >> 2) as usize];
             dest[out_i + 1] = ALPHABET[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize];
@@ -66,7 +85,7 @@ pub fn base64_encode(src: &[u8]) -> std::string::String {
             dest[out_i + 3] = b'=';
         }
         [] => {}
-        _ => unreachable!("chunks_exact(3)'s remainder is always < 3 bytes"),
+        _ => unreachable!("the word fast paths leave at most 3 bytes"),
     }
 
     // ALPHABET and '=' are all ASCII, so this is always valid UTF-8.
@@ -158,7 +177,7 @@ mod tests {
 
     #[test]
     fn round_trips_for_every_remainder_length() {
-        for len in 0..12 {
+        for len in 0..32 {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             let encoded = base64_encode(&data);
             let decoded = base64_decode(encoded.as_bytes()).unwrap();
@@ -197,6 +216,14 @@ mod tests {
         assert_eq!(
             vim_htobe32(0x0102_0304).to_ne_bytes(),
             0x0102_0304_u32.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn word_fast_paths_match_known_output() {
+        assert_eq!(
+            base64_encode(b"0123456789abcdef"),
+            "MDEyMzQ1Njc4OWFiY2RlZg=="
         );
     }
 }
