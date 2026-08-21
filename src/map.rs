@@ -148,6 +148,22 @@ fn equal_color_key(
     first == second
 }
 
+/// Hash a color-cache key's exact C field bytes (`hash_ColorKey`).
+#[allow(dead_code)]
+#[must_use]
+fn hash_color_key(key: crate::highlight_defs::ColorKey) -> u32 {
+    let mut hash = 0u32;
+    for byte in key
+        .ns_id
+        .to_ne_bytes()
+        .into_iter()
+        .chain(key.syn_id.to_ne_bytes())
+    {
+        hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    hash
+}
+
 /// A hash set with insertion-order-preserving compact storage
 /// (`Set(T)`/`MH_DECLS`/`KEY_DECLS`).
 ///
@@ -562,6 +578,25 @@ mod tests {
             key,
             crate::highlight_defs::ColorKey::new(3, 2)
         ));
+    }
+
+    #[test]
+    fn hash_color_key_hashes_both_native_endian_fields() {
+        let key = crate::highlight_defs::ColorKey::new(1, 2);
+        let bytes: Vec<_> = 1i32
+            .to_ne_bytes()
+            .into_iter()
+            .chain(2i32.to_ne_bytes())
+            .collect();
+        let expected = bytes.into_iter().fold(0u32, |hash, byte| {
+            hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+        });
+
+        assert_eq!(hash_color_key(key), expected);
+        assert_ne!(
+            hash_color_key(key),
+            hash_color_key(crate::highlight_defs::ColorKey::new(1, 3))
+        );
     }
 
     #[test]
