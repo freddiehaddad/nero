@@ -144,6 +144,93 @@ fn system_close(fd: i32) -> i32 {
     }
 }
 
+#[cfg(unix)]
+fn system_write(fd: i32, data: &[u8], non_blocking: bool) -> isize {
+    let mut written = 0usize;
+    while written < data.len() {
+        let result = unsafe {
+            libc::write(
+                fd,
+                data[written..].as_ptr().cast(),
+                data.len() - written,
+            )
+        };
+        if result > 0 {
+            written += result as usize;
+            if non_blocking {
+                break;
+            }
+            continue;
+        }
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        if error == libc::EINTR {
+            continue;
+        }
+        return if written == 0 {
+            -(error as isize)
+        } else {
+            written as isize
+        };
+    }
+    written as isize
+}
+
+#[cfg(windows)]
+fn system_write(fd: i32, data: &[u8], non_blocking: bool) -> isize {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _write(fd: i32, buffer: *const std::ffi::c_void, count: u32) -> i32;
+    }
+    let mut written = 0usize;
+    while written < data.len() {
+        let count = (data.len() - written).min(u32::MAX as usize) as u32;
+        let result = unsafe {
+            _write(fd, data[written..].as_ptr().cast(), count)
+        };
+        if result > 0 {
+            written += result as usize;
+            if non_blocking {
+                break;
+            }
+            continue;
+        }
+        if result == 0 {
+            break;
+        }
+        return if written == 0 { -1 } else { written as isize };
+    }
+    written as isize
+}
+
+#[cfg(unix)]
+fn system_fsync(fd: i32) -> i32 {
+    if unsafe { libc::fsync(fd) } == 0 {
+        0
+    } else {
+        -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
+}
+
+#[cfg(windows)]
+fn system_fsync(fd: i32) -> i32 {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _commit(fd: i32) -> i32;
+    }
+    if unsafe { _commit(fd) } == 0 {
+        0
+    } else {
+        -1
+    }
+}
+
 #[cfg(windows)]
 fn system_close(fd: i32) -> i32 {
     #[link(name = "ucrt")]
@@ -205,20 +292,107 @@ pub fn file_open(
 /// Close a read descriptor (`file_close`'s dependency-free path).
 pub fn file_close(
     descriptor: &mut FileDescriptor,
-    _do_fsync: bool,
+    do_fsync: bool,
 ) -> i32 {
     if descriptor.fd < 0 {
         return 0;
     }
-    if descriptor.write {
-        unimplemented!("file_close: write descriptors need file_flush/fsync");
-    }
+    let flush_error = if do_fsync {
+        file_fsync(descriptor)
+    } else {
+        file_flush(descriptor)
+    };
     let result = system_close(descriptor.fd);
     descriptor.fd = -1;
     descriptor.buffer.clear();
     descriptor.read_pos = 0;
     descriptor.write_pos = 0;
-    result
+    if result != 0 {
+        result
+    } else {
+        flush_error
+    }
+}
+
+/// Flush buffered modifications (`file_flush`).
+pub fn file_flush(descriptor: &mut FileDescriptor) -> i32 {
+    if !descriptor.write {
+        return 0;
+    }
+    let to_write =
+        descriptor.write_pos.saturating_sub(descriptor.read_pos);
+    if to_write == 0 {
+        return 0;
+    }
+    let result = system_write(
+        descriptor.fd,
+        &descriptor.buffer
+            [descriptor.read_pos..descriptor.write_pos],
+        descriptor.non_blocking,
+    );
+    descriptor.read_pos = 0;
+    descriptor.write_pos = 0;
+    if result == to_write as isize {
+        0
+    } else if result >= 0 {
+        -libc::EIO
+    } else {
+        result as i32
+    }
+}
+
+/// Flush and synchronize modifications (`file_fsync`).
+pub fn file_fsync(descriptor: &mut FileDescriptor) -> i32 {
+    if !descriptor.write {
+        return 0;
+    }
+    let flush = file_flush(descriptor);
+    if flush != 0 {
+        return flush;
+    }
+    let sync = system_fsync(descriptor.fd);
+    if matches!(
+        sync,
+        value if value == -libc::EINVAL
+            || value == -libc::EROFS
+            || value == -libc::ENOTSUP
+    ) {
+        0
+    } else {
+        sync
+    }
+}
+
+/// Write bytes through the descriptor buffer (`file_write`).
+pub fn file_write(
+    descriptor: &mut FileDescriptor,
+    data: &[u8],
+) -> isize {
+    assert!(descriptor.write);
+    let space = descriptor.buffer.len() - descriptor.write_pos;
+    if data.len() < space {
+        let end = descriptor.write_pos + data.len();
+        descriptor.buffer[descriptor.write_pos..end]
+            .copy_from_slice(data);
+        descriptor.write_pos = end;
+        return data.len() as isize;
+    }
+    let flush = file_flush(descriptor);
+    if flush < 0 {
+        return flush as isize;
+    }
+    if data.len() < descriptor.buffer.len() {
+        descriptor.buffer[..data.len()].copy_from_slice(data);
+        descriptor.write_pos = data.len();
+        return data.len() as isize;
+    }
+    let written =
+        system_write(descriptor.fd, data, descriptor.non_blocking);
+    if written >= 0 && written != data.len() as isize {
+        -(libc::EIO as isize)
+    } else {
+        written
+    }
 }
 
 /// Open caller-provided bytes for buffered reading
@@ -365,10 +539,10 @@ mod tests {
     struct ScratchFile(std::path::PathBuf);
 
     impl ScratchFile {
-        fn new() -> Self {
+        fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "nero_os_fileio_{}.txt",
-                std::process::id()
+                "nero_os_fileio_{name}_{}.txt",
+                std::process::id(),
             ));
             std::fs::write(&path, b"contents").unwrap();
             Self(path)
@@ -384,7 +558,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call open/close FFI")]
     fn file_open_wraps_and_closes_a_read_descriptor() {
-        let scratch = ScratchFile::new();
+        let scratch = ScratchFile::new("read");
         let mut descriptor = FileDescriptor::default();
         let path = scratch.0.to_string_lossy();
 
@@ -402,5 +576,53 @@ mod tests {
         assert_eq!(descriptor.buffer.len(), crate::memory_defs::ARENA_BLOCK_SIZE);
         assert_eq!(file_close(&mut descriptor, false), 0);
         assert_eq!(file_fd(&descriptor), -1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call open/write/fsync FFI")]
+    fn buffered_write_flush_and_fsync_persist_content() {
+        let scratch = ScratchFile::new("write");
+        let mut descriptor = FileDescriptor::default();
+        let path = scratch.0.to_string_lossy();
+        assert_eq!(
+            file_open(
+                &mut descriptor,
+                path.as_bytes(),
+                file_open_flags::WRITE_ONLY
+                    | file_open_flags::TRUNCATE,
+                0o600,
+            ),
+            0
+        );
+
+        assert_eq!(file_write(&mut descriptor, b"hello"), 5);
+        assert_eq!(file_flush(&mut descriptor), 0);
+        assert_eq!(file_write(&mut descriptor, b" world"), 6);
+        assert_eq!(file_close(&mut descriptor, true), 0);
+
+        assert_eq!(std::fs::read(&scratch.0).unwrap(), b"hello world");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call open/write/close FFI")]
+    fn large_write_bypasses_internal_buffer() {
+        let scratch = ScratchFile::new("large");
+        let mut descriptor = FileDescriptor::default();
+        let path = scratch.0.to_string_lossy();
+        assert_eq!(
+            file_open(
+                &mut descriptor,
+                path.as_bytes(),
+                file_open_flags::WRITE_ONLY
+                    | file_open_flags::TRUNCATE,
+                0o600,
+            ),
+            0
+        );
+        let data = vec![b'x'; crate::memory_defs::ARENA_BLOCK_SIZE];
+        assert_eq!(file_write(&mut descriptor, &data), data.len() as isize);
+        assert_eq!(descriptor.write_pos, 0);
+        assert_eq!(file_close(&mut descriptor, false), 0);
+        assert_eq!(std::fs::read(&scratch.0).unwrap(), data);
     }
 }
