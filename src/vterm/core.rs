@@ -66,6 +66,12 @@ pub fn vterm_new(rows: i32, cols: i32) -> VTerm {
     })
 }
 
+/// Release a terminal and all owned parser/output storage
+/// (`vterm_free`).
+pub fn vterm_free(term: VTerm) {
+    drop(term);
+}
+
 /// Writes the current dimensions to requested outputs (`vterm_get_size`).
 pub fn vterm_get_size(
     term: &VTerm,
@@ -359,6 +365,22 @@ mod tests {
         assert_eq!(term.outbuffer_len, 17);
         assert_eq!(term.outbuffer.capacity(), 17);
         assert_eq!(term.tmpbuffer_len, 19);
+    }
+
+    #[test]
+    fn vterm_free_releases_owned_callback_state() {
+        let marker = std::sync::Arc::new(());
+        let captured = marker.clone();
+        let mut term = vterm_new(2, 3);
+        vterm_output_set_callback(
+            &mut term,
+            Some(Box::new(move |_| {
+                let _ = &captured;
+            })),
+        );
+        assert_eq!(std::sync::Arc::strong_count(&marker), 2);
+        vterm_free(term);
+        assert_eq!(std::sync::Arc::strong_count(&marker), 1);
     }
 
     #[test]
