@@ -70,7 +70,7 @@
 //!   exactly as libuv itself does for compatibility).
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_close`/`os_readv`/
+//! - `os_readv`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
 //!   which need this exact shape of I/O, instead go directly through
@@ -350,6 +350,40 @@ pub fn os_write(
         }
     }
     written as isize
+}
+
+/// Close an owned file resource and report the OS result (`os_close`).
+#[must_use]
+pub fn os_close(file: std::fs::File) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::fd::IntoRawFd;
+        let descriptor = file.into_raw_fd();
+        if unsafe { libc::close(descriptor) } == 0 {
+            0
+        } else {
+            -1
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::IntoRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        let handle = file.into_raw_handle();
+        if unsafe { CloseHandle(handle) } != 0 {
+            0
+        } else {
+            -1
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        drop(file);
+        0
+    }
 }
 
 /// Force any buffered modifications to `file` to be written to disk
@@ -1964,6 +1998,15 @@ mod tests {
         std::fs::write(&path, b"old").unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
         assert_eq!(os_write(&mut file, b"new", false), -1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_close_closes_an_owned_file() {
+        let scratch = TempScratch::new("close");
+        let path = scratch.path.join("f.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        assert_eq!(os_close(file), 0);
     }
 
     #[test]
