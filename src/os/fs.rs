@@ -61,8 +61,6 @@
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`:
 //!   platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
-//! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
-//!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
 //! - `os_resolve_shortcut`/`os_is_reparse_point_include`: Windows
 //!   shortcut (`*.lnk`)/reparse-point resolution via COM
 //!   (`IPersistFile`), a genuinely different, more complex API surface
@@ -1786,6 +1784,11 @@ pub fn os_scandir_next(
     }
 }
 
+/// Release directory iteration state (`os_closedir`).
+pub fn os_closedir(directory: &mut crate::os::fs_defs::Directory) {
+    directory.entries = None;
+}
+
 /// Remove a file (`os_remove`).
 ///
 /// @return `0` for success, non-zero for failure.
@@ -2495,6 +2498,20 @@ mod tests {
         names.sort();
         assert_eq!(names, [b"alpha".to_vec(), b"beta".to_vec()]);
         assert_eq!(os_scandir_next(&mut directory), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_closedir_releases_iteration_state_idempotently() {
+        let scratch = TempScratch::new("closedir");
+        std::fs::write(scratch.path.join("entry"), b"x").unwrap();
+        let mut directory =
+            crate::os::fs_defs::Directory::default();
+        assert!(os_scandir(&mut directory, &scratch.path));
+        os_closedir(&mut directory);
+        assert!(directory.entries.is_none());
+        assert_eq!(os_scandir_next(&mut directory), None);
+        os_closedir(&mut directory);
     }
 
     #[test]
