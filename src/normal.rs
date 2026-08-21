@@ -529,6 +529,15 @@ pub fn nv_ignore(cap: &mut crate::normal_defs::CmdargT) {
 /// `edit()` to run.
 pub fn nv_nop(_cap: &mut crate::normal_defs::CmdargT) {}
 
+/// Handle an unknown Normal-mode command (`nv_error`).
+///
+/// # Safety
+/// `cap.oap` must point to a live operator argument.
+pub unsafe fn nv_error(cap: &mut crate::normal_defs::CmdargT) {
+    assert!(!cap.oap.is_null());
+    unsafe { clearopbeep(&mut *cap.oap) };
+}
+
 /// Include the character under the cursor for `'selection'` ==
 /// `"exclusive"` (`adjust_for_sel`).
 ///
@@ -2277,6 +2286,29 @@ mod tests {
                 crate::ops_defs::OpType::Nop as i32
             );
         }
+    }
+
+    #[test]
+    fn nv_error_clears_the_command_operator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            regname: i32::from(b'a'),
+            ..Default::default()
+        };
+        let oap_ptr = std::ptr::addr_of_mut!(oap);
+        let mut cap = crate::normal_defs::CmdargT {
+            oap: oap_ptr,
+            ..Default::default()
+        };
+
+        unsafe { nv_error(&mut cap) };
+
+        assert_eq!(
+            unsafe { (*oap_ptr).op_type },
+            crate::ops_defs::OpType::Nop as i32
+        );
+        assert_eq!(unsafe { (*oap_ptr).regname }, 0);
     }
 
     #[test]
