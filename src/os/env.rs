@@ -39,9 +39,8 @@
 //! scratch buffer, unnecessary in Rust; see its own doc comment).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `os_free_fullenv`/`os_getenvname_at_index`: need libuv's
-//!   `uv_os_environ`/raw platform `environ`/`GetEnvironmentStringsW`
-//!   enumeration API, not just a single-variable get/set.
+//! - `os_free_fullenv`: no direct Rust equivalent is needed because
+//!   environment iteration returns owned values.
 //! - `free_homedir`: `#ifdef EXITFREE`-only (debug/leak-detection
 //!   build flag with no equivalent concept in this crate, same
 //!   reasoning as other `EXITFREE`-gated functions elsewhere); also
@@ -114,6 +113,74 @@ pub unsafe fn os_getenv_noalloc(
 ) -> Option<&'static [u8]> {
     let globals = unsafe { crate::globals::GLOBALS.get_mut() };
     os_getenv_buf(name, &mut globals.NameBuff)
+}
+
+/// Return the environment variable name at `index`
+/// (`os_getenvname_at_index`).
+#[must_use]
+pub fn os_getenvname_at_index(index: usize) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetEnvironmentStringsW() -> *mut u16;
+            fn FreeEnvironmentStringsW(environment: *mut u16) -> i32;
+        }
+
+        let environment = unsafe { GetEnvironmentStringsW() };
+        if environment.is_null() {
+            return None;
+        }
+        let mut current = environment;
+        let mut current_index = 0usize;
+        let mut result = None;
+        loop {
+            let mut len = 0usize;
+            while unsafe { *current.add(len) } != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                break;
+            }
+            if current_index == index {
+                let entry =
+                    unsafe { std::slice::from_raw_parts(current, len) };
+                let search_start =
+                    usize::from(entry.first() == Some(&(b'=' as u16)));
+                if let Some(separator) = entry[search_start..]
+                    .iter()
+                    .position(|&unit| unit == b'=' as u16)
+                    .map(|offset| search_start + offset)
+                    && separator > 0
+                {
+                    result = Some(
+                        String::from_utf16_lossy(&entry[..separator])
+                            .into_bytes(),
+                    );
+                }
+                break;
+            }
+            current = unsafe { current.add(len + 1) };
+            current_index += 1;
+        }
+        unsafe { FreeEnvironmentStringsW(environment) };
+        result
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::env::vars_os()
+            .nth(index)
+            .map(|(name, _)| name.into_vec())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::env::vars_os().nth(index).map(|(name, _)| {
+            name.to_string_lossy().into_owned().into_bytes()
+        })
+    }
 }
 
 /// Return the next component of a delimited environment value
@@ -1635,6 +1702,24 @@ pub(crate) mod tests {
                 os_getenv_noalloc(b"NERO_TEST_ENV_NOALLOC_UNSET")
             },
             None
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
+    fn os_getenvname_at_index_enumerates_environment_names() {
+        let mut names = Vec::new();
+        for index in 0..10_000 {
+            let Some(name) = os_getenvname_at_index(index) else {
+                assert_eq!(os_getenvname_at_index(index + 1), None);
+                break;
+            };
+            assert!(!name.is_empty());
+            names.push(name);
+        }
+        assert!(!names.is_empty());
+        assert!(
+            names.iter().any(|name| name.eq_ignore_ascii_case(b"PATH"))
         );
     }
 
