@@ -528,6 +528,28 @@ fn format_typeof(type_spec: &[u8]) -> FormatType {
     }
 }
 
+/// Return the diagnostic name for a conversion specification
+/// (`format_typename`).
+#[allow(dead_code)]
+fn format_typename(type_spec: &[u8]) -> &'static str {
+    match format_typeof(type_spec) {
+        FormatType::Int => "int",
+        FormatType::LongInt => "long int",
+        FormatType::LongLongInt => "long long int",
+        FormatType::SignedSizeT => "signed size_t",
+        FormatType::UnsignedInt => "unsigned int",
+        FormatType::UnsignedLongInt => "unsigned long int",
+        FormatType::UnsignedLongLongInt => "unsigned long long int",
+        FormatType::SizeT => "size_t",
+        FormatType::Pointer => "pointer",
+        FormatType::Percent => "percent",
+        FormatType::Char => "char",
+        FormatType::String => "string",
+        FormatType::Float => "float",
+        FormatType::Unknown => "unknown",
+    }
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1280,6 +1302,28 @@ mod tests {
         assert_eq!(format_typeof(b"q"), FormatType::Unknown);
         assert_eq!(format_typeof(b"Ld"), FormatType::Unknown);
         assert_eq!(format_typeof(b"zs"), FormatType::String);
+    }
+
+    #[test]
+    fn format_typename_reports_every_argument_category() {
+        for (spec, expected) in [
+            (&b"d"[..], "int"),
+            (&b"ld"[..], "long int"),
+            (&b"lld"[..], "long long int"),
+            (&b"zd"[..], "signed size_t"),
+            (&b"u"[..], "unsigned int"),
+            (&b"lu"[..], "unsigned long int"),
+            (&b"llu"[..], "unsigned long long int"),
+            (&b"zu"[..], "size_t"),
+            (&b"p"[..], "pointer"),
+            (&b"%"[..], "percent"),
+            (&b"c"[..], "char"),
+            (&b"s"[..], "string"),
+            (&b"f"[..], "float"),
+            (&b"q"[..], "unknown"),
+        ] {
+            assert_eq!(format_typename(spec), expected, "{spec:?}");
+        }
     }
 
     #[test]
