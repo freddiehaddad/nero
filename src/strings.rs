@@ -446,6 +446,88 @@ fn tv_str(
     }
 }
 
+/// Value categories accepted by the portable formatter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatType {
+    Unknown,
+    Int,
+    LongInt,
+    LongLongInt,
+    SignedSizeT,
+    UnsignedInt,
+    UnsignedLongInt,
+    UnsignedLongLongInt,
+    SizeT,
+    Pointer,
+    Percent,
+    Char,
+    String,
+    Float,
+}
+
+/// Determine the argument type for one conversion specification
+/// (`format_typeof`).
+#[allow(dead_code)]
+fn format_typeof(type_spec: &[u8]) -> FormatType {
+    let mut pos = 0usize;
+    let mut length_modifier = NUL;
+    let first = type_spec.first().copied().unwrap_or(NUL);
+    if matches!(first, b'h' | b'l' | b'z') {
+        length_modifier = first;
+        pos += 1;
+        if length_modifier == b'l' && type_spec.get(pos) == Some(&b'l') {
+            length_modifier = b'L';
+            pos += 1;
+        }
+    }
+
+    let mut fmt_spec = type_spec.get(pos).copied().unwrap_or(NUL);
+    match fmt_spec {
+        b'i' => fmt_spec = b'd',
+        b'*' => {
+            fmt_spec = b'd';
+            length_modifier = b'h';
+        }
+        b'D' => {
+            fmt_spec = b'd';
+            length_modifier = b'l';
+        }
+        b'U' => {
+            fmt_spec = b'u';
+            length_modifier = b'l';
+        }
+        b'O' => {
+            fmt_spec = b'o';
+            length_modifier = b'l';
+        }
+        _ => {}
+    }
+
+    match fmt_spec {
+        b'%' => FormatType::Percent,
+        b'c' => FormatType::Char,
+        b's' | b'S' => FormatType::String,
+        b'p' => FormatType::Pointer,
+        b'b' | b'B' => FormatType::UnsignedLongLongInt,
+        b'd' => match length_modifier {
+            NUL | b'h' => FormatType::Int,
+            b'l' => FormatType::LongInt,
+            b'L' => FormatType::LongLongInt,
+            b'z' => FormatType::SignedSizeT,
+            _ => FormatType::Unknown,
+        },
+        b'u' | b'o' | b'x' | b'X' => match length_modifier {
+            NUL | b'h' => FormatType::UnsignedInt,
+            b'l' => FormatType::UnsignedLongInt,
+            b'L' => FormatType::UnsignedLongLongInt,
+            b'z' => FormatType::SizeT,
+            _ => FormatType::Unknown,
+        },
+        b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => FormatType::Float,
+        _ => FormatType::Unknown,
+    }
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1152,6 +1234,52 @@ mod tests {
         let mut missing_index = 2;
         assert_eq!(tv_str(&tvs, &mut missing_index), None);
         assert_eq!(missing_index, 2);
+    }
+
+    #[test]
+    fn format_typeof_parses_scalar_and_float_specifiers() {
+        assert_eq!(format_typeof(b"%"), FormatType::Percent);
+        assert_eq!(format_typeof(b"c"), FormatType::Char);
+        assert_eq!(format_typeof(b"s"), FormatType::String);
+        assert_eq!(format_typeof(b"S"), FormatType::String);
+        assert_eq!(format_typeof(b"p"), FormatType::Pointer);
+        for spec in [b"f", b"F", b"e", b"E", b"g", b"G"] {
+            assert_eq!(format_typeof(spec), FormatType::Float, "{spec:?}");
+        }
+    }
+
+    #[test]
+    fn format_typeof_parses_signed_length_modifiers_and_aliases() {
+        assert_eq!(format_typeof(b"d"), FormatType::Int);
+        assert_eq!(format_typeof(b"i"), FormatType::Int);
+        assert_eq!(format_typeof(b"hd"), FormatType::Int);
+        assert_eq!(format_typeof(b"ld"), FormatType::LongInt);
+        assert_eq!(format_typeof(b"lld"), FormatType::LongLongInt);
+        assert_eq!(format_typeof(b"zd"), FormatType::SignedSizeT);
+        assert_eq!(format_typeof(b"D"), FormatType::LongInt);
+        assert_eq!(format_typeof(b"*"), FormatType::Int);
+    }
+
+    #[test]
+    fn format_typeof_parses_unsigned_length_modifiers_and_aliases() {
+        for spec in [b"u", b"o", b"x", b"X"] {
+            assert_eq!(format_typeof(spec), FormatType::UnsignedInt, "{spec:?}");
+        }
+        assert_eq!(format_typeof(b"lu"), FormatType::UnsignedLongInt);
+        assert_eq!(format_typeof(b"llu"), FormatType::UnsignedLongLongInt);
+        assert_eq!(format_typeof(b"zu"), FormatType::SizeT);
+        assert_eq!(format_typeof(b"b"), FormatType::UnsignedLongLongInt);
+        assert_eq!(format_typeof(b"B"), FormatType::UnsignedLongLongInt);
+        assert_eq!(format_typeof(b"U"), FormatType::UnsignedLongInt);
+        assert_eq!(format_typeof(b"O"), FormatType::UnsignedLongInt);
+    }
+
+    #[test]
+    fn format_typeof_rejects_empty_and_unknown_specifiers() {
+        assert_eq!(format_typeof(b""), FormatType::Unknown);
+        assert_eq!(format_typeof(b"q"), FormatType::Unknown);
+        assert_eq!(format_typeof(b"Ld"), FormatType::Unknown);
+        assert_eq!(format_typeof(b"zs"), FormatType::String);
     }
 
     #[test]
