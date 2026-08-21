@@ -163,12 +163,14 @@ pub unsafe fn multiqueue_get(queue: *mut MultiQueue) -> Event {
     }
 }
 
-/// Enqueue one event (`multiqueue_put_event`).
+/// Insert one event and its parent link (`multiqueue_push`).
+///
+/// Unlike [`multiqueue_put_event`], this internal layer does not invoke the
+/// parent's `on_put` callback.
 ///
 /// # Safety
-/// `queue` and its parent, if any, must be valid and exclusively
-/// accessible.
-pub unsafe fn multiqueue_put_event(
+/// `queue` and its parent, if any, must be valid and exclusively accessible.
+unsafe fn multiqueue_push(
     queue: *mut MultiQueue,
     event: Event,
 ) {
@@ -189,6 +191,21 @@ pub unsafe fn multiqueue_put_event(
         parent_link_id,
     });
     queue_ref.size += 1;
+}
+
+/// Enqueue one event (`multiqueue_put_event`).
+///
+/// # Safety
+/// `queue` and its parent, if any, must be valid and exclusively
+/// accessible.
+pub unsafe fn multiqueue_put_event(
+    queue: *mut MultiQueue,
+    event: Event,
+) {
+    assert!(!queue.is_null());
+    // SAFETY: forwarded from this function's own safety contract.
+    unsafe { multiqueue_push(queue, event) };
+    let queue_ref = unsafe { &mut *queue };
     if !queue_ref.parent.is_null() {
         let parent = unsafe { &mut *queue_ref.parent };
         if let Some(on_put) = parent.on_put {
@@ -379,6 +396,24 @@ mod tests {
             assert!(multiqueue_empty(queue));
             assert_eq!(multiqueue_size(queue), 0);
             multiqueue_free(queue);
+        }
+    }
+
+    #[test]
+    fn internal_push_links_the_parent_without_notifying_it() {
+        let mut callback_count = 0usize;
+        let count_ptr = std::ptr::addr_of_mut!(callback_count);
+        let parent = multiqueue_new(Some(count_put), count_ptr.cast());
+        let child = unsafe { multiqueue_new_child(parent) };
+
+        unsafe {
+            multiqueue_push(child, Event::default());
+            assert_eq!(callback_count, 0);
+            assert!(!multiqueue_empty(parent));
+            assert_eq!(multiqueue_size(child), 1);
+            multiqueue_purge_events(child);
+            multiqueue_free(child);
+            multiqueue_free(parent);
         }
     }
 
