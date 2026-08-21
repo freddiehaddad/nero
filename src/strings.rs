@@ -297,12 +297,17 @@ fn strncmp_bytes(s1: &[u8], s2: &[u8], n: usize) -> i32 {
     0
 }
 
+/// Compare two strings for [`sort_strings`] (`sort_compare`).
+#[inline]
+fn sort_compare(s1: &[u8], s2: &[u8]) -> std::cmp::Ordering {
+    s1.cmp(s2)
+}
+
 /// Sort an array of strings (`sort_strings`). The original sorts in place
-/// via `qsort`+`strcmp`; `sort_unstable` is Rust's native equivalent
-/// (`strcmp`-style byte-lexicographic ordering is exactly `Ord` for
-/// `[u8]`/`Vec<u8>`, and `qsort` never claimed stability either).
+/// via `qsort`; `sort_unstable_by` is Rust's native equivalent and likewise
+/// makes no stability guarantee.
 pub fn sort_strings(files: &mut [Vec<u8>]) {
-    files.sort_unstable();
+    files.sort_unstable_by(|s1, s2| sort_compare(s1, s2));
 }
 
 /// Returns true if the NUL-terminated `s` contains a non-ASCII byte
@@ -938,6 +943,13 @@ mod tests {
         let mut v = vec![b"banana".to_vec(), b"apple".to_vec(), b"cherry".to_vec()];
         sort_strings(&mut v);
         assert_eq!(v, vec![b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]);
+    }
+
+    #[test]
+    fn sort_compare_uses_raw_byte_ordering() {
+        assert_eq!(sort_compare(b"abc", b"abc"), std::cmp::Ordering::Equal);
+        assert_eq!(sort_compare(b"abc", b"abd"), std::cmp::Ordering::Less);
+        assert_eq!(sort_compare(&[0xff], b"z"), std::cmp::Ordering::Greater);
     }
 
     #[test]
