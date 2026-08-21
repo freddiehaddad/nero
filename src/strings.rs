@@ -39,7 +39,7 @@
 //! `get_past_head`).
 //!
 //! Also translated: `vim_strnsave_unquoted`/`del_trailing_spaces`
-//! (as [`del_trailing_spaces_len`]) - both are pure byte-level parsers
+//! (with [`del_trailing_spaces_len`] as its slice-oriented core) - both are pure byte-level parsers
 //! with NO `charset.c`/`g_chartab` dependency at all, despite an
 //! earlier session's own deferral note claiming otherwise (corrected
 //! here after re-reading each real function body directly).
@@ -356,6 +356,12 @@ pub fn del_trailing_spaces_len(s: &[u8]) -> usize {
         len = q;
     }
     len
+}
+
+/// Remove trailing unescaped whitespace in place (`del_trailing_spaces`).
+pub fn del_trailing_spaces(s: &mut Vec<u8>) {
+    let len = del_trailing_spaces_len(s);
+    s.truncate(len);
 }
 
 /// Concatenate two strings and return the result in newly allocated memory
@@ -1442,6 +1448,17 @@ mod tests {
     #[test]
     fn del_trailing_spaces_len_single_space_is_unchanged() {
         assert_eq!(del_trailing_spaces_len(b" "), 1);
+    }
+
+    #[test]
+    fn del_trailing_spaces_truncates_the_owned_string_in_place() {
+        let mut value = b"hello   ".to_vec();
+        del_trailing_spaces(&mut value);
+        assert_eq!(value, b"hello");
+
+        let mut escaped = b"a\\ ".to_vec();
+        del_trailing_spaces(&mut escaped);
+        assert_eq!(escaped, b"a\\ ");
     }
 
     #[test]
