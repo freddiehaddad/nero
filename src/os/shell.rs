@@ -17,7 +17,8 @@
 //! vector as an owned `Vec<Vec<u8>>`, so dropping it frees both the
 //! individual arguments and the vector itself.
 //!
-//! Deferred: everything process-bound.
+//! [`shell_build_argv`] is translated too; everything remaining is
+//! process-bound.
 
 /// Whether any of `argv` contains a wildcard (`have_wildcard`).
 #[must_use]
@@ -56,7 +57,6 @@ fn word_length(string: &[u8]) -> usize {
 }
 
 /// Split a shell command into quote-aware words (`tokenize`).
-#[allow(dead_code)]
 #[must_use]
 fn tokenize(mut string: &[u8]) -> Vec<Vec<u8>> {
     let mut argv = Vec::new();
@@ -77,7 +77,6 @@ fn tokenize(mut string: &[u8]) -> Vec<Vec<u8>> {
 /// # Safety
 /// Reads shared option state and forwards
 /// [`crate::strings::vim_strsave_escaped_ext`]'s requirement.
-#[allow(dead_code)]
 #[must_use]
 unsafe fn shell_xescape_xquote(cmd: &[u8]) -> Vec<u8> {
     let (shellxquote, shellxescape) = {
@@ -126,6 +125,37 @@ unsafe fn shell_xescape_xquote(cmd: &[u8]) -> Vec<u8> {
         }
     }
     result
+}
+
+/// Build the argument vector for the configured shell
+/// (`shell_build_argv`).
+///
+/// # Safety
+/// Reads shared shell option state and forwards
+/// `shell_xescape_xquote`'s requirement.
+#[must_use]
+pub unsafe fn shell_build_argv(
+    cmd: Option<&[u8]>,
+    extra_args: Option<&[u8]>,
+) -> Vec<Vec<u8>> {
+    let (shell, shellcmdflag) = {
+        let options =
+            unsafe { &*crate::option_vars::OPTION_VARS.as_ptr() };
+        (
+            options.p_sh.clone().unwrap_or_default(),
+            options.p_shcf.clone().unwrap_or_default(),
+        )
+    };
+    let mut argv = tokenize(&shell);
+    if let Some(extra_args) = extra_args {
+        argv.push(extra_args.to_vec());
+    }
+    if let Some(cmd) = cmd {
+        argv.extend(tokenize(&shellcmdflag));
+        argv.push(unsafe { shell_xescape_xquote(cmd) });
+    }
+    assert!(!argv.is_empty());
+    argv
 }
 
 /// The size of the buffer `shell_argv_to_str` formats into, including
@@ -204,6 +234,34 @@ mod tests {
                 unsafe { crate::option_vars::OPTION_VARS.get_mut() };
             options.p_sxq = self.shellxquote.take();
             options.p_sxe = self.shellxescape.take();
+        }
+    }
+
+    struct ShellCommandGuard {
+        shell: Option<Vec<u8>>,
+        shellcmdflag: Option<Vec<u8>>,
+    }
+
+    impl ShellCommandGuard {
+        unsafe fn set(shell: &[u8], shellcmdflag: &[u8]) -> Self {
+            let options =
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let previous = Self {
+                shell: options.p_sh.clone(),
+                shellcmdflag: options.p_shcf.clone(),
+            };
+            options.p_sh = Some(shell.to_vec());
+            options.p_shcf = Some(shellcmdflag.to_vec());
+            previous
+        }
+    }
+
+    impl Drop for ShellCommandGuard {
+        fn drop(&mut self) {
+            let options =
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            options.p_sh = self.shell.take();
+            options.p_shcf = self.shellcmdflag.take();
         }
     }
 
@@ -320,6 +378,66 @@ mod tests {
             unsafe { shell_xescape_xquote(b"echo &") },
             b"\"echo &\""
         );
+    }
+
+    #[test]
+    fn shell_build_argv_builds_an_interactive_shell_command() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = unsafe {
+            ShellCommandGuard::set(
+                br#""C:\Program Files\shell" -login"#,
+                b"-c",
+            )
+        };
+        assert_eq!(
+            unsafe { shell_build_argv(None, None) },
+            [
+                br#"C:\Program Files\shell"#.to_vec(),
+                b"-login".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_build_argv_adds_extra_flags_and_a_quoted_command() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _command =
+            unsafe { ShellCommandGuard::set(b"bash", b"-c") };
+        let _quotes = unsafe { ShellQuoteGuard::set(b"(", b"&") };
+
+        assert_eq!(
+            unsafe {
+                shell_build_argv(
+                    Some(b"echo &"),
+                    Some(b"--noprofile"),
+                )
+            },
+            [
+                b"bash".to_vec(),
+                b"--noprofile".to_vec(),
+                b"-c".to_vec(),
+                b"(echo ^&)".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_build_argv_ignores_shellcmdflag_without_a_command() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options =
+            unsafe { ShellCommandGuard::set(b"bash", b"-c") };
+        assert_eq!(
+            unsafe { shell_build_argv(None, Some(b"--noprofile")) },
+            [b"bash".to_vec(), b"--noprofile".to_vec()]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn shell_build_argv_requires_a_configured_shell() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = unsafe { ShellCommandGuard::set(b"", b"-c") };
+        let _ = unsafe { shell_build_argv(None, None) };
     }
 
     #[test]
