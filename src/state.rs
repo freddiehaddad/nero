@@ -29,9 +29,8 @@
 //! core" pattern, even without a real caller yet among currently-
 //! translated code (matching the established precedent, e.g.
 //! `cursor.c`'s batch last session).
-//! [`may_trigger_modechanged`] preserves the real no-handler/interrupt
-//! fast path; its event-dictionary body remains with real autocmd
-//! registration.
+//! [`may_trigger_modechanged`] includes the complete event-dictionary,
+//! pattern, and last-mode update path.
 //!
 //! Everything else - `state_enter`, `check_pending`, `may_sync_undo`,
 //! `restart_edit`-related helpers, `os_breakcheck`/`line_breakcheck`
@@ -196,10 +195,6 @@ pub unsafe fn get_mode() -> Vec<u8> {
 /// Fire `ModeChanged` when the effective mode changed
 /// (`may_trigger_modechanged`).
 ///
-/// The original returns before constructing `v:event` whenever no
-/// handler exists or an interrupt is pending. No translated code can
-/// register a real autocmd yet, so this is the complete reachable path.
-///
 /// # Safety
 /// Reads shared editor/autocmd state.
 pub unsafe fn may_trigger_modechanged() {
@@ -208,9 +203,50 @@ pub unsafe fn may_trigger_modechanged() {
     {
         return;
     }
-    unimplemented!(
-        "may_trigger_modechanged: real handlers need v:event save/restore"
+
+    let current_mode = unsafe { get_mode() };
+    let last_mode = {
+        let stored = unsafe { crate::globals::GLOBALS.get_mut() }.last_mode;
+        let len = stored.iter().position(|&byte| byte == 0).unwrap_or(stored.len());
+        stored[..len].to_vec()
+    };
+    if current_mode == last_mode {
+        return;
+    }
+
+    let mut saved = crate::eval::typval_defs::SaveVEventT::default();
+    let event = unsafe { crate::eval::eval::get_v_event(&mut saved) };
+    unsafe {
+        crate::eval::typval::tv_dict_add_str(
+            &mut *event,
+            b"new_mode",
+            Some(&current_mode),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            &mut *event,
+            b"old_mode",
+            Some(&last_mode),
+        );
+        crate::eval::typval::tv_dict_set_keys_readonly(event);
+    }
+
+    let mut pattern = last_mode;
+    pattern.push(b':');
+    pattern.extend_from_slice(&current_mode);
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    let _ = crate::autocmd::apply_autocmds(
+        crate::autocmd_defs::EventT::ModeChanged,
+        Some(&pattern),
+        None,
+        false,
+        Some(curbuf),
     );
+
+    let stored = &mut unsafe { crate::globals::GLOBALS.get_mut() }.last_mode;
+    stored.fill(0);
+    let count = current_mode.len().min(stored.len().saturating_sub(1));
+    stored[..count].copy_from_slice(&current_mode[..count]);
+    unsafe { crate::eval::eval::restore_v_event(event, &mut saved) };
 }
 
 /// When true in a safe state when starting to wait for a character
