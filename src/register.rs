@@ -611,8 +611,8 @@ static RECORD_REGNAME: crate::globals::GlobalCell<i32> =
 
 /// Start or stop macro recording (`do_record`).
 ///
-/// Display updates are omitted. RecordingEnter dispatch is real;
-/// RecordingLeave payload construction is translated separately below.
+/// Display updates are omitted. RecordingEnter and RecordingLeave dispatch,
+/// including the latter's `v:event` payload, are real.
 ///
 /// # Safety
 /// Mutates shared recording, register and autocmd state.
@@ -641,16 +641,43 @@ pub unsafe fn do_record(c: i32) -> i32 {
         return crate::vim_defs::OK;
     }
 
-    if crate::autocmd::has_event(
-        crate::autocmd_defs::EventT::RecordingLeave,
-    ) {
-        unimplemented!(
-            "do_record: RecordingLeave handlers need the v:event lifecycle"
-        );
-    }
     let mut recorded = unsafe { crate::input::get_recorded() };
     let len = crate::keycodes::vim_unescape_ks(&mut recorded);
     recorded.truncate(len);
+
+    let event = unsafe {
+        crate::eval::vars::get_vim_var_dict(
+            crate::eval::vars::VimVarIndex::Event,
+        )
+    };
+    if !event.is_null() {
+        let mut saved = crate::eval::typval_defs::SaveVEventT::default();
+        let event = unsafe { crate::eval::eval::get_v_event(&mut saved) };
+        unsafe {
+            crate::eval::typval::tv_dict_add_str(
+                &mut *event,
+                b"regcontents",
+                Some(&recorded),
+            );
+            let regname = [*RECORD_REGNAME.get_mut() as u8];
+            crate::eval::typval::tv_dict_add_str(
+                &mut *event,
+                b"regname",
+                Some(&regname),
+            );
+            crate::eval::typval::tv_dict_set_keys_readonly(event);
+        }
+        let curbuf = unsafe { (*globals).curbuf.as_ref() };
+        let _ = crate::autocmd::apply_autocmds(
+            crate::autocmd_defs::EventT::RecordingLeave,
+            None,
+            None,
+            false,
+            curbuf,
+        );
+        unsafe { crate::eval::eval::restore_v_event(event, &mut saved) };
+    }
+
     let recording = unsafe { (*globals).reg_recording };
     unsafe {
         (*globals).reg_recorded = recording;
@@ -2000,6 +2027,10 @@ mod tests {
     struct TypeaheadGuard(crate::input_defs::TasaveT);
     struct LastInsertResetGuard;
     struct InputRecordingGuard(Option<(crate::input_defs::BuffheaderT, usize)>);
+    struct EventVimvarGuard {
+        old: Option<crate::eval::typval_defs::TypvalT>,
+        dict: *mut crate::eval::typval_defs::DictT,
+    }
 
     impl TypeaheadGuard {
         fn save() -> Self {
@@ -2032,6 +2063,40 @@ mod tests {
             crate::input::restore_recording_state_for_test(
                 self.0.take().expect("saved input recording state"),
             );
+        }
+    }
+
+    impl EventVimvarGuard {
+        unsafe fn new() -> Self {
+            let dict = crate::eval::typval::tv_dict_alloc();
+            let slot = unsafe {
+                crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Event,
+                )
+            };
+            let old = std::mem::replace(
+                unsafe { &mut *slot },
+                crate::eval::typval_defs::TypvalT {
+                    value: crate::eval::typval_defs::TypvalValue::Dict(dict),
+                    ..Default::default()
+                },
+            );
+            Self {
+                old: Some(old),
+                dict,
+            }
+        }
+    }
+
+    impl Drop for EventVimvarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let slot = crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Event,
+                );
+                *slot = self.old.take().expect("saved v:event value missing");
+                crate::eval::typval::tv_dict_free(self.dict);
+            }
         }
     }
 
@@ -3137,6 +3202,7 @@ mod tests {
     #[test]
     fn do_record_stops_and_stores_the_recorded_register() {
         let _lock = crate::globals::global_state_test_lock();
+        let event = unsafe { EventVimvarGuard::new() };
         let _registers = RegisterStateGuard::save();
         let _input_recording = InputRecordingGuard::save();
         let _recording = unsafe {
@@ -3175,6 +3241,8 @@ mod tests {
             unsafe { crate::globals::GLOBALS.get_mut() }.reg_recorded,
             i32::from(b'b')
         );
+        assert_eq!(unsafe { (*event.dict).dv_hashtab.ht_used }, 0);
+        assert!(unsafe { (*event.dict).dv_index.is_empty() });
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.reg_recording, 0);
         assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(0));
     }
