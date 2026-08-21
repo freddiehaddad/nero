@@ -1997,16 +1997,11 @@ static TEXTYANKPOST_RECURSIVE: crate::globals::GlobalCell<bool> =
 /// Trigger the `TextYankPost` autocommand
 /// (`do_autocmd_textyankpost`).
 ///
-/// No `TextYankPost` handler can currently be registered, so the
-/// original's own event-presence fast path is always taken. The real
-/// `v:event` payload lifecycle remains deferred until registration is
-/// possible.
-///
 /// # Safety
 /// Reads shared autocmd and recursion state.
 pub unsafe fn do_autocmd_textyankpost(
-    _oap: &crate::normal_defs::OpargT,
-    _reg: &YankregT,
+    oap: &crate::normal_defs::OpargT,
+    reg: &YankregT,
 ) {
     if unsafe { *TEXTYANKPOST_RECURSIVE.get_mut() }
         || !crate::autocmd::has_event(
@@ -2015,9 +2010,88 @@ pub unsafe fn do_autocmd_textyankpost(
     {
         return;
     }
-    unimplemented!(
-        "do_autocmd_textyankpost needs the v:event payload lifecycle"
+
+    unsafe { *TEXTYANKPOST_RECURSIVE.get_mut() = true };
+    let mut saved = crate::eval::typval_defs::SaveVEventT::default();
+    let event = unsafe { crate::eval::eval::get_v_event(&mut saved) };
+    let contents = crate::eval::typval::tv_list_alloc(
+        reg.y_array.as_ref().map_or(
+            crate::eval::typval_defs::ListLenSpecials::Unknown as isize,
+            |lines| lines.len() as isize,
+        ),
     );
+    for line in reg.y_array.as_deref().unwrap_or(&[]) {
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                contents,
+                Some(line),
+            )
+        };
+    }
+    unsafe {
+        crate::eval::typval::tv_list_set_lock(
+            contents,
+            crate::eval::typval_defs::VarLockStatus::Fixed,
+        );
+        crate::eval::typval::tv_dict_add_list(
+            &mut *event,
+            b"regcontents",
+            contents,
+        );
+        add_regtype_to_dict(Some(reg), &mut *event);
+        let regname_storage = [oap.regname as u8];
+        let regname = if oap.regname == 0 {
+            &[][..]
+        } else {
+            &regname_storage
+        };
+        crate::eval::typval::tv_dict_add_str(
+            &mut *event,
+            b"regname",
+            Some(regname),
+        );
+        crate::eval::typval::tv_dict_add_bool(
+            &mut *event,
+            b"inclusive",
+            if oap.inclusive {
+                crate::eval::typval_defs::BoolVarValue::True
+            } else {
+                crate::eval::typval_defs::BoolVarValue::False
+            },
+        );
+        let operator = [crate::ops::OPCHARS
+            [usize::try_from(oap.op_type).expect("negative operator type")]
+            .0];
+        crate::eval::typval::tv_dict_add_str(
+            &mut *event,
+            b"operator",
+            Some(&operator),
+        );
+        crate::eval::typval::tv_dict_add_bool(
+            &mut *event,
+            b"visual",
+            if oap.is_visual {
+                crate::eval::typval_defs::BoolVarValue::True
+            } else {
+                crate::eval::typval_defs::BoolVarValue::False
+            },
+        );
+        crate::eval::typval::tv_dict_set_keys_readonly(event);
+    }
+
+    let globals = crate::globals::GLOBALS.as_ptr();
+    unsafe { (*globals).textlock += 1 };
+    let curbuf = unsafe { (*globals).curbuf.as_ref() };
+    let _ = crate::autocmd::apply_autocmds(
+        crate::autocmd_defs::EventT::TextYankPost,
+        None,
+        None,
+        false,
+        curbuf,
+    );
+    unsafe { (*globals).textlock -= 1 };
+    unsafe { crate::eval::eval::restore_v_event(event, &mut saved) };
+    unsafe { *TEXTYANKPOST_RECURSIVE.get_mut() = false };
 }
 
 #[cfg(test)]
