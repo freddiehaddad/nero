@@ -466,8 +466,8 @@ impl Drop for EmsgSkipGuard {
 /// Evaluate a top-level expression and convert it to a boolean
 /// (`eval_to_bool`).
 ///
-/// `use_simple_function = true` still needs `eval0_simple_funccal`.
-/// Normal evaluation and parse-only (`skip`) mode are complete.
+/// Normal, simple-function-optimized, and parse-only (`skip`) modes
+/// are complete.
 ///
 /// # Safety
 /// Forwarded from [`eval0`] and
@@ -481,12 +481,6 @@ pub unsafe fn eval_to_bool(
     skip: bool,
     use_simple_function: bool,
 ) -> bool {
-    if use_simple_function {
-        unimplemented!(
-            "eval_to_bool: use_simple_function=true needs eval0_simple_funccal"
-        );
-    }
-
     let mut tv = TypvalT::default();
     let mut evalarg = EvalargT::default();
     fill_evalarg_from_eap(&mut evalarg, eap.as_deref(), skip);
@@ -496,12 +490,21 @@ pub unsafe fn eval_to_bool(
 
     // SAFETY: forwarded from this function's own safety doc.
     let result = unsafe {
-        eval0(
-            arg,
-            &mut tv,
-            eap.as_deref_mut(),
-            Some(&mut evalarg),
-        )
+        if use_simple_function {
+            eval0_simple_funccal(
+                arg,
+                &mut tv,
+                eap.as_deref_mut(),
+                Some(&mut evalarg),
+            )
+        } else {
+            eval0(
+                arg,
+                &mut tv,
+                eap.as_deref_mut(),
+                Some(&mut evalarg),
+            )
+        }
     };
     let retval = if result == FAIL {
         *error = true;
@@ -528,8 +531,7 @@ pub unsafe fn eval_to_bool(
 /// Evaluate an expression and return its value (`eval_expr_ext`).
 ///
 /// Rust returns the allocated result by value instead of exposing the
-/// original's heap pointer. `use_simple_function = true` still needs
-/// `eval0_simple_funccal`.
+/// original's heap pointer.
 ///
 /// # Safety
 /// Forwarded from [`eval0`].
@@ -539,12 +541,6 @@ pub unsafe fn eval_expr_ext(
     mut eap: Option<&mut crate::ex_cmds_defs::ExargT>,
     use_simple_function: bool,
 ) -> Option<TypvalT> {
-    if use_simple_function {
-        unimplemented!(
-            "eval_expr_ext: use_simple_function=true needs eval0_simple_funccal"
-        );
-    }
-
     let skip = eap.as_deref().is_some_and(|e| e.skip);
     let mut evalarg = EvalargT::default();
     fill_evalarg_from_eap(&mut evalarg, eap.as_deref(), skip);
@@ -552,12 +548,21 @@ pub unsafe fn eval_expr_ext(
     let mut tv = TypvalT::default();
     // SAFETY: forwarded from this function's own safety doc.
     let result = unsafe {
-        eval0(
-            arg,
-            &mut tv,
-            eap.as_deref_mut(),
-            Some(&mut evalarg),
-        )
+        if use_simple_function {
+            eval0_simple_funccal(
+                arg,
+                &mut tv,
+                eap.as_deref_mut(),
+                Some(&mut evalarg),
+            )
+        } else {
+            eval0(
+                arg,
+                &mut tv,
+                eap.as_deref_mut(),
+                Some(&mut evalarg),
+            )
+        }
     };
     clear_evalarg(Some(&mut evalarg), eap);
 
@@ -599,9 +604,12 @@ impl Drop for EmsgOffGuard {
 /// Evaluate an expression silently and return its number value
 /// (`eval_to_number`).
 ///
-/// `use_simple_function = true` still needs `may_call_simple_func`.
-/// Like the original, ordinary evaluation accepts whatever prefix
-/// [`eval1`] recognizes without checking for trailing text.
+/// The original's `may_call_simple_func` fast path is a pure
+/// optimization for a no-argument user function; until
+/// `call_user_func_check` exists, both values of `use_simple_function`
+/// fall through to [`eval1`] with identical observable behavior.
+/// Like the original, evaluation accepts whatever prefix [`eval1`]
+/// recognizes without checking for trailing text.
 ///
 /// # Safety
 /// Forwarded from [`eval1`] and
@@ -612,11 +620,7 @@ pub unsafe fn eval_to_number(
     expr: &[u8],
     use_simple_function: bool,
 ) -> VarnumberT {
-    if use_simple_function {
-        unimplemented!(
-            "eval_to_number: use_simple_function=true needs may_call_simple_func"
-        );
-    }
+    let _ = use_simple_function;
 
     // SAFETY: forwarded from this function's own safety doc.
     let emsg_off = unsafe { EmsgOffGuard::new() };
@@ -5005,6 +5009,28 @@ pub unsafe fn eval0(
     ret
 }
 
+/// Handle a top-level expression with the simple-function-call
+/// optimization (`eval0_simple_funccal`).
+///
+/// The original first tries `may_call_simple_func` to bypass parser
+/// overhead for a no-argument user function, then falls back to
+/// [`eval0`]. That direct user-function path still needs
+/// `call_user_func_check`; calling [`eval0`] immediately is therefore
+/// behaviorally identical for every currently callable expression and
+/// preserves the fallback as a real source-level boundary.
+///
+/// # Safety
+/// Forwarded from [`eval0`].
+unsafe fn eval0_simple_funccal(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+    evalarg: Option<&mut EvalargT>,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { eval0(arg, rettv, eap, evalarg) }
+}
+
 /// Evaluate the expression at `arg` (must already be skipped of
 /// leading whitespace), reporting a suitable error if it fails
 /// (`eval1_emsg`).
@@ -5261,11 +5287,8 @@ pub unsafe fn eval_to_string_skip(
 /// optional `exarg_T` for multi-line-`:source` context
 /// (`eval_to_string_eap`).
 ///
-/// Only `eap = None`/`use_simple_function = false` are modeled - this
-/// crate's only real caller ([`crate::eval::vars::eval_one_expr_in_str`])
-/// always calls it that way; `use_simple_function = true` would need
-/// `eval0_simple_funccal` (a fast-path shortcut for a bare function
-/// call), not yet translated, `unimplemented!()`s if ever requested.
+/// Both ordinary and simple-function-optimized evaluation are modeled;
+/// the latter uses [`eval0_simple_funccal`]'s real parser fallback.
 ///
 /// Returns `None` on evaluation failure, matching the original's own
 /// `NULL` return (the message-display difference for an E-numbered
@@ -5280,18 +5303,20 @@ pub unsafe fn eval_to_string_eap(
     eap: Option<&mut crate::ex_cmds_defs::ExargT>,
     use_simple_function: bool,
 ) -> Option<Vec<u8>> {
-    if use_simple_function {
-        unimplemented!(
-            "eval_to_string_eap: use_simple_function=true needs eval0_simple_funccal, not yet \
-             translated"
-        );
-    }
-
     let mut tv = TypvalT::default();
-    let mut evalarg = EvalargT { eval_flags: EVAL_EVALUATE, ..Default::default() };
+    let skip = eap.as_deref().is_some_and(|e| e.skip);
+    let mut evalarg = EvalargT::default();
+    fill_evalarg_from_eap(&mut evalarg, eap.as_deref(), skip);
     // SAFETY: forwarded from this function's own safety doc.
-    let ret = unsafe { eval0(arg, &mut tv, eap, Some(&mut evalarg)) };
+    let ret = unsafe {
+        if use_simple_function {
+            eval0_simple_funccal(arg, &mut tv, None, Some(&mut evalarg))
+        } else {
+            eval0(arg, &mut tv, None, Some(&mut evalarg))
+        }
+    };
     if ret == FAIL {
+        clear_evalarg(Some(&mut evalarg), None);
         return None;
     }
     // SAFETY: forwarded from this function's own safety doc (tv was
@@ -5299,6 +5324,7 @@ pub unsafe fn eval_to_string_eap(
     let retval = unsafe { typval2string(&tv, join_list) };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+    clear_evalarg(Some(&mut evalarg), None);
     Some(retval)
 }
 
@@ -9396,12 +9422,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "eval0_simple_funccal")]
-    fn eval_to_bool_simple_function_mode_is_unimplemented() {
+    fn eval_to_bool_simple_function_mode_uses_the_parser_fallback() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut error = false;
-        let _ = unsafe {
-            eval_to_bool(b"len([])", &mut error, None, false, true)
-        };
+        assert!(unsafe {
+            eval_to_bool(b"len(\"x\")", &mut error, None, false, true)
+        });
+        assert!(!error);
     }
 
     #[test]
@@ -9453,9 +9480,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "eval0_simple_funccal")]
-    fn eval_expr_ext_simple_function_mode_is_unimplemented() {
-        let _ = unsafe { eval_expr_ext(b"len([])", None, true) };
+    fn eval_expr_ext_simple_function_mode_uses_the_parser_fallback() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { eval_expr_ext(b"len(\"abc\")", None, true) }
+                .map(|tv| tv.value),
+            Some(TypvalValue::Number(3))
+        );
     }
 
     #[test]
@@ -9505,9 +9536,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "may_call_simple_func")]
-    fn eval_to_number_simple_function_mode_is_unimplemented() {
-        let _ = unsafe { eval_to_number(b"len([])", true) };
+    fn eval_to_number_simple_function_mode_uses_the_parser_fallback() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { eval_to_number(b"len(\"abcd\")", true) }, 4);
     }
 
     #[test]
@@ -12118,14 +12149,35 @@ mod tests {
     }
 
     #[test]
+    fn eval_to_string_eap_honors_parse_only_context_without_nextcmd() {
+        let mut eap =
+            crate::ex_cmds_defs::ExargT { skip: true, ..Default::default() };
+        assert_eq!(
+            unsafe {
+                eval_to_string_eap(
+                    b"1 | echo",
+                    false,
+                    Some(&mut eap),
+                    false,
+                )
+            },
+            Some(Vec::new())
+        );
+        assert!(eap.nextcmd.is_none());
+    }
+
+    #[test]
     fn eval_to_string_failure_returns_none() {
         assert_eq!(unsafe { eval_to_string(b"&notarealoption", false, false) }, None);
     }
 
     #[test]
-    fn eval_to_string_use_simple_function_is_unimplemented() {
-        let result = std::panic::catch_unwind(|| unsafe { eval_to_string(b"42", false, true) });
-        assert!(result.is_err(), "expected a panic (eval0_simple_funccal not yet translated)");
+    fn eval_to_string_uses_the_simple_function_parser_fallback() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { eval_to_string(b"len(\"hello\")", false, true) },
+            Some(b"5".to_vec())
+        );
     }
 
     #[test]
@@ -12175,7 +12227,9 @@ mod tests {
         }
 
         let result = std::panic::catch_unwind(|| {
-            let _ = unsafe { eval_to_string_safe(b"42", true, true) };
+            let _ = unsafe {
+                eval_to_string_safe(b"{x -> x}", true, false)
+            };
         });
         assert!(result.is_err());
         assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
