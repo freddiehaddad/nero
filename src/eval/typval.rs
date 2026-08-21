@@ -206,8 +206,9 @@
 //! doubly-linked-list reversal).
 
 use crate::eval::typval_defs::{
-    dict_item_flags, Callback, DictT, DictitemT, ListLenSpecials, PartialT, ScopeType, TypvalT, TypvalValue,
-    VarLockStatus, VarType, VarnumberT,
+    dict_item_flags, Callback, DictT, DictitemT, ListLenSpecials, ListT,
+    PartialT, ScopeType, TypvalT, TypvalValue, VarLockStatus, VarType,
+    VarnumberT,
 };
 use crate::eval::gc::{GC_FIRST_DICT, GC_FIRST_LIST};
 use crate::globals::GlobalCell;
@@ -1166,10 +1167,9 @@ fn strip_trailing_zeros(s: &str) -> Vec<u8> {
 }
 
 
-/// Release a value's contents one level deep - not the original's
-/// fully recursive `tv_clear` (a separate, substantial subsystem not
-/// attempted here), just enough to correctly release whatever a
-/// single `typval_T` itself directly owns/references. Used by
+/// Release whatever a single value directly owns or references. Container
+/// unrefs that reach zero are drained by [`FreeWorklist`], so arbitrarily
+/// deep List/Dict/Partial graphs do not recurse on the native stack. Used by
 /// [`tv_dict_item_free`]/[`partial_free`]'s own `pt_argv` release, and
 /// by [`partial_unref`] for `pt_dict`/`pt_func`.
 ///
@@ -1224,18 +1224,207 @@ pub(crate) unsafe fn tv_clear_simple(tv: &TypvalT) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FreeTarget {
+    List(*mut ListT, bool),
+    Dict(*mut DictT, bool),
+    Partial(*mut PartialT),
+}
+
+/// Heap-backed destruction stack shared by List, Dict, and Partial values.
+///
+/// `deallocating` prevents a container being destroyed from being
+/// rescheduled through a self-reference or cycle. `protected` identifies
+/// contents-only roots: back-references still decrement their refcount but
+/// may not deallocate the root itself.
+struct FreeWorklist {
+    targets: Vec<FreeTarget>,
+    deallocating: std::collections::HashSet<(u8, usize)>,
+    protected: std::collections::HashSet<(u8, usize)>,
+}
+
+impl FreeWorklist {
+    fn new(target: FreeTarget) -> Self {
+        let mut work = Self {
+            targets: Vec::new(),
+            deallocating: std::collections::HashSet::new(),
+            protected: std::collections::HashSet::new(),
+        };
+        work.push(target);
+        work
+    }
+
+    fn key(target: FreeTarget) -> (u8, usize) {
+        match target {
+            FreeTarget::List(list, _) => (0, list as usize),
+            FreeTarget::Dict(dict, _) => (1, dict as usize),
+            FreeTarget::Partial(partial) => (2, partial as usize),
+        }
+    }
+
+    fn push(&mut self, target: FreeTarget) {
+        let key = Self::key(target);
+        let inserted = match target {
+            FreeTarget::List(_, false)
+            | FreeTarget::Dict(_, false) => self.protected.insert(key),
+            FreeTarget::List(_, true)
+            | FreeTarget::Dict(_, true)
+            | FreeTarget::Partial(_) => self.deallocating.insert(key),
+        };
+        if inserted {
+            self.targets.push(target);
+        }
+    }
+
+    unsafe fn unref_list(&mut self, list: *mut ListT) {
+        if list.is_null() {
+            return;
+        }
+        let key = (0, list as usize);
+        if self.deallocating.contains(&key) {
+            return;
+        }
+        unsafe { (*list).lv_refcount -= 1 };
+        if unsafe { (*list).lv_refcount } <= 0
+            && !self.protected.contains(&key)
+        {
+            self.push(FreeTarget::List(list, true));
+        }
+    }
+
+    unsafe fn unref_dict(&mut self, dict: *mut DictT) {
+        if dict.is_null() {
+            return;
+        }
+        let key = (1, dict as usize);
+        if self.deallocating.contains(&key) {
+            return;
+        }
+        unsafe { (*dict).dv_refcount -= 1 };
+        if unsafe { (*dict).dv_refcount } <= 0
+            && !self.protected.contains(&key)
+        {
+            self.push(FreeTarget::Dict(dict, true));
+        }
+    }
+
+    unsafe fn unref_partial(&mut self, partial: *mut PartialT) {
+        if partial.is_null() {
+            return;
+        }
+        let key = (2, partial as usize);
+        if self.deallocating.contains(&key) {
+            return;
+        }
+        unsafe { (*partial).pt_refcount -= 1 };
+        if unsafe { (*partial).pt_refcount } <= 0 {
+            self.push(FreeTarget::Partial(partial));
+        }
+    }
+
+    unsafe fn clear_value(&mut self, value: &TypvalT) {
+        match &value.value {
+            TypvalValue::List(list) => unsafe { self.unref_list(*list) },
+            TypvalValue::Dict(dict) => unsafe { self.unref_dict(*dict) },
+            TypvalValue::Partial(partial) => {
+                unsafe { self.unref_partial(*partial) };
+            }
+            _ => unsafe { tv_clear_simple(value) },
+        }
+    }
+
+    unsafe fn free_list_contents(
+        &mut self,
+        list: *mut ListT,
+        free_self: bool,
+    ) {
+        let mut item = unsafe { (*list).lv_first };
+        while !item.is_null() {
+            let next = unsafe { (*item).li_next };
+            unsafe { (*list).lv_first = next };
+            unsafe { self.clear_value(&(*item).li_tv) };
+            drop(unsafe { Box::from_raw(item) });
+            item = next;
+        }
+        let list_ref = unsafe { &mut *list };
+        list_ref.lv_len = 0;
+        list_ref.lv_idx_item = std::ptr::null_mut();
+        list_ref.lv_last = std::ptr::null_mut();
+        debug_assert!(
+            list_ref.lv_watch.is_null(),
+            "tv_list_free_contents: lv_watch should be empty"
+        );
+        if free_self {
+            unsafe { tv_list_free_list(list) };
+        }
+    }
+
+    unsafe fn free_dict_contents(
+        &mut self,
+        dict: *mut DictT,
+        free_self: bool,
+    ) {
+        let dict_ref = unsafe { &mut *dict };
+        let items: Vec<*mut DictitemT> =
+            std::mem::take(&mut dict_ref.dv_index)
+                .into_values()
+                .collect();
+        dict_ref.dv_hashtab = crate::hashtab_defs::HashtabT::hash_init();
+        for item in items {
+            unsafe { self.clear_value(&(*item).di_tv) };
+            if unsafe { (*item).di_flags } & dict_item_flags::ALLOC != 0 {
+                drop(unsafe { Box::from_raw(item) });
+            } else {
+                unsafe { (*item).di_tv = TypvalT::default() };
+            }
+        }
+        if free_self {
+            unsafe { tv_dict_free_dict(dict) };
+        }
+    }
+
+    unsafe fn free_partial(&mut self, partial: *mut PartialT) {
+        let boxed = unsafe { Box::from_raw(partial) };
+        for argument in &boxed.pt_argv {
+            unsafe { self.clear_value(argument) };
+        }
+        unsafe { self.unref_dict(boxed.pt_dict) };
+        if boxed.pt_name.is_none() {
+            unsafe {
+                crate::eval::userfunc::func_ptr_unref(boxed.pt_func)
+            };
+        } else {
+            crate::eval::userfunc::func_unref(boxed.pt_name.as_deref());
+        }
+    }
+
+    unsafe fn run(&mut self) {
+        while let Some(target) = self.targets.pop() {
+            match target {
+                FreeTarget::List(list, free_self) => {
+                    unsafe { self.free_list_contents(list, free_self) };
+                }
+                FreeTarget::Dict(dict, free_self) => {
+                    unsafe { self.free_dict_contents(dict, free_self) };
+                }
+                FreeTarget::Partial(partial) => {
+                    unsafe { self.free_partial(partial) };
+                }
+            }
+        }
+    }
+}
+
+unsafe fn free_targets(target: FreeTarget) {
+    let mut work = FreeWorklist::new(target);
+    unsafe { work.run() };
+}
+
 /// Free a partial, releasing everything it owns (`partial_free`,
 /// `eval.c` - kept here alongside this module's other `tv_*_unref`/
 /// `_free` functions since it's small, self-contained, and exactly
 /// analogous in shape to [`tv_dict_free`]/[`tv_list_free`], even
 /// though `partial_T`'s real home is `eval.c`, not `eval/typval.c`).
-///
-/// # Deferred
-/// `pt_argv`'s items are released one level via [`tv_clear_simple`]
-/// (matching this module's own established policy for container
-/// contents - not the original's fully recursive `tv_clear`, which
-/// itself is a separate, substantial `encode_vim_to_nothing`-based
-/// subsystem, not attempted here).
 ///
 /// # Safety
 /// `pt` must be a valid, non-null pointer previously allocated via
@@ -1247,20 +1436,7 @@ pub(crate) unsafe fn tv_clear_simple(tv: &TypvalT) {
 /// `DictT`; if `(*pt).pt_func` is non-null (and `pt_name` is absent),
 /// it must be a valid pointer to a live `UfuncT`.
 unsafe fn partial_free(pt: *mut PartialT) {
-    // SAFETY: forwarded from this function's own safety doc.
-    let boxed = unsafe { Box::from_raw(pt) };
-    for argv in &boxed.pt_argv {
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { tv_clear_simple(argv) };
-    }
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { tv_dict_unref(boxed.pt_dict) };
-    if boxed.pt_name.is_none() {
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { crate::eval::userfunc::func_ptr_unref(boxed.pt_func) };
-    } else {
-        crate::eval::userfunc::func_unref(boxed.pt_name.as_deref());
-    }
+    unsafe { free_targets(FreeTarget::Partial(pt)) };
 }
 
 /// Unreference a partial: decrement the reference count and free it
@@ -1802,23 +1978,14 @@ pub unsafe fn tv_dict_set_keys_readonly(dict: *mut DictT) {
 
 /// Free items contained in a dictionary (`tv_dict_free_contents`).
 ///
+/// Nested List/Dict/Partial values are released through an explicit
+/// worklist instead of recursive native calls.
+///
 /// # Safety
 /// `d` must be a valid, non-null pointer to a live `DictT` whose every
 /// item satisfies [`tv_dict_item_free`]'s own safety contract.
 pub unsafe fn tv_dict_free_contents(d: *mut DictT) {
-    // SAFETY: forwarded from this function's own safety doc.
-    let dict = unsafe { &mut *d };
-    // Unlike the original (which locks dv_hashtab, walks it via
-    // HASHTAB_ITER + TV_DICT_HI2DI, and removes each item one at a
-    // time), dv_index already gives a direct list of every live item -
-    // no hashtab traversal/locking needed at all.
-    let items: Vec<*mut DictitemT> = dict.dv_index.values().copied().collect();
-    for item in items {
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { tv_dict_item_free(item) };
-    }
-    dict.dv_index.clear();
-    dict.dv_hashtab = crate::hashtab_defs::HashtabT::hash_init();
+    unsafe { free_targets(FreeTarget::Dict(d, false)) };
 }
 
 /// Free a dictionary itself, ignoring items it contains. Ignores the
@@ -1853,6 +2020,8 @@ pub unsafe fn tv_dict_free_dict(d: *mut DictT) {
 /// Free a dictionary, including all items it contains. Ignores the
 /// reference count (`tv_dict_free`).
 ///
+/// Nested container destruction is iterative and stack-safe.
+///
 /// # Safety
 /// Same as [`tv_dict_free_contents`]/[`tv_dict_free_dict`] combined.
 pub unsafe fn tv_dict_free(d: *mut DictT) {
@@ -1860,10 +2029,7 @@ pub unsafe fn tv_dict_free(d: *mut DictT) {
     // always false here - nothing in this crate can trigger the
     // garbage-collector's "unreferencing everything" pass that sets it
     // (that pass doesn't exist yet).
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { tv_dict_free_contents(d) };
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { tv_dict_free_dict(d) };
+    unsafe { free_targets(FreeTarget::Dict(d, true)) };
 }
 
 /// Unreference a dictionary: decrements the reference count and frees
@@ -4258,31 +4424,16 @@ pub unsafe fn tv_list_item_remove(
 
 /// Free items contained in a list (`tv_list_free_contents`).
 ///
+/// Nested List/Dict/Partial values are released through an explicit
+/// worklist instead of recursive native calls.
+///
 /// # Safety
 /// `l` must be a valid, non-null pointer to a live `ListT` whose items
 /// were all allocated via `tv_list_item_alloc`/`Box::into_raw`,
 /// matching `tv_clear_simple`'s own safety contract for each item's
 /// value.
 pub unsafe fn tv_list_free_contents(l: *mut crate::eval::typval_defs::ListT) {
-    // SAFETY: forwarded from this function's own safety doc.
-    let mut item = unsafe { (*l).lv_first };
-    while !item.is_null() {
-        // SAFETY: forwarded from this function's own safety doc.
-        let next = unsafe { (*item).li_next };
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { (*l).lv_first = next };
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { tv_clear_simple(&(*item).li_tv) };
-        // SAFETY: forwarded from this function's own safety doc.
-        drop(unsafe { Box::from_raw(item) });
-        item = next;
-    }
-    // SAFETY: forwarded from this function's own safety doc.
-    let l_ref = unsafe { &mut *l };
-    l_ref.lv_len = 0;
-    l_ref.lv_idx_item = std::ptr::null_mut();
-    l_ref.lv_last = std::ptr::null_mut();
-    debug_assert!(l_ref.lv_watch.is_null(), "tv_list_free_contents: lv_watch should be empty");
+    unsafe { free_targets(FreeTarget::List(l, false)) };
 }
 
 /// Free a list itself, ignoring items it contains. Ignores the
@@ -4316,15 +4467,14 @@ pub unsafe fn tv_list_free_list(l: *mut crate::eval::typval_defs::ListT) {
 /// Free a list, including all items it points to. Ignores the
 /// reference count (`tv_list_free`).
 ///
+/// Nested container destruction is iterative and stack-safe.
+///
 /// # Safety
 /// Same as [`tv_list_free_contents`]/[`tv_list_free_list`] combined.
 pub unsafe fn tv_list_free(l: *mut crate::eval::typval_defs::ListT) {
     // The original's `tv_in_free_unref_items` re-entrancy guard is
     // always false here - same reasoning as `tv_dict_free`.
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { tv_list_free_contents(l) };
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { tv_list_free_list(l) };
+    unsafe { free_targets(FreeTarget::List(l, true)) };
 }
 
 /// Unreference a list: decrements the reference count and frees when
@@ -6842,6 +6992,160 @@ mod tests {
             assert!((*l).lv_first.is_null());
             tv_list_free(l);
         }
+    }
+
+    #[test]
+    fn list_contents_cleanup_releases_a_self_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(gc_first_list_is_empty());
+        let list = tv_list_alloc(1);
+        unsafe {
+            tv_list_ref(list);
+            tv_list_append_tv(
+                list,
+                &TypvalT {
+                    value: TypvalValue::List(list),
+                    ..Default::default()
+                },
+            );
+            assert_eq!((*list).lv_refcount, 2);
+
+            tv_list_free_contents(list);
+            assert_eq!((*list).lv_refcount, 1);
+            assert_eq!((*list).lv_len, 0);
+
+            tv_list_unref(list);
+        }
+        assert!(gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn dict_contents_cleanup_releases_a_self_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(gc_first_dict_is_empty());
+        let dict = tv_dict_alloc();
+        unsafe {
+            (*dict).dv_refcount = 1;
+            let item = tv_dict_item_alloc(b"self");
+            (*item).di_tv.value = TypvalValue::Dict(dict);
+            assert_eq!(
+                tv_dict_add(&mut *dict, item),
+                OK
+            );
+            (*dict).dv_refcount += 1;
+            assert_eq!((*dict).dv_refcount, 2);
+
+            tv_dict_free_contents(dict);
+            assert_eq!((*dict).dv_refcount, 1);
+            assert!((*dict).dv_index.is_empty());
+
+            tv_dict_unref(dict);
+        }
+        assert!(gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_dict_cleanup_uses_an_explicit_worklist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let depth = if cfg!(miri) { 512 } else { 20_000 };
+        assert!(gc_first_dict_is_empty());
+        let mut child = tv_dict_alloc();
+        tv_dict_add_nr(unsafe { &mut *child }, b"value", 1);
+        for _ in 0..depth {
+            let parent = tv_dict_alloc();
+            assert_eq!(
+                unsafe {
+                    tv_dict_add_dict(
+                        &mut *parent,
+                        b"child",
+                        child,
+                    )
+                },
+                OK
+            );
+            child = parent;
+        }
+
+        unsafe { tv_dict_unref(child) };
+        assert!(gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn alternating_list_dict_cleanup_uses_one_worklist() {
+        enum Nested {
+            List(*mut ListT),
+            Dict(*mut DictT),
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let depth = if cfg!(miri) { 512 } else { 20_000 };
+        assert!(gc_first_list_is_empty());
+        assert!(gc_first_dict_is_empty());
+        let first = tv_list_alloc(1);
+        unsafe { tv_list_append_number(first, 1) };
+        let mut nested = Nested::List(first);
+
+        for _ in 0..depth {
+            nested = match nested {
+                Nested::List(child) => {
+                    let parent = tv_dict_alloc();
+                    assert_eq!(
+                        unsafe {
+                            tv_dict_add_tv(
+                                &mut *parent,
+                                b"child",
+                                &TypvalT {
+                                    value: TypvalValue::List(child),
+                                    ..Default::default()
+                                },
+                            )
+                        },
+                        OK
+                    );
+                    Nested::Dict(parent)
+                }
+                Nested::Dict(child) => {
+                    let parent = tv_list_alloc(1);
+                    unsafe {
+                        tv_list_append_tv(
+                            parent,
+                            &TypvalT {
+                                value: TypvalValue::Dict(child),
+                                ..Default::default()
+                            },
+                        )
+                    };
+                    Nested::List(parent)
+                }
+            };
+        }
+
+        unsafe {
+            match nested {
+                Nested::List(list) => tv_list_unref(list),
+                Nested::Dict(dict) => tv_dict_unref(dict),
+            }
+        }
+        assert!(gc_first_list_is_empty());
+        assert!(gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_partial_cleanup_uses_an_explicit_worklist() {
+        let depth = if cfg!(miri) { 512 } else { 20_000 };
+        let mut child = Box::into_raw(Box::new(PartialT::default()));
+        for _ in 0..depth {
+            unsafe { (*child).pt_refcount += 1 };
+            child = Box::into_raw(Box::new(PartialT {
+                pt_argv: vec![TypvalT {
+                    value: TypvalValue::Partial(child),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+        }
+
+        unsafe { partial_unref(child) };
     }
 
     #[test]

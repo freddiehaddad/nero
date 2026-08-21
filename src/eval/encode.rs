@@ -818,6 +818,7 @@ mod tests {
     #[test]
     fn deeply_nested_list_does_not_overflow_the_stack() {
         let _lock = crate::globals::global_state_test_lock();
+        let depth = if cfg!(miri) { 512 } else { 20_000 };
         // Build list_19999 = [19999], list_19998 = [list_19999], ...,
         // list_0 = [list_1] - 20,000 levels of list-in-list nesting,
         // matching set_ref_in_list_items's own established
@@ -832,7 +833,7 @@ mod tests {
         // dangling pointer).
         let mut innermost = crate::eval::typval::tv_list_alloc(1);
         unsafe { crate::eval::typval::tv_list_append_number(innermost, 19999) };
-        for _ in 0..19999 {
+        for _ in 1..depth {
             let l = crate::eval::typval::tv_list_alloc(1);
             unsafe {
                 crate::eval::typval::tv_list_append_tv(l, &TypvalT { value: TypvalValue::List(innermost), ..Default::default() });
@@ -842,58 +843,16 @@ mod tests {
         let result = s(&TypvalT { value: TypvalValue::List(innermost), ..Default::default() });
         // 20,000 levels of nesting means 20,000 "[" then "19999" then
         // 20,000 "]" - not a handful of brackets near the value.
-        assert_eq!(result.len(), 20_000 + "19999".len() + 20_000);
-        assert_eq!(&result[..20_000], "[".repeat(20_000));
-        assert_eq!(&result[20_000..20_005], "19999");
-        assert_eq!(&result[20_005..], "]".repeat(20_000));
+        assert_eq!(result.len(), depth + "19999".len() + depth);
+        assert_eq!(&result[..depth], "[".repeat(depth));
+        assert_eq!(&result[depth..depth + 5], "19999");
+        assert_eq!(&result[depth + 5..], "]".repeat(depth));
 
-        // Free the whole 20,000-list chain WITHOUT tv_list_unref: that
-        // was confirmed (via a real stack-overflow crash while writing
-        // this test) to recurse 20,000 native call frames deep through
-        // tv_list_free_contents -> tv_clear_simple -> tv_list_unref ->
-        // tv_list_free -> ... - a genuine, pre-existing gap logged as
-        // SQL todo repo-health-tv-list-free-recursion (unlike THIS
-        // function's own iterative, explicit-stack EncodeFrame walk,
-        // which this test already proved handles the exact same depth
-        // without issue). Leaving the chain unfreed isn't an option
-        // either: every list stays registered in the shared
-        // GC_FIRST_LIST linked list for the rest of the test process's
-        // lifetime, breaking later tests that assert "no list is live
-        // before this test" (confirmed the hard way: this exact
-        // scenario made 3 unrelated GC-linked-list tests fail 8/8 times
-        // before this cleanup loop was added). So: walk the chain
-        // iteratively (collecting every list pointer first, itself
-        // safe since it only follows `lv_first`/`li_tv` reads, no
-        // freeing yet), then free each list's own single item directly
-        // (a plain `Box::from_raw`+`drop` - safe because a `TypvalT`
-        // holding `TypvalValue::List(*mut ListT)` has no `Drop` impact
-        // of its own on that raw pointer, so this does NOT recurse into
-        // the nested list) before unlinking/freeing the list itself via
-        // `tv_list_free_list` (which ignores refcount and contained
-        // items entirely, exactly what's needed here).
-        let mut chain = vec![innermost];
-        loop {
-            let cur = *chain.last().unwrap();
-            // SAFETY: every list in `chain` was allocated above and is
-            // still live (nothing has freed anything yet).
-            let item = unsafe { (*cur).lv_first };
-            if item.is_null() {
-                break;
-            }
-            // SAFETY: forwarded from the same reasoning as above.
-            let TypvalValue::List(next) = (unsafe { &(*item).li_tv }).value else { break };
-            chain.push(next);
-        }
-        for l in chain {
-            // SAFETY: forwarded from this test's own reasoning above.
-            unsafe {
-                let item = (*l).lv_first;
-                if !item.is_null() {
-                    drop(Box::from_raw(item));
-                }
-                crate::eval::typval::tv_list_free_list(l);
-            }
-        }
+        // Container destruction uses its own explicit worklist too, so
+        // releasing this 20,000-level chain must not consume one native
+        // stack frame per nested list.
+        unsafe { crate::eval::typval::tv_list_unref(innermost) };
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 
     #[test]
