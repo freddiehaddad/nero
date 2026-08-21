@@ -626,6 +626,217 @@ fn get_unsigned_int(
     (crate::vim_defs::OK, value)
 }
 
+/// Parse positional argument types from a printf-style format string
+/// (`parse_fmt_types`).
+///
+/// `None` reports the original's `FAIL` path. The returned vector is empty
+/// for a valid format that uses only non-positional arguments.
+#[allow(dead_code)]
+fn parse_fmt_types(
+    fmt: Option<&[u8]>,
+    tvs: Option<&[crate::eval::typval_defs::TypvalT]>,
+) -> Option<Vec<Vec<u8>>> {
+    let Some(fmt) = fmt else {
+        return Some(Vec::new());
+    };
+    let fmt_len = fmt.iter().position(|&byte| byte == NUL).unwrap_or(fmt.len());
+    let fmt = &fmt[..fmt_len];
+    let mut position = 0usize;
+    let mut argument_types: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut any_positional = false;
+    let mut any_sequential = false;
+
+    while position < fmt.len() {
+        if fmt[position] != b'%' {
+            position += 1;
+            continue;
+        }
+
+        position += 1;
+        let positional_start = position;
+        let mut type_probe = position;
+        while fmt.get(type_probe).is_some_and(u8::is_ascii_digit) {
+            type_probe += 1;
+        }
+
+        let mut positional_argument = None;
+        if fmt.get(type_probe) == Some(&b'$') {
+            if fmt.get(position) == Some(&b'0') {
+                return None;
+            }
+            let (status, argument) =
+                get_unsigned_int(fmt, &mut position, tvs.is_some());
+            if status == crate::vim_defs::FAIL {
+                return None;
+            }
+            positional_argument = Some(argument as usize);
+            any_positional = true;
+            if any_sequential {
+                return None;
+            }
+            position += 1;
+        }
+
+        while fmt.get(position).is_some_and(|byte| {
+            matches!(*byte, b'0' | b'-' | b'+' | b' ' | b'#' | b'\'')
+        }) {
+            position += 1;
+        }
+
+        if fmt.get(position) == Some(&b'*') {
+            position += 1;
+            if fmt.get(position).is_some_and(u8::is_ascii_digit) {
+                let (status, argument) =
+                    get_unsigned_int(fmt, &mut position, tvs.is_some());
+                if status == crate::vim_defs::FAIL
+                    || fmt.get(position) != Some(&b'$')
+                {
+                    return None;
+                }
+                position += 1;
+                any_positional = true;
+                if any_sequential
+                    || adjust_types(
+                        &mut argument_types,
+                        argument as usize,
+                        b"*",
+                    ) == crate::vim_defs::FAIL
+                {
+                    return None;
+                }
+            } else {
+                any_sequential = true;
+                if any_positional {
+                    return None;
+                }
+            }
+        } else if fmt.get(position).is_some_and(u8::is_ascii_digit) {
+            let (status, _) = get_unsigned_int(fmt, &mut position, tvs.is_some());
+            if status == crate::vim_defs::FAIL
+                || fmt.get(position) == Some(&b'$')
+            {
+                return None;
+            }
+        }
+
+        if fmt.get(position) == Some(&b'.') {
+            position += 1;
+            if fmt.get(position) == Some(&b'*') {
+                position += 1;
+                if fmt.get(position).is_some_and(u8::is_ascii_digit) {
+                    let (status, argument) =
+                        get_unsigned_int(fmt, &mut position, tvs.is_some());
+                    if status == crate::vim_defs::FAIL
+                        || fmt.get(position) != Some(&b'$')
+                    {
+                        return None;
+                    }
+                    position += 1;
+                    any_positional = true;
+                    if any_sequential
+                        || adjust_types(
+                            &mut argument_types,
+                            argument as usize,
+                            b"*",
+                        ) == crate::vim_defs::FAIL
+                    {
+                        return None;
+                    }
+                } else {
+                    any_sequential = true;
+                    if any_positional {
+                        return None;
+                    }
+                }
+            } else if fmt.get(position).is_some_and(u8::is_ascii_digit) {
+                let (status, _) =
+                    get_unsigned_int(fmt, &mut position, tvs.is_some());
+                if status == crate::vim_defs::FAIL
+                    || fmt.get(position) == Some(&b'$')
+                {
+                    return None;
+                }
+            }
+        }
+
+        let type_start = if positional_argument.is_some() {
+            position
+        } else {
+            positional_start
+        };
+        if matches!(fmt.get(position), Some(b'h' | b'l' | b'z')) {
+            let modifier = fmt[position];
+            position += 1;
+            if modifier == b'l' && fmt.get(position) == Some(&b'l') {
+                position += 1;
+            }
+        }
+
+        let specifier = fmt.get(position).copied().unwrap_or(NUL);
+        let known = matches!(
+            specifier,
+            b'i'
+                | b'*'
+                | b'd'
+                | b'u'
+                | b'o'
+                | b'D'
+                | b'U'
+                | b'O'
+                | b'x'
+                | b'X'
+                | b'b'
+                | b'B'
+                | b'c'
+                | b's'
+                | b'S'
+                | b'p'
+                | b'f'
+                | b'F'
+                | b'e'
+                | b'E'
+                | b'g'
+                | b'G'
+        );
+        if known {
+            if let Some(argument) = positional_argument {
+                let type_end = (position + 1).min(fmt.len());
+                if adjust_types(
+                    &mut argument_types,
+                    argument,
+                    &fmt[type_start..type_end],
+                ) == crate::vim_defs::FAIL
+                {
+                    return None;
+                }
+            } else {
+                any_sequential = true;
+                if any_positional {
+                    return None;
+                }
+            }
+        } else if positional_argument.is_some() {
+            return None;
+        }
+
+        if position < fmt.len() {
+            position += 1;
+        }
+    }
+
+    let argument_types: Vec<Vec<u8>> = argument_types.into_iter().collect::<Option<_>>()?;
+    if let Some(tvs) = tvs {
+        for index in 0..argument_types.len() {
+            if tvs.get(index).is_none_or(|tv| {
+                matches!(&tv.value, crate::eval::typval_defs::TypvalValue::Unknown)
+            }) {
+                return None;
+            }
+        }
+    }
+    Some(argument_types)
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1467,6 +1678,51 @@ mod tests {
             (crate::vim_defs::OK, MAX_ALLOWED_STRING_WIDTH)
         );
         assert_eq!(clamp_position, 7);
+    }
+
+    #[test]
+    fn parse_fmt_types_accepts_sequential_and_non_argument_formats() {
+        assert_eq!(parse_fmt_types(Some(b"%d %s %%"), None), Some(Vec::new()));
+        assert_eq!(parse_fmt_types(Some(b"plain text"), None), Some(Vec::new()));
+        assert_eq!(parse_fmt_types(None, None), Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_fmt_types_records_positional_values_widths_and_precision() {
+        assert_eq!(
+            parse_fmt_types(Some(b"%2$*1$.*3$lld"), None),
+            Some(vec![b"*".to_vec(), b"lld".to_vec(), b"*".to_vec()])
+        );
+    }
+
+    #[test]
+    fn parse_fmt_types_rejects_mixed_gapped_and_incompatible_arguments() {
+        assert_eq!(parse_fmt_types(Some(b"%d %1$d"), None), None);
+        assert_eq!(parse_fmt_types(Some(b"%2$d"), None), None);
+        assert_eq!(parse_fmt_types(Some(b"%1$d %1$s"), None), None);
+        assert_eq!(parse_fmt_types(Some(b"%0$d"), None), None);
+        assert_eq!(parse_fmt_types(Some(b"%*1d"), None), None);
+    }
+
+    #[test]
+    fn parse_fmt_types_checks_typval_bounds_when_values_are_supplied() {
+        let value = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(1),
+            v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+        };
+        assert_eq!(
+            parse_fmt_types(Some(b"%1$d"), Some(std::slice::from_ref(&value))),
+            Some(vec![b"d".to_vec()])
+        );
+        assert_eq!(
+            parse_fmt_types(
+                Some(b"%1$d"),
+                Some(std::slice::from_ref(
+                    &crate::eval::typval_defs::TypvalT::default(),
+                )),
+            ),
+            None
+        );
     }
 
     #[test]
