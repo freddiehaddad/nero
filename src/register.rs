@@ -2094,6 +2094,123 @@ pub unsafe fn do_autocmd_textyankpost(
     unsafe { *TEXTYANKPOST_RECURSIVE.get_mut() = false };
 }
 
+#[allow(dead_code)]
+static TEXTPUT_RECURSIVE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+/// Trigger `TextPutPre` or `TextPutPost` (`put_do_autocmd`).
+///
+/// # Safety
+/// Mutates shared `v:event`, insert/register, autocmd, and editor state.
+#[allow(dead_code)]
+unsafe fn put_do_autocmd(
+    regname: i32,
+    reg: Option<&YankregT>,
+    insert: Option<&[u8]>,
+    post: bool,
+    direction: crate::vim_defs::Direction,
+) {
+    if unsafe { *TEXTPUT_RECURSIVE.get_mut() }
+        || (regname == i32::from(b'_') && reg.is_none())
+    {
+        return;
+    }
+    if regname != i32::from(b'.') && insert.is_none() && reg.is_none() {
+        return;
+    }
+
+    let mut saved = crate::eval::typval_defs::SaveVEventT::default();
+    let event = unsafe { crate::eval::eval::get_v_event(&mut saved) };
+    let contents = crate::eval::typval::tv_list_alloc(
+        reg.and_then(|reg| reg.y_array.as_ref())
+            .map_or(1, |lines| lines.len() as isize),
+    );
+    if regname == i32::from(b'.') {
+        if let Some(last_insert) = unsafe { crate::insert::get_last_insert() } {
+            unsafe {
+                crate::eval::typval::tv_list_append_string(
+                    contents,
+                    Some(&last_insert),
+                )
+            };
+        }
+    } else if let Some(insert) = insert {
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                contents,
+                Some(insert),
+            )
+        };
+    } else if let Some(reg) = reg {
+        for line in reg.y_array.as_deref().unwrap_or(&[]) {
+            unsafe {
+                crate::eval::typval::tv_list_append_string(
+                    contents,
+                    Some(line),
+                )
+            };
+        }
+    }
+
+    unsafe {
+        crate::eval::typval::tv_list_set_lock(
+            contents,
+            crate::eval::typval_defs::VarLockStatus::Fixed,
+        );
+        crate::eval::typval::tv_dict_add_list(
+            &mut *event,
+            b"regcontents",
+            contents,
+        );
+        let regname_storage = [regname as u8];
+        crate::eval::typval::tv_dict_add_str(
+            &mut *event,
+            b"regname",
+            Some(if regname == 0 { &[] } else { &regname_storage }),
+        );
+        let operator = [if direction == crate::vim_defs::Direction::Backward {
+            b'P'
+        } else {
+            b'p'
+        }];
+        crate::eval::typval::tv_dict_add_str(
+            &mut *event,
+            b"operator",
+            Some(&operator),
+        );
+        add_regtype_to_dict(reg, &mut *event);
+        crate::eval::typval::tv_dict_add_bool(
+            &mut *event,
+            b"visual",
+            if crate::globals::GLOBALS.get_mut().Visual.active {
+                crate::eval::typval_defs::BoolVarValue::True
+            } else {
+                crate::eval::typval_defs::BoolVarValue::False
+            },
+        );
+        crate::eval::typval::tv_dict_set_keys_readonly(event);
+    }
+
+    unsafe { *TEXTPUT_RECURSIVE.get_mut() = true };
+    let globals = crate::globals::GLOBALS.as_ptr();
+    unsafe { (*globals).textlock += 1 };
+    let curbuf = unsafe { (*globals).curbuf.as_ref() };
+    let _ = crate::autocmd::apply_autocmds(
+        if post {
+            crate::autocmd_defs::EventT::TextPutPost
+        } else {
+            crate::autocmd_defs::EventT::TextPutPre
+        },
+        None,
+        None,
+        false,
+        curbuf,
+    );
+    unsafe { (*globals).textlock -= 1 };
+    unsafe { *TEXTPUT_RECURSIVE.get_mut() = false };
+    unsafe { crate::eval::eval::restore_v_event(event, &mut saved) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5552,5 +5669,46 @@ mod tests {
                 &YankregT::default(),
             )
         };
+    }
+
+    #[test]
+    fn put_do_autocmd_builds_and_clears_the_event_payload() {
+        let _lock = crate::globals::global_state_test_lock();
+        let event = unsafe { EventVimvarGuard::new() };
+        let previous_textlock =
+            unsafe { crate::globals::GLOBALS.get_mut() }.textlock;
+        let previous_visual =
+            unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active;
+        unsafe {
+            crate::globals::GLOBALS.get_mut().Visual.active = true;
+            *TEXTPUT_RECURSIVE.get_mut() = false;
+        }
+        let reg = YankregT {
+            y_array: Some(vec![b"one".to_vec(), b"two".to_vec()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            ..Default::default()
+        };
+
+        unsafe {
+            put_do_autocmd(
+                i32::from(b'a'),
+                Some(&reg),
+                None,
+                true,
+                crate::vim_defs::Direction::Backward,
+            )
+        };
+
+        assert_eq!(unsafe { (*event.dict).dv_hashtab.ht_used }, 0);
+        assert!(unsafe { (*event.dict).dv_index.is_empty() });
+        assert!(!unsafe { *TEXTPUT_RECURSIVE.get_mut() });
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.textlock,
+            previous_textlock
+        );
+        unsafe {
+            crate::globals::GLOBALS.get_mut().Visual.active =
+                previous_visual;
+        }
     }
 }
