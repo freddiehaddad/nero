@@ -590,6 +590,42 @@ fn adjust_types(
     crate::vim_defs::OK
 }
 
+const MAX_ALLOWED_STRING_WIDTH: u32 = 1_048_576;
+
+/// Parse an unsigned decimal formatter field (`get_unsigned_int`).
+///
+/// Returns the source status and parsed value while advancing `position`.
+/// When `overflow_error` is false, an oversized value is clamped exactly as
+/// in the original.
+#[allow(dead_code)]
+fn get_unsigned_int(
+    input: &[u8],
+    position: &mut usize,
+    overflow_error: bool,
+) -> (i32, u32) {
+    let Some(&first) = input.get(*position) else {
+        return (crate::vim_defs::FAIL, 0);
+    };
+    assert!(first.is_ascii_digit());
+
+    let mut value = u32::from(first - b'0');
+    *position += 1;
+    while input.get(*position).is_some_and(u8::is_ascii_digit)
+        && value < MAX_ALLOWED_STRING_WIDTH
+    {
+        value = value * 10 + u32::from(input[*position] - b'0');
+        *position += 1;
+    }
+
+    if value > MAX_ALLOWED_STRING_WIDTH {
+        if overflow_error {
+            return (crate::vim_defs::FAIL, value);
+        }
+        value = MAX_ALLOWED_STRING_WIDTH;
+    }
+    (crate::vim_defs::OK, value)
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1394,6 +1430,43 @@ mod tests {
         let mut invalid = vec![Some(b"*".to_vec())];
         assert_eq!(adjust_types(&mut invalid, 1, b"s"), crate::vim_defs::FAIL);
         assert_eq!(invalid[0], Some(b"*".to_vec()));
+    }
+
+    #[test]
+    fn get_unsigned_int_parses_and_advances_to_the_first_nondigit() {
+        let mut position = 0;
+        assert_eq!(
+            get_unsigned_int(b"123abc", &mut position, true),
+            (crate::vim_defs::OK, 123)
+        );
+        assert_eq!(position, 3);
+    }
+
+    #[test]
+    fn get_unsigned_int_stops_when_the_limit_is_reached_exactly() {
+        let mut position = 0;
+        assert_eq!(
+            get_unsigned_int(b"10485760", &mut position, true),
+            (crate::vim_defs::OK, MAX_ALLOWED_STRING_WIDTH)
+        );
+        assert_eq!(position, 7);
+    }
+
+    #[test]
+    fn get_unsigned_int_reports_or_clamps_overflow() {
+        let mut error_position = 0;
+        assert_eq!(
+            get_unsigned_int(b"1048577", &mut error_position, true),
+            (crate::vim_defs::FAIL, 1_048_577)
+        );
+        assert_eq!(error_position, 7);
+
+        let mut clamp_position = 0;
+        assert_eq!(
+            get_unsigned_int(b"1048577", &mut clamp_position, false),
+            (crate::vim_defs::OK, MAX_ALLOWED_STRING_WIDTH)
+        );
+        assert_eq!(clamp_position, 7);
     }
 
     #[test]
