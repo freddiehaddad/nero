@@ -299,6 +299,62 @@ use crate::eval::typval_defs::{Callback, TypvalT, TypvalValue, VarLockStatus, Va
 use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
+/// Prepare the shared `v:event` dictionary for one event
+/// (`get_v_event`).
+///
+/// # Safety
+/// `v:event` must contain a valid live dictionary, and access must be
+/// serialized with every other evaluator/global-state operation.
+pub unsafe fn get_v_event(
+    saved: &mut crate::eval::typval_defs::SaveVEventT,
+) -> *mut crate::eval::typval_defs::DictT {
+    let event = unsafe {
+        crate::eval::vars::get_vim_var_dict(
+            crate::eval::vars::VimVarIndex::Event,
+        )
+    };
+    assert!(!event.is_null(), "v:event must be initialized");
+    if unsafe { (*event).dv_hashtab.ht_used } > 0 {
+        saved.sve_did_save = true;
+        saved.sve_hashtab = Some(std::mem::replace(
+            unsafe { &mut (*event).dv_hashtab },
+            crate::hashtab_defs::HashtabT::hash_init(),
+        ));
+        saved.sve_index =
+            Some(std::mem::take(unsafe { &mut (*event).dv_index }));
+    } else {
+        saved.sve_did_save = false;
+        saved.sve_hashtab = None;
+        saved.sve_index = None;
+    }
+    event
+}
+
+/// Clear one event payload and restore any recursively-saved `v:event`
+/// dictionary (`restore_v_event`).
+///
+/// # Safety
+/// `event` must be the live pointer returned by the paired
+/// [`get_v_event`] call, and `saved` must belong to that call.
+pub unsafe fn restore_v_event(
+    event: *mut crate::eval::typval_defs::DictT,
+    saved: &mut crate::eval::typval_defs::SaveVEventT,
+) {
+    unsafe { crate::eval::typval::tv_dict_free_contents(event) };
+    if saved.sve_did_save {
+        unsafe {
+            (*event).dv_hashtab = saved
+                .sve_hashtab
+                .take()
+                .expect("saved v:event hashtable missing");
+            (*event).dv_index = saved
+                .sve_index
+                .take()
+                .expect("saved v:event index missing");
+        }
+    }
+}
+
 /// Persistence class of a variable name (`var_flavour_T`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -5949,6 +6005,118 @@ unsafe fn get_lval_list(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EventDictGuard {
+        old: Option<TypvalT>,
+        dict: *mut crate::eval::typval_defs::DictT,
+    }
+
+    impl EventDictGuard {
+        unsafe fn new() -> Self {
+            let dict = crate::eval::typval::tv_dict_alloc();
+            let slot = unsafe {
+                crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Event,
+                )
+            };
+            let old = std::mem::replace(
+                unsafe { &mut *slot },
+                TypvalT {
+                    value: TypvalValue::Dict(dict),
+                    ..Default::default()
+                },
+            );
+            Self {
+                old: Some(old),
+                dict,
+            }
+        }
+    }
+
+    impl Drop for EventDictGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let slot = crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Event,
+                );
+                *slot = self.old.take().expect("saved v:event value missing");
+                crate::eval::typval::tv_dict_free(self.dict);
+            }
+        }
+    }
+
+    #[test]
+    fn get_and_restore_v_event_preserve_nested_payloads() {
+        let _lock = crate::globals::global_state_test_lock();
+        let event = unsafe { EventDictGuard::new() };
+        unsafe {
+            assert_eq!(
+                crate::eval::typval::tv_dict_add_nr(
+                    &mut *event.dict,
+                    b"old",
+                    1,
+                ),
+                OK
+            );
+
+            let mut outer = crate::eval::typval_defs::SaveVEventT::default();
+            assert_eq!(get_v_event(&mut outer), event.dict);
+            assert!(outer.sve_did_save);
+            assert_eq!((*event.dict).dv_hashtab.ht_used, 0);
+            assert_eq!(
+                crate::eval::typval::tv_dict_add_nr(
+                    &mut *event.dict,
+                    b"outer",
+                    2,
+                ),
+                OK
+            );
+
+            let mut inner = crate::eval::typval_defs::SaveVEventT::default();
+            assert_eq!(get_v_event(&mut inner), event.dict);
+            assert!(inner.sve_did_save);
+            assert_eq!(
+                crate::eval::typval::tv_dict_add_nr(
+                    &mut *event.dict,
+                    b"inner",
+                    3,
+                ),
+                OK
+            );
+
+            restore_v_event(event.dict, &mut inner);
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_number(
+                    Some(&mut *event.dict),
+                    b"outer",
+                ),
+                2
+            );
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_number(
+                    Some(&mut *event.dict),
+                    b"inner",
+                ),
+                0
+            );
+
+            restore_v_event(event.dict, &mut outer);
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_number(
+                    Some(&mut *event.dict),
+                    b"old",
+                ),
+                1
+            );
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_number(
+                    Some(&mut *event.dict),
+                    b"outer",
+                ),
+                0
+            );
+        }
+    }
 
     #[test]
     fn variable_flavour_values_match_eval_h() {
