@@ -50,7 +50,6 @@
 //!   manipulation functions (`home_replace*`) or a much larger slice of
 //!   them plus `` `=expr` `` Vimscript-expression substitution
 //!   (`expand_env*`) than `vim_getenv` alone needed.
-//! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
 
 use super::os::NVIM_TESTING;
 use crate::globals::GlobalCell;
@@ -181,6 +180,21 @@ pub fn os_getenvname_at_index(index: usize) -> Option<Vec<u8>> {
             name.to_string_lossy().into_owned().into_bytes()
         })
     }
+}
+
+/// Copy an environment variable name into command-completion scratch
+/// space (`get_env_name`).
+#[must_use]
+pub fn get_env_name(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    idx: i32,
+) -> Option<&[u8]> {
+    assert!(idx >= 0);
+    let name = os_getenvname_at_index(idx as usize)?;
+    let len = name.len().min(xp.xp_buf.len() - 1);
+    xp.xp_buf[..len].copy_from_slice(&name[..len]);
+    xp.xp_buf[len] = 0;
+    Some(&xp.xp_buf[..len])
 }
 
 /// Return the next component of a delimited environment value
@@ -1721,6 +1735,32 @@ pub(crate) mod tests {
         assert!(
             names.iter().any(|name| name.eq_ignore_ascii_case(b"PATH"))
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
+    fn get_env_name_copies_into_expand_scratch_space() {
+        let expected = os_getenvname_at_index(0).expect("environment");
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        let copied = get_env_name(&mut xp, 0).unwrap().to_vec();
+        let expected_len =
+            expected.len().min(crate::cmdexpand_defs::EXPAND_BUF_LEN - 1);
+        assert_eq!(copied, expected[..expected_len]);
+        assert_eq!(xp.xp_buf[expected_len], 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
+    fn get_env_name_returns_none_past_the_environment() {
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        assert_eq!(get_env_name(&mut xp, i32::MAX), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn get_env_name_rejects_negative_indexes() {
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        let _ = get_env_name(&mut xp, -1);
     }
 
     #[test]
