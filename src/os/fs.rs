@@ -70,7 +70,7 @@
 //!   exactly as libuv itself does for compatibility).
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_close`/`os_readv`/`os_write`/
+//! - `os_close`/`os_readv`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
 //!   which need this exact shape of I/O, instead go directly through
@@ -315,6 +315,41 @@ pub fn os_read(
         }
     }
     (read as isize, eof)
+}
+
+/// Write the complete byte slice to a file (`os_write`).
+///
+/// Errors are collapsed to `-1`, matching this module's other
+/// libuv-wrapper translations.
+#[must_use]
+pub fn os_write(
+    file: &mut std::fs::File,
+    buf: &[u8],
+    non_blocking: bool,
+) -> isize {
+    use std::io::Write;
+    let mut written = 0;
+    while written != buf.len() {
+        match file.write(&buf[written..]) {
+            Ok(0) => return -1,
+            Ok(count) => written += count,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if non_blocking {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => return -1,
+        }
+    }
+    written as isize
 }
 
 /// Force any buffered modifications to `file` to be written to disk
@@ -1899,6 +1934,36 @@ mod tests {
         std::fs::write(&path, b"abc").unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
         assert_eq!(os_read(&mut file, &mut [], false), (0, false));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_write_writes_the_complete_buffer() {
+        let scratch = TempScratch::new("write");
+        let path = scratch.path.join("f.txt");
+        let mut file = std::fs::File::create(&path).unwrap();
+        assert_eq!(os_write(&mut file, b"abcdef", false), 6);
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_write_of_an_empty_buffer_succeeds() {
+        let scratch = TempScratch::new("write_empty");
+        let path = scratch.path.join("f.txt");
+        let mut file = std::fs::File::create(&path).unwrap();
+        assert_eq!(os_write(&mut file, b"", false), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_write_fails_for_a_read_only_handle() {
+        let scratch = TempScratch::new("write_readonly");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"old").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(os_write(&mut file, b"new", false), -1);
     }
 
     #[test]
