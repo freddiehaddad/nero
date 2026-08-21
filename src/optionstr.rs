@@ -400,6 +400,16 @@
 use crate::option_defs::opt_flags;
 use std::ffi::c_void;
 
+/// Build the `E535` option-validation message
+/// (`illegal_char_after_chr`).
+#[allow(dead_code)]
+fn illegal_char_after_chr(c: i32) -> Vec<u8> {
+    let mut message = b"E535: Illegal character after <".to_vec();
+    message.push(c as u8);
+    message.push(b'>');
+    message
+}
+
 /// Whether `val` contains an illegal character for an option flagged
 /// `NFNAME`/`NDNAME` (`check_illegal_path_names`, `optionstr.c`) -
 /// used to reject dangerous characters (e.g. a literal `;`/`&`/`|`
@@ -4643,6 +4653,22 @@ pub unsafe fn did_set_emoji(_args: &mut crate::option_defs::OptsetT) -> Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn illegal_char_after_chr_inserts_the_raw_character_byte() {
+        assert_eq!(
+            illegal_char_after_chr(i32::from(b'F')),
+            b"E535: Illegal character after <F>"
+        );
+        assert_eq!(
+            illegal_char_after_chr(0x80),
+            [
+                &b"E535: Illegal character after <"[..],
+                &[0x80, b'>'],
+            ]
+            .concat()
+        );
+    }
 
     struct BackgroundGuard(Option<Vec<u8>>);
 
