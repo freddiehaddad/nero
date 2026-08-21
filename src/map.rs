@@ -26,9 +26,6 @@
 //! tracks its own length/capacity, so there is nothing left to
 //! independently track.
 //!
-//! Deferred: `pmap_del2` (needs the `cstr_t`/`ptr_t` ownership-freeing
-//! convention of callers not yet translated).
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -531,9 +528,43 @@ impl<K: Hash + Eq + Clone, V: Default + Clone> Map<K, V> {
     }
 }
 
+/// Delete a string-keyed map entry and release its owned key and value
+/// (`pmap_del2`).
+///
+/// The original manually frees both pointers returned by `pmap_del`.
+/// `Map<Vec<u8>, V>` owns both objects, so dropping the removed pair is the
+/// direct Rust equivalent.
+pub fn pmap_del2<V>(map: &mut Map<Vec<u8>, V>, key: &[u8]) {
+    drop(map.remove(&key.to_vec()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct DropCounter(Rc<Cell<usize>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn pmap_del2_removes_and_drops_the_owned_value() {
+        let drops = Rc::new(Cell::new(0));
+        let mut map = Map::new();
+        map.insert(b"key".to_vec(), DropCounter(Rc::clone(&drops)));
+
+        pmap_del2(&mut map, b"key");
+        assert!(map.is_empty());
+        assert_eq!(drops.get(), 1);
+
+        pmap_del2(&mut map, b"missing");
+        assert_eq!(drops.get(), 1);
+    }
 
     #[test]
     fn hash_cstr_t_uses_the_source_polynomial_and_stops_at_nul() {
