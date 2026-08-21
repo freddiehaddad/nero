@@ -60,9 +60,8 @@
 //!   manipulation functions (`home_replace*`) or a much larger slice of
 //!   them plus `` `=expr` `` Vimscript-expression substitution
 //!   (`expand_env*`) than `vim_getenv` alone needed.
-//! - `vim_runtime_dir`/`remove_tail`: only called by `vim_getenv`'s own
-//!   still-deferred `$VIM`/`$VIMRUNTIME` auto-discovery fallback,
-//!   deferred with it.
+//! - `vim_runtime_dir`: only called by `vim_getenv`'s own still-
+//!   deferred `$VIM`/`$VIMRUNTIME` auto-discovery fallback.
 //! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
 
 use super::os::NVIM_TESTING;
@@ -134,6 +133,39 @@ pub fn vim_env_iter_rev(
     match prefix.iter().rposition(|&byte| byte == delim) {
         Some(offset) => (&val[offset + 1..end], Some(offset)),
         None => (prefix, None),
+    }
+}
+
+/// Include `dirname` in a suffix when it immediately precedes that
+/// suffix in `path` (`remove_tail`).
+///
+/// `pend` is the byte offset of the current suffix. The returned
+/// offset either includes `dirname` and its trailing separator or is
+/// unchanged.
+///
+/// # Safety
+/// Forwards [`crate::path::path_fnamencmp`]'s option-state access.
+#[must_use]
+pub unsafe fn remove_tail(
+    path: &[u8],
+    pend: usize,
+    dirname: &[u8],
+) -> usize {
+    let Some(new_tail) = pend.checked_sub(dirname.len() + 1) else {
+        return pend;
+    };
+    if unsafe {
+        crate::path::path_fnamencmp(
+            &path[new_tail..],
+            dirname,
+            dirname.len(),
+        )
+    } == 0
+        && (new_tail == 0 || crate::path::after_pathsep(path, new_tail))
+    {
+        new_tail
+    } else {
+        pend
     }
 }
 
@@ -1252,6 +1284,35 @@ pub(crate) mod tests {
     #[test]
     fn vim_env_iter_rev_handles_an_empty_value() {
         assert_eq!(vim_env_iter_rev(b';', b"", None), (&b""[..], None));
+    }
+
+    #[test]
+    fn remove_tail_includes_the_immediate_directory() {
+        let _lock = crate::globals::global_state_test_lock();
+        let path = b"/usr/local/share/nvim/runtime/doc/help.txt";
+        let help = path.len() - b"help.txt".len();
+
+        let doc = unsafe { remove_tail(path, help, b"doc") };
+        assert_eq!(&path[doc..], b"doc/help.txt");
+
+        let runtime = unsafe { remove_tail(path, doc, b"runtime") };
+        assert_eq!(&path[runtime..], b"runtime/doc/help.txt");
+    }
+
+    #[test]
+    fn remove_tail_keeps_the_suffix_when_directory_does_not_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let path = b"/usr/local/share/nvim/runtime/doc/help.txt";
+        let help = path.len() - b"help.txt".len();
+        let doc = unsafe { remove_tail(path, help, b"doc") };
+
+        assert_eq!(unsafe { remove_tail(path, doc, b"vim74") }, doc);
+    }
+
+    #[test]
+    fn remove_tail_keeps_the_suffix_when_there_is_not_enough_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { remove_tail(b"help.txt", 0, b"doc") }, 0);
     }
 
     #[test]
