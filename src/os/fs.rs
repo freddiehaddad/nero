@@ -70,7 +70,7 @@
 //!   exactly as libuv itself does for compatibility).
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_close`/`os_read`/`os_readv`/`os_write`/
+//! - `os_close`/`os_readv`/`os_write`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
 //!   which need this exact shape of I/O, instead go directly through
@@ -276,6 +276,45 @@ pub fn os_fchown(
         let _ = (file, owner, group);
         -1
     }
+}
+
+/// Read exactly as much as possible into `buf` (`os_read`).
+///
+/// Returns `(bytes_read, eof)`. Errors are collapsed to `-1`, matching
+/// this module's other libuv-wrapper translations.
+#[must_use]
+pub fn os_read(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    non_blocking: bool,
+) -> (isize, bool) {
+    use std::io::Read;
+    let mut read = 0;
+    let mut eof = false;
+    while read != buf.len() {
+        match file.read(&mut buf[read..]) {
+            Ok(0) => {
+                eof = true;
+                break;
+            }
+            Ok(count) => read += count,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if non_blocking {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => return (-1, false),
+        }
+    }
+    (read as isize, eof)
 }
 
 /// Force any buffered modifications to `file` to be written to disk
@@ -1826,6 +1865,40 @@ mod tests {
         } else {
             assert_eq!(result, -1);
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_read_fills_the_requested_buffer_without_probing_eof() {
+        let scratch = TempScratch::new("read_exact");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut buf = [0u8; 3];
+        assert_eq!(os_read(&mut file, &mut buf, false), (3, false));
+        assert_eq!(&buf, b"abc");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_read_reports_eof_after_a_partial_read() {
+        let scratch = TempScratch::new("read_eof");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(os_read(&mut file, &mut buf, false), (3, true));
+        assert_eq!(&buf[..3], b"abc");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_read_of_an_empty_buffer_is_not_eof() {
+        let scratch = TempScratch::new("read_empty");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(os_read(&mut file, &mut [], false), (0, false));
     }
 
     #[test]
