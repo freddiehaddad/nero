@@ -20,6 +20,7 @@
 //! [`dict_get_value`] bridges a scope dictionary item to an API object.
 //! [`dict_set_var`] performs the matching checked write/delete.
 //! [`set_mark`] validates and delegates API mark writes.
+//! [`string_to_array`] converts binary input to readfile-style lines.
 //!
 //! Shared non-variadic API validation formatting now lives in
 //! `api/private/validate.rs`; this file's existing direct `format!`
@@ -27,6 +28,45 @@
 
 use crate::api::private::defs::{Buffer, Error, ErrorType, Object, Tabpage, Window};
 use crate::buffer_defs::{BufT, TabpageT, WinT};
+
+/// Convert a binary string to a readfile-style Array of Strings
+/// (`string_to_array`).
+#[must_use]
+pub fn string_to_array(input: &[u8], crlf: bool) -> Vec<Object> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    while start < input.len() {
+        let mut end = start;
+        while end < input.len()
+            && input[end] != b'\n'
+            && !(crlf && input[end] == b'\r')
+        {
+            end += 1;
+        }
+        let mut line = input[start..end].to_vec();
+        for byte in &mut line {
+            if *byte == 0 {
+                *byte = b'\n';
+            }
+        }
+        result.push(Object::String(line));
+
+        if end == input.len() {
+            break;
+        }
+        start = end + 1;
+        if crlf
+            && input[end] == b'\r'
+            && input.get(start) == Some(&b'\n')
+        {
+            start += 1;
+        }
+        if start == input.len() {
+            result.push(Object::String(Vec::new()));
+        }
+    }
+    result
+}
 
 /// Find window `window` (a real window handle, or `0` for the current
 /// window), populating `err` with a real, structured
@@ -438,6 +478,55 @@ pub unsafe fn object_to_hl_id(obj: &Object, what: &str, err: &mut Error) -> i32 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn array_strings(objects: Vec<Object>) -> Vec<Vec<u8>> {
+        objects
+            .into_iter()
+            .map(|object| {
+                let Object::String(value) = object else {
+                    panic!("expected String");
+                };
+                value
+            })
+            .collect()
+    }
+
+    #[test]
+    fn string_to_array_splits_lf_and_preserves_trailing_empty_line() {
+        assert_eq!(
+            array_strings(string_to_array(b"one\ntwo\n", false)),
+            [
+                b"one".to_vec(),
+                b"two".to_vec(),
+                Vec::<u8>::new(),
+            ]
+        );
+        assert!(string_to_array(b"", false).is_empty());
+    }
+
+    #[test]
+    fn string_to_array_handles_crlf_only_when_requested() {
+        assert_eq!(
+            array_strings(string_to_array(b"one\r\ntwo\r", true)),
+            [
+                b"one".to_vec(),
+                b"two".to_vec(),
+                Vec::<u8>::new(),
+            ]
+        );
+        assert_eq!(
+            array_strings(string_to_array(b"one\rtwo", false)),
+            [b"one\rtwo".to_vec()]
+        );
+    }
+
+    #[test]
+    fn string_to_array_replaces_nul_inside_lines_with_newline() {
+        assert_eq!(
+            array_strings(string_to_array(b"a\0b", false)),
+            [b"a\nb".to_vec()]
+        );
+    }
 
     #[test]
     fn normalize_index_converts_positive_and_negative_indexes() {
