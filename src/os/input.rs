@@ -177,6 +177,22 @@ pub fn os_isatty(fd: i32) -> bool {
     }
 }
 
+/// Whether an optional event queue contains pending work
+/// (`pending_events`).
+///
+/// # Safety
+/// A non-null `events` pointer must identify a live `MultiQueue`.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn pending_events(
+    events: *const crate::event::multiqueue::MultiQueue,
+) -> bool {
+    !events.is_null()
+        && !unsafe {
+            crate::event::multiqueue::multiqueue_empty(events)
+        }
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -445,6 +461,25 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri cannot call isatty FFI")]
     fn os_isatty_accepts_a_real_descriptor_without_panicking() {
         let _ = os_isatty(1);
+    }
+
+    #[test]
+    fn pending_events_handles_null_empty_and_nonempty_queues() {
+        assert!(!unsafe { pending_events(std::ptr::null()) });
+
+        let queue = crate::event::multiqueue::multiqueue_new(
+            None,
+            std::ptr::null_mut(),
+        );
+        assert!(!unsafe { pending_events(queue) });
+        unsafe {
+            crate::event::multiqueue::multiqueue_put_event(
+                queue,
+                crate::event::defs::Event::default(),
+            );
+        }
+        assert!(unsafe { pending_events(queue) });
+        unsafe { crate::event::multiqueue::multiqueue_free(queue) };
     }
 
     #[test]
