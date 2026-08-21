@@ -82,7 +82,7 @@
 //!   Windows, `$PATHEXT` extension probing. The underlying
 //!   [`is_executable`] permission check itself IS translated.
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
-//!   `os_chown`/`os_fchown`: platform ACL/xattr/
+//!   `os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
@@ -214,6 +214,35 @@ pub fn os_fopen(path: &Path, flags: &[u8]) -> Option<std::fs::File> {
         _ => panic!("invalid fopen mode"),
     }
     options.open(path).ok()
+}
+
+/// Change a file's owner and group (`os_chown`).
+///
+/// `u32::MAX` preserves the corresponding ID, matching `(uid_t)-1` /
+/// `(gid_t)-1`. Windows reports unsupported.
+#[must_use]
+pub fn os_chown(path: &Path, owner: u32, group: u32) -> i32 {
+    #[cfg(unix)]
+    {
+        let Some(path) = path_to_cstring(path) else { return -1 };
+        if unsafe {
+            libc::chown(
+                path.as_ptr(),
+                owner as libc::uid_t,
+                group as libc::gid_t,
+            )
+        } == 0
+        {
+            0
+        } else {
+            -1
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, owner, group);
+        -1
+    }
 }
 
 /// Force any buffered modifications to `file` to be written to disk
@@ -1727,6 +1756,29 @@ mod tests {
     #[should_panic(expected = "invalid fopen mode")]
     fn os_fopen_rejects_invalid_modes() {
         let _ = os_fopen(Path::new("ignored"), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call chown FFI")]
+    fn os_chown_can_preserve_both_ids() {
+        let scratch = TempScratch::new("chown");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(os_chown(&path, u32::MAX, u32::MAX), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_chown_fails_for_a_missing_path() {
+        assert_eq!(
+            os_chown(
+                Path::new("nero-chown-missing-path"),
+                u32::MAX,
+                u32::MAX,
+            ),
+            -1
+        );
     }
 
     #[test]
