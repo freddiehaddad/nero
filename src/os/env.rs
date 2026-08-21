@@ -41,9 +41,6 @@
 //! scratch buffer, unnecessary in Rust; see its own doc comment).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `os_getenv_noalloc`: writes into `NameBuff`
-//!   (`crate::globals::GLOBALS`), a shared-buffer reuse optimization
-//!   with no translated caller yet.
 //! - `os_free_fullenv`/`os_getenvname_at_index`: need libuv's
 //!   `uv_os_environ`/raw platform `environ`/`GetEnvironmentStringsW`
 //!   enumeration API, not just a single-variable get/set.
@@ -107,6 +104,20 @@ pub fn os_getenv_buf<'a>(
     buf[..len].copy_from_slice(&value[..len]);
     buf[len] = 0;
     (len != 0).then_some(&buf[..len])
+}
+
+/// Read an environment value into the shared `NameBuff` scratch
+/// buffer (`os_getenv_noalloc`).
+///
+/// # Safety
+/// The returned slice is invalidated by any later use of `NameBuff`.
+/// Callers must prevent overlapping access to shared global state.
+#[must_use]
+pub unsafe fn os_getenv_noalloc(
+    name: &[u8],
+) -> Option<&'static [u8]> {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    os_getenv_buf(name, &mut globals.NameBuff)
 }
 
 /// Return the next component of a delimited environment value
@@ -1352,6 +1363,51 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(buf, [0]);
+    }
+
+    #[test]
+    fn os_getenv_noalloc_uses_namebuff() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _namebuff = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.NameBuff,
+                [0xaa; crate::os::os_defs::MAXPATHL as usize],
+            )
+        };
+        let _guard = EnvVarGuard::set(&[
+            ("NERO_TEST_ENV_NOALLOC", Some("shared")),
+        ]);
+
+        let value =
+            unsafe { os_getenv_noalloc(b"NERO_TEST_ENV_NOALLOC") }
+                .unwrap()
+                .to_vec();
+        assert_eq!(value, b"shared");
+        assert_eq!(
+            &unsafe { crate::globals::GLOBALS.get_mut() }.NameBuff[..8],
+            b"shared\0\xaa"
+        );
+    }
+
+    #[test]
+    fn os_getenv_noalloc_returns_none_for_an_unset_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _namebuff = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.NameBuff,
+                [0xaa; crate::os::os_defs::MAXPATHL as usize],
+            )
+        };
+        let _guard = EnvVarGuard::set(&[
+            ("NERO_TEST_ENV_NOALLOC_UNSET", None),
+        ]);
+
+        assert_eq!(
+            unsafe {
+                os_getenv_noalloc(b"NERO_TEST_ENV_NOALLOC_UNSET")
+            },
+            None
+        );
     }
 
     #[test]
