@@ -23,7 +23,6 @@ pub const RW_BUFFER_SIZE: usize = 1024;
 ///
 /// The original stores three pointers into one allocation. Rust keeps
 /// the allocation in `buffer` and stores equivalent byte offsets.
-#[derive(Default)]
 pub struct FileDescriptor {
     /// Raw descriptor, or `-1` for an in-memory buffer.
     pub fd: i32,
@@ -41,6 +40,185 @@ pub struct FileDescriptor {
     pub non_blocking: bool,
     /// Total bytes returned or skipped.
     pub bytes_read: u64,
+}
+
+impl Default for FileDescriptor {
+    fn default() -> Self {
+        Self {
+            fd: -1,
+            buffer: Vec::new(),
+            read_pos: 0,
+            write_pos: 0,
+            write: false,
+            eof: false,
+            non_blocking: false,
+            bytes_read: 0,
+        }
+    }
+}
+
+fn open_flags(flags: i32) -> (i32, bool) {
+    let write = flags
+        & (file_open_flags::CREATE
+            | file_open_flags::CREATE_ONLY
+            | file_open_flags::TRUNCATE
+            | file_open_flags::APPEND
+            | file_open_flags::WRITE_ONLY)
+        != 0;
+    assert!(
+        !write || flags & file_open_flags::READ_ONLY == 0,
+        "simultaneous read/write is unsupported"
+    );
+    let mut system = if write {
+        libc::O_WRONLY
+    } else {
+        libc::O_RDONLY
+    };
+    if flags & file_open_flags::CREATE != 0 {
+        system |= libc::O_CREAT;
+    }
+    if flags & file_open_flags::CREATE_ONLY != 0 {
+        assert_eq!(flags & file_open_flags::CREATE, 0);
+        system |= libc::O_CREAT | libc::O_EXCL;
+    }
+    if flags & file_open_flags::TRUNCATE != 0 {
+        assert_eq!(flags & file_open_flags::CREATE_ONLY, 0);
+        system |= libc::O_TRUNC;
+    }
+    if flags & file_open_flags::APPEND != 0 {
+        assert_eq!(flags & file_open_flags::CREATE_ONLY, 0);
+        system |= libc::O_APPEND;
+    }
+    #[cfg(unix)]
+    if flags & file_open_flags::NO_SYMLINK != 0 {
+        system |= libc::O_NOFOLLOW;
+    }
+    (system, write)
+}
+
+#[cfg(unix)]
+fn system_open(path: &[u8], flags: i32, mode: i32) -> i32 {
+    let Ok(path) = std::ffi::CString::new(path) else {
+        return -libc::EINVAL;
+    };
+    let descriptor =
+        unsafe { libc::open(path.as_ptr(), flags, mode as libc::mode_t) };
+    if descriptor < 0 {
+        -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    } else {
+        descriptor
+    }
+}
+
+#[cfg(windows)]
+fn system_open(path: &[u8], flags: i32, mode: i32) -> i32 {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32;
+    }
+    let Ok(path) = std::str::from_utf8(path) else {
+        return -libc::EINVAL;
+    };
+    let mut path: Vec<u16> = path.encode_utf16().collect();
+    path.push(0);
+    let descriptor = unsafe { _wopen(path.as_ptr(), flags, mode) };
+    if descriptor < 0 {
+        -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    } else {
+        descriptor
+    }
+}
+
+#[cfg(unix)]
+fn system_close(fd: i32) -> i32 {
+    if unsafe { libc::close(fd) } == 0 {
+        0
+    } else {
+        -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
+}
+
+#[cfg(windows)]
+fn system_close(fd: i32) -> i32 {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _close(fd: i32) -> i32;
+    }
+    if unsafe { _close(fd) } == 0 {
+        0
+    } else {
+        -std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
+}
+
+/// Wrap an existing raw descriptor (`file_open_fd`).
+pub fn file_open_fd(
+    descriptor: &mut FileDescriptor,
+    fd: i32,
+    flags: i32,
+) -> i32 {
+    let (_, write) = open_flags(flags);
+    let non_blocking = flags & file_open_flags::NON_BLOCKING != 0;
+    assert!(!write || !non_blocking);
+    *descriptor = FileDescriptor {
+        fd,
+        buffer: vec![0; crate::memory_defs::ARENA_BLOCK_SIZE],
+        read_pos: 0,
+        write_pos: 0,
+        write,
+        eof: false,
+        non_blocking,
+        bytes_read: 0,
+    };
+    0
+}
+
+/// Open a filesystem path (`file_open`).
+pub fn file_open(
+    descriptor: &mut FileDescriptor,
+    filename: &[u8],
+    flags: i32,
+    mode: i32,
+) -> i32 {
+    if flags & file_open_flags::MKDIR != 0 {
+        let path = String::from_utf8_lossy(filename);
+        if std::fs::create_dir_all(path.as_ref()).is_err() {
+            return -1;
+        }
+    }
+    let (system_flags, _) = open_flags(flags);
+    let fd = system_open(filename, system_flags, mode);
+    if fd < 0 {
+        return fd;
+    }
+    file_open_fd(descriptor, fd, flags)
+}
+
+/// Close a read descriptor (`file_close`'s dependency-free path).
+pub fn file_close(
+    descriptor: &mut FileDescriptor,
+    _do_fsync: bool,
+) -> i32 {
+    if descriptor.fd < 0 {
+        return 0;
+    }
+    if descriptor.write {
+        unimplemented!("file_close: write descriptors need file_flush/fsync");
+    }
+    let result = system_close(descriptor.fd);
+    descriptor.fd = -1;
+    descriptor.buffer.clear();
+    descriptor.read_pos = 0;
+    descriptor.write_pos = 0;
+    result
 }
 
 /// Open caller-provided bytes for buffered reading
@@ -182,5 +360,47 @@ mod tests {
         assert_eq!(file_skip(&mut descriptor, 9), 2);
         assert_eq!(descriptor.bytes_read, 6);
         assert!(file_eof(&descriptor));
+    }
+
+    struct ScratchFile(std::path::PathBuf);
+
+    impl ScratchFile {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "nero_os_fileio_{}.txt",
+                std::process::id()
+            ));
+            std::fs::write(&path, b"contents").unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call open/close FFI")]
+    fn file_open_wraps_and_closes_a_read_descriptor() {
+        let scratch = ScratchFile::new();
+        let mut descriptor = FileDescriptor::default();
+        let path = scratch.0.to_string_lossy();
+
+        assert_eq!(
+            file_open(
+                &mut descriptor,
+                path.as_bytes(),
+                file_open_flags::READ_ONLY,
+                0,
+            ),
+            0
+        );
+        assert!(file_fd(&descriptor) >= 0);
+        assert!(!descriptor.write);
+        assert_eq!(descriptor.buffer.len(), crate::memory_defs::ARENA_BLOCK_SIZE);
+        assert_eq!(file_close(&mut descriptor, false), 0);
+        assert_eq!(file_fd(&descriptor), -1);
     }
 }
