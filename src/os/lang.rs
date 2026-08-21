@@ -64,6 +64,11 @@ fn find_locales() -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// Lazily initialize and return all available locales (`init_locales`).
+fn init_locales() -> Option<&'static [Vec<u8>]> {
+    LOCALES.as_deref()
+}
+
 /// Obtain the locale value from the libraries for category `what`
 /// (one of the `libc::LC_*` constants), without changing it
 /// (`get_locale_val`). Returns `None` when the platform reports no
@@ -208,7 +213,7 @@ pub fn get_lang_arg(idx: i32) -> Option<&'static [u8]> {
         3 => Some(b"collate"),
         _ => usize::try_from(idx - 4)
             .ok()
-            .and_then(|idx| LOCALES.as_ref()?.get(idx))
+            .and_then(|idx| init_locales()?.get(idx))
             .map(Vec::as_slice),
     }
 }
@@ -218,7 +223,7 @@ pub fn get_lang_arg(idx: i32) -> Option<&'static [u8]> {
 pub fn get_locales(idx: i32) -> Option<&'static [u8]> {
     usize::try_from(idx)
         .ok()
-        .and_then(|idx| LOCALES.as_ref()?.get(idx))
+        .and_then(|idx| init_locales()?.get(idx))
         .map(Vec::as_slice)
 }
 
@@ -330,7 +335,13 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot spawn `locale -a`")]
     fn locale_completion_accessors_share_the_same_cache() {
-        for index in 0..LOCALES.as_ref().map_or(0, Vec::len) {
+        let first = init_locales();
+        let second = init_locales();
+        assert_eq!(
+            first.map(|locales| locales.as_ptr()),
+            second.map(|locales| locales.as_ptr()),
+        );
+        for index in 0..first.map_or(0, |locales| locales.len()) {
             let locale = get_locales(index as i32).unwrap();
             assert_eq!(get_lang_arg(index as i32 + 4), Some(locale));
             assert!(!locale.is_empty());
