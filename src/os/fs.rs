@@ -1768,6 +1768,24 @@ pub fn os_scandir(
     }
 }
 
+/// Return the next directory entry name (`os_scandir_next`).
+#[must_use]
+pub fn os_scandir_next(
+    directory: &mut crate::os::fs_defs::Directory,
+) -> Option<Vec<u8>> {
+    let entry = directory.entries.as_mut()?.next()?.ok()?;
+    let name = entry.file_name();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(name.into_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        Some(name.to_string_lossy().into_owned().into_bytes())
+    }
+}
+
 /// Remove a file (`os_remove`).
 ///
 /// @return `0` for success, non-zero for failure.
@@ -2458,6 +2476,25 @@ mod tests {
             &scratch.path.join("missing"),
         ));
         assert!(directory.entries.is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_scandir_next_returns_each_entry_then_none() {
+        let scratch = TempScratch::new("scandir_next");
+        std::fs::write(scratch.path.join("alpha"), b"a").unwrap();
+        std::fs::write(scratch.path.join("beta"), b"b").unwrap();
+        let mut directory =
+            crate::os::fs_defs::Directory::default();
+        assert!(os_scandir(&mut directory, &scratch.path));
+
+        let mut names = Vec::new();
+        while let Some(name) = os_scandir_next(&mut directory) {
+            names.push(name);
+        }
+        names.sort();
+        assert_eq!(names, [b"alpha".to_vec(), b"beta".to_vec()]);
+        assert_eq!(os_scandir_next(&mut directory), None);
     }
 
     #[test]
