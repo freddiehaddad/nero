@@ -27,14 +27,10 @@ static DIRCHANGED_RECURSIVE: crate::globals::GlobalCell<bool> =
     crate::globals::GlobalCell::new(false);
 
 /// Trigger `DirChangedPre` or `DirChanged` (`do_autocmd_dirchanged`).
-///
-/// No autocmd can currently be registered, so the original's own first
-/// bypass is always taken. The event-payload body remains explicit at the
-/// boundary where a future registration would make it reachable.
 pub fn do_autocmd_dirchanged(
-    _new_dir: &[u8],
-    _scope: crate::vim_defs::CdScope,
-    _cause: crate::vim_defs::CdCause,
+    new_dir: &[u8],
+    scope: crate::vim_defs::CdScope,
+    cause: crate::vim_defs::CdCause,
     pre: bool,
 ) {
     let event = if pre {
@@ -47,10 +43,60 @@ pub fn do_autocmd_dirchanged(
     {
         return;
     }
-    unimplemented!(
-        "do_autocmd_dirchanged: event payload setup needs the complete \
-         v:event save/restore and live autocmd execution path"
+
+    unsafe { *DIRCHANGED_RECURSIVE.get_mut() = true };
+    let mut saved = crate::eval::typval_defs::SaveVEventT::default();
+    let event_dict = unsafe { crate::eval::eval::get_v_event(&mut saved) };
+    let scope_name: &[u8] = match scope {
+        crate::vim_defs::CdScope::Global => b"global",
+        crate::vim_defs::CdScope::Tabpage => b"tabpage",
+        crate::vim_defs::CdScope::Window => b"window",
+        crate::vim_defs::CdScope::Invalid => {
+            panic!("do_autocmd_dirchanged received an invalid scope")
+        }
+    };
+    unsafe {
+        let dict = &mut *event_dict;
+        crate::eval::typval::tv_dict_add_str(
+            dict,
+            if pre { b"directory" } else { b"cwd" },
+            Some(new_dir),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            dict,
+            b"scope",
+            Some(scope_name),
+        );
+        crate::eval::typval::tv_dict_add_bool(
+            dict,
+            b"changed_window",
+            if cause == crate::vim_defs::CdCause::Window {
+                crate::eval::typval_defs::BoolVarValue::True
+            } else {
+                crate::eval::typval_defs::BoolVarValue::False
+            },
+        );
+        crate::eval::typval::tv_dict_set_keys_readonly(event_dict);
+    }
+
+    let pattern = match cause {
+        crate::vim_defs::CdCause::Manual
+        | crate::vim_defs::CdCause::Window => scope_name,
+        crate::vim_defs::CdCause::Auto => b"auto",
+        crate::vim_defs::CdCause::Other => {
+            panic!("do_autocmd_dirchanged received CdCause::Other")
+        }
+    };
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    let _ = crate::autocmd::apply_autocmds(
+        event,
+        Some(pattern),
+        Some(new_dir),
+        false,
+        Some(curbuf),
     );
+    unsafe { crate::eval::eval::restore_v_event(event_dict, &mut saved) };
+    unsafe { *DIRCHANGED_RECURSIVE.get_mut() = false };
 }
 
 /// Change to the directory containing `fname` (`vim_chdirfile`).
