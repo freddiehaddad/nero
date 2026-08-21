@@ -6,6 +6,29 @@
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+const fn build_char_to_index() -> [u8; 256] {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 26 {
+        table[b'A' as usize + i] = i as u8 + 1;
+        table[b'a' as usize + i] = i as u8 + 27;
+        i += 1;
+    }
+    i = 0;
+    while i < 10 {
+        table[b'0' as usize + i] = i as u8 + 53;
+        i += 1;
+    }
+    table[b'+' as usize] = 63;
+    table[b'/' as usize] = 64;
+    table
+}
+
+/// One-based alphabet indices (`char_to_index`).
+///
+/// Zero means that the byte is not part of the Base64 alphabet.
+const CHAR_TO_INDEX: [u8; 256] = build_char_to_index();
+
 /// Convert a host-order 64-bit word to big endian (`vim_htobe64`).
 #[must_use]
 pub const fn vim_htobe64(value: u64) -> u64 {
@@ -16,20 +39,6 @@ pub const fn vim_htobe64(value: u64) -> u64 {
 #[must_use]
 pub const fn vim_htobe32(value: u32) -> u32 {
     value.to_be()
-}
-
-/// `char_to_index` (1-based; `None` means "not part of the alphabet",
-/// matching the original's `0` sentinel).
-#[inline]
-fn char_to_index(c: u8) -> Option<u8> {
-    match c {
-        b'A'..=b'Z' => Some(c - b'A' + 1),
-        b'a'..=b'z' => Some(c - b'a' + 27),
-        b'0'..=b'9' => Some(c - b'0' + 53),
-        b'+' => Some(63),
-        b'/' => Some(64),
-        _ => None,
-    }
 }
 
 /// Encode a byte string using Base64 (`base64_encode`).
@@ -120,22 +129,19 @@ pub fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
     let mut src_i = 0;
     while src_i < src.len() {
         let c = src[src_i];
-        match char_to_index(c) {
-            None => {
-                if c == b'=' {
-                    leftover_i = Some(src_i);
-                    break;
-                }
-                return None;
+        let d = CHAR_TO_INDEX[c as usize];
+        if d == 0 {
+            if c == b'=' {
+                leftover_i = Some(src_i);
+                break;
             }
-            Some(d) => {
-                acc = ((acc << 6) & 0xFFF) + (d as i32 - 1);
-                acc_len += 6;
-                if acc_len >= 8 {
-                    acc_len -= 8;
-                    dest.push((acc >> acc_len) as u8);
-                }
-            }
+            return None;
+        }
+        acc = ((acc << 6) & 0xFFF) + (d as i32 - 1);
+        acc_len += 6;
+        if acc_len >= 8 {
+            acc_len -= 8;
+            dest.push((acc >> acc_len) as u8);
         }
         src_i += 1;
     }
@@ -225,5 +231,17 @@ mod tests {
             base64_encode(b"0123456789abcdef"),
             "MDEyMzQ1Njc4OWFiY2RlZg=="
         );
+    }
+
+    #[test]
+    fn decode_table_matches_the_alphabet_and_zero_sentinel() {
+        for (idx, byte) in ALPHABET.iter().copied().enumerate() {
+            assert_eq!(CHAR_TO_INDEX[byte as usize], idx as u8 + 1);
+        }
+        for byte in 0u8..=u8::MAX {
+            if !ALPHABET.contains(&byte) {
+                assert_eq!(CHAR_TO_INDEX[byte as usize], 0);
+            }
+        }
     }
 }
