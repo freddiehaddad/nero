@@ -24,9 +24,8 @@
 //! path-like names on Windows) and the Windows-only `$HOME` special
 //! case (`os_homedir`). Its OWN fallback - discovering `$VIM`/
 //! `$VIMRUNTIME` by locating the nvim executable itself when neither
-//! is set as a real environment variable - `unimplemented!()`s when
-//! actually reached (the helpers are translated, but the complete
-//! runtime-path auto-discovery chain is not yet assembled).
+//! is set as a real environment variable - is translated through
+//! `$VIM`, `'helpfile'`, and `v:progpath` layouts.
 //!
 //! Also translated: `restore_env_var` (`#ifdef MSWIN`-only in the
 //! original, matched here via `#[cfg(windows)]`), `os_shell_is_cmdexe`
@@ -219,7 +218,6 @@ pub unsafe fn remove_tail(
 /// # Safety
 /// Reads shared option and `v:` state and forwards [`remove_tail`]'s
 /// filename-comparison requirement.
-#[allow(dead_code)]
 #[must_use]
 unsafe fn discover_vim_path(vimruntime: bool) -> Option<Vec<u8>> {
     let helpfile = unsafe {
@@ -844,8 +842,9 @@ pub unsafe fn init_homedir() {
 /// == NULL || *string == NUL` check at every real call site).
 ///
 /// # Safety
-/// Forwarded from [`os_homedir`]'s own safety doc (Windows `$HOME`
-/// path only).
+/// Reads shared option/`v:` state during install-path discovery,
+/// mutates shared `$VIM` cache flags, and forwards [`os_homedir`]'s
+/// Windows `$HOME` requirement.
 #[must_use]
 pub unsafe fn vim_getenv(name: &[u8]) -> Option<Vec<u8>> {
     if cfg!(windows) && name == b"HOME" {
@@ -882,21 +881,24 @@ pub unsafe fn vim_getenv(name: &[u8]) -> Option<Vec<u8>> {
         return Some(runtime);
     }
 
-    if name == b"VIM" || vimruntime {
-        // When expanding $VIM/$VIMRUNTIME fails via a real
-        // environment variable, the original falls back to
-        // discovering the runtime directory relative to the nvim
-        // executable itself (vim_runtime_dir/
-        // vim_get_prefix_from_exepath, using 'helpfile' or argv[0] as
-        // a last resort) - none of that runtime-path-discovery
-        // machinery is translated yet.
-        unimplemented!(
-            "vim_getenv: $VIM/$VIMRUNTIME auto-discovery (vim_runtime_dir/\
-             vim_get_prefix_from_exepath) not yet translated"
-        );
+    if name != b"VIM" && !vimruntime {
+        return None;
     }
 
-    None
+    let path = unsafe { discover_vim_path(vimruntime) }?;
+    if vimruntime {
+        unsafe { os_setenv(b"VIMRUNTIME", &path, 1) };
+        unsafe {
+            (*crate::globals::GLOBALS.as_ptr()).didset_vimruntime =
+                true;
+        }
+    } else {
+        unsafe { os_setenv(b"VIM", &path, 1) };
+        unsafe {
+            (*crate::globals::GLOBALS.as_ptr()).didset_vim = true;
+        }
+    }
+    Some(path)
 }
 
 /// Expand environment variables (`$VAR`, and Unix `${VAR}`) and a
@@ -1978,19 +1980,84 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn vim_getenv_vimruntime_auto_discovery_is_unimplemented_when_unset() {
-        let _lock = homedir_test_lock();
-        let _guard = EnvVarGuard::set(&[("VIMRUNTIME", None)]);
-        let result = std::panic::catch_unwind(|| unsafe { vim_getenv(b"VIMRUNTIME") });
-        assert!(result.is_err(), "expected a panic (vim_runtime_dir not yet translated)");
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn vim_getenv_vimruntime_discovers_the_helpfile_layout() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _didset = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.didset_vimruntime,
+                false,
+            )
+        };
+        let scratch = RuntimeDirScratch::new();
+        let runtime = scratch
+            .0
+            .join(crate::vim_defs::RUNTIME_DIRNAME);
+        let doc = runtime.join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        let helpfile = doc.join("help.txt");
+        std::fs::write(&helpfile, b"help").unwrap();
+        let helpfile_bytes =
+            helpfile.to_string_lossy().into_owned().into_bytes();
+        let expected =
+            runtime.to_string_lossy().into_owned().into_bytes();
+        let _helpfile =
+            unsafe { HelpfileGuard::set(Some(&helpfile_bytes)) };
+        let _environment = EnvVarGuard::set(&[
+            ("VIM", None),
+            ("VIMRUNTIME", None),
+        ]);
+
+        assert_eq!(
+            unsafe { vim_getenv(b"VIMRUNTIME") },
+            Some(expected.clone())
+        );
+        assert_eq!(os_getenv(b"VIMRUNTIME"), Some(expected));
+        assert!(
+            unsafe {
+                (*crate::globals::GLOBALS.as_ptr()).didset_vimruntime
+            }
+        );
     }
 
     #[test]
-    fn vim_getenv_vim_auto_discovery_is_unimplemented_when_unset() {
-        let _lock = homedir_test_lock();
-        let _guard = EnvVarGuard::set(&[("VIM", None)]);
-        let result = std::panic::catch_unwind(|| unsafe { vim_getenv(b"VIM") });
-        assert!(result.is_err(), "expected a panic (vim_runtime_dir not yet translated)");
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn vim_getenv_vim_discovers_the_helpfile_layout() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _didset = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.didset_vim,
+                false,
+            )
+        };
+        let scratch = RuntimeDirScratch::new();
+        let runtime = scratch
+            .0
+            .join(crate::vim_defs::RUNTIME_DIRNAME);
+        let doc = runtime.join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        let helpfile = doc.join("help.txt");
+        std::fs::write(&helpfile, b"help").unwrap();
+        let helpfile_bytes =
+            helpfile.to_string_lossy().into_owned().into_bytes();
+        let expected = scratch.bytes();
+        let _helpfile =
+            unsafe { HelpfileGuard::set(Some(&helpfile_bytes)) };
+        let _environment = EnvVarGuard::set(&[
+            ("VIM", None),
+            ("VIMRUNTIME", None),
+        ]);
+
+        assert_eq!(
+            unsafe { vim_getenv(b"VIM") },
+            Some(expected.clone())
+        );
+        assert_eq!(os_getenv(b"VIM"), Some(expected));
+        assert!(
+            unsafe { (*crate::globals::GLOBALS.as_ptr()).didset_vim }
+        );
     }
 
     // --- vim_setenv_ext / vim_unsetenv_ext ---
