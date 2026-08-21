@@ -538,6 +538,37 @@ pub unsafe fn nv_error(cap: &mut crate::normal_defs::CmdargT) {
     unsafe { clearopbeep(&mut *cap.oap) };
 }
 
+/// Clear syntax state and schedule a full redraw (`nv_clear`).
+///
+/// # Safety
+/// `cap.oap`, `GLOBALS.curwin`, `GLOBALS.firstwin`, every `w_next`,
+/// and every non-null `w_s` must point to live values.
+pub unsafe fn nv_clear(cap: &mut crate::normal_defs::CmdargT) {
+    assert!(!cap.oap.is_null());
+    if unsafe { checkclearop(&mut *cap.oap) } {
+        return;
+    }
+    let globals = crate::globals::GLOBALS.as_ptr();
+    let curwin = unsafe { (*globals).curwin };
+    if !unsafe { (*curwin).w_s }.is_null() {
+        unsafe { crate::syntax::syn_stack_free_all(&mut *(*curwin).w_s) };
+    }
+    let mut window = unsafe { (*globals).firstwin };
+    while !window.is_null() {
+        let syntax = unsafe { (*window).w_s };
+        if !syntax.is_null() {
+            unsafe { (*syntax).b_syn_slow = false };
+        }
+        window = unsafe { (*window).w_next };
+    }
+    unsafe {
+        crate::drawscreen::redraw_later(
+            curwin,
+            crate::drawscreen::UPD_CLEAR,
+        )
+    };
+}
+
 /// Include the character under the cursor for `'selection'` ==
 /// `"exclusive"` (`adjust_for_sel`).
 ///
@@ -2354,6 +2385,86 @@ mod tests {
             crate::ops_defs::OpType::Nop as i32
         );
         assert_eq!(unsafe { (*oap_ptr).regname }, 0);
+    }
+
+    #[test]
+    fn nv_clear_resets_syntax_state_and_schedules_redraw() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut first_syntax = crate::buffer_defs::SynblockT {
+            b_syn_slow: true,
+            ..Default::default()
+        };
+        let mut second_syntax = crate::buffer_defs::SynblockT {
+            b_syn_slow: true,
+            ..Default::default()
+        };
+        let first_syntax_ptr = std::ptr::addr_of_mut!(first_syntax);
+        let second_syntax_ptr = std::ptr::addr_of_mut!(second_syntax);
+        let mut second = crate::buffer_defs::WinT {
+            w_s: second_syntax_ptr,
+            ..Default::default()
+        };
+        let second_ptr = std::ptr::addr_of_mut!(second);
+        let mut first = crate::buffer_defs::WinT {
+            w_s: first_syntax_ptr,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let _curwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curwin,
+                first_ptr,
+            )
+        };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.firstwin,
+                first_ptr,
+            )
+        };
+        let _exiting = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.exiting,
+                false,
+            )
+        };
+        let mut oap = crate::normal_defs::OpargT::default();
+        let oap_ptr = std::ptr::addr_of_mut!(oap);
+        let mut cap = crate::normal_defs::CmdargT {
+            oap: oap_ptr,
+            ..Default::default()
+        };
+
+        unsafe { nv_clear(&mut cap) };
+
+        assert!(!unsafe { (*first_syntax_ptr).b_syn_slow });
+        assert!(!unsafe { (*second_syntax_ptr).b_syn_slow });
+        assert_eq!(
+            unsafe { (*first_ptr).w_redr_type },
+            crate::drawscreen::UPD_CLEAR
+        );
+    }
+
+    #[test]
+    fn nv_clear_stops_after_clearing_an_active_operator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            ..Default::default()
+        };
+        let oap_ptr = std::ptr::addr_of_mut!(oap);
+        let mut cap = crate::normal_defs::CmdargT {
+            oap: oap_ptr,
+            ..Default::default()
+        };
+
+        unsafe { nv_clear(&mut cap) };
+
+        assert_eq!(
+            unsafe { (*oap_ptr).op_type },
+            crate::ops_defs::OpType::Nop as i32
+        );
     }
 
     #[test]
