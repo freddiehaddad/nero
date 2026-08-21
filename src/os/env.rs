@@ -44,8 +44,6 @@
 //! - `os_free_fullenv`/`os_getenvname_at_index`: need libuv's
 //!   `uv_os_environ`/raw platform `environ`/`GetEnvironmentStringsW`
 //!   enumeration API, not just a single-variable get/set.
-//! - `os_hint_priority`: platform-specific process scheduling-priority
-//!   hints (`setpriority`/`task_policy_set`), no real caller yet.
 //! - `free_homedir`: `#ifdef EXITFREE`-only (debug/leak-detection
 //!   build flag with no equivalent concept in this crate, same
 //!   reasoning as other `EXITFREE`-gated functions elsewhere); also
@@ -321,6 +319,37 @@ pub unsafe fn os_unsetenv(name: &[u8]) -> i32 {
 #[must_use]
 pub fn os_get_pid() -> i64 {
     std::process::id() as i64
+}
+
+/// Hint that Nvim is an interactive application
+/// (`os_hint_priority`).
+///
+/// This is a no-op outside macOS, exactly as in the original.
+pub fn os_hint_priority() {
+    #[cfg(target_os = "macos")]
+    {
+        const TASK_CATEGORY_POLICY: u32 = 1;
+        const TASK_DEFAULT_APPLICATION: i32 = 7;
+
+        unsafe extern "C" {
+            fn task_policy_set(
+                task: u32,
+                flavor: u32,
+                policy: *mut i32,
+                count: u32,
+            ) -> i32;
+        }
+
+        let mut policy = TASK_DEFAULT_APPLICATION;
+        unsafe {
+            task_policy_set(
+                libc::mach_task_self(),
+                TASK_CATEGORY_POLICY,
+                &mut policy,
+                1,
+            );
+        }
+    }
 }
 
 /// Removes environment variable `name` and takes care of side effects
@@ -1606,6 +1635,11 @@ pub(crate) mod tests {
     #[test]
     fn os_get_pid_matches_std_process_id() {
         assert_eq!(os_get_pid(), std::process::id() as i64);
+    }
+
+    #[test]
+    fn os_hint_priority_is_supported_on_every_platform() {
+        os_hint_priority();
     }
 
     #[test]
