@@ -425,71 +425,73 @@ unsafe fn illegal_char(c: i32) -> Vec<u8> {
     message
 }
 
+/// Replace a null string-option value with an owned empty string
+/// (`check_string_option`).
+pub fn check_string_option(option: &mut Option<Vec<u8>>) {
+    option.get_or_insert_with(Vec::new);
+}
+
 /// Ensure every buffer string option has a non-null value
 /// (`check_buf_options`).
 pub fn check_buf_options(buf: &mut crate::buffer_defs::BufT) {
-    fn check(option: &mut Option<Vec<u8>>) {
-        option.get_or_insert_with(Vec::new);
-    }
-
-    check(&mut buf.b_p_bh);
-    check(&mut buf.b_p_bt);
-    check(&mut buf.b_p_fenc);
-    check(&mut buf.b_p_ff);
-    check(&mut buf.b_p_def);
-    check(&mut buf.b_p_inc);
-    check(&mut buf.b_p_inex);
-    check(&mut buf.b_p_inde);
-    check(&mut buf.b_p_indk);
-    check(&mut buf.b_p_fp);
-    check(&mut buf.b_p_fex);
-    check(&mut buf.b_p_kp);
-    check(&mut buf.b_p_mps);
-    check(&mut buf.b_p_fo);
-    check(&mut buf.b_p_flp);
-    check(&mut buf.b_p_isk);
-    check(&mut buf.b_p_com);
-    check(&mut buf.b_p_cms);
-    check(&mut buf.b_p_nf);
-    check(&mut buf.b_p_qe);
-    check(&mut buf.b_p_syn);
-    check(&mut buf.b_s.b_syn_isk);
-    check(&mut buf.b_s.b_p_spc);
-    check(&mut buf.b_s.b_p_spf);
-    check(&mut buf.b_s.b_p_spl);
-    check(&mut buf.b_s.b_p_spo);
-    check(&mut buf.b_p_sua);
-    check(&mut buf.b_p_cink);
-    check(&mut buf.b_p_cino);
+    check_string_option(&mut buf.b_p_bh);
+    check_string_option(&mut buf.b_p_bt);
+    check_string_option(&mut buf.b_p_fenc);
+    check_string_option(&mut buf.b_p_ff);
+    check_string_option(&mut buf.b_p_def);
+    check_string_option(&mut buf.b_p_inc);
+    check_string_option(&mut buf.b_p_inex);
+    check_string_option(&mut buf.b_p_inde);
+    check_string_option(&mut buf.b_p_indk);
+    check_string_option(&mut buf.b_p_fp);
+    check_string_option(&mut buf.b_p_fex);
+    check_string_option(&mut buf.b_p_kp);
+    check_string_option(&mut buf.b_p_mps);
+    check_string_option(&mut buf.b_p_fo);
+    check_string_option(&mut buf.b_p_flp);
+    check_string_option(&mut buf.b_p_isk);
+    check_string_option(&mut buf.b_p_com);
+    check_string_option(&mut buf.b_p_cms);
+    check_string_option(&mut buf.b_p_nf);
+    check_string_option(&mut buf.b_p_qe);
+    check_string_option(&mut buf.b_p_syn);
+    check_string_option(&mut buf.b_s.b_syn_isk);
+    check_string_option(&mut buf.b_s.b_p_spc);
+    check_string_option(&mut buf.b_s.b_p_spf);
+    check_string_option(&mut buf.b_s.b_p_spl);
+    check_string_option(&mut buf.b_s.b_p_spo);
+    check_string_option(&mut buf.b_p_sua);
+    check_string_option(&mut buf.b_p_cink);
+    check_string_option(&mut buf.b_p_cino);
     crate::indent_c::parse_cino(buf);
-    check(&mut buf.b_p_lop);
-    check(&mut buf.b_p_ft);
-    check(&mut buf.b_p_cinw);
-    check(&mut buf.b_p_cinsd);
-    check(&mut buf.b_p_cot);
-    check(&mut buf.b_p_cpt);
-    check(&mut buf.b_p_cfu);
-    check(&mut buf.b_p_ofu);
-    check(&mut buf.b_p_keymap);
-    check(&mut buf.b_p_gefm);
-    check(&mut buf.b_p_gp);
-    check(&mut buf.b_p_mp);
-    check(&mut buf.b_p_efm);
-    check(&mut buf.b_p_ep);
-    check(&mut buf.b_p_path);
-    check(&mut buf.b_p_tags);
-    check(&mut buf.b_p_ffu);
-    check(&mut buf.b_p_tfu);
-    check(&mut buf.b_p_tc);
-    check(&mut buf.b_p_dict);
-    check(&mut buf.b_p_dia);
-    check(&mut buf.b_p_tsr);
-    check(&mut buf.b_p_tsrfu);
-    check(&mut buf.b_p_lw);
-    check(&mut buf.b_p_bkc);
-    check(&mut buf.b_p_menc);
-    check(&mut buf.b_p_vsts);
-    check(&mut buf.b_p_vts);
+    check_string_option(&mut buf.b_p_lop);
+    check_string_option(&mut buf.b_p_ft);
+    check_string_option(&mut buf.b_p_cinw);
+    check_string_option(&mut buf.b_p_cinsd);
+    check_string_option(&mut buf.b_p_cot);
+    check_string_option(&mut buf.b_p_cpt);
+    check_string_option(&mut buf.b_p_cfu);
+    check_string_option(&mut buf.b_p_ofu);
+    check_string_option(&mut buf.b_p_keymap);
+    check_string_option(&mut buf.b_p_gefm);
+    check_string_option(&mut buf.b_p_gp);
+    check_string_option(&mut buf.b_p_mp);
+    check_string_option(&mut buf.b_p_efm);
+    check_string_option(&mut buf.b_p_ep);
+    check_string_option(&mut buf.b_p_path);
+    check_string_option(&mut buf.b_p_tags);
+    check_string_option(&mut buf.b_p_ffu);
+    check_string_option(&mut buf.b_p_tfu);
+    check_string_option(&mut buf.b_p_tc);
+    check_string_option(&mut buf.b_p_dict);
+    check_string_option(&mut buf.b_p_dia);
+    check_string_option(&mut buf.b_p_tsr);
+    check_string_option(&mut buf.b_p_tsrfu);
+    check_string_option(&mut buf.b_p_lw);
+    check_string_option(&mut buf.b_p_bkc);
+    check_string_option(&mut buf.b_p_menc);
+    check_string_option(&mut buf.b_p_vsts);
+    check_string_option(&mut buf.b_p_vts);
 }
 
 /// Whether `val` contains an illegal character for an option flagged
@@ -4840,6 +4842,17 @@ mod tests {
             .into_iter()
             .all(|option| option.is_some())
         );
+    }
+
+    #[test]
+    fn check_string_option_only_initializes_null_values() {
+        let mut missing = None;
+        check_string_option(&mut missing);
+        assert_eq!(missing, Some(Vec::new()));
+
+        let mut present = Some(b"value".to_vec());
+        check_string_option(&mut present);
+        assert_eq!(present, Some(b"value".to_vec()));
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
