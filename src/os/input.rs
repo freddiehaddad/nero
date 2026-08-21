@@ -326,6 +326,50 @@ unsafe fn check_multiclick(
     (modifiers, false)
 }
 
+/// Encode and enqueue one mouse event (`input_enqueue_mouse`).
+///
+/// # Safety
+/// Mutates shared mouse coordinates, multi-click state, and raw input
+/// state.
+pub unsafe fn input_enqueue_mouse(
+    code: i32,
+    mut modifier: u8,
+    grid: i32,
+    row: i32,
+    col: i32,
+) {
+    let (multi_click, skip_event) =
+        unsafe { check_multiclick(code, grid, row, col) };
+    modifier |= multi_click;
+    if skip_event {
+        return;
+    }
+
+    let mut buf = [0u8; 6];
+    let mut pos = 0;
+    if modifier != 0 {
+        buf[..3].copy_from_slice(&[
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_MODIFIER,
+            modifier,
+        ]);
+        pos = 3;
+    }
+    buf[pos..pos + 3].copy_from_slice(&[
+        crate::keycodes_defs::K_SPECIAL,
+        crate::keycodes_defs::KS_EXTRA,
+        code as u8,
+    ]);
+
+    let globals = crate::globals::GLOBALS.as_ptr();
+    unsafe {
+        (*globals).mouse_grid = grid;
+        (*globals).mouse_row = row;
+        (*globals).mouse_col = col;
+        input_enqueue_raw(&buf[..pos + 3]);
+    }
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -894,6 +938,130 @@ mod tests {
         assert_eq!(unsafe { check_multiclick(code, 1, 3, 4) }, (0, false));
         assert_eq!(unsafe { MULTICLICK.get_mut() }.num_clicks, 1);
         assert_eq!(unsafe { MULTICLICK.get_mut() }.col, 4);
+    }
+
+    #[test]
+    fn input_enqueue_mouse_writes_a_plain_mouse_sequence() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _mouse = unsafe {
+            MultiClickGuard::set(MultiClickState::default(), 500)
+        };
+        let _grid = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.mouse_grid,
+                -1,
+            )
+        };
+        let _row = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.mouse_row,
+                -1,
+            )
+        };
+        let _col = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.mouse_col,
+                -1,
+            )
+        };
+
+        unsafe {
+            input_enqueue_mouse(
+                i32::from(crate::keycodes_defs::KE_LEFTMOUSE),
+                0,
+                2,
+                3,
+                4,
+            )
+        };
+
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(
+            &input.data[..3],
+            &[
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_EXTRA,
+                crate::keycodes_defs::KE_LEFTMOUSE,
+            ]
+        );
+        let globals = crate::globals::GLOBALS.as_ptr();
+        assert_eq!(unsafe { (*globals).mouse_grid }, 2);
+        assert_eq!(unsafe { (*globals).mouse_row }, 3);
+        assert_eq!(unsafe { (*globals).mouse_col }, 4);
+    }
+
+    #[test]
+    fn input_enqueue_mouse_prefixes_explicit_modifiers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _mouse = unsafe {
+            MultiClickGuard::set(MultiClickState::default(), 500)
+        };
+        let _grid = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.mouse_grid,
+                -1,
+            )
+        };
+        let _row = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.mouse_row,
+                -1,
+            )
+        };
+        let _col = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.mouse_col,
+                -1,
+            )
+        };
+        let modifier = crate::keycodes_defs::MOD_MASK_CTRL as u8;
+        unsafe {
+            input_enqueue_mouse(
+                i32::from(crate::keycodes_defs::KE_MOUSEDOWN),
+                modifier,
+                0,
+                0,
+                0,
+            )
+        };
+
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(
+            &input.data[..6],
+            &[
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_MODIFIER,
+                modifier,
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_EXTRA,
+                crate::keycodes_defs::KE_MOUSEDOWN,
+            ]
+        );
+    }
+
+    #[test]
+    fn input_enqueue_mouse_drops_a_stationary_drag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let state = MultiClickState {
+            grid: 1,
+            row: 2,
+            col: 3,
+            ..MultiClickState::default()
+        };
+        let _mouse = unsafe { MultiClickGuard::set(state, 500) };
+        unsafe {
+            input_enqueue_mouse(
+                i32::from(crate::keycodes_defs::KE_LEFTDRAG),
+                0,
+                1,
+                2,
+                3,
+            )
+        };
+        assert_eq!(unsafe { input_available() }, 0);
     }
 
     #[test]
