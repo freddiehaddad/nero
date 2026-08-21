@@ -38,6 +38,52 @@ pub(crate) static CTX_WIN_VEC: std::sync::LazyLock<crate::globals::GlobalCell<Ve
 static NEXT_CTX_WIN_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
     crate::globals::GlobalCell::new(1_000_000_000);
 
+/// Convert a readfile-style API Array into serialized bytes
+/// (`array_to_string`).
+///
+/// # Safety
+/// Allocates temporary eval containers and mutates their GC registry.
+#[must_use]
+pub unsafe fn array_to_string(
+    array: &[crate::api::private::defs::Object],
+    error: &mut crate::api::private::defs::Error,
+) -> Vec<u8> {
+    let value = unsafe {
+        crate::api::private::converter::object_to_vim(
+            &crate::api::private::defs::Object::Array(
+                array.to_vec(),
+            ),
+            error,
+        )
+    };
+    let crate::eval::typval_defs::TypvalValue::List(list) =
+        value.value
+    else {
+        unreachable!("Object::Array always converts to a List")
+    };
+    let output =
+        unsafe { crate::eval::encode::encode_vim_list_to_buf(list) };
+    if output.is_none() {
+        error.r#type =
+            crate::api::private::defs::ErrorType::Exception;
+        error.msg = Some(
+            "E474: Failed to convert list to msgpack string buffer"
+                .to_owned(),
+        );
+    }
+    unsafe {
+        crate::eval::typval::tv_clear_simple(
+            &crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(
+                    list,
+                ),
+                ..Default::default()
+            },
+        );
+    }
+    output.unwrap_or_default()
+}
+
 #[cfg(test)]
 unsafe fn reset_ctx_win_pool_for_test() {
     let entries = std::mem::take(unsafe { CTX_WIN_VEC.get_mut() });
@@ -567,6 +613,49 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_to_string_joins_readfile_style_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut error = crate::api::private::defs::Error::default();
+        let array = [
+            crate::api::private::defs::Object::String(
+                b"one".to_vec(),
+            ),
+            crate::api::private::defs::Object::String(Vec::new()),
+            crate::api::private::defs::Object::String(
+                b"two".to_vec(),
+            ),
+        ];
+        assert_eq!(
+            unsafe { array_to_string(&array, &mut error) },
+            b"one\n\ntwo"
+        );
+        assert!(!error.is_set());
+    }
+
+    #[test]
+    fn array_to_string_sets_e474_for_nonstring_items() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut error = crate::api::private::defs::Error::default();
+        assert_eq!(
+            unsafe {
+                array_to_string(
+                    &[crate::api::private::defs::Object::Integer(1)],
+                    &mut error,
+                )
+            },
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            error.r#type,
+            crate::api::private::defs::ErrorType::Exception
+        );
+        assert_eq!(
+            error.msg.as_deref(),
+            Some("E474: Failed to convert list to msgpack string buffer")
+        );
+    }
 
     // --- ctx_saved_curwin / ctx_restore_curwin ---
 
