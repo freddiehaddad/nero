@@ -26,11 +26,10 @@
 //! tracks its own length/capacity, so there is nothing left to
 //! independently track.
 //!
-//! Deferred: `hash_path_t`/`equal_path_t` (Windows drive-letter/backslash
-//! folding + case-insensitive comparison, needs `path_fnamencmp` -
-//! `path.c`, not fully translated - and `mbyte.c`'s `str_foldcase`);
-//! `pmap_del2` (needs the `cstr_t`/`ptr_t` ownership-freeing convention of
-//! callers not yet translated).
+//! Deferred: `equal_path_t` (Windows drive-letter/backslash folding +
+//! case-insensitive comparison) and `pmap_del2` (needs the
+//! `cstr_t`/`ptr_t` ownership-freeing convention of callers not yet
+//! translated).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -69,6 +68,39 @@ fn hash_cstr_t(key: &[u8]) -> u32 {
         hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
     }
     hash
+}
+
+/// Hash a NUL-terminated path key (`hash_path_t`).
+///
+/// On Windows this preserves Neovim's compile-time
+/// `CASE_INSENSITIVE_FILENAME` behavior and drops an explicit drive prefix
+/// before hashing.
+///
+/// # Safety
+/// On Windows this reads shared option state through [`crate::charset::str_foldcase`].
+pub unsafe fn hash_path_t(path: &[u8]) -> u32 {
+    let len = path.iter().position(|&byte| byte == 0).unwrap_or(path.len());
+    let path = &path[..len];
+
+    #[cfg(windows)]
+    {
+        let path =
+            if path.len() >= 2 && path[1] == b':' && path[0].is_ascii_alphabetic() {
+                &path[2..]
+            } else {
+                path
+            };
+        let mut terminated = path.to_vec();
+        terminated.push(0);
+        // SAFETY: forwarded from this function's own safety contract.
+        let folded = unsafe { crate::charset::str_foldcase(&terminated) };
+        hash_cstr_t(&folded)
+    }
+
+    #[cfg(not(windows))]
+    {
+        hash_cstr_t(path)
+    }
 }
 
 /// A hash set with insertion-order-preserving compact storage
@@ -414,6 +446,24 @@ mod tests {
         assert_eq!(hash_cstr_t(b"a"), u32::from(b'a'));
         assert_eq!(hash_cstr_t(b"ab"), u32::from(b'a') * 31 + u32::from(b'b'));
         assert_eq!(hash_cstr_t(b"ab\0ignored"), hash_cstr_t(b"ab"));
+    }
+
+    #[test]
+    fn hash_path_t_matches_the_platform_filename_rules() {
+        #[cfg(windows)]
+        {
+            let _lock = crate::globals::global_state_test_lock();
+            assert_eq!(
+                unsafe { hash_path_t(b"C:\\Foo\0ignored") },
+                unsafe { hash_path_t(b"D:\\foo") }
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(unsafe { hash_path_t(b"foo\0ignored") }, hash_cstr_t(b"foo"));
+            assert_ne!(unsafe { hash_path_t(b"Foo") }, unsafe { hash_path_t(b"foo") });
+        }
     }
 
     #[test]
