@@ -1750,6 +1750,24 @@ pub fn os_rmdir(path: &Path) -> i32 {
     }
 }
 
+/// Open a directory for iteration (`os_scandir`).
+#[must_use]
+pub fn os_scandir(
+    directory: &mut crate::os::fs_defs::Directory,
+    path: &Path,
+) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            directory.entries = Some(entries);
+            true
+        }
+        Err(_) => {
+            directory.entries = None;
+            false
+        }
+    }
+}
+
 /// Remove a file (`os_remove`).
 ///
 /// @return `0` for success, non-zero for failure.
@@ -2412,6 +2430,34 @@ mod tests {
 
         assert_eq!(os_rmdir(&new_dir), 0);
         assert!(!os_path_exists(&new_dir));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_scandir_opens_empty_and_populated_directories() {
+        let scratch = TempScratch::new("scandir");
+        let mut directory =
+            crate::os::fs_defs::Directory::default();
+        assert!(os_scandir(&mut directory, &scratch.path));
+        assert!(directory.entries.is_some());
+
+        std::fs::write(scratch.path.join("entry"), b"x").unwrap();
+        assert!(os_scandir(&mut directory, &scratch.path));
+        assert!(directory.entries.is_some());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_scandir_clears_state_on_failure() {
+        let scratch = TempScratch::new("scandir_failure");
+        let mut directory =
+            crate::os::fs_defs::Directory::default();
+        assert!(os_scandir(&mut directory, &scratch.path));
+        assert!(!os_scandir(
+            &mut directory,
+            &scratch.path.join("missing"),
+        ));
+        assert!(directory.entries.is_none());
     }
 
     #[test]

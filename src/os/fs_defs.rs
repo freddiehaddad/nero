@@ -2,7 +2,7 @@
 //!
 //! `FileInfo` is represented by `crate::os::fs::FileInfoT`, backed by
 //! optional native metadata plus the original path offsets/type.
-//! `Directory` remains with the directory-scanning implementation.
+//! `Directory` owns Rust's native directory iterator.
 
 /// Currently supports Windows and is extensible (`PathType`).
 /// See <https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats>
@@ -37,6 +37,12 @@ impl FileID {
     pub const fn empty() -> Self {
         FileID { inode: 0, device_id: 0 }
     }
+}
+
+/// Open directory iteration state (`Directory`).
+#[derive(Default)]
+pub struct Directory {
+    pub(crate) entries: Option<std::fs::ReadDir>,
 }
 
 // Values returned by `os_nodetype()`.
