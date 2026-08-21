@@ -956,6 +956,102 @@ pub fn os_fileinfo(path: &Path) -> Option<FileInfoT> {
     std::fs::metadata(path).ok().map(FileInfoT::from_metadata)
 }
 
+/// Parse path prefix, root, and remainder offsets (`os_fileinfo2`).
+#[must_use]
+pub fn os_fileinfo2(path: &[u8]) -> FileInfoT {
+    use crate::os::fs_defs::PathType;
+
+    let mut info = FileInfoT::default();
+    if crate::path::path_with_url(path) != 0 {
+        return info;
+    }
+
+    let leading_slashes = crate::path::path_skip_sep(path, false);
+    #[cfg(windows)]
+    let mut pos = leading_slashes;
+
+    #[cfg(windows)]
+    {
+        if leading_slashes == 0
+            && path.first().is_some_and(u8::is_ascii_alphabetic)
+            && path.get(1) == Some(&b':')
+        {
+            info.type_ = PathType::Drive;
+            pos = 2 + crate::path::path_skip_sep(&path[2..], false);
+            info.rest_off = pos;
+            return info;
+        }
+
+        if matches!(path.get(pos), Some(b'?' | b'.')) {
+            if !path
+                .get(pos + 1)
+                .is_some_and(|&byte| {
+                    crate::path::vim_ispathsep_nocolon(i32::from(byte))
+                })
+            {
+                return info;
+            }
+            info.type_ = PathType::Device;
+            info.prefix_off = leading_slashes.saturating_sub(2);
+            pos += 2;
+            pos += crate::path::path_skip_sep(&path[pos..], false);
+
+            let device_unc = path
+                .get(pos..pos + 3)
+                .is_some_and(|part| part.eq_ignore_ascii_case(b"unc"))
+                && path
+                    .get(pos + 3)
+                    .is_some_and(|&byte| {
+                        crate::path::vim_ispathsep_nocolon(
+                            i32::from(byte),
+                        )
+                    });
+            if device_unc {
+                info.type_ = PathType::DeviceUnc;
+                pos += 4;
+                pos += crate::path::path_skip_sep(&path[pos..], false);
+                info.root_off = pos;
+                pos += crate::path::path_next_component(&path[pos..]);
+                pos += crate::path::path_skip_sep(&path[pos..], false);
+                pos += crate::path::path_next_component(&path[pos..]);
+                pos += crate::path::path_skip_sep(&path[pos..], false);
+                info.rest_off = pos;
+                return info;
+            }
+
+            info.root_off = pos;
+            if path
+                .get(pos)
+                .is_some_and(u8::is_ascii_alphabetic)
+                && path.get(pos + 1) == Some(&b':')
+            {
+                pos += 2;
+            }
+            pos += crate::path::path_next_component(&path[pos..]);
+            pos += crate::path::path_skip_sep(&path[pos..], false);
+            info.rest_off = pos;
+            return info;
+        }
+
+        if leading_slashes == 2 {
+            info.type_ = PathType::Unc;
+            pos += crate::path::path_next_component(&path[pos..]);
+            pos += crate::path::path_skip_sep(&path[pos..], false);
+            pos += crate::path::path_next_component(&path[pos..]);
+            pos += crate::path::path_skip_sep(&path[pos..], false);
+            info.rest_off = pos;
+            return info;
+        }
+    }
+
+    info.type_ = PathType::Generic;
+    info.rest_off = leading_slashes;
+    info.root_off =
+        if leading_slashes > 2 { leading_slashes - 1 } else { 0 };
+    info.prefix_off = info.root_off;
+    info
+}
+
 /// Get information about a file, WITHOUT following a trailing symlink
 /// (`os_fileinfo_link`).
 #[must_use]
@@ -2968,6 +3064,68 @@ mod tests {
         );
         assert_eq!(os_fileinfo_mode(&info), 0);
         assert_eq!(os_fileinfo_type_str(&info), "other");
+    }
+
+    #[test]
+    fn os_fileinfo2_parses_generic_roots() {
+        let relative = os_fileinfo2(b"foo/bar");
+        assert_eq!(
+            relative.type_,
+            crate::os::fs_defs::PathType::Generic
+        );
+        assert_eq!(relative.rest_off, 0);
+        assert_eq!(relative.root_off, 0);
+        assert_eq!(relative.prefix_off, 0);
+
+        let absolute = os_fileinfo2(b"/foo/bar");
+        assert_eq!(absolute.rest_off, 1);
+        assert_eq!(absolute.root_off, 0);
+
+        let many_slashes = os_fileinfo2(b"///foo");
+        assert_eq!(many_slashes.rest_off, 3);
+        assert_eq!(many_slashes.root_off, 2);
+        assert_eq!(many_slashes.prefix_off, 2);
+    }
+
+    #[test]
+    fn os_fileinfo2_leaves_url_paths_unknown() {
+        let info = os_fileinfo2(b"https://example.test/path");
+        assert_eq!(info.type_, crate::os::fs_defs::PathType::Unknown);
+        assert_eq!(info.rest_off, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_fileinfo2_parses_drive_and_unc_paths() {
+        let drive = br"C:\dir\file";
+        let info = os_fileinfo2(drive);
+        assert_eq!(info.type_, crate::os::fs_defs::PathType::Drive);
+        assert_eq!(&drive[info.rest_off..], br"dir\file");
+
+        let unc = br"\\server\share\dir\file";
+        let info = os_fileinfo2(unc);
+        assert_eq!(info.type_, crate::os::fs_defs::PathType::Unc);
+        assert_eq!(&unc[info.rest_off..], br"dir\file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_fileinfo2_parses_device_paths() {
+        let drive = br"\\?\C:\dir\file";
+        let info = os_fileinfo2(drive);
+        assert_eq!(info.type_, crate::os::fs_defs::PathType::Device);
+        assert_eq!(info.prefix_off, 0);
+        assert_eq!(&drive[info.root_off..], br"C:\dir\file");
+        assert_eq!(&drive[info.rest_off..], br"dir\file");
+
+        let unc = br"\\?\UNC\server\share\dir\file";
+        let info = os_fileinfo2(unc);
+        assert_eq!(
+            info.type_,
+            crate::os::fs_defs::PathType::DeviceUnc
+        );
+        assert_eq!(&unc[info.root_off..], br"server\share\dir\file");
+        assert_eq!(&unc[info.rest_off..], br"dir\file");
     }
 
     #[test]
