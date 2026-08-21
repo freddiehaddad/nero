@@ -645,6 +645,89 @@ pub unsafe fn eval_to_number(
     value
 }
 
+/// Call a Vimscript function with pre-evaluated arguments
+/// (`call_vim_function`).
+///
+/// Builtin dispatch is complete. The `v:lua.` partial path remains at
+/// the Lua-host boundary.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::call_func`] and
+/// [`crate::eval::typval::tv_clear_simple`].
+pub unsafe fn call_vim_function(
+    func: &[u8],
+    argv: &[TypvalT],
+    rettv: &mut TypvalT,
+) -> i32 {
+    if func.starts_with(b"v:lua.") {
+        unimplemented!(
+            "call_vim_function: v:lua functions need the Lua host"
+        );
+    }
+
+    rettv.value = TypvalValue::Unknown;
+    // SAFETY: forwarded from this function's own safety doc.
+    let error = unsafe {
+        crate::eval::userfunc::call_func(func, rettv, argv, true)
+    };
+    if error != crate::eval::userfunc::FnameTransError::None {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(rettv) };
+        return FAIL;
+    }
+    OK
+}
+
+/// Call a Vimscript function and return its string conversion
+/// (`call_func_retstr`).
+///
+/// # Safety
+/// Forwarded from [`call_vim_function`] and
+/// [`crate::eval::typval::tv_clear_simple`].
+#[must_use]
+pub unsafe fn call_func_retstr(
+    func: &[u8],
+    argv: &[TypvalT],
+) -> Option<Vec<u8>> {
+    let mut rettv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { call_vim_function(func, argv, &mut rettv) } == FAIL {
+        return None;
+    }
+
+    let result = crate::eval::typval::tv_get_string(&rettv);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    Some(result)
+}
+
+/// Call a Vimscript function and transfer its List result
+/// (`call_func_retlist`).
+///
+/// Returns null if the call fails or returns another type.
+///
+/// # Safety
+/// Forwarded from [`call_vim_function`] and
+/// [`crate::eval::typval::tv_clear_simple`].
+#[must_use]
+pub unsafe fn call_func_retlist(
+    func: &[u8],
+    argv: &[TypvalT],
+) -> *mut crate::eval::typval_defs::ListT {
+    let mut rettv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { call_vim_function(func, argv, &mut rettv) } == FAIL {
+        return std::ptr::null_mut();
+    }
+
+    let TypvalValue::List(list) = rettv.value else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+        return std::ptr::null_mut();
+    };
+    list
+}
+
 /// Initialize global/`v:` variables and the function table
 /// (`eval_init`).
 ///
@@ -9294,8 +9377,8 @@ mod tests {
     }
 
     // --- fill_evalarg_from_eap / eval_to_bool / eval_expr /
-    //     eval_to_number / eval1_emsg / eval_expr_string /
-    //     eval_expr_typval / eval_expr_to_bool ---
+    //     eval_to_number / call_vim_function / eval1_emsg /
+    //     eval_expr_string / eval_expr_typval / eval_expr_to_bool ---
 
     #[test]
     fn fill_evalarg_from_eap_sets_evaluate_and_skip_flags() {
@@ -9539,6 +9622,97 @@ mod tests {
     fn eval_to_number_simple_function_mode_uses_the_parser_fallback() {
         let _lock = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { eval_to_number(b"len(\"abcd\")", true) }, 4);
+    }
+
+    #[test]
+    fn call_vim_function_dispatches_to_a_builtin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = [TypvalT {
+            value: TypvalValue::String(Some(b"hello".to_vec())),
+            ..TypvalT::default()
+        }];
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe { call_vim_function(b"len", &args, &mut rettv) },
+            OK
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn call_vim_function_fails_for_an_unknown_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                call_vim_function(
+                    b"NeroDefinitelyMissing",
+                    &[],
+                    &mut rettv,
+                )
+            },
+            FAIL
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "need the Lua host")]
+    fn call_vim_function_v_lua_path_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let _ =
+            unsafe { call_vim_function(b"v:lua.foo", &[], &mut rettv) };
+    }
+
+    #[test]
+    fn call_func_retstr_converts_the_builtin_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = [TypvalT {
+            value: TypvalValue::String(Some(b"hello".to_vec())),
+            ..TypvalT::default()
+        }];
+        assert_eq!(
+            unsafe { call_func_retstr(b"len", &args) },
+            Some(b"5".to_vec())
+        );
+        assert_eq!(unsafe { call_func_retstr(b"Missing", &[]) }, None);
+    }
+
+    #[test]
+    fn call_func_retlist_transfers_a_list_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let args = [TypvalT {
+            value: TypvalValue::String(Some(b"ab".to_vec())),
+            ..TypvalT::default()
+        }];
+
+        let list = unsafe { call_func_retlist(b"str2list", &args) };
+        assert!(!list.is_null());
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_list_find_nr(list, 0, None) },
+            i64::from(b'a')
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_list_find_nr(list, 1, None) },
+            i64::from(b'b')
+        );
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn call_func_retlist_rejects_a_non_list_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = [TypvalT {
+            value: TypvalValue::String(Some(b"hello".to_vec())),
+            ..TypvalT::default()
+        }];
+        assert!(
+            unsafe { call_func_retlist(b"len", &args) }.is_null()
+        );
     }
 
     #[test]
