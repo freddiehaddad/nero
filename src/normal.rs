@@ -604,6 +604,21 @@ pub unsafe fn clearopbeep(oap: &mut crate::normal_defs::OpargT) {
     crate::input::beep_flush();
 }
 
+/// Check for and clear an active operator (`checkclearop`).
+///
+/// # Safety
+/// Forwarded from [`clearopbeep`].
+#[must_use]
+pub unsafe fn checkclearop(
+    oap: &mut crate::normal_defs::OpargT,
+) -> bool {
+    if oap.op_type == crate::ops_defs::OpType::Nop as i32 {
+        return false;
+    }
+    unsafe { clearopbeep(oap) };
+    true
+}
+
 /// Swap the ends of the Visual selection (`v_swap_corners`).
 ///
 /// For `O` in blockwise Visual mode this swaps the LEFT/RIGHT corners
@@ -2197,6 +2212,25 @@ mod tests {
             unsafe { crate::globals::GLOBALS.get_mut() }.motion_force,
             0
         );
+    }
+
+    #[test]
+    fn checkclearop_distinguishes_idle_and_active_operators() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut idle = crate::normal_defs::OpargT::default();
+        assert!(!unsafe { checkclearop(&mut idle) });
+
+        let mut active = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            regname: i32::from(b'a'),
+            ..Default::default()
+        };
+        assert!(unsafe { checkclearop(&mut active) });
+        assert_eq!(
+            active.op_type,
+            crate::ops_defs::OpType::Nop as i32
+        );
+        assert_eq!(active.regname, 0);
     }
 
     #[test]
