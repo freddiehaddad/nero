@@ -415,6 +415,116 @@ pub fn eval_expr_valid_arg(value: &TypvalT) -> bool {
     }
 }
 
+/// Fill expression-evaluation context from an Ex-command
+/// (`fill_evalarg_from_eap`).
+///
+/// The real multi-line `:source` continuation branch remains
+/// unavailable: identifying `getsourceline`/`get_list_line` needs the
+/// source-line machinery. A non-null `ea_getline` therefore panics
+/// rather than being copied for the wrong kind of line getter.
+fn fill_evalarg_from_eap(
+    evalarg: &mut EvalargT,
+    eap: Option<&crate::ex_cmds_defs::ExargT>,
+    skip: bool,
+) {
+    *evalarg = EvalargT {
+        eval_flags: if skip { 0 } else { EVAL_EVALUATE },
+        ..EvalargT::default()
+    };
+
+    if eap.and_then(|e| e.ea_getline).is_some() {
+        unimplemented!(
+            "fill_evalarg_from_eap: a non-null ea_getline needs sourcing_a_script/get_list_line"
+        );
+    }
+}
+
+struct EmsgSkipGuard {
+    active: bool,
+}
+
+impl EmsgSkipGuard {
+    unsafe fn new(active: bool) -> Self {
+        if active {
+            // SAFETY: callers serialize access to GLOBALS.emsg_skip.
+            unsafe { crate::globals::GLOBALS.get_mut().emsg_skip += 1 };
+        }
+        Self { active }
+    }
+}
+
+impl Drop for EmsgSkipGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: construction's caller serialized access to
+            // GLOBALS.emsg_skip for this guard's full lifetime.
+            unsafe { crate::globals::GLOBALS.get_mut().emsg_skip -= 1 };
+        }
+    }
+}
+
+/// Evaluate a top-level expression and convert it to a boolean
+/// (`eval_to_bool`).
+///
+/// `use_simple_function = true` still needs `eval0_simple_funccal`.
+/// Normal evaluation and parse-only (`skip`) mode are complete.
+///
+/// # Safety
+/// Forwarded from [`eval0`] and
+/// [`crate::eval::typval::tv_clear_simple`]. Callers must also
+/// serialize access to `GLOBALS.emsg_skip`.
+#[must_use]
+pub unsafe fn eval_to_bool(
+    arg: &[u8],
+    error: &mut bool,
+    mut eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+    skip: bool,
+    use_simple_function: bool,
+) -> bool {
+    if use_simple_function {
+        unimplemented!(
+            "eval_to_bool: use_simple_function=true needs eval0_simple_funccal"
+        );
+    }
+
+    let mut tv = TypvalT::default();
+    let mut evalarg = EvalargT::default();
+    fill_evalarg_from_eap(&mut evalarg, eap.as_deref(), skip);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let emsg_skip = unsafe { EmsgSkipGuard::new(skip) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe {
+        eval0(
+            arg,
+            &mut tv,
+            eap.as_deref_mut(),
+            Some(&mut evalarg),
+        )
+    };
+    let retval = if result == FAIL {
+        *error = true;
+        false
+    } else {
+        *error = false;
+        if skip {
+            false
+        } else {
+            let value =
+                crate::eval::typval::tv_get_number_chk(&tv, Some(error))
+                    != 0;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+            value
+        }
+    };
+
+    drop(emsg_skip);
+    clear_evalarg(Some(&mut evalarg), eap);
+    retval
+}
+
 /// Initialize global/`v:` variables and the function table
 /// (`eval_init`).
 ///
@@ -8934,8 +9044,141 @@ mod tests {
         assert_eq!(eap.arg, Some(b"new_line".to_vec()));
     }
 
-    // --- eval1_emsg / eval_expr_string / eval_expr_typval /
-    //     eval_expr_to_bool ---
+    // --- fill_evalarg_from_eap / eval_to_bool / eval1_emsg /
+    //     eval_expr_string / eval_expr_typval / eval_expr_to_bool ---
+
+    #[test]
+    fn fill_evalarg_from_eap_sets_evaluate_and_skip_flags() {
+        let mut evalarg = EvalargT::default();
+        fill_evalarg_from_eap(&mut evalarg, None, false);
+        assert_eq!(evalarg.eval_flags, EVAL_EVALUATE);
+
+        fill_evalarg_from_eap(&mut evalarg, None, true);
+        assert_eq!(evalarg.eval_flags, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sourcing_a_script/get_list_line")]
+    fn fill_evalarg_from_eap_rejects_an_untranslated_line_getter() {
+        fn getter(
+            _c: i32,
+            _cookie: *mut std::ffi::c_void,
+            _indent: i32,
+            _do_concat: bool,
+        ) -> *mut std::os::raw::c_char {
+            std::ptr::null_mut()
+        }
+
+        let eap = crate::ex_cmds_defs::ExargT {
+            ea_getline: Some(getter),
+            ..crate::ex_cmds_defs::ExargT::default()
+        };
+        fill_evalarg_from_eap(&mut EvalargT::default(), Some(&eap), false);
+    }
+
+    #[test]
+    fn eval_to_bool_returns_truthy_and_falsy_results() {
+        let mut error = false;
+        assert!(unsafe {
+            eval_to_bool(b"2 > 1", &mut error, None, false, false)
+        });
+        assert!(!error);
+
+        assert!(!unsafe {
+            eval_to_bool(b"0", &mut error, None, false, false)
+        });
+        assert!(!error);
+    }
+
+    #[test]
+    fn eval_to_bool_reports_a_parse_failure() {
+        let mut error = false;
+        assert!(!unsafe {
+            eval_to_bool(b")", &mut error, None, false, false)
+        });
+        assert!(error);
+    }
+
+    #[test]
+    fn eval_to_bool_skip_mode_only_parses_and_restores_emsg_skip() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = unsafe { crate::globals::GLOBALS.get_mut().emsg_skip };
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_skip = 7 };
+
+        let mut error = true;
+        assert!(!unsafe {
+            eval_to_bool(b"1 + 2", &mut error, None, true, false)
+        });
+        assert!(!error);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().emsg_skip }, 7);
+
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_skip = old };
+    }
+
+    #[test]
+    fn eval_to_bool_restores_emsg_skip_when_parse_only_evaluation_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = unsafe { crate::globals::GLOBALS.get_mut().emsg_skip };
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_skip = 5 };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || {
+                let mut error = false;
+                let _ = unsafe {
+                    eval_to_bool(
+                        b"{x -> x}",
+                        &mut error,
+                        None,
+                        true,
+                        false,
+                    )
+                };
+            },
+        ));
+        assert!(result.is_err());
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().emsg_skip }, 5);
+
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_skip = old };
+    }
+
+    #[test]
+    fn eval_to_bool_releases_a_non_numeric_list_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        let mut error = false;
+        assert!(!unsafe {
+            eval_to_bool(b"[1]", &mut error, None, false, false)
+        });
+        assert!(error);
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn eval_to_bool_updates_exarg_nextcmd() {
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        let mut error = false;
+        assert!(unsafe {
+            eval_to_bool(
+                b"1 | echo",
+                &mut error,
+                Some(&mut eap),
+                false,
+                false,
+            )
+        });
+        assert!(!error);
+        assert_eq!(eap.nextcmd, Some(b" echo".to_vec()));
+    }
+
+    #[test]
+    #[should_panic(expected = "eval0_simple_funccal")]
+    fn eval_to_bool_simple_function_mode_is_unimplemented() {
+        let mut error = false;
+        let _ = unsafe {
+            eval_to_bool(b"len([])", &mut error, None, false, true)
+        };
+    }
 
     #[test]
     fn eval1_emsg_evaluates_a_simple_expression() {
