@@ -35,6 +35,7 @@ impl InputBuffer {
 static INPUT_BUFFER: GlobalCell<InputBuffer> =
     GlobalCell::new(InputBuffer::new());
 static EVENT_KEY_INDEX: GlobalCell<usize> = GlobalCell::new(0);
+static INPUT_EOF: GlobalCell<bool> = GlobalCell::new(false);
 
 /// Number of unread bytes in the raw input buffer
 /// (`input_available`).
@@ -207,6 +208,21 @@ pub unsafe fn os_input_ready(
             || unsafe { pending_events(events) }
 }
 
+/// Append one stream read into the raw input buffer
+/// (`input_read_cb`).
+///
+/// # Safety
+/// Mutates shared raw-input and EOF state.
+#[allow(dead_code)]
+unsafe fn input_read_cb(data: &[u8], at_eof: bool) -> usize {
+    if at_eof {
+            unsafe { *INPUT_EOF.get_mut() = true };
+    }
+    assert!(unsafe { input_space() } >= data.len());
+    unsafe { input_enqueue_raw(data) };
+    data.len()
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -253,6 +269,22 @@ mod tests {
     impl Drop for EventKeyIndexGuard {
         fn drop(&mut self) {
             unsafe { *EVENT_KEY_INDEX.get_mut() = self.0 };
+        }
+    }
+
+    struct InputEofGuard(bool);
+
+    impl InputEofGuard {
+        unsafe fn reset() -> Self {
+            Self(unsafe {
+                std::mem::replace(INPUT_EOF.get_mut(), false)
+            })
+        }
+    }
+
+    impl Drop for InputEofGuard {
+        fn drop(&mut self) {
+            unsafe { *INPUT_EOF.get_mut() = self.0 };
         }
     }
 
@@ -560,6 +592,28 @@ mod tests {
         }
         assert!(unsafe { os_input_ready(queue) });
         unsafe { crate::event::multiqueue::multiqueue_free(queue) };
+    }
+
+    #[test]
+    fn input_read_cb_enqueues_stream_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _eof = unsafe { InputEofGuard::reset() };
+        assert_eq!(unsafe { input_read_cb(b"abc", false) }, 3);
+
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(&input.data[..3], b"abc");
+        assert_eq!(input.write_pos, 3);
+        assert!(!unsafe { *INPUT_EOF.get_mut() });
+    }
+
+    #[test]
+    fn input_read_cb_records_end_of_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _eof = unsafe { InputEofGuard::reset() };
+        assert_eq!(unsafe { input_read_cb(b"", true) }, 0);
+        assert!(unsafe { *INPUT_EOF.get_mut() });
     }
 
     #[test]
