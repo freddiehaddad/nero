@@ -57,24 +57,17 @@
 //! one a few lines later backs "echo") - this was double-checked
 //! against the real binary specifically because of that risk.
 //!
-//! `Func`/`Partial` values `unimplemented!()` inside the shared
-//! container walker - `string()`/`:echo` of a Funcref/Partial is a
-//! narrow case, and `Partial`'s own "bound args"/"self dict"
-//! sub-iteration would add a third, rarely-needed `EncodeFrame`
-//! variant for comparatively little value; add if a real caller ever
-//! needs it. A bare `VAR_FUNC` (no partial wrapper) IS implemented in
-//! full for both backends, since it needed no extra stack-frame
-//! machinery beyond what `encode_string_quoted` already provides -
-//! its own exact output (`function('name')`) was also confirmed
-//! against the same real `nvim` binary.
+//! `Func` and `Partial` values are translated in full. Partial bound
+//! arguments and self dictionaries use dedicated explicit stack frames,
+//! matching the shared C encoder's `kMPConvPartial`/
+//! `kMPConvPartialList` states without recursive Rust calls.
 
-use crate::eval::typval_defs::{BlobT, DictT, ListT, ListitemT, TypvalT, TypvalValue};
+use crate::eval::typval_defs::{
+    BlobT, DictT, ListT, ListitemT, PartialT, TypvalT, TypvalValue,
+};
 
-/// One entry of the explicit stack used to walk a List/Dict without
-/// recursion (`MPConvStackVal`, `eval/typval_encode.c.h`) - only the
-/// two variants [`encode_vim_to_string`] needs (`kMPConvList`/
-/// `kMPConvDict`); `kMPConvPartial` is not modeled, see this module's
-/// own doc comment.
+/// One entry of the explicit stack used to walk Lists, Dicts and Partials
+/// without recursion (`MPConvStackVal`, `eval/typval_encode.c.h`).
 enum EncodeFrame {
     List {
         /// The list itself (`data.l.list`) - needed to recognize a
@@ -98,6 +91,21 @@ enum EncodeFrame {
         todo: usize,
         saved_copy_id: i32,
     },
+    Partial {
+        partial: *mut PartialT,
+        stage: PartialStage,
+    },
+    PartialList {
+        partial: *mut PartialT,
+        index: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum PartialStage {
+    Args,
+    SelfDict,
+    End,
 }
 
 /// Quote and escape a string the way `string()` does: wrapped in `'`,
@@ -162,7 +170,11 @@ fn encode_float(out: &mut Vec<u8>, f: f64) {
 /// `_END`, called back-to-back with `len: 0`/`len: -1` for a plain,
 /// non-partial `VAR_FUNC` - both conditions those macros gate on are
 /// then false, so no extra `", "` separator is ever emitted here).
-fn encode_func(out: &mut Vec<u8>, name: Option<&[u8]>) {
+fn encode_func_start(
+    out: &mut Vec<u8>,
+    name: Option<&[u8]>,
+    prefix: &[u8],
+) {
     out.extend_from_slice(b"function(");
     match name {
         // internal_error("string(): NULL function name") in the
@@ -172,8 +184,19 @@ fn encode_func(out: &mut Vec<u8>, name: Option<&[u8]>) {
         // literal in that case, faithfully reproduced here rather
         // than narrowed away.
         None => out.extend_from_slice(b"NULL"),
-        Some(name) => encode_string_quoted(out, Some(name)),
+        Some(name) => {
+            let name =
+                &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+            let mut full_name = Vec::with_capacity(prefix.len() + name.len());
+            full_name.extend_from_slice(prefix);
+            full_name.extend_from_slice(name);
+            encode_string_quoted(out, Some(&full_name));
+        }
     }
+}
+
+fn encode_func(out: &mut Vec<u8>, name: Option<&[u8]>) {
+    encode_func_start(out, name, b"");
     out.push(b')');
 }
 
@@ -207,11 +230,24 @@ unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv:
             unsafe { encode_blob(out, *b) };
         }
         TypvalValue::Func(name) => encode_func(out, name.as_deref()),
-        TypvalValue::Partial(_) => {
-            unimplemented!(
-                "encode_vim_to_string/encode_vim_to_echo: Partial values not yet \
-                 translated - see this module's own doc comment"
-            );
+        TypvalValue::Partial(partial) => {
+            let name = unsafe { crate::eval::eval::partial_name(*partial) };
+            let prefix = if !partial.is_null()
+                && unsafe { (**partial).pt_name.is_none() }
+                && name
+                    .as_deref()
+                    .and_then(|name| name.first())
+                    .is_some_and(u8::is_ascii_uppercase)
+            {
+                b"g:".as_slice()
+            } else {
+                b"".as_slice()
+            };
+            encode_func_start(out, name.as_deref(), prefix);
+            stack.push(EncodeFrame::Partial {
+                partial: *partial,
+                stage: PartialStage::Args,
+            });
         }
         TypvalValue::List(l) => {
             // SAFETY: forwarded from this function's own safety doc.
@@ -326,10 +362,9 @@ fn encode_backref(stack: &[EncodeFrame], val: EncodeRef) -> usize {
 /// (`TYPVAL_ENCODE_ENCODE`, shared driving loop for both the "string"
 /// and "echo" backends).
 ///
-/// Drives `convert_one_value` in a loop exactly like the original's
-/// own `while (kv_size(mpstack))` - each iteration either finishes a
-/// List/Dict frame (popping it and emitting its closing bracket/
-/// brace) or advances one and converts its next item/entry.
+/// Drives `convert_one_value` in a loop exactly like the original's own
+/// `while (kv_size(mpstack))`, including Partial argument and self-dict
+/// stages.
 ///
 /// # Safety
 /// If `top_tv`'s value is `List`/`Dict`/`Blob`-typed with a non-null
@@ -345,73 +380,173 @@ unsafe fn encode_generic(top_tv: &TypvalT, mode: EncodeMode) -> Vec<u8> {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { convert_one_value(&mut out, &mut stack, top_tv, copy_id, mode) };
 
-    while let Some(frame) = stack.last_mut() {
-        let next_tv: *const TypvalT = match frame {
-            EncodeFrame::Dict { dict, idx, todo, saved_copy_id } => {
-                if *todo == 0 {
-                    let dict = *dict;
-                    let saved_copy_id = *saved_copy_id;
-                    stack.pop();
-                    // SAFETY: forwarded from this function's own safety doc.
+    enum NextValue {
+        Borrowed(*const TypvalT),
+        PartialSelf(*mut DictT),
+        None,
+    }
+
+    while let Some(frame) = stack.pop() {
+        let next = match frame {
+            EncodeFrame::Dict {
+                dict,
+                mut idx,
+                mut todo,
+                saved_copy_id,
+            } => {
+                if todo == 0 {
                     unsafe { (*dict).dv_copy_id = saved_copy_id };
                     out.push(b'}');
                     continue;
                 }
-                let dict = *dict;
-                // SAFETY: forwarded from this function's own safety doc.
                 let full_todo = unsafe { (*dict).dv_hashtab.ht_used };
-                if *todo != full_todo {
+                if todo != full_todo {
                     out.extend_from_slice(b", ");
                 }
-                // SAFETY: forwarded from this function's own safety doc.
                 let array = unsafe { (*dict).dv_hashtab.ht_array.as_slice() };
-                while crate::hashtab::hashitem_empty(&array[*idx]) {
-                    *idx += 1;
+                while crate::hashtab::hashitem_empty(&array[idx]) {
+                    idx += 1;
                 }
-                let hi_key = array[*idx].hi_key as usize;
-                *todo -= 1;
-                *idx += 1;
-                // SAFETY: forwarded from this function's own safety doc.
+                let hi_key = array[idx].hi_key as usize;
+                todo -= 1;
+                idx += 1;
+                stack.push(EncodeFrame::Dict {
+                    dict,
+                    idx,
+                    todo,
+                    saved_copy_id,
+                });
                 let di = *unsafe { &(*dict).dv_index }
                     .get(&hi_key)
                     .expect("dv_index must track every live hi_key - see DictT's own doc comment");
-                // SAFETY: forwarded from this function's own safety doc.
                 let di_key = unsafe { &(*di).di_key };
-                // di_key always carries a trailing NUL terminator
-                // (matching hi_key's C-string contract - see
-                // tv_dict_item_alloc's own doc comment), which the
-                // real key text does NOT include - strip it here,
-                // matching this crate's own established idiom (e.g.
-                // tv_dict_equal's own di_key handling).
-                encode_string_quoted(&mut out, Some(&di_key[..di_key.len() - 1]));
+                encode_string_quoted(
+                    &mut out,
+                    Some(&di_key[..di_key.len() - 1]),
+                );
                 out.extend_from_slice(b": ");
-                // SAFETY: forwarded from this function's own safety doc.
-                unsafe { std::ptr::addr_of!((*di).di_tv) }
+                NextValue::Borrowed(unsafe {
+                    std::ptr::addr_of!((*di).di_tv)
+                })
             }
-            EncodeFrame::List { list, li, saved_copy_id } => {
+            EncodeFrame::List {
+                list,
+                li,
+                saved_copy_id,
+            } => {
                 if li.is_null() {
-                    let list = *list;
-                    let saved_copy_id = *saved_copy_id;
-                    stack.pop();
-                    // SAFETY: forwarded from this function's own safety doc.
                     unsafe { (*list).lv_copy_id = saved_copy_id };
                     out.push(b']');
                     continue;
                 }
-                let list = *list;
-                let cur_li = *li;
-                // SAFETY: forwarded from this function's own safety doc.
-                if !std::ptr::eq(cur_li, unsafe { (*list).lv_first }) {
+                if !std::ptr::eq(li, unsafe { (*list).lv_first }) {
                     out.extend_from_slice(b", ");
                 }
-                // SAFETY: forwarded from this function's own safety doc.
-                *li = unsafe { (*cur_li).li_next };
-                // SAFETY: forwarded from this function's own safety doc.
-                unsafe { std::ptr::addr_of!((*cur_li).li_tv) }
+                stack.push(EncodeFrame::List {
+                    list,
+                    li: unsafe { (*li).li_next },
+                    saved_copy_id,
+                });
+                NextValue::Borrowed(unsafe {
+                    std::ptr::addr_of!((*li).li_tv)
+                })
+            }
+            EncodeFrame::Partial {
+                partial,
+                stage: PartialStage::Args,
+            } => {
+                stack.push(EncodeFrame::Partial {
+                    partial,
+                    stage: PartialStage::SelfDict,
+                });
+                let argument_count = if partial.is_null() {
+                    0
+                } else {
+                    unsafe { (*partial).pt_argv.len() }
+                };
+                if argument_count != 0 {
+                    out.extend_from_slice(b", [");
+                    stack.push(EncodeFrame::PartialList {
+                        partial,
+                        index: 0,
+                    });
+                }
+                NextValue::None
+            }
+            EncodeFrame::Partial {
+                partial,
+                stage: PartialStage::SelfDict,
+            } => {
+                stack.push(EncodeFrame::Partial {
+                    partial,
+                    stage: PartialStage::End,
+                });
+                let dict = if partial.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    unsafe { (*partial).pt_dict }
+                };
+                if dict.is_null() {
+                    NextValue::None
+                } else {
+                    out.extend_from_slice(b", ");
+                    NextValue::PartialSelf(dict)
+                }
+            }
+            EncodeFrame::Partial {
+                stage: PartialStage::End,
+                ..
+            } => {
+                out.push(b')');
+                continue;
+            }
+            EncodeFrame::PartialList {
+                partial,
+                index,
+            } => {
+                let arguments = unsafe { &(*partial).pt_argv };
+                if index == arguments.len() {
+                    out.push(b']');
+                    continue;
+                }
+                if index != 0 {
+                    out.extend_from_slice(b", ");
+                }
+                stack.push(EncodeFrame::PartialList {
+                    partial,
+                    index: index + 1,
+                });
+                NextValue::Borrowed(&arguments[index])
             }
         };
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { convert_one_value(&mut out, &mut stack, &*next_tv, copy_id, mode) };
+
+        match next {
+            NextValue::Borrowed(next_tv) => unsafe {
+                convert_one_value(
+                    &mut out,
+                    &mut stack,
+                    &*next_tv,
+                    copy_id,
+                    mode,
+                )
+            },
+            NextValue::PartialSelf(dict) => {
+                let value = TypvalT {
+                    value: TypvalValue::Dict(dict),
+                    ..Default::default()
+                };
+                unsafe {
+                    convert_one_value(
+                        &mut out,
+                        &mut stack,
+                        &value,
+                        copy_id,
+                        mode,
+                    )
+                };
+            }
+            NextValue::None => {}
+        }
     }
 
     out
@@ -643,6 +778,108 @@ mod tests {
     fn func_renders_as_function_call_with_quoted_name() {
         let tv = TypvalT { value: TypvalValue::Func(Some(b"tr".to_vec())), ..Default::default() };
         assert_eq!(s(&tv), "function('tr')");
+    }
+
+    #[test]
+    fn null_partial_renders_as_null_function() {
+        let tv = TypvalT {
+            value: TypvalValue::Partial(std::ptr::null_mut()),
+            ..Default::default()
+        };
+        assert_eq!(s(&tv), "function(NULL)");
+    }
+
+    #[test]
+    fn partial_renders_bound_arguments_and_self_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *dict },
+            b"self",
+            2,
+        );
+        unsafe { (*dict).dv_refcount = 1 };
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"Callback".to_vec()),
+            pt_argv: vec![
+                TypvalT {
+                    value: TypvalValue::Number(1),
+                    ..Default::default()
+                },
+                TypvalT {
+                    value: TypvalValue::String(Some(b"x".to_vec())),
+                    ..Default::default()
+                },
+            ],
+            pt_dict: dict,
+            ..Default::default()
+        }));
+        let tv = TypvalT {
+            value: TypvalValue::Partial(partial),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            s(&tv),
+            "function('Callback', [1, 'x'], {'self': 2})"
+        );
+
+        unsafe { crate::eval::typval::partial_unref(partial) };
+    }
+
+    #[test]
+    fn partial_underlying_global_function_gets_g_prefix() {
+        let function = Box::into_raw(Box::new(
+            crate::eval::typval_defs::UfuncT {
+                uf_name: b"GlobalCallback\0".to_vec(),
+                ..Default::default()
+            },
+        ));
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_func: function,
+            ..Default::default()
+        }));
+        let tv = TypvalT {
+            value: TypvalValue::Partial(partial),
+            ..Default::default()
+        };
+
+        assert_eq!(s(&tv), "function('g:GlobalCallback')");
+
+        unsafe {
+            drop(Box::from_raw(partial));
+            drop(Box::from_raw(function));
+        }
+    }
+
+    #[test]
+    fn deeply_nested_partial_arguments_do_not_overflow_the_stack() {
+        let depth = if cfg!(miri) { 256 } else { 5_000 };
+        let mut child = Box::into_raw(Box::new(PartialT {
+            pt_name: Some(b"F".to_vec()),
+            ..Default::default()
+        }));
+        for _ in 0..depth {
+            unsafe { (*child).pt_refcount += 1 };
+            child = Box::into_raw(Box::new(PartialT {
+                pt_name: Some(b"F".to_vec()),
+                pt_argv: vec![TypvalT {
+                    value: TypvalValue::Partial(child),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }));
+        }
+        let tv = TypvalT {
+            value: TypvalValue::Partial(child),
+            ..Default::default()
+        };
+
+        let encoded = s(&tv);
+        assert_eq!(encoded.matches("function('F'").count(), depth + 1);
+
+        unsafe { crate::eval::typval::partial_unref(child) };
     }
 
     #[test]
