@@ -267,15 +267,29 @@ pub fn find_special_key(src: &[u8], flags: i32) -> Option<(i32, i32, usize, bool
     Some((key, modifiers, consumed, did_simplify))
 }
 
-/// Return the printable `<...>` name for a key and modifiers
-/// (`get_special_key_name`).
+/// Structured key chord produced by [`get_special_key`]
+/// (`struct keychord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyChord {
+    pub mods: u16,
+    pub key: Vec<u8>,
+    pub key_alt: Option<Vec<u8>>,
+}
+
+/// Return the printable `<...>` name and structured key chord
+/// (`get_special_key`).
 ///
 /// # Safety
 /// May consult the current character table through
 /// `charset::vim_isprintc`/`transchar`.
 #[must_use]
-pub unsafe fn get_special_key_name(mut key: i32, mut modifiers: i32) -> Vec<u8> {
+pub unsafe fn get_special_key(
+    mut key: i32,
+    mut modifiers: i32,
+) -> (Vec<u8>, KeyChord) {
     let mut result = vec![b'<'];
+    let mut chord = KeyChord::default();
+    let mut is_ascii_ctrl = false;
 
     if crate::keycodes_defs::is_special(key)
         && crate::keycodes_defs::key2termcap0(key) == crate::keycodes_defs::KS_KEY
@@ -304,6 +318,7 @@ pub unsafe fn get_special_key_name(mut key: i32, mut modifiers: i32) -> Vec<u8> 
     {
         key += i32::from(b'@');
         modifiers |= i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        is_ascii_ctrl = true;
     }
 
     for entry in crate::keycodes_defs::MOD_MASK_TABLE
@@ -312,34 +327,73 @@ pub unsafe fn get_special_key_name(mut key: i32, mut modifiers: i32) -> Vec<u8> 
     {
         if modifiers & i32::from(entry.mod_mask) == i32::from(entry.mod_flag) {
             result.extend_from_slice(&[entry.name, b'-']);
+            chord.mods |= entry.mod_flag;
         }
     }
 
     if table_idx < 0 {
         if crate::keycodes_defs::is_special(key) {
-            result.extend_from_slice(&[
+            let name = [
                 b't',
                 b'_',
                 crate::keycodes_defs::key2termcap0(key),
                 crate::keycodes_defs::key2termcap1(key),
-            ]);
+            ];
+            chord.key = name.to_vec();
+            result.extend_from_slice(&name);
         } else {
             let len = crate::mbyte::utf_char2len(key);
             if len == 1 && unsafe { crate::charset::vim_isprintc(key) } {
+                if (key as u8).is_ascii_uppercase() {
+                    chord.key = vec![(key as u8).to_ascii_lowercase()];
+                    if !is_ascii_ctrl {
+                        chord.mods |=
+                            crate::keycodes_defs::MOD_MASK_SHIFT;
+                    }
+                    chord.key_alt = Some(vec![key as u8]);
+                } else {
+                    chord.key = vec![key as u8];
+                }
                 result.push(key as u8);
             } else if len > 1 {
                 let mut encoded = [0; crate::mbyte_defs::MB_MAXCHAR];
                 let written = crate::mbyte::utf_char2bytes(key, &mut encoded) as usize;
+                chord.key.extend_from_slice(&encoded[..written]);
                 result.extend_from_slice(&encoded[..written]);
             } else {
-                result.extend_from_slice(&unsafe { crate::charset::transchar(key) });
+                let translated =
+                    unsafe { crate::charset::transchar(key) };
+                chord.key = vec![key as u8];
+                chord.key_alt = Some(translated.clone());
+                result.extend_from_slice(&translated);
             }
         }
     } else {
-        result.extend_from_slice(KEY_NAMES_TABLE[table_idx as usize].name.as_bytes());
+        let name =
+            KEY_NAMES_TABLE[table_idx as usize].name.as_bytes();
+        if (0..=0x7f).contains(&key) {
+            chord.key = vec![key as u8];
+            chord.key_alt = Some(name.to_vec());
+        } else {
+            chord.key = name.to_vec();
+        }
+        result.extend_from_slice(name);
     }
     result.push(b'>');
-    result
+    (result, chord)
+}
+
+/// Return only the printable `<...>` key name
+/// (`get_special_key_name`).
+///
+/// # Safety
+/// Forwards [`get_special_key`]'s requirements.
+#[must_use]
+pub unsafe fn get_special_key_name(
+    key: i32,
+    modifiers: i32,
+) -> Vec<u8> {
+    unsafe { get_special_key(key, modifiers) }.0
 }
 
 /// Translate one `<...>` key name into Neovim's internal byte
@@ -1541,6 +1595,55 @@ mod tests {
     }
 
     // --- get_special_key_name ---
+
+    #[test]
+    fn get_special_key_reports_structured_named_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (name, chord) =
+            unsafe { get_special_key(K_UP, 0) };
+        assert_eq!(name, b"<Up>");
+        assert_eq!(
+            chord,
+            KeyChord {
+                mods: 0,
+                key: b"Up".to_vec(),
+                key_alt: None,
+            }
+        );
+    }
+
+    #[test]
+    fn get_special_key_normalizes_uppercase_and_control_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (_, uppercase) =
+            unsafe { get_special_key(i32::from(b'A'), 0) };
+        assert_eq!(uppercase.key, b"a");
+        assert_eq!(
+            uppercase.mods,
+            crate::keycodes_defs::MOD_MASK_SHIFT
+        );
+        assert_eq!(uppercase.key_alt, Some(b"A".to_vec()));
+
+        let (_, control) = unsafe {
+            get_special_key(i32::from(crate::ascii_defs::CTRL_A), 0)
+        };
+        assert_eq!(control.key, b"a");
+        assert_eq!(
+            control.mods,
+            crate::keycodes_defs::MOD_MASK_CTRL
+        );
+        assert_eq!(control.key_alt, Some(b"A".to_vec()));
+    }
+
+    #[test]
+    fn get_special_key_reports_unknown_termcap_keys() {
+        let _lock = crate::globals::global_state_test_lock();
+        let key = termcap2key(b'a', b'b');
+        let (name, chord) = unsafe { get_special_key(key, 0) };
+        assert_eq!(name, b"<t_ab>");
+        assert_eq!(chord.key, b"t_ab");
+        assert_eq!(chord.key_alt, None);
+    }
 
     #[test]
     fn get_special_key_name_formats_named_and_shifted_keys() {
