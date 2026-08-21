@@ -81,8 +81,8 @@
 //!   logic tied to `'path'`-searching semantics (`path.c`) and, on
 //!   Windows, `$PATHEXT` extension probing. The underlying
 //!   [`is_executable`] permission check itself IS translated.
-//! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
-//!   `os_fchown`: platform ACL/xattr/
+//! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`:
+//!   platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
@@ -241,6 +241,39 @@ pub fn os_chown(path: &Path, owner: u32, group: u32) -> i32 {
     #[cfg(not(unix))]
     {
         let _ = (path, owner, group);
+        -1
+    }
+}
+
+/// Change the owner and group of an open file (`os_fchown`).
+///
+/// `u32::MAX` preserves the corresponding ID. Windows reports
+/// unsupported, matching libuv's platform result.
+#[must_use]
+pub fn os_fchown(
+    file: &std::fs::File,
+    owner: u32,
+    group: u32,
+) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe {
+            libc::fchown(
+                file.as_raw_fd(),
+                owner as libc::uid_t,
+                group as libc::gid_t,
+            )
+        } == 0
+        {
+            0
+        } else {
+            -1
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, owner, group);
         -1
     }
 }
@@ -1779,6 +1812,20 @@ mod tests {
             ),
             -1
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_fchown_preserves_ids_or_reports_unsupported() {
+        let scratch = TempScratch::new("fchown");
+        let path = scratch.path.join("f.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        let result = os_fchown(&file, u32::MAX, u32::MAX);
+        if cfg!(unix) {
+            assert_eq!(result, 0);
+        } else {
+            assert_eq!(result, -1);
+        }
     }
 
     #[test]
