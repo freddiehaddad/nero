@@ -71,6 +71,63 @@ fn tokenize(mut string: &[u8]) -> Vec<Vec<u8>> {
     argv
 }
 
+/// Apply `'shellxescape'` and `'shellxquote'` to a command
+/// (`shell_xescape_xquote`).
+///
+/// # Safety
+/// Reads shared option state and forwards
+/// [`crate::strings::vim_strsave_escaped_ext`]'s requirement.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn shell_xescape_xquote(cmd: &[u8]) -> Vec<u8> {
+    let (shellxquote, shellxescape) = {
+        let options =
+            unsafe { &*crate::option_vars::OPTION_VARS.as_ptr() };
+        (
+            options.p_sxq.clone().unwrap_or_default(),
+            options.p_sxe.clone().unwrap_or_default(),
+        )
+    };
+    if shellxquote.is_empty() {
+        return cmd.to_vec();
+    }
+
+    let escaped = if !shellxescape.is_empty() && shellxquote == b"(" {
+        unsafe {
+            crate::strings::vim_strsave_escaped_ext(
+                cmd,
+                &shellxescape,
+                b'^',
+                false,
+            )
+        }
+    } else {
+        cmd.to_vec()
+    };
+
+    let mut result = Vec::with_capacity(
+        escaped.len() + shellxquote.len() * 2,
+    );
+    match shellxquote.as_slice() {
+        b"(" => {
+            result.push(b'(');
+            result.extend_from_slice(&escaped);
+            result.push(b')');
+        }
+        b"\"(" => {
+            result.extend_from_slice(b"\"(");
+            result.extend_from_slice(&escaped);
+            result.extend_from_slice(b")\"");
+        }
+        _ => {
+            result.extend_from_slice(&shellxquote);
+            result.extend_from_slice(&escaped);
+            result.extend_from_slice(&shellxquote);
+        }
+    }
+    result
+}
+
 /// The size of the buffer `shell_argv_to_str` formats into, including
 /// the terminating NUL (the original's own `xcalloc(256, ...)`).
 const ARGV_STR_MAXSIZE: usize = 256;
@@ -118,6 +175,37 @@ pub fn shell_argv_to_str(argv: &[Vec<u8>]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ShellQuoteGuard {
+        shellxquote: Option<Vec<u8>>,
+        shellxescape: Option<Vec<u8>>,
+    }
+
+    impl ShellQuoteGuard {
+        unsafe fn set(
+            shellxquote: &[u8],
+            shellxescape: &[u8],
+        ) -> Self {
+            let options =
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let previous = Self {
+                shellxquote: options.p_sxq.clone(),
+                shellxescape: options.p_sxe.clone(),
+            };
+            options.p_sxq = Some(shellxquote.to_vec());
+            options.p_sxe = Some(shellxescape.to_vec());
+            previous
+        }
+    }
+
+    impl Drop for ShellQuoteGuard {
+        fn drop(&mut self) {
+            let options =
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            options.p_sxq = self.shellxquote.take();
+            options.p_sxe = self.shellxescape.take();
+        }
+    }
 
     #[test]
     fn have_wildcard_finds_one_anywhere_in_the_vector() {
@@ -192,6 +280,46 @@ mod tests {
     #[test]
     fn tokenize_of_an_empty_string_is_empty() {
         assert_eq!(tokenize(b""), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn shell_xescape_xquote_copies_when_shellxquote_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = unsafe { ShellQuoteGuard::set(b"", b"&") };
+        assert_eq!(
+            unsafe { shell_xescape_xquote(b"echo &") },
+            b"echo &"
+        );
+    }
+
+    #[test]
+    fn shell_xescape_xquote_parenthesizes_and_escapes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = unsafe { ShellQuoteGuard::set(b"(", b"&|") };
+        assert_eq!(
+            unsafe { shell_xescape_xquote(b"echo & | more") },
+            b"(echo ^& ^| more)"
+        );
+    }
+
+    #[test]
+    fn shell_xescape_xquote_handles_quote_parenthesis_form() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = unsafe { ShellQuoteGuard::set(b"\"(", b"&") };
+        assert_eq!(
+            unsafe { shell_xescape_xquote(b"echo &") },
+            b"\"(echo &)\""
+        );
+    }
+
+    #[test]
+    fn shell_xescape_xquote_wraps_with_other_quote_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _options = unsafe { ShellQuoteGuard::set(b"\"", b"&") };
+        assert_eq!(
+            unsafe { shell_xescape_xquote(b"echo &") },
+            b"\"echo &\""
+        );
     }
 
     #[test]
