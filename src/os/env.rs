@@ -41,10 +41,9 @@
 //! scratch buffer, unnecessary in Rust; see its own doc comment).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `os_getenv_buf`/`os_getenv_noalloc`: write into `NameBuff`
-//!   (`crate::globals::GLOBALS`) - tractable in principle, deferred only
-//!   because nothing calls them yet without a fixed-size-buffer-filling
-//!   caller to validate against.
+//! - `os_getenv_noalloc`: writes into `NameBuff`
+//!   (`crate::globals::GLOBALS`), a shared-buffer reuse optimization
+//!   with no translated caller yet.
 //! - `os_free_fullenv`/`os_getenvname_at_index`: need libuv's
 //!   `uv_os_environ`/raw platform `environ`/`GetEnvironmentStringsW`
 //!   enumeration API, not just a single-variable get/set.
@@ -88,6 +87,26 @@ pub fn os_getenv(name: &[u8]) -> Option<Vec<u8>> {
         Some(v) if !v.is_empty() => Some(v.to_string_lossy().into_owned().into_bytes()),
         _ => None,
     }
+}
+
+/// Read an environment value into a caller-provided buffer
+/// (`os_getenv_buf`).
+///
+/// The value is truncated to leave room for a trailing NUL byte. The
+/// returned slice excludes that terminator and borrows `buf`.
+#[must_use]
+pub fn os_getenv_buf<'a>(
+    name: &[u8],
+    buf: &'a mut [u8],
+) -> Option<&'a [u8]> {
+    if buf.is_empty() {
+        return None;
+    }
+    let value = os_getenv(name)?;
+    let len = value.len().min(buf.len() - 1);
+    buf[..len].copy_from_slice(&value[..len]);
+    buf[len] = 0;
+    (len != 0).then_some(&buf[..len])
 }
 
 /// Return the next component of a delimited environment value
@@ -1270,6 +1289,69 @@ pub(crate) mod tests {
     #[test]
     fn os_getenv_returns_none_for_empty_name() {
         assert_eq!(os_getenv(b""), None);
+    }
+
+    #[test]
+    fn os_getenv_buf_copies_and_nul_terminates_a_value() {
+        let _guard = EnvVarGuard::set(&[
+            ("NERO_TEST_ENV_BUFFER", Some("hello")),
+        ]);
+        let mut buf = [0xaau8; 8];
+
+        assert_eq!(
+            os_getenv_buf(b"NERO_TEST_ENV_BUFFER", &mut buf),
+            Some(&b"hello"[..])
+        );
+        assert_eq!(&buf, b"hello\0\xaa\xaa");
+    }
+
+    #[test]
+    fn os_getenv_buf_truncates_to_leave_room_for_nul() {
+        let _guard = EnvVarGuard::set(&[
+            ("NERO_TEST_ENV_BUFFER_TRUNCATE", Some("abcdef")),
+        ]);
+        let mut buf = [0xaau8; 5];
+
+        assert_eq!(
+            os_getenv_buf(b"NERO_TEST_ENV_BUFFER_TRUNCATE", &mut buf),
+            Some(&b"abcd"[..])
+        );
+        assert_eq!(&buf, b"abcd\0");
+    }
+
+    #[test]
+    fn os_getenv_buf_rejects_missing_empty_and_zero_capacity_values() {
+        let _guard = EnvVarGuard::set(&[
+            ("NERO_TEST_ENV_BUFFER_MISSING", None),
+            ("NERO_TEST_ENV_BUFFER_EMPTY", Some("")),
+            ("NERO_TEST_ENV_BUFFER_PRESENT", Some("x")),
+        ]);
+        let mut buf = [0xaau8; 4];
+        assert_eq!(
+            os_getenv_buf(b"NERO_TEST_ENV_BUFFER_MISSING", &mut buf),
+            None
+        );
+        assert_eq!(
+            os_getenv_buf(b"NERO_TEST_ENV_BUFFER_EMPTY", &mut buf),
+            None
+        );
+        assert_eq!(
+            os_getenv_buf(b"NERO_TEST_ENV_BUFFER_PRESENT", &mut []),
+            None
+        );
+    }
+
+    #[test]
+    fn os_getenv_buf_returns_none_when_only_the_nul_fits() {
+        let _guard = EnvVarGuard::set(&[
+            ("NERO_TEST_ENV_BUFFER_ONE_BYTE", Some("x")),
+        ]);
+        let mut buf = [0xaau8; 1];
+        assert_eq!(
+            os_getenv_buf(b"NERO_TEST_ENV_BUFFER_ONE_BYTE", &mut buf),
+            None
+        );
+        assert_eq!(buf, [0]);
     }
 
     #[test]
