@@ -139,6 +139,62 @@ pub fn ctx_to_dict(
     .collect()
 }
 
+/// Populate a Context snapshot from its API Dict representation
+/// (`ctx_from_dict`).
+///
+/// Returns the OR-ed [`crate::context_defs::ctx_state_flags`] fields
+/// that were present.
+///
+/// # Safety
+/// Forwards [`array_to_string`]'s temporary eval-container
+/// requirements.
+pub unsafe fn ctx_from_dict(
+    dictionary: &crate::api::private::defs::Dict,
+    context: &mut crate::context_defs::Context,
+    error: &mut crate::api::private::defs::Error,
+) -> i32 {
+    use crate::api::private::defs::Object;
+    use crate::context_defs::ctx_state_flags;
+
+    let mut types = 0;
+    for item in dictionary {
+        if error.is_set() {
+            break;
+        }
+        let Object::Array(array) = &item.value else {
+            continue;
+        };
+        match item.key.as_slice() {
+            b"regs" => {
+                types |= ctx_state_flags::REGS;
+                context.regs =
+                    Some(unsafe { array_to_string(array, error) });
+            }
+            b"jumps" => {
+                types |= ctx_state_flags::JUMPS;
+                context.jumps =
+                    Some(unsafe { array_to_string(array, error) });
+            }
+            b"bufs" => {
+                types |= ctx_state_flags::BUFS;
+                context.bufs =
+                    Some(unsafe { array_to_string(array, error) });
+            }
+            b"gvars" => {
+                types |= ctx_state_flags::GVARS;
+                context.gvars =
+                    Some(unsafe { array_to_string(array, error) });
+            }
+            b"funcs" => {
+                types |= ctx_state_flags::FUNCS;
+                context.funcs = array.clone();
+            }
+            _ => {}
+        }
+    }
+    types
+}
+
 #[cfg(test)]
 unsafe fn reset_ctx_win_pool_for_test() {
     let entries = std::mem::take(unsafe { CTX_WIN_VEC.get_mut() });
@@ -669,6 +725,16 @@ pub unsafe fn ctx_restore(cs: &CtxSwitch) {
 mod tests {
     use super::*;
 
+    fn empty_context() -> crate::context_defs::Context {
+        crate::context_defs::Context {
+            regs: None,
+            jumps: None,
+            bufs: None,
+            gvars: None,
+            funcs: Vec::new(),
+        }
+    }
+
     #[test]
     fn array_to_string_joins_readfile_style_lines() {
         let _lock = crate::globals::global_state_test_lock();
@@ -762,6 +828,92 @@ mod tests {
             Some(crate::api::private::defs::Object::String(value))
                 if value == b"function body"
         ));
+    }
+
+    #[test]
+    fn ctx_from_dict_round_trips_all_context_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let original = crate::context_defs::Context {
+            regs: Some(b"one\ntwo\n".to_vec()),
+            jumps: Some(b"jump".to_vec()),
+            bufs: Some(Vec::new()),
+            gvars: Some(b"gvar".to_vec()),
+            funcs: vec![crate::api::private::defs::Object::String(
+                b"function body".to_vec(),
+            )],
+        };
+        let dictionary = ctx_to_dict(&original);
+        let mut restored = empty_context();
+        let mut error = crate::api::private::defs::Error::default();
+        let flags = unsafe {
+            ctx_from_dict(&dictionary, &mut restored, &mut error)
+        };
+        assert!(!error.is_set());
+        assert_eq!(restored.regs, original.regs);
+        assert_eq!(restored.jumps, original.jumps);
+        assert_eq!(restored.bufs, original.bufs);
+        assert_eq!(restored.gvars, original.gvars);
+        assert!(matches!(
+            restored.funcs.first(),
+            Some(crate::api::private::defs::Object::String(value))
+                if value == b"function body"
+        ));
+        assert_eq!(
+            flags,
+            crate::context_defs::ctx_state_flags::REGS
+                | crate::context_defs::ctx_state_flags::JUMPS
+                | crate::context_defs::ctx_state_flags::BUFS
+                | crate::context_defs::ctx_state_flags::GVARS
+                | crate::context_defs::ctx_state_flags::FUNCS
+        );
+    }
+
+    #[test]
+    fn ctx_from_dict_ignores_unknown_and_nonarray_values() {
+        let mut context = empty_context();
+        let mut error = crate::api::private::defs::Error::default();
+        let dictionary = vec![
+            crate::api::private::defs::KeyValuePair {
+                key: b"regs".to_vec(),
+                value: crate::api::private::defs::Object::Integer(1),
+            },
+            crate::api::private::defs::KeyValuePair {
+                key: b"unknown".to_vec(),
+                value: crate::api::private::defs::Object::Array(
+                    Vec::new(),
+                ),
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                ctx_from_dict(&dictionary, &mut context, &mut error)
+            },
+            0
+        );
+        assert!(!error.is_set());
+    }
+
+    #[test]
+    fn ctx_from_dict_propagates_array_conversion_errors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut context = empty_context();
+        let mut error = crate::api::private::defs::Error::default();
+        let dictionary = vec![
+            crate::api::private::defs::KeyValuePair {
+                key: b"regs".to_vec(),
+                value: crate::api::private::defs::Object::Array(vec![
+                    crate::api::private::defs::Object::Integer(1),
+                ]),
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                ctx_from_dict(&dictionary, &mut context, &mut error)
+            },
+            crate::context_defs::ctx_state_flags::REGS
+        );
+        assert!(error.is_set());
+        assert_eq!(context.regs, Some(Vec::new()));
     }
 
     // --- ctx_saved_curwin / ctx_restore_curwin ---
