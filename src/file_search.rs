@@ -63,7 +63,7 @@ pub fn do_autocmd_dirchanged(
 /// # Safety
 /// Forwarded from [`crate::path::pathcmp`]'s option/global-state
 /// requirements.
-pub unsafe fn vim_chdirfile(fname: &[u8], _cause: crate::vim_defs::CdCause) -> i32 {
+pub unsafe fn vim_chdirfile(fname: &[u8], cause: crate::vim_defs::CdCause) -> i32 {
     let tail = crate::path::path_tail_with_sep(fname);
     let dir = &fname[..tail];
     let Some(current) = crate::os::fs::os_dirname() else {
@@ -77,7 +77,23 @@ pub unsafe fn vim_chdirfile(fname: &[u8], _cause: crate::vim_defs::CdCause) -> i
     let Ok(dir) = std::str::from_utf8(dir) else {
         return crate::vim_defs::FAIL;
     };
+    if cause != crate::vim_defs::CdCause::Other {
+        do_autocmd_dirchanged(
+            dir.as_bytes(),
+            crate::vim_defs::CdScope::Window,
+            cause,
+            true,
+        );
+    }
     if crate::os::fs::os_chdir(std::path::Path::new(dir)) == 0 {
+        if cause != crate::vim_defs::CdCause::Other {
+            do_autocmd_dirchanged(
+                dir.as_bytes(),
+                crate::vim_defs::CdScope::Window,
+                cause,
+                false,
+            );
+        }
         crate::vim_defs::OK
     } else {
         crate::vim_defs::FAIL
@@ -541,6 +557,7 @@ mod tests {
 
     #[test]
     fn vim_chdirfile_returns_ok_when_the_file_is_already_in_cwd() {
+        let _globals_lock = crate::globals::global_state_test_lock();
         let _cwd_lock = crate::os::fs::cwd_test_lock();
         let current = crate::os::fs::os_dirname().expect("current directory");
         let fname = crate::path::concat_fnames(&current, b"file.txt", true);
@@ -553,6 +570,7 @@ mod tests {
 
     #[test]
     fn vim_chdirfile_changes_to_the_files_directory() {
+        let _globals_lock = crate::globals::global_state_test_lock();
         let _cwd_lock = crate::os::fs::cwd_test_lock();
         let scratch = ScratchDir::new("chdirfile");
         let child = scratch.0.join("child");
@@ -572,6 +590,7 @@ mod tests {
 
     #[test]
     fn vim_chdirfile_fails_when_the_directory_does_not_exist() {
+        let _globals_lock = crate::globals::global_state_test_lock();
         let _cwd_lock = crate::os::fs::cwd_test_lock();
         let scratch = ScratchDir::new("chdirfile_missing");
         let _cwd = CwdGuard::set(&scratch.0);
