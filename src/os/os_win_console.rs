@@ -22,6 +22,8 @@ unsafe extern "system" {
     fn GetConsoleTitleA(title: *mut u8, size: u32) -> u32;
     fn SetConsoleTitleA(title: *const u8) -> i32;
     fn GetConsoleWindow() -> WindowHandle;
+    fn FreeConsole() -> i32;
+    fn AllocConsole() -> i32;
     fn CreateFileA(
         filename: *const u8,
         desired_access: u32,
@@ -51,6 +53,7 @@ unsafe extern "system" {
         wparam: usize,
         lparam: isize,
     ) -> isize;
+    fn ShowWindow(window: WindowHandle, command: i32) -> i32;
 }
 
 #[link(name = "ucrt")]
@@ -238,6 +241,18 @@ pub fn os_reattach_console_stdio() {
     os_enable_ctrl_c();
     os_redirect_stdin_to_conin();
     os_redirect_stdout_stderr_to_conout();
+}
+
+/// Detach from the current console and use a hidden private console
+/// (`os_swap_to_hidden_console`).
+pub fn os_swap_to_hidden_console() {
+    const SW_HIDE: i32 = 0;
+    unsafe {
+        FreeConsole();
+        AllocConsole();
+        ShowWindow(GetConsoleWindow(), SW_HIDE);
+    }
+    os_reattach_console_stdio();
 }
 
 /// Save the current console title (`os_title_save`).
