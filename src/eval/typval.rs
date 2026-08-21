@@ -4894,16 +4894,6 @@ pub unsafe fn tv_list_extend(
 /// that precomputation isn't needed here for correctness or
 /// asymptotic performance.
 ///
-/// # Panics
-/// Panics if any item is `List`/`Dict`/`Blob`/`Funcref`/`Partial`-
-/// typed - stringifying those needs the full `encode_tv2echo`
-/// machinery (`eval/encode.c`, ~970 lines, a substantial separate
-/// undertaking not attempted here) to render e.g. `[1, 2]`/`{'a': 1}`
-/// nested structures; `Number`/`Float`/`String`/`Bool`/`Special`
-/// items (the overwhelmingly common real-world case, matching
-/// `join()`'s own documented example of joining a `List` of strings)
-/// are fully real, via the already-existing [`tv_get_string_chk`].
-///
 /// # Safety
 /// `l`, if non-null, must be a valid pointer to a live `ListT`.
 pub unsafe fn tv_list_join(l: *mut crate::eval::typval_defs::ListT, sep: &[u8]) -> Vec<u8> {
@@ -4916,14 +4906,9 @@ pub unsafe fn tv_list_join(l: *mut crate::eval::typval_defs::ListT, sep: &[u8]) 
             out.extend_from_slice(sep);
         }
         first = false;
-        // SAFETY: forwarded from this function's own safety doc.
         let tv = unsafe { &(*item).li_tv };
-        let Some(s) = tv_get_string_chk(tv) else {
-            unimplemented!(
-                "tv_list_join: stringifying a List/Dict/Blob/Funcref item needs eval/encode.c's \
-                 encode_tv2echo, not yet translated - see this function's own doc comment"
-            );
-        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let s = unsafe { crate::eval::encode::encode_tv2echo(tv) };
         out.extend_from_slice(&s);
         // SAFETY: forwarded from this function's own safety doc.
         item = unsafe { (*item).li_next };
@@ -9809,19 +9794,19 @@ mod tests {
     }
 
     #[test]
-    fn tv_list_join_of_a_nested_list_item_panics() {
-        // Uses catch_unwind (rather than #[should_panic]) so the
-        // allocated lists can be cleanly released regardless of the
-        // panic - #[should_panic] would leak them into GC_FIRST_LIST
-        // forever, corrupting every later GC-linked-list test in this
-        // process (matching eval.rs's own
-        // eval_to_string_list_value_is_unimplemented precedent).
+    fn tv_list_join_stringifies_nested_values_with_echo_rules() {
         let _lock = crate::globals::global_state_test_lock();
-        let inner = tv_list_alloc(0);
+        let inner = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(inner, 1);
+            tv_list_append_string(inner, Some(b"x"));
+        }
         let l = tv_list_alloc(1);
         unsafe { tv_list_append_owned_tv(l, TypvalT { value: TypvalValue::List(inner), ..Default::default() }) };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { tv_list_join(l, b" ") }));
-        assert!(result.is_err(), "expected a panic (encode_tv2echo not yet translated)");
+        assert_eq!(
+            unsafe { tv_list_join(l, b" ") },
+            b"[1, 'x']".to_vec()
+        );
         unsafe { tv_list_free(l) };
     }
 
