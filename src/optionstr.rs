@@ -431,6 +431,12 @@ pub fn check_string_option(option: &mut Option<Vec<u8>>) {
     option.get_or_insert_with(Vec::new);
 }
 
+/// Release a string option's old value and install the canonical empty value
+/// (`clear_string_option`).
+pub fn clear_string_option(option: &mut Option<Vec<u8>>) {
+    *option = Some(Vec::new());
+}
+
 /// Ensure every buffer string option has a non-null value
 /// (`check_buf_options`).
 pub fn check_buf_options(buf: &mut crate::buffer_defs::BufT) {
@@ -4853,6 +4859,17 @@ mod tests {
         let mut present = Some(b"value".to_vec());
         check_string_option(&mut present);
         assert_eq!(present, Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn clear_string_option_replaces_any_value_with_empty() {
+        let mut present = Some(b"value".to_vec());
+        clear_string_option(&mut present);
+        assert_eq!(present, Some(Vec::new()));
+
+        let mut missing = None;
+        clear_string_option(&mut missing);
+        assert_eq!(missing, Some(Vec::new()));
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
