@@ -619,6 +619,24 @@ pub unsafe fn checkclearop(
     true
 }
 
+/// Check for an active operator or Visual selection
+/// (`checkclearopq`).
+///
+/// # Safety
+/// Reads shared Visual state and forwards [`clearopbeep`].
+#[must_use]
+pub unsafe fn checkclearopq(
+    oap: &mut crate::normal_defs::OpargT,
+) -> bool {
+    if oap.op_type == crate::ops_defs::OpType::Nop as i32
+        && !unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active
+    {
+        return false;
+    }
+    unsafe { clearopbeep(oap) };
+    true
+}
+
 /// Swap the ends of the Visual selection (`v_swap_corners`).
 ///
 /// For `O` in blockwise Visual mode this swaps the LEFT/RIGHT corners
@@ -2231,6 +2249,34 @@ mod tests {
             crate::ops_defs::OpType::Nop as i32
         );
         assert_eq!(active.regname, 0);
+    }
+
+    #[test]
+    fn checkclearopq_also_detects_visual_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut oap = crate::normal_defs::OpargT::default();
+        {
+            let _visual = unsafe {
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.Visual.active,
+                    false,
+                )
+            };
+            assert!(!unsafe { checkclearopq(&mut oap) });
+        }
+        {
+            let _visual = unsafe {
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.Visual.active,
+                    true,
+                )
+            };
+            assert!(unsafe { checkclearopq(&mut oap) });
+            assert_eq!(
+                oap.op_type,
+                crate::ops_defs::OpType::Nop as i32
+            );
+        }
     }
 
     #[test]
