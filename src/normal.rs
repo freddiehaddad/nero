@@ -595,6 +595,15 @@ pub unsafe fn clearop(oap: &mut crate::normal_defs::OpargT) {
     unsafe { crate::globals::GLOBALS.get_mut() }.motion_force = i32::from(crate::ascii_defs::NUL);
 }
 
+/// Clear an active operator and flush mapped input (`clearopbeep`).
+///
+/// # Safety
+/// Forwards [`clearop`]'s shared motion-force mutation.
+pub unsafe fn clearopbeep(oap: &mut crate::normal_defs::OpargT) {
+    unsafe { clearop(oap) };
+    crate::input::beep_flush();
+}
+
 /// Swap the ends of the Visual selection (`v_swap_corners`).
 ///
 /// For `O` in blockwise Visual mode this swaps the LEFT/RIGHT corners
@@ -2161,6 +2170,33 @@ mod tests {
         unsafe { clearop(&mut oap) };
         unsafe { clearop(&mut oap) };
         assert_eq!(oap.op_type, crate::ops_defs::OpType::Nop as i32);
+    }
+
+    #[test]
+    fn clearopbeep_clears_an_active_operator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _motion_force = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.motion_force,
+                i32::from(b'v'),
+            )
+        };
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            regname: i32::from(b'a'),
+            motion_force: i32::from(b'v'),
+            ..Default::default()
+        };
+
+        unsafe { clearopbeep(&mut oap) };
+
+        assert_eq!(oap.op_type, crate::ops_defs::OpType::Nop as i32);
+        assert_eq!(oap.regname, 0);
+        assert_eq!(oap.motion_force, 0);
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.motion_force,
+            0
+        );
     }
 
     #[test]
