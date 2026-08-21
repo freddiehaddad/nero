@@ -52,12 +52,6 @@
 //! would be redundant, not a missing translation.
 //!
 //! Deferred:
-//! - `os_stat` (raw Unix-style mode bits beyond the permission set -
-//!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_can_exe`/`is_executable_ext`: executable-SEARCH
-//!   logic tied to `'path'`-searching semantics (`path.c`) and, on
-//!   Windows, `$PATHEXT` extension probing. The underlying
-//!   [`is_executable`] permission check itself IS translated.
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`:
 //!   platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
@@ -951,7 +945,11 @@ impl FileInfoT {
 ///         out-parameter and the status into one `Option`).
 #[must_use]
 pub fn os_fileinfo(path: &Path) -> Option<FileInfoT> {
-    std::fs::metadata(path).ok().map(FileInfoT::from_metadata)
+    os_stat(Some(path))
+}
+
+fn os_stat(path: Option<&Path>) -> Option<FileInfoT> {
+    std::fs::metadata(path?).ok().map(FileInfoT::from_metadata)
 }
 
 /// Parse path prefix, root, and remainder offsets (`os_fileinfo2`).
@@ -1085,7 +1083,7 @@ pub fn os_fileid_equal(
 pub fn os_fileid(
     path: &Path,
 ) -> Option<crate::os::fs_defs::FileID> {
-    os_fileinfo(path).map(|info| os_fileinfo_id(&info))
+    os_stat(Some(path)).map(|info| os_fileinfo_id(&info))
 }
 
 /// Get the file size from a `FileInfoT` (`os_fileinfo_size`).
@@ -1158,7 +1156,7 @@ pub fn os_copy(path: &Path, new_path: &Path, flags: i32) -> i32 {
 /// synthesizes them there, exactly as libuv itself does for
 /// compatibility, so this reports the same synthesized value.
 pub fn os_getperm(path: &Path) -> i32 {
-    match os_fileinfo(path) {
+    match os_stat(Some(path)) {
         Some(info) => os_fileinfo_mode(&info),
         None => -1,
     }
@@ -3445,6 +3443,11 @@ mod tests {
     fn os_fileinfo_returns_none_for_a_missing_path() {
         let scratch = TempScratch::new("fileinfo_missing");
         assert!(os_fileinfo(&scratch.path.join("nope.txt")).is_none());
+    }
+
+    #[test]
+    fn os_stat_rejects_a_missing_name() {
+        assert!(os_stat(None).is_none());
     }
 
     #[test]
