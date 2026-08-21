@@ -830,6 +830,59 @@ pub fn utf8_to_utf16(utf8: &[u8]) -> Option<Vec<u16>> {
     (written != 0).then_some(output)
 }
 
+/// Convert a NUL-terminated UTF-16 string to UTF-8 (`utf16_to_utf8`).
+#[cfg(windows)]
+#[must_use]
+pub fn utf16_to_utf8(utf16: &[u16]) -> Option<Vec<u8>> {
+    const CP_UTF8: u32 = 65_001;
+    unsafe extern "system" {
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            input: *const u16,
+            input_len: i32,
+            output: *mut std::os::raw::c_char,
+            output_len: i32,
+            default_char: *const std::os::raw::c_char,
+            used_default_char: *mut i32,
+        ) -> i32;
+    }
+
+    let len = utf16.iter().position(|&unit| unit == 0).unwrap_or(utf16.len());
+    let mut terminated = utf16[..len].to_vec();
+    terminated.push(0);
+    let input = terminated.as_ptr();
+    let required = unsafe {
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            input,
+            -1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if required == 0 {
+        return None;
+    }
+    let mut output = vec![0u8; required as usize];
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            input,
+            -1,
+            output.as_mut_ptr().cast(),
+            required,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    (written != 0).then_some(output)
+}
+
 /// Build a `schar_T` from `buf`, prefixing a space when the sequence
 /// begins with a composing character (`schar_from_buf_first`).
 ///
@@ -3461,6 +3514,23 @@ mod tests {
         assert_eq!(utf8_to_utf16(b"hello"), Some("hello\0".encode_utf16().collect()));
         assert_eq!(utf8_to_utf16("日本".as_bytes()), Some("日本\0".encode_utf16().collect()));
         assert_eq!(utf8_to_utf16(b"one\0two"), Some("one\0".encode_utf16().collect()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf16_to_utf8_converts_and_nul_terminates_text() {
+        assert_eq!(
+            utf16_to_utf8(&"hello\0".encode_utf16().collect::<Vec<_>>()),
+            Some(b"hello\0".to_vec())
+        );
+        assert_eq!(
+            utf16_to_utf8(&"日本\0".encode_utf16().collect::<Vec<_>>()),
+            Some("日本\0".as_bytes().to_vec())
+        );
+        assert_eq!(
+            utf16_to_utf8(&"one\0two".encode_utf16().collect::<Vec<_>>()),
+            Some(b"one\0".to_vec())
+        );
     }
 
     #[test]
