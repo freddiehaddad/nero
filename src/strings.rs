@@ -419,6 +419,33 @@ fn tv_float(tvs: &[crate::eval::typval_defs::TypvalT], idx: &mut usize) -> f64 {
     }
 }
 
+/// Read one formatter argument as display text and advance its one-based
+/// index (`tv_str`).
+///
+/// Rust returns owned bytes for every case, replacing the original's
+/// borrowed-string plus `tofree` out-parameter split.
+#[allow(dead_code)]
+fn tv_str(
+    tvs: &[crate::eval::typval_defs::TypvalT],
+    idx: &mut usize,
+) -> Option<Vec<u8>> {
+    let index = idx.checked_sub(1)?;
+    let tv = tvs.get(index)?;
+    if matches!(&tv.value, crate::eval::typval_defs::TypvalValue::Unknown) {
+        return None;
+    }
+
+    *idx += 1;
+    match &tv.value {
+        crate::eval::typval_defs::TypvalValue::String(_)
+        | crate::eval::typval_defs::TypvalValue::Number(_) => {
+            crate::eval::typval::tv_get_string_chk(tv)
+        }
+        // SAFETY: the value remains live for the entire encoding call.
+        _ => Some(unsafe { crate::eval::encode::encode_tv2echo(tv) }),
+    }
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1087,6 +1114,44 @@ mod tests {
         assert_eq!(index, 2);
         assert_eq!(tv_float(&tvs, &mut index), 0.0);
         assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn tv_str_reads_strings_numbers_and_echo_formatted_values() {
+        let tvs = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"text".to_vec())),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(42),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Special(
+                    crate::eval::typval_defs::SpecialVarValue::Null,
+                ),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+        ];
+        let mut index = 1;
+
+        assert_eq!(tv_str(&tvs, &mut index), Some(b"text".to_vec()));
+        assert_eq!(tv_str(&tvs, &mut index), Some(b"42".to_vec()));
+        assert_eq!(tv_str(&tvs, &mut index), Some(b"v:null".to_vec()));
+        assert_eq!(index, 4);
+    }
+
+    #[test]
+    fn tv_str_does_not_advance_past_unknown_or_missing_arguments() {
+        let tvs = [crate::eval::typval_defs::TypvalT::default()];
+        let mut index = 1;
+
+        assert_eq!(tv_str(&tvs, &mut index), None);
+        assert_eq!(index, 1);
+        let mut missing_index = 2;
+        assert_eq!(tv_str(&tvs, &mut missing_index), None);
+        assert_eq!(missing_index, 2);
     }
 
     #[test]
