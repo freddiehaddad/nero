@@ -2630,6 +2630,16 @@ pub const ENC_ALIAS_TABLE: &[(&[u8], &[u8])] = &[
     (b"mac-roman", b"macroman"),
 ];
 
+/// Search for an encoding alias and return its canonical-table index
+/// (`enc_alias_search`).
+#[must_use]
+fn enc_alias_search(name: &[u8]) -> Option<usize> {
+    let (_, canonical) = ENC_ALIAS_TABLE
+        .iter()
+        .find(|(alias, _)| *alias == name)?;
+    enc_canon_search(canonical)
+}
+
 /// Return the canonical spelling of an encoding name
 /// (`enc_canonize`).
 #[must_use]
@@ -2664,8 +2674,8 @@ pub fn enc_canonize(enc: &[u8]) -> Vec<u8> {
     if enc_canon_search(&name).is_some() {
         return name;
     }
-    if let Some((_, canon)) = ENC_ALIAS_TABLE.iter().find(|(alias, _)| *alias == name) {
-        return canon.to_vec();
+    if let Some(index) = enc_alias_search(&name) {
+        return ENC_CANON_TABLE[index].name.as_bytes().to_vec();
     }
 
     normalized.truncate(prefix_len);
@@ -2925,6 +2935,13 @@ mod tests {
             ENC_ALIAS_TABLE[62],
             (&b"mac-roman"[..], &b"macroman"[..])
         );
+    }
+
+    #[test]
+    fn enc_alias_search_returns_the_canonical_table_index() {
+        assert_eq!(enc_alias_search(b"utf8"), enc_canon_search(b"utf-8"));
+        assert_eq!(enc_alias_search(b"gbk"), enc_canon_search(b"cp936"));
+        assert_eq!(enc_alias_search(b"not-an-alias"), None);
     }
 
     #[test]
