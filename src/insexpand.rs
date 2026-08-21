@@ -269,6 +269,65 @@ pub struct ComplT {
     pub cp_cpt_source_idx: i32,
 }
 
+/// Convert one completion match into its fixed dictionary
+/// (`ins_compl_dict_alloc`).
+///
+/// # Safety
+/// Allocates and mutates a dictionary in the shared evaluator GC registry.
+#[allow(dead_code)]
+unsafe fn ins_compl_dict_alloc(
+    completion: &ComplT,
+) -> *mut crate::eval::typval_defs::DictT {
+    let dict = crate::eval::typval::tv_dict_alloc_lock(
+        crate::eval::typval_defs::VarLockStatus::Fixed,
+    );
+    unsafe {
+        let dict_ref = &mut *dict;
+        crate::eval::typval::tv_dict_add_str(
+            dict_ref,
+            b"word",
+            completion.cp_str.as_deref(),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            dict_ref,
+            b"abbr",
+            completion.cp_text[CPT_ABBR as usize].as_deref(),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            dict_ref,
+            b"menu",
+            completion.cp_text[CPT_MENU as usize].as_deref(),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            dict_ref,
+            b"kind",
+            completion.cp_text[CPT_KIND as usize].as_deref(),
+        );
+        crate::eval::typval::tv_dict_add_str(
+            dict_ref,
+            b"info",
+            completion.cp_text[CPT_INFO as usize].as_deref(),
+        );
+        if matches!(
+            completion.cp_user_data.value,
+            crate::eval::typval_defs::TypvalValue::Unknown
+        ) {
+            crate::eval::typval::tv_dict_add_str(
+                dict_ref,
+                b"user_data",
+                Some(b""),
+            );
+        } else {
+            crate::eval::typval::tv_dict_add_tv(
+                dict_ref,
+                b"user_data",
+                &completion.cp_user_data,
+            );
+        }
+    }
+    dict
+}
+
 /// One `'complete'` option source (`cpt_source_T`).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2430,6 +2489,45 @@ pub unsafe fn set_ref_in_insexpand_funcs(copy_id: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ins_compl_dict_alloc_copies_completion_fields_and_default_user_data() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut completion = ComplT {
+            cp_str: Some(b"word".to_vec()),
+            ..ComplT::default()
+        };
+        completion.cp_text[CPT_ABBR as usize] = Some(b"abbr".to_vec());
+        completion.cp_text[CPT_MENU as usize] = Some(b"menu".to_vec());
+        completion.cp_text[CPT_KIND as usize] = Some(b"kind".to_vec());
+        completion.cp_text[CPT_INFO as usize] = Some(b"info".to_vec());
+
+        let dict = unsafe { ins_compl_dict_alloc(&completion) };
+        unsafe {
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_string(
+                    (&mut *dict).into(),
+                    b"word",
+                ),
+                Some(b"word".to_vec())
+            );
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_string(
+                    (&mut *dict).into(),
+                    b"abbr",
+                ),
+                Some(b"abbr".to_vec())
+            );
+            assert_eq!(
+                crate::eval::typval::tv_dict_get_string(
+                    (&mut *dict).into(),
+                    b"user_data",
+                ),
+                Some(Vec::new())
+            );
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
     use crate::globals::global_state_test_lock;
 
     // ---- compl_shown_match predicates ----
