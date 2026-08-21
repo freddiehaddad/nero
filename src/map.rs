@@ -57,6 +57,20 @@ fn hash_of<K: Hash>(key: &K) -> u32 {
     hasher.finish() as u32
 }
 
+/// Hash a NUL-terminated string key (`hash_cstr_t`).
+#[allow(dead_code)]
+#[must_use]
+fn hash_cstr_t(key: &[u8]) -> u32 {
+    let mut hash = 0u32;
+    for &byte in key {
+        if byte == 0 {
+            break;
+        }
+        hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    hash
+}
+
 /// A hash set with insertion-order-preserving compact storage
 /// (`Set(T)`/`MH_DECLS`/`KEY_DECLS`).
 ///
@@ -393,6 +407,14 @@ impl<K: Hash + Eq + Clone, V: Default + Clone> Map<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_cstr_t_uses_the_source_polynomial_and_stops_at_nul() {
+        assert_eq!(hash_cstr_t(b""), 0);
+        assert_eq!(hash_cstr_t(b"a"), u32::from(b'a'));
+        assert_eq!(hash_cstr_t(b"ab"), u32::from(b'a') * 31 + u32::from(b'b'));
+        assert_eq!(hash_cstr_t(b"ab\0ignored"), hash_cstr_t(b"ab"));
+    }
 
     #[test]
     fn set_put_get_delete_roundtrip() {
