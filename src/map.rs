@@ -138,6 +138,16 @@ fn equal_hl_entry(
     first == second
 }
 
+/// Compare color-cache map keys (`equal_ColorKey`).
+#[allow(dead_code)]
+#[must_use]
+fn equal_color_key(
+    first: crate::highlight_defs::ColorKey,
+    second: crate::highlight_defs::ColorKey,
+) -> bool {
+    first == second
+}
+
 /// A hash set with insertion-order-preserving compact storage
 /// (`Set(T)`/`MH_DECLS`/`KEY_DECLS`).
 ///
@@ -537,6 +547,20 @@ mod tests {
                 winid: 4,
                 ..entry
             }
+        ));
+    }
+
+    #[test]
+    fn equal_color_key_compares_namespace_and_syntax_ids() {
+        let key = crate::highlight_defs::ColorKey::new(1, 2);
+        assert!(equal_color_key(key, key));
+        assert!(!equal_color_key(
+            key,
+            crate::highlight_defs::ColorKey::new(1, 3)
+        ));
+        assert!(!equal_color_key(
+            key,
+            crate::highlight_defs::ColorKey::new(3, 2)
         ));
     }
 
