@@ -182,7 +182,6 @@ pub fn os_isatty(fd: i32) -> bool {
 ///
 /// # Safety
 /// A non-null `events` pointer must identify a live `MultiQueue`.
-#[allow(dead_code)]
 #[must_use]
 unsafe fn pending_events(
     events: *const crate::event::multiqueue::MultiQueue,
@@ -191,6 +190,21 @@ unsafe fn pending_events(
         && !unsafe {
             crate::event::multiqueue::multiqueue_empty(events)
         }
+}
+
+/// Whether typeahead, raw input, or queued events are pending
+/// (`os_input_ready`).
+///
+/// # Safety
+/// A non-null `events` pointer must identify a live `MultiQueue`;
+/// reads shared input and global typeahead state.
+#[must_use]
+pub unsafe fn os_input_ready(
+        events: *const crate::event::multiqueue::MultiQueue,
+) -> bool {
+        (unsafe { (*crate::globals::GLOBALS.as_ptr()).typebuf_was_filled })
+            || unsafe { input_available() } != 0
+            || unsafe { pending_events(events) }
 }
 
 /// Whether the main loop is blocked waiting for input
@@ -479,6 +493,72 @@ mod tests {
             );
         }
         assert!(unsafe { pending_events(queue) });
+        unsafe { crate::event::multiqueue::multiqueue_free(queue) };
+    }
+
+    #[test]
+    fn os_input_ready_is_false_without_typeahead_input_or_events() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _typebuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.typebuf_was_filled,
+                false,
+            )
+        };
+        assert!(!unsafe { os_input_ready(std::ptr::null()) });
+    }
+
+    #[test]
+    fn os_input_ready_short_circuits_for_typeahead() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _typebuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.typebuf_was_filled,
+                true,
+            )
+        };
+        let dangling = std::ptr::dangling();
+        assert!(unsafe { os_input_ready(dangling) });
+    }
+
+    #[test]
+    fn os_input_ready_short_circuits_for_raw_input() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _typebuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.typebuf_was_filled,
+                false,
+            )
+        };
+        unsafe { input_enqueue_raw(b"x") };
+        let dangling = std::ptr::dangling();
+        assert!(unsafe { os_input_ready(dangling) });
+    }
+
+    #[test]
+    fn os_input_ready_detects_a_queued_event() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _typebuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.typebuf_was_filled,
+                false,
+            )
+        };
+        let queue = crate::event::multiqueue::multiqueue_new(
+            None,
+            std::ptr::null_mut(),
+        );
+        unsafe {
+            crate::event::multiqueue::multiqueue_put_event(
+                queue,
+                crate::event::defs::Event::default(),
+            );
+        }
+        assert!(unsafe { os_input_ready(queue) });
         unsafe { crate::event::multiqueue::multiqueue_free(queue) };
     }
 
