@@ -410,6 +410,21 @@ fn illegal_char_after_chr(c: i32) -> Vec<u8> {
     message
 }
 
+/// Build the `E539` option-validation message (`illegal_char`).
+///
+/// # Safety
+/// Forwards [`crate::charset::transchar`]'s shared-current-buffer contract.
+#[allow(dead_code)]
+unsafe fn illegal_char(c: i32) -> Vec<u8> {
+    let mut message = b"E539: Illegal character <".to_vec();
+    // SAFETY: forwarded from this function's own safety contract.
+    let rendered = unsafe { crate::charset::transchar(c) };
+    let len = rendered.iter().position(|&byte| byte == 0).unwrap_or(rendered.len());
+    message.extend_from_slice(&rendered[..len]);
+    message.push(b'>');
+    message
+}
+
 /// Whether `val` contains an illegal character for an option flagged
 /// `NFNAME`/`NDNAME` (`check_illegal_path_names`, `optionstr.c`) -
 /// used to reject dangerous characters (e.g. a literal `;`/`&`/`|`
@@ -4668,6 +4683,22 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    #[test]
+    fn illegal_char_uses_transchar_rendering() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buffer = crate::buffer_defs::BufT::default();
+        let buffer_ptr = std::ptr::addr_of_mut!(buffer);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buffer_ptr,
+            )
+        };
+
+        assert_eq!(unsafe { illegal_char(i32::from(b'X')) }, b"E539: Illegal character <X>");
+        assert_eq!(unsafe { illegal_char(1) }, b"E539: Illegal character <^A>");
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
