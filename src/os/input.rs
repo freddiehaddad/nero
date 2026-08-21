@@ -34,6 +34,7 @@ impl InputBuffer {
 
 static INPUT_BUFFER: GlobalCell<InputBuffer> =
     GlobalCell::new(InputBuffer::new());
+static EVENT_KEY_INDEX: GlobalCell<usize> = GlobalCell::new(0);
 
 /// Number of unread bytes in the raw input buffer
 /// (`input_available`).
@@ -83,6 +84,31 @@ pub unsafe fn input_enqueue_raw(data: &[u8]) {
     input.write_pos += to_write;
 }
 
+/// Emit the `KE_EVENT` key sequence, continuing across calls when the
+/// caller's buffer is shorter than three bytes (`push_event_key`).
+///
+/// # Safety
+/// Mutates shared event-key cursor state.
+pub unsafe fn push_event_key(buf: &mut [u8]) -> usize {
+    assert!(!buf.is_empty());
+    const KEY: [u8; 3] = [
+        crate::keycodes_defs::K_SPECIAL,
+        crate::keycodes_defs::KS_EXTRA,
+        crate::keycodes_defs::KE_EVENT,
+    ];
+    let key_index = unsafe { EVENT_KEY_INDEX.get_mut() };
+    let mut written = 0;
+    loop {
+        buf[written] = KEY[*key_index];
+        written += 1;
+        *key_index = (*key_index + 1) % KEY.len();
+        if *key_index == 0 || written == buf.len() {
+            break;
+        }
+    }
+    written
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -113,6 +139,22 @@ mod tests {
     impl Drop for InputBufferGuard {
         fn drop(&mut self) {
             unsafe { *INPUT_BUFFER.get_mut() = self.0 };
+        }
+    }
+
+    struct EventKeyIndexGuard(usize);
+
+    impl EventKeyIndexGuard {
+        unsafe fn reset() -> Self {
+            Self(unsafe {
+                std::mem::replace(EVENT_KEY_INDEX.get_mut(), 0)
+            })
+        }
+    }
+
+    impl Drop for EventKeyIndexGuard {
+        fn drop(&mut self) {
+            unsafe { *EVENT_KEY_INDEX.get_mut() = self.0 };
         }
     }
 
@@ -188,6 +230,51 @@ mod tests {
         let input = unsafe { INPUT_BUFFER.get_mut() };
         assert_eq!(input.write_pos, INPUT_BUFFER_SIZE);
         assert_eq!(&input.data[INPUT_BUFFER_SIZE - 2..], b"ab");
+    }
+
+    #[test]
+    fn push_event_key_emits_the_full_sequence_when_it_fits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _index = unsafe { EventKeyIndexGuard::reset() };
+        let mut buf = [0u8; 3];
+        assert_eq!(unsafe { push_event_key(&mut buf) }, 3);
+        assert_eq!(
+            buf,
+            [
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_EXTRA,
+                crate::keycodes_defs::KE_EVENT,
+            ]
+        );
+        assert_eq!(unsafe { *EVENT_KEY_INDEX.get_mut() }, 0);
+    }
+
+    #[test]
+    fn push_event_key_continues_a_partial_sequence_across_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _index = unsafe { EventKeyIndexGuard::reset() };
+        let mut first = [0u8; 2];
+        let mut second = [0u8; 2];
+
+        assert_eq!(unsafe { push_event_key(&mut first) }, 2);
+        assert_eq!(
+            first,
+            [
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_EXTRA,
+            ]
+        );
+        assert_eq!(unsafe { push_event_key(&mut second) }, 1);
+        assert_eq!(second[0], crate::keycodes_defs::KE_EVENT);
+        assert_eq!(unsafe { *EVENT_KEY_INDEX.get_mut() }, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn push_event_key_requires_nonempty_output() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _index = unsafe { EventKeyIndexGuard::reset() };
+        let _ = unsafe { push_event_key(&mut []) };
     }
 
     #[test]
