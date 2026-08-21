@@ -4853,12 +4853,6 @@ pub unsafe fn skip_expr(arg: &[u8], mut evalarg: Option<&mut EvalargT>) -> (i32,
 /// [`crate::eval::typval::tv_get_string`]'s own implicit requirement,
 /// same as every other function in this crate touching those types).
 ///
-/// # Deferred
-/// A `List`/`Dict` value with `join_list = false` needs
-/// `encode_tv2string` (`eval/encode.c`'s ~970-line JSON-like
-/// stringification engine, a substantial separate undertaking) -
-/// `unimplemented!()`s there. Every other value type uses
-/// [`crate::eval::typval::tv_get_string`], already real.
 unsafe fn typval2string(tv: &TypvalT, join_list: bool) -> Vec<u8> {
     if join_list
         && let TypvalValue::List(l) = tv.value
@@ -4876,10 +4870,7 @@ unsafe fn typval2string(tv: &TypvalT, join_list: bool) -> Vec<u8> {
         return out;
     }
     if matches!(tv.value, TypvalValue::List(_) | TypvalValue::Dict(_)) {
-        unimplemented!(
-            "typval2string: List/Dict stringification needs encode_tv2string (eval/encode.c), \
-             a substantial separate undertaking, not yet translated"
-        );
+        return unsafe { crate::eval::encode::encode_tv2string(tv) };
     }
     crate::eval::typval::tv_get_string(tv)
 }
@@ -11224,24 +11215,35 @@ mod tests {
     }
 
     #[test]
-    fn eval_to_string_list_value_is_unimplemented() {
+    fn typval2string_encodes_list_and_dict_values() {
         let _lock = crate::globals::global_state_test_lock();
-        // Tests typval2string directly (rather than through the full
-        // eval_to_string/eval0 pipeline that would evaluate "[1, 2]"
-        // as a real expression) so the allocated list can be cleanly
-        // released regardless of the panic below - going through
-        // eval_to_string would leak the list into GC_FIRST_LIST
-        // forever, since the panic unwinds past any point where this
-        // test could reach eval_to_string's own internal `tv` to clean
-        // it up, corrupting every later GC-linked-list test in this
-        // process.
         let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 1);
+            crate::eval::typval::tv_list_append_number(list, 2);
+        }
         let tv = TypvalT { value: TypvalValue::List(list), ..Default::default() };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { typval2string(&tv, false) }));
-        assert!(result.is_err(), "expected a panic (encode_tv2string not yet translated)");
-        // SAFETY: list was freshly allocated above and never shared
-        // with anything else; typval2string never takes ownership.
+        assert_eq!(
+            unsafe { typval2string(&tv, false) },
+            b"[1, 2]".to_vec()
+        );
         unsafe { crate::eval::typval::tv_list_unref(list) };
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        crate::eval::typval::tv_dict_add_nr(
+            unsafe { &mut *dict },
+            b"key",
+            3,
+        );
+        let tv = TypvalT {
+            value: TypvalValue::Dict(dict),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { typval2string(&tv, false) },
+            b"{'key': 3}".to_vec()
+        );
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
     }
 
     #[test]
