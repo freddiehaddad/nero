@@ -16,6 +16,15 @@ fn user_db_lock() -> std::sync::MutexGuard<'static, ()> {
 static USERS: std::sync::LazyLock<Vec<Vec<u8>>> =
     std::sync::LazyLock::new(os_get_usernames);
 
+/// Append one nonempty username (`add_user`).
+fn add_user(users: &mut Vec<Vec<u8>>, user: Option<&[u8]>) {
+    if let Some(user) = user
+        && !user.is_empty()
+    {
+        users.push(user.to_vec());
+    }
+}
+
 /// Gets the username associated with `uid` (`os_get_uname`).
 ///
 /// @return `Ok(name)` if a real username was found, `Err(fallback)`
@@ -100,9 +109,7 @@ pub fn os_get_usernames() -> Vec<Vec<u8>> {
                 continue;
             }
             let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
-            if !name.is_empty() {
-                users.push(name.to_vec());
-            }
+            add_user(&mut users, Some(name));
         }
         unsafe { libc::endpwent() };
 
@@ -117,9 +124,7 @@ pub fn os_get_usernames() -> Vec<Vec<u8>> {
                 if !name.is_null() {
                     let name =
                         unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
-                    if !name.is_empty() {
-                        users.push(name.to_vec());
-                    }
+                    add_user(&mut users, Some(name));
                 }
             }
         }
@@ -181,11 +186,8 @@ pub fn os_get_usernames() -> Vec<Vec<u8>> {
                 }
                 let name =
                     unsafe { std::slice::from_raw_parts(entry.name, len) };
-                if !name.is_empty() {
-                    users.push(
-                        String::from_utf16_lossy(name).into_bytes(),
-                    );
-                }
+                let name = String::from_utf16_lossy(name).into_bytes();
+                add_user(&mut users, Some(&name));
             }
             unsafe { NetApiBufferFree(buffer.cast()) };
         }
@@ -273,6 +275,18 @@ pub fn os_get_userdir(name: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_user_ignores_missing_and_empty_names_and_copies_values() {
+        let mut users = vec![b"existing".to_vec()];
+        add_user(&mut users, None);
+        add_user(&mut users, Some(b""));
+        let mut source = b"new-user".to_vec();
+        add_user(&mut users, Some(&source));
+        source[0] = b'X';
+
+        assert_eq!(users, vec![b"existing".to_vec(), b"new-user".to_vec()]);
+    }
 
     #[test]
     fn os_get_username_returns_something_nonempty() {
