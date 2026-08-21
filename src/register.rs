@@ -611,9 +611,8 @@ static RECORD_REGNAME: crate::globals::GlobalCell<i32> =
 
 /// Start or stop macro recording (`do_record`).
 ///
-/// Display updates are omitted. A genuinely registered RecordingEnter
-/// or RecordingLeave handler still needs the full `v:event` payload
-/// lifecycle and stops at that point.
+/// Display updates are omitted. RecordingEnter dispatch is real;
+/// RecordingLeave payload construction is translated separately below.
 ///
 /// # Safety
 /// Mutates shared recording, register and autocmd state.
@@ -630,13 +629,15 @@ pub unsafe fn do_record(c: i32) -> i32 {
             (*globals).reg_recording = c;
             *RECORD_REGNAME.get_mut() = c;
         }
-        if crate::autocmd::has_event(
+        let curbuf =
+            unsafe { (*globals).curbuf.as_ref() };
+        let _ = crate::autocmd::apply_autocmds(
             crate::autocmd_defs::EventT::RecordingEnter,
-        ) {
-            unimplemented!(
-                "do_record: RecordingEnter handlers need the v:event lifecycle"
-            );
-        }
+            None,
+            None,
+            false,
+            curbuf,
+        );
         return crate::vim_defs::OK;
     }
 
