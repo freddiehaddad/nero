@@ -8,7 +8,8 @@
 //! (trivial `mb_strnicmp(s1, s2, MAXCOL)` wrapper) - plus, now that
 //! the `utf8proc-sys` FFI dependency has actually been added (see
 //! `Cargo.toml`'s own comment recording that decision):
-//! `utf_iscomposing_first`, `utf_composinglike`, `utf_iscomposing`,
+//! `utf_iscomposing_first`, `utf_iscomposing_legacy`,
+//! `utf_composinglike`, `utf_iscomposing`,
 //! `utfc_ptr2len`, `utfc_ptr2len_len`, `utf_fold`, `mb_toupper`/
 //! `mb_tolower`/`mb_islower`/`mb_isupper`; character *display width*:
 //! `intable`/`utf_printable` (the portable, non-`__SSE2__` reference
@@ -582,6 +583,19 @@ pub fn utf_iscomposing_first(c: i32) -> bool {
     // SAFETY: utf8proc_grapheme_break is a pure function with no
     // preconditions on its inputs.
     c >= 128 && !unsafe { utf8proc_sys::utf8proc_grapheme_break(b' ' as i32, c) }
+}
+
+/// Return whether `c` is a legacy composing UTF-8 character
+/// (`utf_iscomposing_legacy`).
+#[must_use]
+pub fn utf_iscomposing_legacy(c: i32) -> bool {
+    // SAFETY: utf8proc_get_property always returns a valid property pointer,
+    // including for invalid or unassigned codepoints.
+    let category = unsafe { (*utf8proc_sys::utf8proc_get_property(c)).category };
+    category
+        == utf8proc_sys::utf8proc_category_t::UTF8PROC_CATEGORY_MN.0 as i16
+        || category
+            == utf8proc_sys::utf8proc_category_t::UTF8PROC_CATEGORY_ME.0 as i16
 }
 
 /// Check if the character pointed to by `p2` is a composing character
@@ -3305,6 +3319,19 @@ mod tests {
     fn utf_iscomposing_first_is_true_for_a_combining_mark() {
         // U+0301 COMBINING ACUTE ACCENT is a well-known combining mark.
         assert!(utf_iscomposing_first(0x0301));
+    }
+
+    #[test]
+    fn utf_iscomposing_legacy_accepts_nonspacing_and_enclosing_marks() {
+        assert!(utf_iscomposing_legacy(0x0301)); // Mn
+        assert!(utf_iscomposing_legacy(0x20dd)); // Me
+    }
+
+    #[test]
+    fn utf_iscomposing_legacy_rejects_other_categories_and_invalid_values() {
+        assert!(!utf_iscomposing_legacy(0x0903)); // Mc
+        assert!(!utf_iscomposing_legacy(b'A' as i32));
+        assert!(!utf_iscomposing_legacy(-1));
     }
 
     #[test]
