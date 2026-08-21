@@ -227,12 +227,21 @@ pub unsafe fn remove_duplicate_strings(names: &mut Vec<Vec<u8>>) {
 /// For a list of strings: concatenate all of them with `sep` as
 /// separator (`ga_concat_strings`). Modeled as a plain `&[Vec<u8>]`-
 /// taking function rather than a `GarrayT` method, per this module's
-/// own doc comment. Rust's own `[T]::join` already does exactly what
-/// the original's own manual length-then-copy two-pass loop achieves
-/// by hand.
+/// own doc comment.
 #[must_use]
 pub fn concat_strings(strings: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
-    strings.join(sep)
+    let payload_len: usize = strings.iter().map(Vec::len).sum();
+    let separator_len = sep.len().saturating_mul(strings.len().saturating_sub(1));
+    let mut result = Vec::with_capacity(payload_len + separator_len);
+
+    for (idx, string) in strings.iter().enumerate() {
+        if idx != 0 {
+            result.extend_from_slice(sep);
+        }
+        result.extend_from_slice(string);
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -383,5 +392,12 @@ mod tests {
     fn concat_strings_single_element_has_no_separator() {
         let strings = vec![b"only".to_vec()];
         assert_eq!(concat_strings(&strings, b","), b"only".to_vec());
+    }
+
+    #[test]
+    fn concat_strings_supports_empty_elements_and_separator() {
+        let strings = vec![Vec::new(), b"b".to_vec(), Vec::new()];
+        assert_eq!(concat_strings(&strings, b"::"), b"::b::".to_vec());
+        assert_eq!(concat_strings(&strings, b""), b"b".to_vec());
     }
 }
