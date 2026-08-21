@@ -36,6 +36,8 @@ static INPUT_BUFFER: GlobalCell<InputBuffer> =
     GlobalCell::new(InputBuffer::new());
 static EVENT_KEY_INDEX: GlobalCell<usize> = GlobalCell::new(0);
 static INPUT_EOF: GlobalCell<bool> = GlobalCell::new(false);
+static CURSORHOLD_TIME: GlobalCell<i32> = GlobalCell::new(0);
+static CURSORHOLD_TB_CHANGE_CNT: GlobalCell<i32> = GlobalCell::new(0);
 
 /// Number of unread bytes in the raw input buffer
 /// (`input_available`).
@@ -223,6 +225,19 @@ unsafe fn input_read_cb(data: &[u8], at_eof: bool) -> usize {
     data.len()
 }
 
+/// Restart the CursorHold wait for a new typeahead generation
+/// (`reset_cursorhold_wait`).
+///
+/// # Safety
+/// Mutates shared CursorHold timing state.
+#[allow(dead_code)]
+unsafe fn reset_cursorhold_wait(tb_change_cnt: i32) {
+    unsafe {
+        *CURSORHOLD_TIME.get_mut() = 0;
+        *CURSORHOLD_TB_CHANGE_CNT.get_mut() = tb_change_cnt;
+    }
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -285,6 +300,37 @@ mod tests {
     impl Drop for InputEofGuard {
         fn drop(&mut self) {
             unsafe { *INPUT_EOF.get_mut() = self.0 };
+        }
+    }
+
+    struct CursorholdGuard {
+        time: i32,
+        change_count: i32,
+    }
+
+    impl CursorholdGuard {
+        unsafe fn set(time: i32, change_count: i32) -> Self {
+            let previous = Self {
+                time: unsafe { *CURSORHOLD_TIME.get_mut() },
+                change_count: unsafe {
+                    *CURSORHOLD_TB_CHANGE_CNT.get_mut()
+                },
+            };
+            unsafe {
+                *CURSORHOLD_TIME.get_mut() = time;
+                *CURSORHOLD_TB_CHANGE_CNT.get_mut() = change_count;
+            }
+            previous
+        }
+    }
+
+    impl Drop for CursorholdGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *CURSORHOLD_TIME.get_mut() = self.time;
+                *CURSORHOLD_TB_CHANGE_CNT.get_mut() =
+                    self.change_count;
+            }
         }
     }
 
@@ -614,6 +660,18 @@ mod tests {
         let _eof = unsafe { InputEofGuard::reset() };
         assert_eq!(unsafe { input_read_cb(b"", true) }, 0);
         assert!(unsafe { *INPUT_EOF.get_mut() });
+    }
+
+    #[test]
+    fn reset_cursorhold_wait_clears_time_and_records_change_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cursorhold = unsafe { CursorholdGuard::set(123, 456) };
+        unsafe { reset_cursorhold_wait(789) };
+        assert_eq!(unsafe { *CURSORHOLD_TIME.get_mut() }, 0);
+        assert_eq!(
+            unsafe { *CURSORHOLD_TB_CHANGE_CNT.get_mut() },
+            789
+        );
     }
 
     #[test]
