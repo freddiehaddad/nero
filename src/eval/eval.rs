@@ -4806,6 +4806,33 @@ pub unsafe fn eval_expr_typval(
     unsafe { eval_expr_string(expr, rettv) }
 }
 
+/// Evaluate a String/Funcref/Partial expression and convert its result
+/// to a boolean (`eval_expr_to_bool`).
+///
+/// String expressions are fully supported. Funcref/Partial expressions
+/// inherit [`eval_expr_typval`]'s documented function-call dependency.
+///
+/// # Safety
+/// Forwarded from [`eval_expr_typval`] and
+/// [`crate::eval::typval::tv_clear_simple`].
+#[must_use]
+pub unsafe fn eval_expr_to_bool(expr: &TypvalT, error: &mut bool) -> bool {
+    let mut rettv = TypvalT::default();
+    // The original passes an uninitialized one-element `argv` buffer
+    // with `argc == 0`; an empty slice is its exact Rust equivalent.
+    let mut argv = [];
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { eval_expr_typval(expr, false, &mut argv, &mut rettv) } == FAIL {
+        *error = true;
+        return false;
+    }
+
+    let result = crate::eval::typval::tv_get_number_chk(&rettv, Some(error)) != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    result
+}
+
 /// Skip over an expression at `arg`, without evaluating it
 /// (`skip_expr`).
 ///
@@ -8815,7 +8842,8 @@ mod tests {
         assert_eq!(eap.arg, Some(b"new_line".to_vec()));
     }
 
-    // --- eval1_emsg / eval_expr_string / eval_expr_typval ---
+    // --- eval1_emsg / eval_expr_string / eval_expr_typval /
+    //     eval_expr_to_bool ---
 
     #[test]
     fn eval1_emsg_evaluates_a_simple_expression() {
@@ -8879,6 +8907,42 @@ mod tests {
         let ret = unsafe { eval_expr_typval(&expr, false, &mut [], &mut rettv) };
         assert_eq!(ret, OK);
         assert_eq!(rettv.value, TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn eval_expr_to_bool_returns_true_for_a_truthy_expression() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"3 > 2".to_vec())), ..TypvalT::default() };
+        let mut error = false;
+        assert!(unsafe { eval_expr_to_bool(&expr, &mut error) });
+        assert!(!error);
+    }
+
+    #[test]
+    fn eval_expr_to_bool_returns_false_for_a_falsy_expression() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"0".to_vec())), ..TypvalT::default() };
+        let mut error = false;
+        assert!(!unsafe { eval_expr_to_bool(&expr, &mut error) });
+        assert!(!error);
+    }
+
+    #[test]
+    fn eval_expr_to_bool_reports_an_expression_failure() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b")".to_vec())), ..TypvalT::default() };
+        let mut error = false;
+        assert!(!unsafe { eval_expr_to_bool(&expr, &mut error) });
+        assert!(error);
+    }
+
+    #[test]
+    fn eval_expr_to_bool_releases_a_non_numeric_list_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        let expr = TypvalT { value: TypvalValue::String(Some(b"[1]".to_vec())), ..TypvalT::default() };
+        let mut error = false;
+        assert!(!unsafe { eval_expr_to_bool(&expr, &mut error) });
+        assert!(error);
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 
     #[test]
