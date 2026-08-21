@@ -110,13 +110,8 @@ pub fn get_real_state() -> i32 {
 /// that default (no insert-completion subsystem exists) - but this is
 /// no longer a hardcoded assumption baked into THIS function, it is
 /// the genuine, current answer from `insexpand.rs`'s own real state.
-/// The `MODE_CMDLINE`-dependent branches (needing `ex_getln.c`'s
-/// `get_cmdline_info()`/`cmdline_overstrike()`, neither translated)
-/// panic via `unimplemented!()` if ever actually reached - unlike the
-/// two predicates above, nothing in this crate can currently
-/// construct a `State` value with the `MODE_CMDLINE` bit set at all
-/// (no command-line editing subsystem exists), so there is no real
-/// default to fall back on for those specific branches.
+/// Command-line one-key and overstrike state comes from the translated
+/// `ex_getln` accessors.
 ///
 /// # Safety
 /// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
@@ -127,18 +122,12 @@ pub unsafe fn get_mode() -> Vec<u8> {
     let g = unsafe { crate::globals::GLOBALS.get_mut() };
     let mut buf = Vec::new();
 
-    // The 4th OR operand (`(State & MODE_CMDLINE) && get_cmdline_info()
-    // .one_key`) is short-circuited exactly like the original: the
-    // `unimplemented!()` only actually runs if the CMDLINE bit is set,
-    // which nothing in this crate can currently do.
     #[allow(clippy::nonminimal_bool)]
     if g.State == mode::HITRETURN as i32
         || g.State == mode::ASKMORE as i32
         || g.State == mode::SETWSIZE as i32
         || (g.State & mode::CMDLINE as i32 != 0
-            && unimplemented!(
-                "get_mode: MODE_CMDLINE's one_key state needs ex_getln.c's get_cmdline_info, not yet translated"
-            ))
+            && unsafe { (*crate::ex_getln::get_cmdline_info()).one_key })
     {
         buf.push(b'r');
         if g.State == mode::ASKMORE as i32 {
@@ -169,9 +158,7 @@ pub unsafe fn get_mode() -> Vec<u8> {
             buf.push(b'v');
         }
         if g.State & mode::CMDLINE as i32 != 0
-            && unimplemented!(
-                "get_mode: MODE_CMDLINE's overstrike state needs ex_getln.c's cmdline_overstrike, not yet translated"
-            )
+            && crate::ex_getln::cmdline_overstrike()
         {
             buf.push(b'r');
         }
@@ -661,6 +648,66 @@ mod tests {
         let result = unsafe { get_mode() };
         reset_mode_globals();
         assert_eq!(result, b"!".to_vec());
+    }
+
+    struct CmdlineModeGuard {
+        one_key: bool,
+        overstrike: i32,
+    }
+
+    impl CmdlineModeGuard {
+        fn set(one_key: bool, overstrike: i32) -> Self {
+            let info = unsafe { &mut *crate::ex_getln::get_cmdline_info() };
+            let guard = Self {
+                one_key: info.one_key,
+                overstrike: info.overstrike,
+            };
+            info.one_key = one_key;
+            info.overstrike = overstrike;
+            guard
+        }
+    }
+
+    impl Drop for CmdlineModeGuard {
+        fn drop(&mut self) {
+            let info = unsafe { &mut *crate::ex_getln::get_cmdline_info() };
+            info.one_key = self.one_key;
+            info.overstrike = self.overstrike;
+        }
+    }
+
+    #[test]
+    fn get_mode_cmdline_reports_normal_and_overstrike_modes() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard =
+            CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        reset_mode_globals();
+        unsafe { GLOBALS.get_mut() }.State = mode::CMDLINE as i32;
+
+        {
+            let _cmdline = CmdlineModeGuard::set(false, 0);
+            assert_eq!(unsafe { get_mode() }, b"c");
+        }
+        {
+            let _cmdline = CmdlineModeGuard::set(false, 1);
+            assert_eq!(unsafe { get_mode() }, b"cr");
+        }
+        reset_mode_globals();
+    }
+
+    #[test]
+    fn get_mode_cmdline_one_key_reports_prompt_mode() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard =
+            CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        let _cmdline = CmdlineModeGuard::set(true, 0);
+        reset_mode_globals();
+        unsafe { GLOBALS.get_mut() }.State = mode::CMDLINE as i32;
+
+        let result = unsafe { get_mode() };
+
+        reset_mode_globals();
+        assert_eq!(result, b"r?");
     }
 
     /// Resets `GLOBALS.global_busy`/`debug_mode` to their real
