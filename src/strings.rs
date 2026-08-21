@@ -394,6 +394,31 @@ fn tv_nr(
     if error { 0 } else { number }
 }
 
+/// Read one floating-point formatter argument and advance its one-based index
+/// (`tv_float`).
+///
+/// Number values are widened to `f64`; missing or invalid values retain the
+/// source's zero fallback.
+#[allow(dead_code)]
+fn tv_float(tvs: &[crate::eval::typval_defs::TypvalT], idx: &mut usize) -> f64 {
+    let Some(index) = idx.checked_sub(1) else {
+        return 0.0;
+    };
+    let Some(tv) = tvs.get(index) else {
+        return 0.0;
+    };
+    if matches!(&tv.value, crate::eval::typval_defs::TypvalValue::Unknown) {
+        return 0.0;
+    }
+
+    *idx += 1;
+    match &tv.value {
+        crate::eval::typval_defs::TypvalValue::Float(value) => *value,
+        crate::eval::typval_defs::TypvalValue::Number(value) => *value as f64,
+        _ => 0.0,
+    }
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -1025,6 +1050,42 @@ mod tests {
         let mut index = 1;
 
         assert_eq!(tv_nr(&tvs, &mut index), 0);
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn tv_float_reads_float_and_number_arguments() {
+        let tvs = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Float(1.5),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(7),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+        ];
+        let mut index = 1;
+
+        assert_eq!(tv_float(&tvs, &mut index), 1.5);
+        assert_eq!(tv_float(&tvs, &mut index), 7.0);
+        assert_eq!(index, 3);
+    }
+
+    #[test]
+    fn tv_float_rejects_other_types_and_does_not_advance_past_unknown() {
+        let tvs = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"x".to_vec())),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT::default(),
+        ];
+        let mut index = 1;
+
+        assert_eq!(tv_float(&tvs, &mut index), 0.0);
+        assert_eq!(index, 2);
+        assert_eq!(tv_float(&tvs, &mut index), 0.0);
         assert_eq!(index, 2);
     }
 
