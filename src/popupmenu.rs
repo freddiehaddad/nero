@@ -36,12 +36,8 @@
 //! translated through `ui_pum_get_height` with the original fallback.
 //!
 //! Also [`pum_set_event_info`] (`pum_getpos()`'s own real backend) -
-//! its own FIRST check is `!pum_visible()`, always true today, so it
-//! always takes the "leave the dict empty" early return - the real
-//! body needing `ui_pum_get_pos`/`pum_width`/`pum_height`/`pum_row`/
-//! `pum_col`/`pum_size`/`pum_scrollbar` is `unimplemented!()`,
-//! unreachable for the same reason `pum_visible` itself never returns
-//! `true`.
+//! it uses attached-UI geometry when available and otherwise reports
+//! the internal popup-menu geometry.
 //!
 //! Also translated: [`PumitemT`] (`pumitem_T`, from `popupmenu.h`) -
 //! one popup menu entry. Translated ahead of `pum_display`, its own
@@ -128,6 +124,8 @@ static PUM_SCROLLBAR: GlobalCell<i32> = GlobalCell::new(0);
 static PUM_RL: GlobalCell<bool> = GlobalCell::new(false);
 /// Popup-menu anchor column (`pum_col`).
 static PUM_COL: GlobalCell<i32> = GlobalCell::new(0);
+/// Popup-menu anchor row (`pum_row`).
+static PUM_ROW: GlobalCell<i32> = GlobalCell::new(0);
 
 /// One popup menu entry (`pumitem_T`).
 ///
@@ -425,21 +423,37 @@ pub unsafe fn pum_align_order() -> [i32; 3] {
 /// EMPTY if the popup menu isn't currently visible
 /// (`pum_set_event_info`).
 ///
-/// Since [`pum_visible`] always returns `false` today (nothing in this
-/// crate can currently display a real popup menu), this always takes
-/// the early-return branch - a real, faithful consequence of the
-/// current state, matching this file's own established
-/// "always-empty" pattern, not a hardcoded stub. The real body
-/// (`ui_pum_get_pos`/`pum_width`/`pum_height`/`pum_row`/`pum_col`/
-/// `pum_size`/`pum_scrollbar`, none translated) is `unimplemented!()`,
-/// unreachable today for the same reason.
-pub fn pum_set_event_info(_dict: &mut crate::eval::typval_defs::DictT) {
+pub fn pum_set_event_info(dict: &mut crate::eval::typval_defs::DictT) {
     if !pum_visible() {
         return;
     }
-    unimplemented!(
-        "pum_set_event_info: needs ui_pum_get_pos/pum_width/pum_height/pum_row/pum_col/ \
-         pum_size/pum_scrollbar, none translated"
+    // SAFETY: UI and popup-menu state access is serialized with editor state.
+    let (width, height, row, col) =
+        unsafe { crate::ui::ui_pum_get_pos() }.unwrap_or_else(|| unsafe {
+            (
+                f64::from(*PUM_WIDTH.get_mut()),
+                f64::from(*PUM_HEIGHT.get_mut()),
+                f64::from(*PUM_ROW.get_mut()),
+                f64::from(*PUM_COL.get_mut()),
+            )
+        });
+    crate::eval::typval::tv_dict_add_float(dict, b"height", height);
+    crate::eval::typval::tv_dict_add_float(dict, b"width", width);
+    crate::eval::typval::tv_dict_add_float(dict, b"row", row);
+    crate::eval::typval::tv_dict_add_float(dict, b"col", col);
+    crate::eval::typval::tv_dict_add_nr(
+        dict,
+        b"size",
+        i64::from(unsafe { *PUM_SIZE.get_mut() }),
+    );
+    crate::eval::typval::tv_dict_add_bool(
+        dict,
+        b"scrollbar",
+        if unsafe { *PUM_SCROLLBAR.get_mut() } != 0 {
+            crate::eval::typval_defs::BoolVarValue::True
+        } else {
+            crate::eval::typval_defs::BoolVarValue::False
+        },
     );
 }
 
@@ -528,6 +542,8 @@ pub(crate) mod tests {
         scrollbar: i32,
         right_left: bool,
         col: i32,
+        row: i32,
+        height: i32,
     }
 
     impl PumSizingGuard {
@@ -543,6 +559,8 @@ pub(crate) mod tests {
                 scrollbar: std::mem::replace(unsafe { PUM_SCROLLBAR.get_mut() }, 0),
                 right_left: std::mem::replace(unsafe { PUM_RL.get_mut() }, false),
                 col: std::mem::replace(unsafe { PUM_COL.get_mut() }, 0),
+                row: std::mem::replace(unsafe { PUM_ROW.get_mut() }, 0),
+                height: std::mem::replace(unsafe { PUM_HEIGHT.get_mut() }, 0),
             }
         }
     }
@@ -558,6 +576,8 @@ pub(crate) mod tests {
             *unsafe { PUM_SCROLLBAR.get_mut() } = self.scrollbar;
             *unsafe { PUM_RL.get_mut() } = self.right_left;
             *unsafe { PUM_COL.get_mut() } = self.col;
+            *unsafe { PUM_ROW.get_mut() } = self.row;
+            *unsafe { PUM_HEIGHT.get_mut() } = self.height;
         }
     }
 
@@ -681,6 +701,67 @@ pub(crate) mod tests {
 
         let options = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         (options.p_pw, options.p_pmw) = saved;
+    }
+
+    #[test]
+    fn pum_set_event_info_reports_internal_geometry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _visible = PumVisibleGuard::set(true);
+        let _sizing = PumSizingGuard::install(Vec::new());
+        unsafe {
+            *PUM_WIDTH.get_mut() = 12;
+            *PUM_HEIGHT.get_mut() = 4;
+            *PUM_ROW.get_mut() = 3;
+            *PUM_COL.get_mut() = 7;
+            *PUM_SIZE.get_mut() = 9;
+            *PUM_SCROLLBAR.get_mut() = 1;
+        }
+        let dict = crate::eval::typval::tv_dict_alloc();
+        pum_set_event_info(unsafe { &mut *dict });
+
+        for (key, expected) in [
+            (b"height".as_slice(), 4.0),
+            (b"width".as_slice(), 12.0),
+            (b"row".as_slice(), 3.0),
+            (b"col".as_slice(), 7.0),
+        ] {
+            let mut value = crate::eval::typval_defs::TypvalT::default();
+            assert_eq!(
+                unsafe {
+                    crate::eval::typval::tv_dict_get_tv(
+                        Some(&mut *dict),
+                        key,
+                        &mut value,
+                    )
+                },
+                crate::vim_defs::OK
+            );
+            assert!(matches!(
+                value.value,
+                crate::eval::typval_defs::TypvalValue::Float(number)
+                    if number == expected
+            ));
+        }
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_number(
+                    Some(&mut *dict),
+                    b"size",
+                )
+            },
+            9
+        );
+        assert_eq!(
+            unsafe {
+                crate::eval::typval::tv_dict_get_bool(
+                    Some(&mut *dict),
+                    b"scrollbar",
+                    0,
+                )
+            },
+            1
+        );
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
     }
 
     #[test]
