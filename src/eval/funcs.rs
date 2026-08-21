@@ -500,6 +500,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getfontname"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_getfontname });
         m.insert(&b"isinf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isinf });
         m.insert(&b"isnan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isnan });
+        m.insert(&b"id"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_id });
         m.insert(&b"islocked"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_islocked });
         m.insert(&b"blob2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_blob2list });
         m.insert(&b"list2blob"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_list2blob });
@@ -3392,6 +3393,14 @@ fn f_isinf(argvars: &[TypvalT], rettv: &mut TypvalT) {
 fn f_isnan(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let is_nan = matches!(argvars[0].value, TypvalValue::Float(f) if f.is_nan());
     rettv.value = TypvalValue::Number(i64::from(is_nan));
+}
+
+/// `id({expr})` - the `%p` identity of a typval's payload (`f_id`,
+/// `funcs.c`).
+fn f_id(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut index = 1usize;
+    let pointer = crate::strings::tv_ptr(argvars, &mut index);
+    rettv.value = TypvalValue::String(Some(crate::strings::format_pointer(pointer)));
 }
 
 /// `islocked({expr})` - whether `{expr}` (the NAME of a variable, List
@@ -9499,6 +9508,7 @@ mod tests {
             "getfontname",
             "isinf",
             "isnan",
+            "id",
             "sha256",
             "exists",
             "fullcommand",
@@ -12585,6 +12595,41 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_isnan(&[num(5)], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_id ---
+
+    #[test]
+    fn id_formats_scalar_and_null_container_identity() {
+        let mut rettv = TypvalT::default();
+        f_id(&[num(1)], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(crate::strings::format_pointer(1)))
+        );
+
+        f_id(
+            &[TypvalT {
+                value: TypvalValue::List(std::ptr::null_mut()),
+                ..Default::default()
+            }],
+            &mut rettv,
+        );
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(crate::strings::format_pointer(0)))
+        );
+    }
+
+    #[test]
+    fn id_dispatches_through_the_builtin_table() {
+        let mut rettv = TypvalT::default();
+        let result = unsafe { call_internal_func(b"id", &[num(42)], &mut rettv) };
+        assert_eq!(result, FnameTransError::None);
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(crate::strings::format_pointer(42)))
+        );
     }
 
     // --- f_islocked ---

@@ -451,7 +451,6 @@ fn tv_str(
 ///
 /// Pointer-bearing values expose their real allocation address. Scalar
 /// values preserve the original typval union's raw-bit interpretation.
-#[allow(dead_code)]
 pub(crate) fn tv_ptr(
     tvs: &[crate::eval::typval_defs::TypvalT],
     idx: &mut usize,
@@ -489,7 +488,6 @@ pub(crate) fn tv_ptr(
 /// Render one pointer exactly as the platform C library's `%p` conversion
 /// used by Neovim (`vim_vsnprintf_typval`'s pointer branch).
 #[must_use]
-#[allow(dead_code)]
 pub(crate) fn format_pointer(pointer: usize) -> Vec<u8> {
     #[cfg(windows)]
     {
