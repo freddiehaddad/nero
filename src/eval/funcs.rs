@@ -528,6 +528,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tabpagewinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_tabpagewinnr });
         m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
         m.insert(&b"gettabinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettabinfo });
+        m.insert(&b"getwininfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwininfo });
         m.insert(&b"getbufinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getbufinfo });
         m.insert(&b"getbufline"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_getbufline });
         m.insert(&b"getbufoneline"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_getbufoneline });
@@ -4129,6 +4130,74 @@ unsafe fn f_gettabinfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
         // SAFETY: forwarded from this function's own safety doc.
         tp = unsafe { &*tp }.tp_next;
+    }
+}
+
+/// `getwininfo([{winid}])` - information about all windows or one
+/// window selected by handle (`f_getwininfo`, `eval/window.c`).
+///
+/// # Safety
+/// The global tab/window lists must contain valid live pointers;
+/// forwards [`crate::eval::window::get_win_info`]'s requirements.
+unsafe fn f_getwininfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let list = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(
+            rettv,
+            crate::eval::typval_defs::ListLenSpecials::MayKnow
+                as isize,
+        )
+    };
+    let selected = if let Some(argument) = argvars.first() {
+        let window = unsafe {
+            crate::eval::window::win_id2wp(
+                crate::eval::typval::tv_get_number(argument) as i32,
+            )
+        };
+        if window.is_null() {
+            return;
+        }
+        window
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let globals = crate::globals::GLOBALS.as_ptr();
+    let current_tab = unsafe { (*globals).curtab };
+    let mut tabnr = 0i16;
+    let mut tab = unsafe { (*globals).first_tabpage };
+    while !tab.is_null() {
+        tabnr += 1;
+        let mut winnr = 0i16;
+        let mut window = if tab == current_tab {
+            unsafe { (*globals).firstwin }
+        } else {
+            unsafe { (*tab).tp_firstwin }
+        };
+        while !window.is_null() {
+            let has_number =
+                unsafe { crate::eval::window::win_has_winnr(window, tab) };
+            winnr += i16::from(has_number);
+            if selected.is_null() || window == selected {
+                let dictionary = unsafe {
+                    crate::eval::window::get_win_info(
+                        window,
+                        tabnr,
+                        if has_number { winnr } else { 0 },
+                    )
+                };
+                unsafe {
+                    crate::eval::typval::tv_list_append_dict(
+                        list,
+                        dictionary,
+                    )
+                };
+                if !selected.is_null() {
+                    return;
+                }
+            }
+            window = unsafe { (*window).w_next };
+        }
+        tab = unsafe { (*tab).tp_next };
     }
 }
 
@@ -13502,6 +13571,80 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(0));
 
         unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+    }
+
+    #[test]
+    fn getwininfo_returns_window_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buffer = crate::buffer_defs::BufT {
+            handle: 42,
+            ..Default::default()
+        };
+        let variables = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*variables).dv_refcount = 1 };
+        let mut win = focusable_win(77);
+        win.w_buffer = &mut buffer;
+        win.w_vars = variables;
+        win.w_valid = i32::from(
+            crate::buffer_defs::w_valid::VALID_BOTLINE,
+        );
+        win.w_botline = 2;
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_firstwin: &mut win,
+            tp_curwin: &mut win,
+            ..Default::default()
+        };
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getwininfo(&[], &mut rettv) };
+        let TypvalValue::List(list) = rettv.value else {
+            panic!("expected list");
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 1);
+        let item = unsafe {
+            crate::eval::typval::tv_list_find(list, 0)
+        };
+        let TypvalValue::Dict(dictionary) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            panic!("expected dictionary");
+        };
+        let winid = unsafe {
+            crate::eval::typval::tv_dict_find(
+                Some(&mut **dictionary),
+                b"winid",
+            )
+        }
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*winid).di_tv.value },
+            TypvalValue::Number(77)
+        ));
+
+        unsafe {
+            crate::eval::typval::tv_list_unref(list);
+            crate::eval::typval::tv_dict_unref(variables);
+        }
+    }
+
+    #[test]
+    fn getwininfo_returns_empty_for_unknown_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(77);
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_firstwin: &mut win,
+            tp_curwin: &mut win,
+            ..Default::default()
+        };
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        let mut rettv = TypvalT::default();
+        unsafe { f_getwininfo(&[num(999)], &mut rettv) };
+        let TypvalValue::List(list) = rettv.value else {
+            panic!("expected list");
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(list) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 
     // --- f_gettabinfo ---
