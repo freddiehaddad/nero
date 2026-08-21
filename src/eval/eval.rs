@@ -5312,6 +5312,67 @@ pub unsafe fn eval_to_string(arg: &[u8], join_list: bool, use_simple_function: b
     unsafe { eval_to_string_eap(arg, join_list, None, use_simple_function) }
 }
 
+struct SafeEvalFunccalGuard;
+
+impl Drop for SafeEvalFunccalGuard {
+    fn drop(&mut self) {
+        crate::eval::userfunc::restore_funccal();
+    }
+}
+
+struct SafeEvalStateGuard {
+    use_sandbox: bool,
+}
+
+impl Drop for SafeEvalStateGuard {
+    fn drop(&mut self) {
+        // SAFETY: construction's caller serialized access to these
+        // GLOBALS fields for this guard's full lifetime.
+        unsafe {
+            if self.use_sandbox {
+                crate::globals::GLOBALS.get_mut().sandbox -= 1;
+            }
+            crate::globals::GLOBALS.get_mut().textlock -= 1;
+        }
+    }
+}
+
+/// Evaluate text without exposing the current local variables and
+/// while holding textlock (`eval_to_string_safe`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::save_funccal`] and
+/// [`eval_to_string`]. Callers must serialize access to funccall state
+/// and `GLOBALS.sandbox`/`GLOBALS.textlock`.
+#[must_use]
+pub unsafe fn eval_to_string_safe(
+    arg: &[u8],
+    use_sandbox: bool,
+    use_simple_function: bool,
+) -> Option<Vec<u8>> {
+    let mut entry = crate::eval::userfunc::FuncCalEntryT::default();
+    // SAFETY: `entry` remains in this stack frame until the restore
+    // guard (created immediately afterward) runs.
+    unsafe {
+        crate::eval::userfunc::save_funccal(
+            std::ptr::addr_of_mut!(entry),
+        )
+    };
+    let _funccal = SafeEvalFunccalGuard;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if use_sandbox {
+            crate::globals::GLOBALS.get_mut().sandbox += 1;
+        }
+        crate::globals::GLOBALS.get_mut().textlock += 1;
+    }
+    let _state = SafeEvalStateGuard { use_sandbox };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { eval_to_string(arg, false, use_simple_function) }
+}
+
 /// Evaluate a single or double quoted string possibly containing
 /// expressions: `$"..."`/`$'...'` (`eval_interp_string`).
 ///
@@ -12065,6 +12126,68 @@ mod tests {
     fn eval_to_string_use_simple_function_is_unimplemented() {
         let result = std::panic::catch_unwind(|| unsafe { eval_to_string(b"42", false, true) });
         assert!(result.is_err(), "expected a panic (eval0_simple_funccal not yet translated)");
+    }
+
+    #[test]
+    fn eval_to_string_safe_restores_funccal_and_global_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc =
+            Box::new(crate::eval::typval_defs::FunccallT::default());
+        let fc_ptr = std::ptr::addr_of_mut!(*fc);
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        let old_sandbox = unsafe { crate::globals::GLOBALS.get_mut().sandbox };
+        let old_textlock = unsafe { crate::globals::GLOBALS.get_mut().textlock };
+        unsafe {
+            crate::globals::GLOBALS.get_mut().sandbox = 2;
+            crate::globals::GLOBALS.get_mut().textlock = 3;
+        }
+
+        assert_eq!(
+            unsafe { eval_to_string_safe(b"6 * 7", true, false) },
+            Some(b"42".to_vec())
+        );
+        assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().sandbox }, 2);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().textlock }, 3);
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe {
+            crate::globals::GLOBALS.get_mut().sandbox = old_sandbox;
+            crate::globals::GLOBALS.get_mut().textlock = old_textlock;
+        }
+        drop(fc);
+    }
+
+    #[test]
+    fn eval_to_string_safe_restores_state_when_evaluation_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc =
+            Box::new(crate::eval::typval_defs::FunccallT::default());
+        let fc_ptr = std::ptr::addr_of_mut!(*fc);
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        let old_sandbox = unsafe { crate::globals::GLOBALS.get_mut().sandbox };
+        let old_textlock = unsafe { crate::globals::GLOBALS.get_mut().textlock };
+        unsafe {
+            crate::globals::GLOBALS.get_mut().sandbox = 4;
+            crate::globals::GLOBALS.get_mut().textlock = 5;
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = unsafe { eval_to_string_safe(b"42", true, true) };
+        });
+        assert!(result.is_err());
+        assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().sandbox }, 4);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().textlock }, 5);
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe {
+            crate::globals::GLOBALS.get_mut().sandbox = old_sandbox;
+            crate::globals::GLOBALS.get_mut().textlock = old_textlock;
+        }
+        drop(fc);
     }
 
     #[test]
