@@ -218,6 +218,64 @@ fn system_fsync(fd: i32) -> i32 {
     }
 }
 
+#[cfg(unix)]
+fn system_read(
+    fd: i32,
+    output: &mut [u8],
+    non_blocking: bool,
+    eof: &mut bool,
+) -> isize {
+    loop {
+        let result = unsafe {
+            libc::read(fd, output.as_mut_ptr().cast(), output.len())
+        };
+        if result == 0 {
+            *eof = true;
+            return 0;
+        }
+        if result > 0 {
+            return result as isize;
+        }
+        let error = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        if error == libc::EINTR {
+            continue;
+        }
+        if non_blocking
+            && (error == libc::EAGAIN
+                || (libc::EWOULDBLOCK != libc::EAGAIN
+                    && error == libc::EWOULDBLOCK))
+        {
+            return 0;
+        }
+        return -(error as isize);
+    }
+}
+
+#[cfg(windows)]
+fn system_read(
+    fd: i32,
+    output: &mut [u8],
+    _non_blocking: bool,
+    eof: &mut bool,
+) -> isize {
+    #[link(name = "ucrt")]
+    unsafe extern "C" {
+        fn _read(fd: i32, buffer: *mut std::ffi::c_void, count: u32) -> i32;
+    }
+    let count = output.len().min(u32::MAX as usize) as u32;
+    let result = unsafe { _read(fd, output.as_mut_ptr().cast(), count) };
+    if result == 0 {
+        *eof = true;
+        0
+    } else if result < 0 {
+        -1
+    } else {
+        result as isize
+    }
+}
+
 #[cfg(windows)]
 fn system_fsync(fd: i32) -> i32 {
     #[link(name = "ucrt")]
@@ -423,10 +481,8 @@ pub fn file_fd(descriptor: &FileDescriptor) -> i32 {
     descriptor.fd
 }
 
-/// Read bytes from an in-memory or buffered descriptor (`file_read`).
-///
-/// File-backed refill is added with the file-opening layer; an
-/// in-memory descriptor is already at EOF after its supplied bytes.
+/// Read bytes from an in-memory or file-backed descriptor
+/// (`file_read`).
 pub fn file_read(
     descriptor: &mut FileDescriptor,
     output: &mut [u8],
@@ -440,11 +496,44 @@ pub fn file_read(
             [descriptor.read_pos..descriptor.read_pos + copied],
     );
     descriptor.read_pos += copied;
-    descriptor.bytes_read += copied as u64;
     if copied == output.len() || descriptor.fd < 0 || descriptor.eof {
+        descriptor.bytes_read += copied as u64;
         return copied as isize;
     }
-    unimplemented!("file_read: file-backed refill needs os_read/readv");
+    descriptor.read_pos = 0;
+    descriptor.write_pos = 0;
+    let remaining = &mut output[copied..];
+    let read = if remaining.len() >= descriptor.buffer.len() {
+        system_read(
+            descriptor.fd,
+            remaining,
+            descriptor.non_blocking,
+            &mut descriptor.eof,
+        )
+    } else {
+        let read = system_read(
+            descriptor.fd,
+            &mut descriptor.buffer,
+            descriptor.non_blocking,
+            &mut descriptor.eof,
+        );
+        if read > 0 {
+            descriptor.write_pos = read as usize;
+            let take = remaining.len().min(read as usize);
+            remaining[..take]
+                .copy_from_slice(&descriptor.buffer[..take]);
+            descriptor.read_pos = take;
+            take as isize
+        } else {
+            read
+        }
+    };
+    if read < 0 {
+        return read;
+    }
+    let total = copied as isize + read;
+    descriptor.bytes_read += total as u64;
+    total
 }
 
 /// Borrow `size` already-buffered bytes in place
@@ -475,11 +564,41 @@ pub fn file_skip(
         descriptor.write_pos.saturating_sub(descriptor.read_pos);
     let skipped = available.min(size);
     descriptor.read_pos += skipped;
-    descriptor.bytes_read += skipped as u64;
     if skipped == size || descriptor.fd < 0 || descriptor.eof {
+        descriptor.bytes_read += skipped as u64;
         return skipped as isize;
     }
-    unimplemented!("file_skip: file-backed refill needs os_read");
+    descriptor.read_pos = 0;
+    descriptor.write_pos = 0;
+    let mut remaining = size - skipped;
+    let mut called_read = false;
+    while remaining > 0 {
+        if descriptor.eof
+            || (called_read && descriptor.non_blocking)
+        {
+            break;
+        }
+        let read = system_read(
+            descriptor.fd,
+            &mut descriptor.buffer,
+            descriptor.non_blocking,
+            &mut descriptor.eof,
+        );
+        if read < 0 {
+            return read;
+        }
+        if read as usize > remaining {
+            descriptor.read_pos = remaining;
+            descriptor.write_pos = read as usize;
+            descriptor.bytes_read += size as u64;
+            return size as isize;
+        }
+        remaining -= read as usize;
+        called_read = true;
+    }
+    let total = size - remaining;
+    descriptor.bytes_read += total as u64;
+    total as isize
 }
 
 #[cfg(test)]
@@ -624,5 +743,55 @@ mod tests {
         assert_eq!(descriptor.write_pos, 0);
         assert_eq!(file_close(&mut descriptor, false), 0);
         assert_eq!(std::fs::read(&scratch.0).unwrap(), data);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call open/read/close FFI")]
+    fn file_read_refills_and_reuses_internal_buffer() {
+        let scratch = ScratchFile::new("read_refill");
+        let mut descriptor = FileDescriptor::default();
+        let path = scratch.0.to_string_lossy();
+        assert_eq!(
+            file_open(
+                &mut descriptor,
+                path.as_bytes(),
+                file_open_flags::READ_ONLY,
+                0,
+            ),
+            0
+        );
+        let mut first = [0u8; 3];
+        assert_eq!(file_read(&mut descriptor, &mut first), 3);
+        assert_eq!(&first, b"con");
+        assert!(descriptor.write_pos > descriptor.read_pos);
+
+        let mut rest = [0u8; 5];
+        assert_eq!(file_read(&mut descriptor, &mut rest), 5);
+        assert_eq!(&rest, b"tents");
+        assert_eq!(descriptor.bytes_read, 8);
+        assert_eq!(file_close(&mut descriptor, false), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call open/read/close FFI")]
+    fn file_skip_refills_and_leaves_extra_bytes_buffered() {
+        let scratch = ScratchFile::new("skip_refill");
+        let mut descriptor = FileDescriptor::default();
+        let path = scratch.0.to_string_lossy();
+        assert_eq!(
+            file_open(
+                &mut descriptor,
+                path.as_bytes(),
+                file_open_flags::READ_ONLY,
+                0,
+            ),
+            0
+        );
+        assert_eq!(file_skip(&mut descriptor, 3), 3);
+        let mut output = [0u8; 5];
+        assert_eq!(file_read(&mut descriptor, &mut output), 5);
+        assert_eq!(&output, b"tents");
+        assert_eq!(descriptor.bytes_read, 8);
+        assert_eq!(file_close(&mut descriptor, false), 0);
     }
 }
