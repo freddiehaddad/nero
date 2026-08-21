@@ -11,7 +11,8 @@
 //! consults before deciding it needs a shell at all, and
 //! [`shell_argv_to_str`], which only formats. The quote-aware
 //! `word_length`/`tokenize` parser chain is translated independently
-//! of process spawning.
+//! of process spawning, as is wildcard fallback copying
+//! (`save_patterns`).
 //!
 //! `shell_free_argv` has no equivalent: this crate models an argument
 //! vector as an owned `Vec<Vec<u8>>`, so dropping it frees both the
@@ -32,6 +33,17 @@ pub fn have_dollars(files: &[Vec<u8>]) -> bool {
     files
         .iter()
         .any(|f| crate::strings::vim_strchr(f, i32::from(b'$')).is_some())
+}
+
+/// Copy wildcard patterns while halving escaped backslashes
+/// (`save_patterns`).
+#[allow(dead_code)]
+#[must_use]
+fn save_patterns(patterns: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    patterns
+        .iter()
+        .map(|pattern| crate::charset::backslash_halve_save(pattern))
+        .collect()
 }
 
 /// Return the byte length of one shell word (`word_length`).
@@ -278,6 +290,31 @@ mod tests {
         assert!(!have_dollars(&[b"plain".to_vec(), b"also_plain".to_vec()]));
         assert!(have_dollars(&[b"plain".to_vec(), b"$HOME".to_vec()]));
         assert!(!have_dollars(&[]));
+    }
+
+    #[test]
+    fn save_patterns_copies_and_halves_backslashes() {
+        let patterns =
+            [br"a\ b".to_vec(), br"c\\d".to_vec(), br"tail\".to_vec()];
+        let middle = if cfg!(windows) {
+            br"c\\d".to_vec()
+        } else {
+            br"c\d".to_vec()
+        };
+        assert_eq!(
+            save_patterns(&patterns),
+            [
+                b"a b".to_vec(),
+                middle,
+                br"tail\".to_vec(),
+            ]
+        );
+        assert_eq!(patterns[0], br"a\ b");
+    }
+
+    #[test]
+    fn save_patterns_of_an_empty_list_is_empty() {
+        assert_eq!(save_patterns(&[]), Vec::<Vec<u8>>::new());
     }
 
     #[test]
