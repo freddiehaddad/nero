@@ -10,7 +10,8 @@
 //! `Cargo.toml`'s own comment recording that decision):
 //! `utf_iscomposing_first`, `utf_iscomposing_legacy`,
 //! `utf_composinglike`, `utf_iscomposing`,
-//! `utfc_ptr2len`, `utfc_ptr2len_len`, `utf_fold`, `mb_toupper`/
+//! `utfc_ptr2len`, `utfc_ptr2len_len`, `mb_copy_char`, `utf_fold`,
+//! `mb_toupper`/
 //! `mb_tolower`/`mb_islower`/`mb_isupper`; character *display width*:
 //! `intable`/`utf_printable` (the portable, non-`__SSE2__` reference
 //! algorithm; the SSE2 intrinsics fast path is a pure optimization
@@ -775,6 +776,23 @@ pub unsafe fn utfc_ptr2len_len(p: &[u8], size: usize) -> i32 {
         len += len_next_char;
     }
     len
+}
+
+/// Copy one grapheme cluster and advance the source (`mb_copy_char`).
+///
+/// Rust's growable destination vector replaces the original's separately
+/// advanced destination pointer.
+///
+/// # Safety
+/// `source` must begin with a complete, non-NUL character and provide the
+/// same valid UTF-8 storage required by [`utfc_ptr2len`].
+pub unsafe fn mb_copy_char(source: &mut &[u8], destination: &mut Vec<u8>) {
+    // SAFETY: forwarded from this function's own safety contract.
+    let len = usize::try_from(unsafe { utfc_ptr2len(source) })
+        .expect("mb_copy_char requires a nonnegative character length");
+    assert!(len <= source.len(), "character extends past source storage");
+    destination.extend_from_slice(&source[..len]);
+    *source = &source[len..];
 }
 
 /// Build a `schar_T` from `buf`, prefixing a space when the sequence
@@ -3377,6 +3395,29 @@ mod tests {
     fn utfc_ptr2len_returns_zero_for_empty_or_nul() {
         assert_eq!(unsafe { utfc_ptr2len(b"") }, 0);
         assert_eq!(unsafe { utfc_ptr2len(b"\0") }, 0);
+    }
+
+    #[test]
+    fn mb_copy_char_copies_one_ascii_character_and_advances() {
+        let mut source = &b"abc\0"[..];
+        let mut destination = b"prefix-".to_vec();
+
+        unsafe { mb_copy_char(&mut source, &mut destination) };
+
+        assert_eq!(destination, b"prefix-a");
+        assert_eq!(source, b"bc\0");
+    }
+
+    #[test]
+    fn mb_copy_char_keeps_a_combining_sequence_together() {
+        let input = "e\u{0301}x\0".as_bytes();
+        let mut source = input;
+        let mut destination = Vec::new();
+
+        unsafe { mb_copy_char(&mut source, &mut destination) };
+
+        assert_eq!(destination, "e\u{0301}".as_bytes());
+        assert_eq!(source, b"x\0");
     }
 
     #[test]
