@@ -3860,6 +3860,34 @@ pub fn find_name_end(arg: &[u8], flags: i32) -> (usize, Option<(usize, usize)>) 
     (p, expr_start.map(|s| (s, expr_end.unwrap_or(0))))
 }
 
+/// Find the end of a variable/function name without recognizing magic
+/// braces (`to_name_end`).
+///
+/// When `use_namespace` is true, a one-letter `b:`/`g:`/`s:`/`t:`/
+/// `v:`/`w:` prefix is included; any other colon ends the name.
+#[must_use]
+pub fn to_name_end(arg: &[u8], use_namespace: bool) -> usize {
+    if !arg
+        .first()
+        .is_some_and(|&c| eval_isnamec1(i32::from(c)))
+    {
+        return 0;
+    }
+
+    let mut p = 1;
+    while arg.get(p).is_some_and(|&c| eval_isnamec(i32::from(c))) {
+        if arg[p] == b':'
+            && (p != 1
+                || !use_namespace
+                || !b"bgstvw".contains(&arg[0]))
+        {
+            break;
+        }
+        p += 1;
+    }
+    p
+}
+
 /// Expand magic `{expr}` components in a variable/function name
 /// (`make_expanded_name`).
 ///
@@ -10601,6 +10629,36 @@ mod tests {
             find_name_end(b"1bad[0]", FNE_INCL_BR | FNE_CHECK_START),
             (0, None)
         );
+    }
+
+    // --- to_name_end ---
+
+    #[test]
+    fn to_name_end_scans_a_plain_name() {
+        assert_eq!(to_name_end(b"Func_Name(", true), 9);
+    }
+
+    #[test]
+    fn to_name_end_includes_a_valid_namespace_prefix() {
+        assert_eq!(to_name_end(b"g:name(", true), 6);
+        assert_eq!(to_name_end(b"s:local", true), 7);
+    }
+
+    #[test]
+    fn to_name_end_stops_at_a_namespace_when_disabled() {
+        assert_eq!(to_name_end(b"g:name", false), 1);
+    }
+
+    #[test]
+    fn to_name_end_rejects_an_invalid_namespace_prefix() {
+        assert_eq!(to_name_end(b"n:slice", true), 1);
+        assert_eq!(to_name_end(b"xx:name", true), 2);
+    }
+
+    #[test]
+    fn to_name_end_rejects_an_invalid_first_byte() {
+        assert_eq!(to_name_end(b"1name", true), 0);
+        assert_eq!(to_name_end(b"", true), 0);
     }
 
     // --- make_expanded_name ---
