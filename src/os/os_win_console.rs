@@ -190,11 +190,46 @@ pub fn os_open_conin_fd() -> i32 {
     descriptor
 }
 
+fn os_open_conout_handle() -> WindowHandle {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: WindowHandle =
+        -1isize as WindowHandle;
+    let handle = unsafe {
+        CreateFileA(
+            c"CONOUT$".as_ptr().cast(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(handle, INVALID_HANDLE_VALUE);
+    handle
+}
+
 /// Replace standard input with `CONIN$`
 /// (`os_redirect_stdin_to_conin`).
 pub fn os_redirect_stdin_to_conin() {
     unsafe { _close(0) };
     assert_eq!(os_open_conin_fd(), 0);
+}
+
+/// Replace standard output and error with `CONOUT$`
+/// (`os_redirect_stdout_stderr_to_conout`).
+pub fn os_redirect_stdout_stderr_to_conout() {
+    let handle = os_open_conout_handle();
+    unsafe { _close(1) };
+    let output = unsafe { _open_osfhandle(handle as isize, 0) };
+    assert_eq!(output, 1);
+    unsafe { _close(2) };
+    let error = unsafe { _open_osfhandle(handle as isize, 0) };
+    assert_eq!(error, 2);
 }
 
 /// Save the current console title (`os_title_save`).
@@ -322,6 +357,18 @@ mod tests {
             return;
         }
         let descriptor = os_open_conin_fd();
+        assert!(descriptor >= 0);
+        assert_eq!(unsafe { _close(descriptor) }, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call console Win32 FFI")]
+    fn console_output_can_be_wrapped_when_a_console_is_attached() {
+        if unsafe { GetConsoleWindow() }.is_null() {
+            return;
+        }
+        let handle = os_open_conout_handle();
+        let descriptor = unsafe { _open_osfhandle(handle as isize, 0) };
         assert!(descriptor >= 0);
         assert_eq!(unsafe { _close(descriptor) }, 0);
     }
