@@ -39,6 +39,26 @@ static INPUT_EOF: GlobalCell<bool> = GlobalCell::new(false);
 static CURSORHOLD_TIME: GlobalCell<i32> = GlobalCell::new(0);
 static CURSORHOLD_TB_CHANGE_CNT: GlobalCell<i32> = GlobalCell::new(0);
 
+#[derive(Clone, Copy, Default)]
+struct MultiClickState {
+    num_clicks: i32,
+    mouse_code: i32,
+    grid: i32,
+    col: i32,
+    row: i32,
+    time: u64,
+}
+
+static MULTICLICK: GlobalCell<MultiClickState> =
+    GlobalCell::new(MultiClickState {
+        num_clicks: 0,
+        mouse_code: 0,
+        grid: 0,
+        col: 0,
+        row: 0,
+        time: 0,
+    });
+
 /// Number of unread bytes in the raw input buffer
 /// (`input_available`).
 ///
@@ -238,6 +258,74 @@ unsafe fn reset_cursorhold_wait(tb_change_cnt: i32) {
     }
 }
 
+/// Update multi-click state for one mouse event (`check_multiclick`).
+///
+/// Returns `(modifier_bits, skip_event)`.
+///
+/// # Safety
+/// Mutates shared mouse-click state and reads `'mousetime'`.
+#[allow(dead_code)]
+unsafe fn check_multiclick(
+    code: i32,
+    grid: i32,
+    row: i32,
+    col: i32,
+) -> (u8, bool) {
+    if code >= i32::from(crate::keycodes_defs::KE_MOUSEDOWN)
+        && code <= i32::from(crate::keycodes_defs::KE_MOUSERIGHT)
+    {
+        return (0, false);
+    }
+
+    let state = unsafe { MULTICLICK.get_mut() };
+    let no_move =
+        state.grid == grid && state.col == col && state.row == row;
+    let (_, is_click, is_drag) = crate::keycodes::get_mouse_button(code);
+    if is_drag && no_move {
+        return (0, true);
+    }
+
+    if is_click {
+        let mouse_time = crate::os::time::os_hrtime();
+        let timediff = mouse_time.wrapping_sub(state.time);
+        let mousetime = (unsafe {
+            (*crate::option_vars::OPTION_VARS.as_ptr()).p_mouset
+        } as u64)
+            .wrapping_mul(1_000_000);
+        if code == state.mouse_code
+            && no_move
+            && timediff < mousetime
+            && state.num_clicks != 4
+        {
+            state.num_clicks += 1;
+        } else {
+            state.num_clicks = 1;
+        }
+        state.mouse_code = code;
+        state.time = mouse_time;
+    } else if !no_move {
+        state.mouse_code = code;
+    }
+
+    state.grid = grid;
+    state.col = col;
+    state.row = row;
+
+    let modifiers = if code
+        == i32::from(crate::keycodes_defs::KE_MOUSEMOVE)
+    {
+        0
+    } else {
+        match state.num_clicks {
+            2 => crate::keycodes_defs::MOD_MASK_2CLICK as u8,
+            3 => crate::keycodes_defs::MOD_MASK_3CLICK as u8,
+            4 => crate::keycodes_defs::MOD_MASK_4CLICK as u8,
+            _ => 0,
+        }
+    };
+    (modifiers, false)
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -330,6 +418,42 @@ mod tests {
                 *CURSORHOLD_TIME.get_mut() = self.time;
                 *CURSORHOLD_TB_CHANGE_CNT.get_mut() =
                     self.change_count;
+            }
+        }
+    }
+
+    struct MultiClickGuard {
+        state: MultiClickState,
+        mousetime: crate::types_defs::OptInt,
+    }
+
+    impl MultiClickGuard {
+        unsafe fn set(
+            state: MultiClickState,
+            mousetime: crate::types_defs::OptInt,
+        ) -> Self {
+            let previous = Self {
+                state: unsafe { *MULTICLICK.get_mut() },
+                mousetime: unsafe {
+                    (*crate::option_vars::OPTION_VARS.as_ptr())
+                        .p_mouset
+                },
+            };
+            unsafe {
+                *MULTICLICK.get_mut() = state;
+                (*crate::option_vars::OPTION_VARS.as_ptr()).p_mouset =
+                    mousetime;
+            }
+            previous
+        }
+    }
+
+    impl Drop for MultiClickGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *MULTICLICK.get_mut() = self.state;
+                (*crate::option_vars::OPTION_VARS.as_ptr()).p_mouset =
+                    self.mousetime;
             }
         }
     }
@@ -672,6 +796,104 @@ mod tests {
             unsafe { *CURSORHOLD_TB_CHANGE_CNT.get_mut() },
             789
         );
+    }
+
+    #[test]
+    fn check_multiclick_ignores_wheel_events() {
+        let _lock = crate::globals::global_state_test_lock();
+        let state = MultiClickState {
+            num_clicks: 3,
+            mouse_code: 17,
+            grid: 1,
+            col: 2,
+            row: 3,
+            time: 4,
+        };
+        let _mouse = unsafe { MultiClickGuard::set(state, 500) };
+        assert_eq!(
+            unsafe {
+                check_multiclick(
+                    i32::from(crate::keycodes_defs::KE_MOUSEDOWN),
+                    9,
+                    8,
+                    7,
+                )
+            },
+            (0, false)
+        );
+        assert_eq!(unsafe { MULTICLICK.get_mut() }.num_clicks, 3);
+        assert_eq!(unsafe { MULTICLICK.get_mut() }.grid, 1);
+    }
+
+    #[test]
+    fn check_multiclick_skips_a_stationary_drag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let state = MultiClickState {
+            grid: 1,
+            col: 2,
+            row: 3,
+            ..MultiClickState::default()
+        };
+        let _mouse = unsafe { MultiClickGuard::set(state, 500) };
+        assert_eq!(
+            unsafe {
+                check_multiclick(
+                    i32::from(crate::keycodes_defs::KE_LEFTDRAG),
+                    1,
+                    3,
+                    2,
+                )
+            },
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn check_multiclick_counts_repeated_clicks_up_to_four() {
+        let _lock = crate::globals::global_state_test_lock();
+        let code = i32::from(crate::keycodes_defs::KE_LEFTMOUSE);
+        let state = MultiClickState {
+            num_clicks: 1,
+            mouse_code: code,
+            grid: 1,
+            col: 2,
+            row: 3,
+            time: crate::os::time::os_hrtime(),
+        };
+        let _mouse = unsafe { MultiClickGuard::set(state, 10_000) };
+
+        assert_eq!(
+            unsafe { check_multiclick(code, 1, 3, 2) }.0,
+            crate::keycodes_defs::MOD_MASK_2CLICK as u8
+        );
+        assert_eq!(
+            unsafe { check_multiclick(code, 1, 3, 2) }.0,
+            crate::keycodes_defs::MOD_MASK_3CLICK as u8
+        );
+        assert_eq!(
+            unsafe { check_multiclick(code, 1, 3, 2) }.0,
+            crate::keycodes_defs::MOD_MASK_4CLICK as u8
+        );
+        assert_eq!(unsafe { check_multiclick(code, 1, 3, 2) }.0, 0);
+        assert_eq!(unsafe { MULTICLICK.get_mut() }.num_clicks, 1);
+    }
+
+    #[test]
+    fn check_multiclick_resets_when_the_mouse_moves() {
+        let _lock = crate::globals::global_state_test_lock();
+        let code = i32::from(crate::keycodes_defs::KE_LEFTMOUSE);
+        let state = MultiClickState {
+            num_clicks: 2,
+            mouse_code: code,
+            grid: 1,
+            col: 2,
+            row: 3,
+            time: crate::os::time::os_hrtime(),
+        };
+        let _mouse = unsafe { MultiClickGuard::set(state, 10_000) };
+        assert_eq!(unsafe { check_multiclick(code, 1, 3, 4) }, (0, false));
+        assert_eq!(unsafe { MULTICLICK.get_mut() }.num_clicks, 1);
+        assert_eq!(unsafe { MULTICLICK.get_mut() }.col, 4);
     }
 
     #[test]
