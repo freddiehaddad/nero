@@ -10,18 +10,48 @@
 //! only already-translated pieces (`mbyte.rs`, `path.rs`,
 //! `option_vars.rs`).
 //! Also translated: [`vim_chdirfile`] - changes to the directory
-//! containing a file. DirChanged autocmd dispatch is inert today
-//! because no autocmd can be registered yet.
+//! containing a file, and [`do_autocmd_dirchanged`]'s real
+//! no-registered-event bypass.
 //!
 //! Deferred: everything else - `vim_findfile_init`/`vim_findfile`/
 //! `find_file_in_path`/`find_directory_in_path`/`grab_file_name`/
-//! `file_name_in_line`/`vim_chdirfile`/`vim_chdir`/
+//! `file_name_in_line`/`vim_chdir`/
 //! `find_file_in_path_option`/`find_file_name_in_path`/
 //! `file_name_at_cursor`, all needing the full search-context/path-
 //! traversal/file-expansion machinery.
 
 use crate::mbyte::utf_ptr2char;
 use crate::path::{path_fnamencmp, vim_ispathsep};
+
+static DIRCHANGED_RECURSIVE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+/// Trigger `DirChangedPre` or `DirChanged` (`do_autocmd_dirchanged`).
+///
+/// No autocmd can currently be registered, so the original's own first
+/// bypass is always taken. The event-payload body remains explicit at the
+/// boundary where a future registration would make it reachable.
+pub fn do_autocmd_dirchanged(
+    _new_dir: &[u8],
+    _scope: crate::vim_defs::CdScope,
+    _cause: crate::vim_defs::CdCause,
+    pre: bool,
+) {
+    let event = if pre {
+        crate::autocmd_defs::EventT::DirChangedPre
+    } else {
+        crate::autocmd_defs::EventT::DirChanged
+    };
+    if unsafe { *DIRCHANGED_RECURSIVE.get_mut() }
+        || !crate::autocmd::has_event(event)
+    {
+        return;
+    }
+    unimplemented!(
+        "do_autocmd_dirchanged: event payload setup needs the complete \
+         v:event save/restore and live autocmd execution path"
+    );
+}
 
 /// Change to the directory containing `fname` (`vim_chdirfile`).
 ///
@@ -454,6 +484,24 @@ pub unsafe fn ff_free_stack_element(stack_ptr: *mut FfStackT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn do_autocmd_dirchanged_is_inert_without_registered_events() {
+        let _lock = crate::globals::global_state_test_lock();
+        do_autocmd_dirchanged(
+            b"/tmp",
+            crate::vim_defs::CdScope::Global,
+            crate::vim_defs::CdCause::Manual,
+            true,
+        );
+        do_autocmd_dirchanged(
+            b"/tmp",
+            crate::vim_defs::CdScope::Window,
+            crate::vim_defs::CdCause::Auto,
+            false,
+        );
+        assert!(!unsafe { *DIRCHANGED_RECURSIVE.get_mut() });
+    }
 
     struct CwdGuard(std::path::PathBuf);
 
