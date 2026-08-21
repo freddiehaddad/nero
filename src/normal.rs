@@ -646,6 +646,28 @@ pub unsafe fn checkclearopq(
     true
 }
 
+/// Check whether text changes are locked (`check_text_locked`).
+///
+/// The original's diagnostic display is omitted with the rest of the
+/// message pipeline; the predicate and optional clear/beep side effect
+/// are complete.
+///
+/// # Safety
+/// Forwarded from [`crate::ex_getln::text_locked`] and
+/// [`clearopbeep`].
+#[must_use]
+pub unsafe fn check_text_locked(
+    oap: Option<&mut crate::normal_defs::OpargT>,
+) -> bool {
+    if !unsafe { crate::ex_getln::text_locked() } {
+        return false;
+    }
+    if let Some(oap) = oap {
+        unsafe { clearopbeep(oap) };
+    }
+    true
+}
+
 /// Swap the ends of the Visual selection (`v_swap_corners`).
 ///
 /// For `O` in blockwise Visual mode this swaps the LEFT/RIGHT corners
@@ -2309,6 +2331,66 @@ mod tests {
             crate::ops_defs::OpType::Nop as i32
         );
         assert_eq!(unsafe { (*oap_ptr).regname }, 0);
+    }
+
+    #[test]
+    fn check_text_locked_clears_an_operator_only_when_locked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.expr_map_lock,
+                0,
+            )
+        };
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            ..Default::default()
+        };
+
+        {
+            let _text = unsafe {
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.textlock,
+                    0,
+                )
+            };
+            assert!(!unsafe { check_text_locked(Some(&mut oap)) });
+            assert_eq!(
+                oap.op_type,
+                crate::ops_defs::OpType::Delete as i32
+            );
+        }
+        {
+            let _text = unsafe {
+                crate::globals::GlobalFieldGuard::install(
+                    |globals| &mut globals.textlock,
+                    1,
+                )
+            };
+            assert!(unsafe { check_text_locked(Some(&mut oap)) });
+            assert_eq!(
+                oap.op_type,
+                crate::ops_defs::OpType::Nop as i32
+            );
+        }
+    }
+
+    #[test]
+    fn check_text_locked_accepts_a_null_operator_argument() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.expr_map_lock,
+                0,
+            )
+        };
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.textlock,
+                1,
+            )
+        };
+        assert!(unsafe { check_text_locked(None) });
     }
 
     #[test]
