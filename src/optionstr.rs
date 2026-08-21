@@ -375,21 +375,17 @@
 //! `'emoji'` itself, since both feed the same character-width tables.
 //! The `E834`/`E835` "conflicts with value of" messages are kept
 //! distinguishable so a caller can tell which of the two options was
-//! at fault. `clear_string_option` is inlined as a plain assignment:
-//! it exists in the original purely to free a C string and point it at
-//! the shared empty one, which an owned `Option<Vec<u8>>` handles.
+//! at fault. The now-real [`clear_string_option`] performs the owned
+//! assignment that replaces the original's free-and-retarget operation.
 //!
 //! `did_set_background` remains deferred - it needs `init_highlight`
 //! and `do_unlet` (colorscheme reload), neither translated.
 //!
-//! `free_string_option`, `clear_string_option` and
-//! `check_string_option` need NO Rust equivalent at all: all three
-//! exist purely to manage the original's `empty_string_option`
-//! sentinel pointer (a C technique for avoiding an allocation for the
-//! empty string, and for telling "empty" apart from "unset"). This
-//! crate models a string option as `Option<Vec<u8>>`, where `None`
-//! already carries the "unset" distinction and `Vec`'s own `Drop`
-//! already performs the free - see `option_vars.rs`'s own module doc.
+//! [`clear_string_option`] and [`check_string_option`] are translated
+//! explicitly over `Option<Vec<u8>>`. `free_string_option` needs no
+//! separate Rust function: consuming or replacing the owned option
+//! automatically drops its allocation, while an empty `Vec` is safe to
+//! drop and needs no sentinel-pointer exemption.
 //!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
@@ -4498,15 +4494,16 @@ unsafe fn did_set_global_chars_option(
     // If the current window is set to use the global
     // 'listchars'/'fillchars' value, clear the window-local value.
     if !is_global {
-        // `clear_string_option` in the original: frees the old string
-        // and points it at the shared empty one. With an owned
-        // `Option<Vec<u8>>` that is just an assignment.
         // SAFETY: forwarded from this function's own safety doc.
         unsafe {
             let w = &mut *win;
             match what {
-                CharsOption::Listchars => w.w_onebuf_opt.wo_lcs = Some(Vec::new()),
-                CharsOption::Fillchars => w.w_onebuf_opt.wo_fcs = Some(Vec::new()),
+                CharsOption::Listchars => {
+                    clear_string_option(&mut w.w_onebuf_opt.wo_lcs)
+                }
+                CharsOption::Fillchars => {
+                    clear_string_option(&mut w.w_onebuf_opt.wo_fcs)
+                }
             }
         }
     }
