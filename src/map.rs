@@ -128,6 +128,16 @@ pub unsafe fn equal_path_t(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
     }
 }
 
+/// Compare highlight map keys (`equal_HlEntry`).
+#[allow(dead_code)]
+#[must_use]
+fn equal_hl_entry(
+    first: crate::highlight_defs::HlEntry,
+    second: crate::highlight_defs::HlEntry,
+) -> bool {
+    first == second
+}
+
 /// A hash set with insertion-order-preserving compact storage
 /// (`Set(T)`/`MH_DECLS`/`KEY_DECLS`).
 ///
@@ -509,6 +519,25 @@ mod tests {
         {
             assert!(!unsafe { equal_path_t(Some(b"Foo/Bar"), Some(b"foo/bar")) });
         }
+    }
+
+    #[test]
+    fn equal_hl_entry_compares_every_field() {
+        let entry = crate::highlight_defs::HlEntry {
+            attr: crate::highlight_defs::HlAttrs::default(),
+            kind: crate::highlight_defs::HlKind::Ui,
+            id1: 1,
+            id2: 2,
+            winid: 3,
+        };
+        assert!(equal_hl_entry(entry, entry));
+        assert!(!equal_hl_entry(
+            entry,
+            crate::highlight_defs::HlEntry {
+                winid: 4,
+                ..entry
+            }
+        ));
     }
 
     #[test]
