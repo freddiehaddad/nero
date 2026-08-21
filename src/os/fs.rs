@@ -70,7 +70,7 @@
 //!   exactly as libuv itself does for compatibility).
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
-//! - `os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/
+//! - `os_close`/`os_read`/`os_readv`/`os_write`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
 //!   which need this exact shape of I/O, instead go directly through
@@ -182,6 +182,38 @@ pub fn os_open(
     // every platform via create_new() above.
 
     opts.open(path).ok()
+}
+
+/// Open a file using an `fopen(3)` mode string (`os_fopen`).
+///
+/// Binary mode is intentionally a no-op at the Rust `File` layer;
+/// its reads and writes already operate byte-for-byte.
+#[must_use]
+pub fn os_fopen(path: &Path, flags: &[u8]) -> Option<std::fs::File> {
+    assert!(!flags.is_empty() && flags.len() <= 2);
+    let mut options = std::fs::OpenOptions::new();
+    match flags {
+        b"r" | b"rb" => {
+            options.read(true);
+        }
+        b"w" | b"wb" => {
+            options.write(true).create(true).truncate(true);
+        }
+        b"a" | b"ab" => {
+            options.write(true).create(true).append(true);
+        }
+        b"r+" => {
+            options.read(true).write(true);
+        }
+        b"w+" => {
+            options.read(true).write(true).create(true).truncate(true);
+        }
+        b"a+" => {
+            options.read(true).write(true).create(true).append(true);
+        }
+        _ => panic!("invalid fopen mode"),
+    }
+    options.open(path).ok()
 }
 
 /// Force any buffered modifications to `file` to be written to disk
@@ -1657,6 +1689,44 @@ mod tests {
         let file = os_open(&path, libc::O_RDWR | libc::O_TRUNC, 0).expect("file exists");
         drop(file);
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_fopen_supports_read_write_and_append_modes() {
+        let scratch = TempScratch::new("fopen");
+        let path = scratch.path.join("f.txt");
+
+        let mut file = os_fopen(&path, b"wb").expect("create");
+        file.write_all(b"one").unwrap();
+        drop(file);
+
+        let mut file = os_fopen(&path, b"ab").expect("append");
+        file.write_all(b"two").unwrap();
+        drop(file);
+
+        let mut file = os_fopen(&path, b"rb").expect("read");
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"onetwo");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_fopen_supports_update_modes() {
+        let scratch = TempScratch::new("fopen_update");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"old").unwrap();
+
+        assert!(os_fopen(&path, b"r+").is_some());
+        assert!(os_fopen(&path, b"w+").is_some());
+        assert!(os_fopen(&path, b"a+").is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid fopen mode")]
+    fn os_fopen_rejects_invalid_modes() {
+        let _ = os_fopen(Path::new("ignored"), b"x");
     }
 
     #[test]
