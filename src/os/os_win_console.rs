@@ -232,6 +232,14 @@ pub fn os_redirect_stdout_stderr_to_conout() {
     assert_eq!(error, 2);
 }
 
+/// Re-enable Ctrl-C processing and attach standard I/O to the current
+/// console (`os_reattach_console_stdio`).
+pub fn os_reattach_console_stdio() {
+    os_enable_ctrl_c();
+    os_redirect_stdin_to_conin();
+    os_redirect_stdout_stderr_to_conout();
+}
+
 /// Save the current console title (`os_title_save`).
 pub fn os_title_save() {
     let title = unsafe { ORIGINAL_TITLE.get_mut() };
