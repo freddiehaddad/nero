@@ -71,7 +71,6 @@
 //! - `os_stat` (raw Unix-style mode bits beyond the permission set -
 //!   libuv synthesizes these even on Windows for compatibility).
 //! - `os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/
-//!   `os_dup_cloexec`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
 //!   which need this exact shape of I/O, instead go directly through
@@ -216,6 +215,18 @@ pub fn os_dup(file: &std::fs::File) -> Option<std::fs::File> {
             Err(_) => return None,
         }
     }
+}
+
+/// Duplicate a file and keep the duplicate close-on-exec /
+/// non-inheritable (`os_dup_cloexec`).
+///
+/// Rust opens and duplicates `File` resources with those flags by
+/// default, so [`os_dup`] already provides the complete behavior.
+#[must_use]
+pub fn os_dup_cloexec(
+    file: &std::fs::File,
+) -> Option<std::fs::File> {
+    os_dup(file)
 }
 
 /// Changes the current directory to `path` (`os_chdir`).
@@ -1619,6 +1630,50 @@ mod tests {
         duplicate.read_exact(&mut second).unwrap();
         assert_eq!(first, [b'a']);
         assert_eq!(second, [b'b']);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_dup_cloexec_returns_a_noninheritable_duplicate() {
+        let scratch = TempScratch::new("dup_cloexec");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let duplicate = os_dup_cloexec(&file).expect("dup succeeds");
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let flags = unsafe {
+                libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD)
+            };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetHandleInformation(
+                    handle: *mut std::ffi::c_void,
+                    flags: *mut u32,
+                ) -> i32;
+            }
+            const HANDLE_FLAG_INHERIT: u32 = 1;
+            let mut flags = 0u32;
+            assert_ne!(
+                unsafe {
+                    GetHandleInformation(
+                        duplicate.as_raw_handle(),
+                        &mut flags,
+                    )
+                },
+                0
+            );
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+        }
     }
 
     #[cfg(unix)]
