@@ -202,6 +202,76 @@ fn vim_findfile_free_visited_list(list: &mut Option<Box<FfVisitedListHdrT>>) {
     *list = None;
 }
 
+/// Record a newly visited file or directory (`ff_check_visited`).
+///
+/// URLs are identified by their path text; filesystem paths use their
+/// device/inode identity. The wildcard recursion path is part of the key in
+/// both cases.
+///
+/// # Safety
+/// Forwards [`crate::path::path_fnamecmp`]'s shared option-state
+/// requirements.
+#[allow(dead_code)]
+unsafe fn ff_check_visited(
+    visited_list: &mut Option<Box<FfVisitedT>>,
+    fname: &[u8],
+    wc_path: Option<&[u8]>,
+) -> i32 {
+    let is_url = crate::path::path_with_url(fname) != 0;
+    let file_id = if is_url {
+        None
+    } else {
+        let Ok(fname) = std::str::from_utf8(fname) else {
+            return crate::vim_defs::FAIL;
+        };
+        let Some(file_id) =
+            crate::os::fs::os_fileid(std::path::Path::new(fname))
+        else {
+            return crate::vim_defs::FAIL;
+        };
+        Some(file_id)
+    };
+
+    let mut current = visited_list.as_deref();
+    while let Some(visited) = current {
+        let same_file = if is_url {
+            // SAFETY: byte slices are live for the call.
+            unsafe {
+                crate::path::path_fnamecmp(
+                    &visited.ffv_fname,
+                    fname,
+                ) == 0
+            }
+        } else {
+            visited.file_id_valid
+                && crate::os::fs::os_fileid_equal(
+                    &visited.file_id,
+                    file_id.as_ref().expect("filesystem identity missing"),
+                )
+        };
+        if same_file
+            && ff_wc_equal(visited.ffv_wc_path.as_deref(), wc_path)
+        {
+            return crate::vim_defs::FAIL;
+        }
+        current = visited.ffv_next.as_deref();
+    }
+
+    let next = visited_list.take();
+    *visited_list = Some(Box::new(FfVisitedT {
+        ffv_next: next,
+        ffv_wc_path: wc_path.map(<[u8]>::to_vec),
+        file_id_valid: !is_url,
+        file_id: file_id.unwrap_or_default(),
+        ffv_fname: if is_url {
+            fname.to_vec()
+        } else {
+            Vec::new()
+        },
+    }));
+    crate::vim_defs::OK
+}
+
 /// Get or create the visited list for `filename`
 /// (`ff_get_visited_list`).
 #[allow(dead_code)]
@@ -599,6 +669,88 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn ff_check_visited_deduplicates_urls_by_name_and_wildcard_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut visited = None;
+        assert_eq!(
+            unsafe {
+                ff_check_visited(
+                    &mut visited,
+                    b"https://example.test/path",
+                    Some(b"**/*.rs"),
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe {
+                ff_check_visited(
+                    &mut visited,
+                    b"https://example.test/path",
+                    Some(b"**/*.rs"),
+                )
+            },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(
+            unsafe {
+                ff_check_visited(
+                    &mut visited,
+                    b"https://example.test/path",
+                    Some(b"*.rs"),
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            visited.as_ref().map_or(0, |head| {
+                1 + usize::from(head.ffv_next.is_some())
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn ff_check_visited_uses_filesystem_identity_for_local_paths() {
+        let _lock = crate::globals::global_state_test_lock();
+        let scratch = ScratchDir::new("visited_file");
+        let path = scratch.0.join("file.txt");
+        std::fs::write(&path, b"x").expect("create visited file");
+        let path = path.to_string_lossy().into_owned().into_bytes();
+        let mut visited = None;
+
+        assert_eq!(
+            unsafe {
+                ff_check_visited(&mut visited, &path, Some(b"**"))
+            },
+            crate::vim_defs::OK
+        );
+        let node = visited.as_ref().expect("visited node");
+        assert!(node.file_id_valid);
+        assert!(node.ffv_fname.is_empty());
+        assert_eq!(
+            unsafe {
+                ff_check_visited(&mut visited, &path, Some(b"**"))
+            },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(
+            unsafe {
+                ff_check_visited(
+                    &mut visited,
+                    scratch
+                        .0
+                        .join("missing")
+                        .to_string_lossy()
+                        .as_bytes(),
+                    None,
+                )
+            },
+            crate::vim_defs::FAIL
+        );
     }
 
     #[test]
