@@ -1,11 +1,8 @@
-//! Translated from `src/nvim/os/fs_defs.h` (partial).
+//! Translated from `src/nvim/os/fs_defs.h`.
 //!
-//! Translated: `PathType`, `FileID`, the `NODE_*` constants.
-//!
-//! Deferred: `FileInfo`/`Directory` - both embed vendored libuv types
-//! (`uv_stat_t`/`uv_fs_t`/`uv_dirent_t`) that are out of scope until this
-//! project's FFI-vs-Rust-crate decision for libuv is made (see the
-//! project plan's deferred decisions, tied to the event loop phase).
+//! `FileInfo` is represented by `crate::os::fs::FileInfoT`, backed by
+//! optional native metadata plus the original path offsets/type.
+//! `Directory` remains with the directory-scanning implementation.
 
 /// Currently supports Windows and is extensible (`PathType`).
 /// See <https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats>

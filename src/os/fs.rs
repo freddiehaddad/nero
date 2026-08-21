@@ -927,9 +927,22 @@ pub fn os_isrealdir(name: &Path) -> bool {
 /// `stat`/`uv_stat_t` translation. Deliberately has NO raw Unix-style
 /// mode/permission bits - see this module's own top doc comment for
 /// why (the same still-deferred decision as `os_getperm`).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct FileInfoT {
-    metadata: std::fs::Metadata,
+    metadata: Option<std::fs::Metadata>,
+    pub prefix_off: usize,
+    pub root_off: usize,
+    pub rest_off: usize,
+    pub type_: crate::os::fs_defs::PathType,
+}
+
+impl FileInfoT {
+    fn from_metadata(metadata: std::fs::Metadata) -> Self {
+        Self {
+            metadata: Some(metadata),
+            ..Self::default()
+        }
+    }
 }
 
 /// Get information about a file, following symlinks (`os_fileinfo`).
@@ -940,20 +953,22 @@ pub struct FileInfoT {
 ///         out-parameter and the status into one `Option`).
 #[must_use]
 pub fn os_fileinfo(path: &Path) -> Option<FileInfoT> {
-    std::fs::metadata(path).ok().map(|metadata| FileInfoT { metadata })
+    std::fs::metadata(path).ok().map(FileInfoT::from_metadata)
 }
 
 /// Get information about a file, WITHOUT following a trailing symlink
 /// (`os_fileinfo_link`).
 #[must_use]
 pub fn os_fileinfo_link(path: &Path) -> Option<FileInfoT> {
-    std::fs::symlink_metadata(path).ok().map(|metadata| FileInfoT { metadata })
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(FileInfoT::from_metadata)
 }
 
 /// Get information about an open file (`os_fileinfo_fd`).
 #[must_use]
 pub fn os_fileinfo_fd(file: &std::fs::File) -> Option<FileInfoT> {
-    file.metadata().ok().map(|metadata| FileInfoT { metadata })
+    file.metadata().ok().map(FileInfoT::from_metadata)
 }
 
 /// Whether two [`crate::os::fs_defs::FileID`]s refer to the same file
@@ -982,7 +997,7 @@ pub fn os_fileid(
 /// Get the file size from a `FileInfoT` (`os_fileinfo_size`).
 #[must_use]
 pub fn os_fileinfo_size(info: &FileInfoT) -> u64 {
-    info.metadata.len()
+    info.metadata.as_ref().map_or(0, std::fs::Metadata::len)
 }
 
 /// Get the last modification time from a `FileInfoT`, as seconds
@@ -995,8 +1010,8 @@ pub fn os_fileinfo_size(info: &FileInfoT) -> u64 {
 #[must_use]
 pub fn os_fileinfo_mtime(info: &FileInfoT) -> i64 {
     info.metadata
-        .modified()
-        .ok()
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs() as i64)
 }
@@ -1126,7 +1141,7 @@ pub fn os_fileinfo_device_id(info: &FileInfoT) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        info.metadata.dev()
+        info.metadata.as_ref().map_or(0, MetadataExt::dev)
     }
     #[cfg(not(unix))]
     {
@@ -1170,7 +1185,7 @@ pub fn os_fileinfo_inode(info: &FileInfoT) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        info.metadata.ino()
+        info.metadata.as_ref().map_or(0, MetadataExt::ino)
     }
     #[cfg(not(unix))]
     {
@@ -1190,12 +1205,11 @@ pub fn os_fileinfo_hardlinks(info: &FileInfoT) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        info.metadata.nlink()
+        info.metadata.as_ref().map_or(0, MetadataExt::nlink)
     }
     #[cfg(not(unix))]
     {
-        let _ = info;
-        1
+        u64::from(info.metadata.is_some())
     }
 }
 
@@ -1208,7 +1222,7 @@ pub fn os_fileinfo_blocksize(info: &FileInfoT) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        info.metadata.blksize()
+        info.metadata.as_ref().map_or(0, MetadataExt::blksize)
     }
     #[cfg(not(unix))]
     {
@@ -1226,8 +1240,8 @@ pub fn os_fileinfo_blocksize(info: &FileInfoT) -> u64 {
 #[must_use]
 pub fn os_fileinfo_mtime_ns(info: &FileInfoT) -> i64 {
     info.metadata
-        .modified()
-        .ok()
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| i64::from(d.subsec_nanos()))
 }
@@ -1244,11 +1258,19 @@ pub fn os_fileinfo_mode(info: &FileInfoT) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        info.metadata.mode() as i32
+        info.metadata.as_ref().map_or(0, |metadata| {
+            metadata.mode() as i32
+        })
     }
     #[cfg(not(unix))]
     {
-        if info.metadata.permissions().readonly() { 0o444 } else { 0o666 }
+        info.metadata.as_ref().map_or(0, |metadata| {
+            if metadata.permissions().readonly() {
+                0o444
+            } else {
+                0o666
+            }
+        })
     }
 }
 
@@ -1263,7 +1285,10 @@ pub fn os_fileinfo_mode(info: &FileInfoT) -> i32 {
 /// `std::fs::FileType`'s own platform-native capabilities.
 #[must_use]
 pub fn os_fileinfo_type_str(info: &FileInfoT) -> &'static str {
-    let ft = info.metadata.file_type();
+    let Some(metadata) = &info.metadata else {
+        return "other";
+    };
+    let ft = metadata.file_type();
     if ft.is_symlink() {
         return "link";
     }
@@ -2928,6 +2953,22 @@ mod tests {
     }
 
     // --- os_fileinfo_id / os_fileinfo_id_equal ---
+
+    #[test]
+    fn empty_fileinfo_matches_cleared_fileinfo_state() {
+        let info = FileInfoT::default();
+        assert_eq!(info.prefix_off, 0);
+        assert_eq!(info.root_off, 0);
+        assert_eq!(info.rest_off, 0);
+        assert_eq!(info.type_, crate::os::fs_defs::PathType::Unknown);
+        assert_eq!(os_fileinfo_size(&info), 0);
+        assert_eq!(
+            os_fileinfo_id(&info),
+            crate::os::fs_defs::FileID::empty()
+        );
+        assert_eq!(os_fileinfo_mode(&info), 0);
+        assert_eq!(os_fileinfo_type_str(&info), "other");
+    }
 
     #[test]
     fn os_fileinfo_id_equal_is_true_for_the_same_file_read_twice() {
