@@ -917,6 +917,19 @@ pub const VAR_SHORT_LEN: usize = 20;
 /// Number of fixed variables used for arguments (`FIXVAR_CNT`).
 pub const FIXVAR_CNT: usize = 12;
 
+/// Saved `v:event` dictionary state (`save_v_event_T`).
+///
+/// `sve_index` accompanies the original saved hashtable because this
+/// translation uses `DictT.dv_index` instead of recovering owning
+/// `DictitemT` values through C pointer arithmetic.
+#[derive(Default)]
+pub struct SaveVEventT {
+    pub sve_did_save: bool,
+    pub sve_hashtab: Option<crate::hashtab_defs::HashtabT>,
+    pub sve_index:
+        Option<std::collections::HashMap<usize, *mut DictitemT>>,
+}
+
 /// Type used for script ID (`scid_T`).
 pub type ScidT = i32;
 
@@ -942,6 +955,14 @@ pub struct SctxT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_v_event_default_has_no_saved_dictionary_state() {
+        let saved = SaveVEventT::default();
+        assert!(!saved.sve_did_save);
+        assert!(saved.sve_hashtab.is_none());
+        assert!(saved.sve_index.is_none());
+    }
 
     #[test]
     fn typval_default_is_unknown_and_unlocked() {
