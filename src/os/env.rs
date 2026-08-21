@@ -63,8 +63,6 @@
 //! - `vim_runtime_dir`/`remove_tail`: only called by `vim_getenv`'s own
 //!   still-deferred `$VIM`/`$VIMRUNTIME` auto-discovery fallback,
 //!   deferred with it.
-//! - `vim_env_iter`/`vim_env_iter_rev`: only consumed by
-//!   `set_runtimepath_default`/similar (not yet translated).
 //! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
 
 use super::os::NVIM_TESTING;
@@ -93,6 +91,29 @@ pub fn os_getenv(name: &[u8]) -> Option<Vec<u8>> {
     match std::env::var_os(name) {
         Some(v) if !v.is_empty() => Some(v.to_string_lossy().into_owned().into_bytes()),
         _ => None,
+    }
+}
+
+/// Return the next component of a delimited environment value
+/// (`vim_env_iter`).
+///
+/// `iter` is the byte offset returned by the previous call. The
+/// returned component borrows `val`; the optional offset advances
+/// past the delimiter for the next call.
+#[must_use]
+pub fn vim_env_iter(
+    delim: u8,
+    val: &[u8],
+    iter: Option<usize>,
+) -> (&[u8], Option<usize>) {
+    let start = iter.unwrap_or(0);
+    let rest = &val[start..];
+    match rest.iter().position(|&byte| byte == delim) {
+        Some(offset) => (
+            &rest[..offset],
+            Some(start + offset + 1),
+        ),
+        None => (rest, None),
     }
 }
 
@@ -1149,6 +1170,37 @@ pub(crate) mod tests {
     #[test]
     fn os_getenv_returns_none_for_empty_name() {
         assert_eq!(os_getenv(b""), None);
+    }
+
+    #[test]
+    fn vim_env_iter_walks_components_in_order() {
+        let value = b"one;two;three";
+        let (one, next) = vim_env_iter(b';', value, None);
+        let (two, next) = vim_env_iter(b';', value, next);
+        let (three, next) = vim_env_iter(b';', value, next);
+
+        assert_eq!(one, b"one");
+        assert_eq!(two, b"two");
+        assert_eq!(three, b"three");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn vim_env_iter_preserves_empty_components() {
+        let value = b";one;";
+        let (leading, next) = vim_env_iter(b';', value, None);
+        let (one, next) = vim_env_iter(b';', value, next);
+        let (trailing, next) = vim_env_iter(b';', value, next);
+
+        assert_eq!(leading, b"");
+        assert_eq!(one, b"one");
+        assert_eq!(trailing, b"");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn vim_env_iter_handles_an_empty_value() {
+        assert_eq!(vim_env_iter(b';', b"", None), (&b""[..], None));
     }
 
     #[test]
