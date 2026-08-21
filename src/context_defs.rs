@@ -46,6 +46,19 @@ pub struct Context {
     pub funcs: Vec<crate::api::private::defs::Object>,
 }
 
+/// `CONTEXT_INIT`.
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            regs: None,
+            jumps: None,
+            bufs: None,
+            gvars: None,
+            funcs: Vec::new(),
+        }
+    }
+}
+
 /// A vector of [`Context`]s (`ContextVec`).
 pub type ContextVec = Vec<Context>;
 
@@ -210,5 +223,15 @@ mod tests {
         assert_eq!(ctx_state_flags::GVARS, 8);
         assert_eq!(ctx_state_flags::SFUNCS, 16);
         assert_eq!(ctx_state_flags::FUNCS, 32);
+    }
+
+    #[test]
+    fn context_default_matches_context_init() {
+        let context = Context::default();
+        assert!(context.regs.is_none());
+        assert!(context.jumps.is_none());
+        assert!(context.bufs.is_none());
+        assert!(context.gvars.is_none());
+        assert!(context.funcs.is_empty());
     }
 }
