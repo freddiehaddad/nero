@@ -274,7 +274,6 @@ pub struct ComplT {
 ///
 /// # Safety
 /// Allocates and mutates a dictionary in the shared evaluator GC registry.
-#[allow(dead_code)]
 unsafe fn ins_compl_dict_alloc(
     completion: &ComplT,
 ) -> *mut crate::eval::typval_defs::DictT {
@@ -326,6 +325,54 @@ unsafe fn ins_compl_dict_alloc(
         }
     }
     dict
+}
+
+static COMPLETE_CHANGED_RECURSIVE: GlobalCell<bool> =
+    GlobalCell::new(false);
+
+/// Trigger the `CompleteChanged` autocmd (`trigger_complete_changed_event`).
+///
+/// # Safety
+/// `COMPL_CURR_MATCH` must be live when `cur >= 0`; mutates shared
+/// completion, evaluator, popup-menu, autocmd, and editor state.
+#[allow(dead_code)]
+unsafe fn trigger_complete_changed_event(cur: i32) {
+    if unsafe { *COMPLETE_CHANGED_RECURSIVE.get_mut() } {
+        return;
+    }
+
+    let item = if cur < 0 {
+        crate::eval::typval::tv_dict_alloc()
+    } else {
+        let current = unsafe { *COMPL_CURR_MATCH.get_mut() };
+        assert!(!current.is_null(), "current completion match missing");
+        unsafe { ins_compl_dict_alloc(&*current) }
+    };
+    let mut saved = crate::eval::typval_defs::SaveVEventT::default();
+    let event = unsafe { crate::eval::eval::get_v_event(&mut saved) };
+    unsafe {
+        crate::eval::typval::tv_dict_add_dict(
+            &mut *event,
+            b"completed_item",
+            item,
+        );
+        crate::popupmenu::pum_set_event_info(&mut *event);
+        crate::eval::typval::tv_dict_set_keys_readonly(event);
+        *COMPLETE_CHANGED_RECURSIVE.get_mut() = true;
+    }
+    let globals = crate::globals::GLOBALS.as_ptr();
+    unsafe { (*globals).textlock += 1 };
+    let curbuf = unsafe { (*globals).curbuf.as_ref() };
+    let _ = crate::autocmd::apply_autocmds(
+        crate::autocmd_defs::EventT::CompleteChanged,
+        None,
+        None,
+        false,
+        curbuf,
+    );
+    unsafe { (*globals).textlock -= 1 };
+    unsafe { *COMPLETE_CHANGED_RECURSIVE.get_mut() = false };
+    unsafe { crate::eval::eval::restore_v_event(event, &mut saved) };
 }
 
 /// One `'complete'` option source (`cpt_source_T`).
@@ -2490,6 +2537,45 @@ pub unsafe fn set_ref_in_insexpand_funcs(copy_id: i32) -> bool {
 mod tests {
     use super::*;
 
+    struct EventVimvarGuard {
+        old: Option<crate::eval::typval_defs::TypvalT>,
+        dict: *mut crate::eval::typval_defs::DictT,
+    }
+
+    impl EventVimvarGuard {
+        unsafe fn new() -> Self {
+            let dict = crate::eval::typval::tv_dict_alloc();
+            let slot = unsafe {
+                crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Event,
+                )
+            };
+            let old = std::mem::replace(
+                unsafe { &mut *slot },
+                crate::eval::typval_defs::TypvalT {
+                    value: crate::eval::typval_defs::TypvalValue::Dict(dict),
+                    ..Default::default()
+                },
+            );
+            Self {
+                old: Some(old),
+                dict,
+            }
+        }
+    }
+
+    impl Drop for EventVimvarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let slot = crate::eval::vars::get_vim_var_tv(
+                    crate::eval::vars::VimVarIndex::Event,
+                );
+                *slot = self.old.take().expect("saved v:event value missing");
+                crate::eval::typval::tv_dict_free(self.dict);
+            }
+        }
+    }
+
     #[test]
     fn ins_compl_dict_alloc_copies_completion_fields_and_default_user_data() {
         let _lock = crate::globals::global_state_test_lock();
@@ -2527,6 +2613,25 @@ mod tests {
             );
             crate::eval::typval::tv_dict_unref(dict);
         }
+    }
+
+    #[test]
+    fn trigger_complete_changed_event_clears_an_unselected_payload() {
+        let _lock = crate::globals::global_state_test_lock();
+        let event = unsafe { EventVimvarGuard::new() };
+        let previous_textlock =
+            unsafe { crate::globals::GLOBALS.get_mut() }.textlock;
+        unsafe { *COMPLETE_CHANGED_RECURSIVE.get_mut() = false };
+
+        unsafe { trigger_complete_changed_event(-1) };
+
+        assert_eq!(unsafe { (*event.dict).dv_hashtab.ht_used }, 0);
+        assert!(unsafe { (*event.dict).dv_index.is_empty() });
+        assert!(!unsafe { *COMPLETE_CHANGED_RECURSIVE.get_mut() });
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.textlock,
+            previous_textlock
+        );
     }
     use crate::globals::global_state_test_lock;
 
