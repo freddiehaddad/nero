@@ -25,8 +25,10 @@
 //! `free_locales` needs no Rust equivalent because the `LazyLock`
 //! owns its process-lifetime vectors.
 //!
-//! Deferred: `init_locale`/`ex_language`/`lang_init`, which actually
-//! change process locale state and need Ex-command parsing or macOS
+//! `init_locale` is translated for the crate's no-libintl build:
+//! process locale setup is real, while `bindtextdomain`/`textdomain`
+//! follow `gettext_defs.rs`'s compiled no-op branch. Deferred:
+//! `ex_language`/`lang_init`, which need Ex-command parsing or macOS
 //! platform integration.
 
 #[cfg(windows)]
@@ -146,6 +148,33 @@ pub fn get_mess_env() -> Option<Vec<u8>> {
     }
 }
 
+fn locale_dir_from_progpath(progpath: &[u8]) -> Vec<u8> {
+    let mut path = progpath.to_vec();
+    path.truncate(crate::path::path_tail_with_sep(&path));
+    path.truncate(crate::path::path_tail(&path));
+    path.extend_from_slice(b"share/locale");
+    path
+}
+
+/// Initialize the process locale and gettext domain (`init_locale`).
+///
+/// # Safety
+/// Mutates process-global C locale state and reads shared `v:progpath`.
+pub unsafe fn init_locale() {
+    unsafe {
+        libc::setlocale(libc::LC_ALL, c"".as_ptr());
+        libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+    }
+
+    let progpath =
+        unsafe { crate::eval::vars::get_vim_var_str(VimVarIndex::Progpath) };
+    let locale_dir = locale_dir_from_progpath(&progpath);
+    if let Ok(locale_dir) = std::str::from_utf8(&locale_dir) {
+        crate::gettext_defs::bindtextdomain("nvim", locale_dir);
+    }
+    crate::gettext_defs::textdomain("nvim");
+}
+
 /// Set the `v:lang` variable according to the current locale setting.
 /// Also does `v:lc_time` and `v:ctype` (`set_lang_var`).
 ///
@@ -196,6 +225,33 @@ pub fn get_locales(idx: i32) -> Option<&'static [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locale_dir_is_relative_to_the_install_prefix() {
+        assert_eq!(
+            locale_dir_from_progpath(b"/usr/local/bin/nvim"),
+            b"/usr/local/share/locale"
+        );
+    }
+
+    #[test]
+    fn locale_dir_for_a_bare_program_name_is_relative() {
+        assert_eq!(
+            locale_dir_from_progpath(b"nvim"),
+            b"share/locale"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locale_dir_handles_windows_install_paths() {
+        assert_eq!(
+            locale_dir_from_progpath(
+                br"C:\Program Files\Nvim\bin\nvim.exe"
+            ),
+            br"C:\Program Files\Nvim\share/locale"
+        );
+    }
 
     #[test]
     fn get_locale_val_returns_the_current_ctype() {
