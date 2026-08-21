@@ -26,7 +26,8 @@
 //! same underlying syscall the original's own `uv_fs_access` wraps -
 //! needs a `Path` -> `CString` conversion, requiring valid UTF-8, a
 //! narrow, documented gap matching `path.rs`'s own established
-//! `path_full_dir_name` precedent for the same reason).
+//! `path_full_dir_name` precedent for the same reason), and
+//! `os_nodetype`.
 //! Functions that in the original return a raw libuv error code
 //! (`os_chdir`/`os_mkdir`/`os_rmdir`/`os_remove`/`os_fsync`) are
 //! translated to return `0` on success and `-1` on any failure: this
@@ -67,10 +68,8 @@
 //! - `os_setperm`/`os_getperm`: real Unix-style mode bits, reported
 //!   via [`os_fileinfo_mode`] (which synthesizes them on Windows,
 //!   exactly as libuv itself does for compatibility).
-//! - `os_nodetype`/`os_stat` (raw Unix-style mode bits beyond the
-//!   permission set - libuv synthesizes these even on Windows for
-//!   compatibility; needs a real decision on how to model that
-//!   cross-platform rather than rushing it).
+//! - `os_stat` (raw Unix-style mode bits beyond the permission set -
+//!   libuv synthesizes these even on Windows for compatibility).
 //! - `os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/`os_dup*`/
 //!   `os_copy`: real byte-level file I/O with the raw-fd calling
 //!   convention (`memfile.c`'s own `mf_read`/`mf_write`/`mf_close`,
@@ -525,6 +524,59 @@ pub fn os_file_is_writable(path: &Path) -> i32 {
 #[must_use]
 pub fn os_isdir(name: &Path) -> bool {
     std::fs::metadata(name).is_ok_and(|m| m.is_dir())
+}
+
+/// Classify a path as an ordinary node, writable special node, or
+/// non-writable special node (`os_nodetype`).
+#[must_use]
+pub fn os_nodetype(name: &Path) -> i32 {
+    use crate::os::fs_defs::{
+        NODE_NORMAL, NODE_OTHER, NODE_WRITABLE,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let Ok(metadata) = std::fs::metadata(name) else {
+            return NODE_NORMAL;
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_file() || file_type.is_dir() {
+            NODE_NORMAL
+        } else if file_type.is_block_device() {
+            NODE_OTHER
+        } else {
+            NODE_WRITABLE
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if name.to_string_lossy().starts_with(r"\\.\") {
+            return NODE_WRITABLE;
+        }
+        let Ok(file) = std::fs::File::open(name) else {
+            return NODE_NORMAL;
+        };
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
+        }
+        const FILE_TYPE_DISK: u32 = 1;
+        const FILE_TYPE_CHAR: u32 = 2;
+        match unsafe { GetFileType(file.as_raw_handle()) } {
+            FILE_TYPE_CHAR => NODE_WRITABLE,
+            FILE_TYPE_DISK => NODE_NORMAL,
+            _ => NODE_OTHER,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = name;
+        NODE_NORMAL
+    }
 }
 
 /// Check if the given path is a directory and not a symlink to a
@@ -1538,6 +1590,46 @@ mod tests {
         assert!(os_isdir(&scratch.path));
         assert!(!os_isdir(&file_path));
         assert!(!os_isdir(&scratch.path.join("does_not_exist")));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_nodetype_classifies_files_dirs_and_missing_paths_as_normal() {
+        let scratch = TempScratch::new("nodetype");
+        let file = scratch.path.join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert_eq!(
+            os_nodetype(&scratch.path),
+            crate::os::fs_defs::NODE_NORMAL
+        );
+        assert_eq!(
+            os_nodetype(&file),
+            crate::os::fs_defs::NODE_NORMAL
+        );
+        assert_eq!(
+            os_nodetype(&scratch.path.join("missing")),
+            crate::os::fs_defs::NODE_NORMAL
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn os_nodetype_classifies_character_devices_as_writable() {
+        assert_eq!(
+            os_nodetype(Path::new("/dev/null")),
+            crate::os::fs_defs::NODE_WRITABLE
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_nodetype_classifies_win32_device_paths_as_writable() {
+        assert_eq!(
+            os_nodetype(Path::new(r"\\.\con")),
+            crate::os::fs_defs::NODE_WRITABLE
+        );
     }
 
     #[test]
