@@ -41,11 +41,6 @@
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `os_free_fullenv`: no direct Rust equivalent is needed because
 //!   environment iteration returns owned values.
-//! - `free_homedir`: `#ifdef EXITFREE`-only (debug/leak-detection
-//!   build flag with no equivalent concept in this crate, same
-//!   reasoning as other `EXITFREE`-gated functions elsewhere); also
-//!   moot here since `HOMEDIR`'s `Option<Vec<u8>>` already drops its
-//!   contents automatically, with no separate "free" step needed.
 //! - `expand_env*`/`home_replace*`: need `path.c`'s directory/file-name
 //!   manipulation functions (`home_replace*`) or a much larger slice of
 //!   them plus `` `=expr` `` Vimscript-expression substitution
@@ -727,6 +722,14 @@ fn os_get_hostname_windows() -> Vec<u8> {
 static HOMEDIR: std::sync::LazyLock<GlobalCell<Option<Vec<u8>>>> =
     std::sync::LazyLock::new(|| GlobalCell::new(None));
 
+/// Release the resolved home-directory cache (`free_homedir`).
+///
+/// # Safety
+/// Must not run concurrently with home-directory initialization or reads.
+pub unsafe fn free_homedir() {
+    unsafe { *HOMEDIR.get_mut() = None };
+}
+
 /// Gets the "real", resolved user home directory as determined by
 /// [`init_homedir`] (`os_homedir`).
 ///
@@ -1381,6 +1384,21 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             unsafe { *HOMEDIR.get_mut() = self.0.take() };
         }
+    }
+
+    #[test]
+    fn free_homedir_releases_the_cached_value() {
+        let _lock = homedir_test_lock();
+        let _home =
+            unsafe { HomedirValueGuard::set(Some(b"/cached/home")) };
+        assert_eq!(
+            unsafe { os_homedir() },
+            Some(b"/cached/home".to_vec())
+        );
+
+        unsafe { free_homedir() };
+
+        assert_eq!(unsafe { os_homedir() }, None);
     }
 
     // --- vim_get_prefix_from_exepath ---
