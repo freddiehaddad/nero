@@ -236,6 +236,15 @@ pub fn memcnt(data: &[u8], c: u8) -> usize {
     data.iter().filter(|&&b| b == c).count()
 }
 
+/// Count occurrences of `c` before the first NUL (`strcnt`).
+#[inline]
+#[must_use]
+pub fn strcnt(data: &[u8], c: u8) -> usize {
+    assert_ne!(c, NUL);
+    let len = data.iter().position(|&byte| byte == NUL).unwrap_or(data.len());
+    memcnt(&data[..len], c)
+}
+
 /// A version of `memchr` that starts the search from the end
 /// (`xmemrchr`). Based on glibc's `memrchr`.
 #[inline]
@@ -449,6 +458,13 @@ mod tests {
     fn memcnt_counts_occurrences() {
         assert_eq!(memcnt(b"aabaa", b'a'), 4);
         assert_eq!(memcnt(b"aabaa", b'b'), 1);
+    }
+
+    #[test]
+    fn strcnt_stops_at_the_first_nul() {
+        assert_eq!(strcnt(b"aabaa\0aaa", b'a'), 4);
+        assert_eq!(memcnt(b"aabaa\0aaa", b'a'), 7);
+        assert_eq!(strcnt(b"\0aaa", b'a'), 0);
     }
 
     #[test]
