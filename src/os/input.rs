@@ -607,6 +607,41 @@ pub unsafe fn input_blocking() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) struct RawInputGuard(InputBuffer);
+
+#[cfg(test)]
+impl RawInputGuard {
+    /// Save and clear raw input state.
+    ///
+    /// # Safety
+    /// The caller must hold the global test lock.
+    pub(crate) unsafe fn save() -> Self {
+        Self(unsafe {
+            std::mem::replace(
+                INPUT_BUFFER.get_mut(),
+                InputBuffer::new(),
+            )
+        })
+    }
+
+    /// Return the unread raw bytes.
+    ///
+    /// # Safety
+    /// The caller must hold the global test lock.
+    pub(crate) unsafe fn bytes() -> Vec<u8> {
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        input.data[input.read_pos..input.write_pos].to_vec()
+    }
+}
+
+#[cfg(test)]
+impl Drop for RawInputGuard {
+    fn drop(&mut self) {
+        unsafe { *INPUT_BUFFER.get_mut() = self.0 };
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

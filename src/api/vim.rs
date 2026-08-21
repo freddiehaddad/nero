@@ -430,8 +430,8 @@ pub unsafe fn nvim__invalidate_glyph_cache() {
 /// Queue keys in the typeahead buffer (`nvim_feedkeys`).
 ///
 /// Normal mapped/nonmapped, typed and front-insertion modes are
-/// complete. Low-level raw input still needs `input_enqueue_raw`;
-/// immediate execution (`"x"`) still needs `exec_normal`.
+/// complete, including low-level raw input. Immediate execution
+/// (`"x"`) still needs `exec_normal`.
 ///
 /// # Safety
 /// Mutates the shared typeahead buffer and input globals; forwarded
@@ -470,24 +470,32 @@ pub unsafe fn nvim_feedkeys(
         keys.as_slice()
     };
     if lowlevel {
-        unimplemented!(
-            "nvim_feedkeys: low-level mode needs input_enqueue_raw"
+        unsafe { crate::os::input::input_enqueue_raw(keys) };
+    } else {
+        let offset = if insert {
+            0
+        } else {
+            crate::input::typebuf_len()
+        };
+        let noremap = if remap {
+            crate::input_defs::RemapValues::Yes as i32
+        } else {
+            crate::input_defs::RemapValues::None as i32
+        };
+        let _ = crate::input::ins_typebuf(
+            keys,
+            noremap,
+            offset,
+            !typed,
+            false,
         );
-    }
-
-    let offset = if insert {
-        0
-    } else {
-        crate::input::typebuf_len()
-    };
-    let noremap = if remap {
-        crate::input_defs::RemapValues::Yes as i32
-    } else {
-        crate::input_defs::RemapValues::None as i32
-    };
-    let _ = crate::input::ins_typebuf(keys, noremap, offset, !typed, false);
-    if unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy != 0 {
-        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+        if unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy != 0
+        {
+            unsafe {
+                crate::globals::GLOBALS.get_mut()
+            }
+            .typebuf_was_filled = true;
+        }
     }
     if execute {
         unimplemented!("nvim_feedkeys: immediate execution needs exec_normal");
@@ -955,11 +963,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "input_enqueue_raw")]
-    fn nvim_feedkeys_lowlevel_mode_needs_the_raw_input_queue() {
+    fn nvim_feedkeys_lowlevel_mode_uses_the_raw_input_queue() {
         let _lock = crate::globals::global_state_test_lock();
         let _typeahead = TypeaheadGuard::save();
+        let _raw =
+            unsafe { crate::os::input::RawInputGuard::save() };
         unsafe { nvim_feedkeys(&b"x".to_vec(), &b"L".to_vec(), false) };
+        assert_eq!(
+            unsafe { crate::os::input::RawInputGuard::bytes() },
+            b"x"
+        );
+        assert_eq!(crate::input::typebuf_len(), 0);
     }
 
     #[test]
