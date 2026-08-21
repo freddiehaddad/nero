@@ -487,6 +487,41 @@ pub unsafe fn encode_tv2echo(tv: &TypvalT) -> Vec<u8> {
     }
 }
 
+/// Convert a readfile-style list of strings into newline-separated
+/// bytes (`encode_vim_list_to_buf`).
+///
+/// Returns `None` if any list item is not a String.
+///
+/// # Safety
+/// `list`, if non-null, must be a valid live list with a valid item
+/// chain.
+#[must_use]
+pub unsafe fn encode_vim_list_to_buf(
+    list: *const ListT,
+) -> Option<Vec<u8>> {
+    if list.is_null() {
+        return Some(Vec::new());
+    }
+    let mut output = Vec::new();
+    let mut item = unsafe { (*list).lv_first };
+    let mut first = true;
+    while !item.is_null() {
+        let TypvalValue::String(value) =
+            (unsafe { &(*item).li_tv.value })
+        else {
+            return None;
+        };
+        if !first {
+            output.push(b'\n');
+        }
+        if let Some(value) = value {
+            output.extend_from_slice(value);
+        }
+        first = false;
+        item = unsafe { (*item).li_next };
+    }
+    Some(output)
+}
 
 #[cfg(test)]
 mod tests {
@@ -507,6 +542,54 @@ mod tests {
 
     fn string(v: &[u8]) -> TypvalT {
         TypvalT { value: TypvalValue::String(Some(v.to_vec())), ..Default::default() }
+    }
+
+    #[test]
+    fn encode_vim_list_to_buf_joins_string_items_with_newlines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                list,
+                Some(b"one"),
+            );
+            crate::eval::typval::tv_list_append_string(list, None);
+            crate::eval::typval::tv_list_append_string(
+                list,
+                Some(b"two"),
+            );
+        }
+        assert_eq!(
+            unsafe { encode_vim_list_to_buf(list) },
+            Some(b"one\n\ntwo".to_vec())
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn encode_vim_list_to_buf_handles_empty_and_null_lists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        assert_eq!(
+            unsafe { encode_vim_list_to_buf(list) },
+            Some(Vec::new())
+        );
+        assert_eq!(
+            unsafe { encode_vim_list_to_buf(std::ptr::null()) },
+            Some(Vec::new())
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn encode_vim_list_to_buf_rejects_nonstring_items() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 42);
+        }
+        assert_eq!(unsafe { encode_vim_list_to_buf(list) }, None);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 
     // All expected outputs in this module were cross-checked directly
@@ -935,4 +1018,3 @@ mod tests {
         unsafe { crate::eval::typval::tv_list_unref(l) };
     }
 }
-
