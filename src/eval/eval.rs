@@ -728,6 +728,137 @@ pub unsafe fn call_func_retlist(
     list
 }
 
+struct FoldexprEvalGuard {
+    saved_sctx: crate::eval::typval_defs::SctxT,
+    use_sandbox: bool,
+}
+
+impl Drop for FoldexprEvalGuard {
+    fn drop(&mut self) {
+        // SAFETY: construction's caller serialized access to these
+        // GLOBALS fields for this guard's full lifetime.
+        unsafe {
+            crate::globals::GLOBALS.get_mut().emsg_off -= 1;
+            if self.use_sandbox {
+                crate::globals::GLOBALS.get_mut().sandbox -= 1;
+            }
+            crate::globals::GLOBALS.get_mut().textlock -= 1;
+            crate::globals::GLOBALS.get_mut().current_sctx =
+                self.saved_sctx;
+        }
+    }
+}
+
+/// Evaluate a window's `'foldexpr'` (`eval_foldexpr`).
+///
+/// Returns the fold level and writes any non-digit prefix character to
+/// `cp`, matching the original's `">2"`/`"<1"` convention.
+///
+/// # Safety
+/// `wp` must point to a live window. Forwarded from
+/// [`crate::option::was_set_insecurely`], [`eval0_simple_funccal`],
+/// and [`crate::eval::typval::tv_clear_simple`]. Callers must
+/// serialize the touched GLOBALS fields.
+#[must_use]
+pub unsafe fn eval_foldexpr(
+    wp: *mut crate::buffer_defs::WinT,
+    cp: &mut i32,
+) -> i32 {
+    debug_assert!(!wp.is_null());
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let use_sandbox = unsafe {
+        crate::option::was_set_insecurely(
+            wp,
+            crate::option_defs::OptIndex::Foldexpr,
+            crate::option_defs::opt_set_flags::OPT_LOCAL,
+        )
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let expression = unsafe {
+        (*wp)
+            .w_onebuf_opt
+            .wo_fde
+            .clone()
+            .unwrap_or_default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let script_contexts = unsafe {
+        &*std::ptr::addr_of!((*wp).w_onebuf_opt.wo_script_ctx)
+    };
+    let script_ctx = script_contexts
+        .get(crate::option_defs::WinOptIndex::Foldexpr as usize)
+        .copied()
+        .unwrap_or_default();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let saved_sctx = unsafe { crate::globals::GLOBALS.get_mut().current_sctx };
+    unsafe {
+        crate::globals::GLOBALS.get_mut().current_sctx = script_ctx;
+        crate::globals::GLOBALS.get_mut().emsg_off += 1;
+        if use_sandbox {
+            crate::globals::GLOBALS.get_mut().sandbox += 1;
+        }
+        crate::globals::GLOBALS.get_mut().textlock += 1;
+    }
+    let state = FoldexprEvalGuard { saved_sctx, use_sandbox };
+
+    *cp = i32::from(crate::ascii_defs::NUL);
+    let mut tv = TypvalT::default();
+    let mut evalarg = EvalargT {
+        eval_flags: EVAL_EVALUATE,
+        ..EvalargT::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe {
+        eval0_simple_funccal(
+            &expression[skipwhite(&expression)..],
+            &mut tv,
+            None,
+            Some(&mut evalarg),
+        )
+    };
+    let retval = if result == FAIL {
+        0
+    } else {
+        let value = match &tv.value {
+            TypvalValue::Number(n) => *n,
+            TypvalValue::String(Some(text)) => {
+                let mut start = 0;
+                if let Some(&first) = text.first()
+                    && first != crate::ascii_defs::NUL
+                    && !first.is_ascii_digit()
+                    && first != b'-'
+                {
+                    *cp = i32::from(first);
+                    start = 1;
+                }
+                let mut number = 0;
+                crate::charset::vim_str2nr(
+                    &text[start..],
+                    None,
+                    None,
+                    0,
+                    Some(&mut number),
+                    None,
+                    0,
+                    false,
+                    None,
+                );
+                number
+            }
+            _ => 0,
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+        value
+    };
+
+    clear_evalarg(Some(&mut evalarg), None);
+    drop(state);
+    retval as i32
+}
+
 /// Initialize global/`v:` variables and the function table
 /// (`eval_init`).
 ///
@@ -9377,8 +9508,9 @@ mod tests {
     }
 
     // --- fill_evalarg_from_eap / eval_to_bool / eval_expr /
-    //     eval_to_number / call_vim_function / eval1_emsg /
-    //     eval_expr_string / eval_expr_typval / eval_expr_to_bool ---
+    //     eval_to_number / call_vim_function / eval_foldexpr /
+    //     eval1_emsg / eval_expr_string / eval_expr_typval /
+    //     eval_expr_to_bool ---
 
     #[test]
     fn fill_evalarg_from_eap_sets_evaluate_and_skip_flags() {
@@ -9713,6 +9845,126 @@ mod tests {
         assert!(
             unsafe { call_func_retlist(b"len", &args) }.is_null()
         );
+    }
+
+    fn foldexpr_window(expr: &[u8]) -> Box<crate::buffer_defs::WinT> {
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_onebuf_opt.wo_fde = Some(expr.to_vec());
+        win.w_onebuf_opt.wo_script_ctx = vec![
+            crate::eval::typval_defs::SctxT::default();
+            crate::option_defs::WIN_OPT_COUNT
+        ];
+        win
+    }
+
+    #[test]
+    fn eval_foldexpr_returns_a_numeric_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldexpr_window(b"  2 + 1");
+        let mut cp = -1;
+        assert_eq!(
+            unsafe { eval_foldexpr(std::ptr::addr_of_mut!(*win), &mut cp) },
+            3
+        );
+        assert_eq!(cp, i32::from(crate::ascii_defs::NUL));
+    }
+
+    #[test]
+    fn eval_foldexpr_extracts_a_string_prefix_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldexpr_window(b"'>2'");
+        let mut cp = -1;
+        assert_eq!(
+            unsafe { eval_foldexpr(std::ptr::addr_of_mut!(*win), &mut cp) },
+            2
+        );
+        assert_eq!(cp, i32::from(b'>'));
+    }
+
+    #[test]
+    fn eval_foldexpr_keeps_a_minus_sign_as_part_of_the_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldexpr_window(b"'-12'");
+        let mut cp = -1;
+        assert_eq!(
+            unsafe { eval_foldexpr(std::ptr::addr_of_mut!(*win), &mut cp) },
+            -12
+        );
+        assert_eq!(cp, i32::from(crate::ascii_defs::NUL));
+    }
+
+    #[test]
+    fn eval_foldexpr_returns_zero_for_failure_and_wrong_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut failed = foldexpr_window(b")");
+        let mut cp = -1;
+        assert_eq!(
+            unsafe {
+                eval_foldexpr(std::ptr::addr_of_mut!(*failed), &mut cp)
+            },
+            0
+        );
+
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let mut list = foldexpr_window(b"[1]");
+        assert_eq!(
+            unsafe { eval_foldexpr(std::ptr::addr_of_mut!(*list), &mut cp) },
+            0
+        );
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn eval_foldexpr_restores_script_and_lock_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldexpr_window(b"1");
+        win.w_onebuf_opt.wo_fde_flags =
+            crate::option_defs::opt_flags::INSECURE;
+        win.w_onebuf_opt.wo_script_ctx
+            [crate::option_defs::WinOptIndex::Foldexpr as usize] =
+            crate::eval::typval_defs::SctxT {
+                sc_sid: 42,
+                ..Default::default()
+            };
+
+        let old_sctx =
+            unsafe { crate::globals::GLOBALS.get_mut().current_sctx };
+        let old_emsg_off =
+            unsafe { crate::globals::GLOBALS.get_mut().emsg_off };
+        let old_sandbox =
+            unsafe { crate::globals::GLOBALS.get_mut().sandbox };
+        let old_textlock =
+            unsafe { crate::globals::GLOBALS.get_mut().textlock };
+        unsafe {
+            crate::globals::GLOBALS.get_mut().current_sctx =
+                crate::eval::typval_defs::SctxT {
+                    sc_sid: 7,
+                    ..Default::default()
+                };
+            crate::globals::GLOBALS.get_mut().emsg_off = 2;
+            crate::globals::GLOBALS.get_mut().sandbox = 3;
+            crate::globals::GLOBALS.get_mut().textlock = 4;
+        }
+
+        let mut cp = -1;
+        assert_eq!(
+            unsafe { eval_foldexpr(std::ptr::addr_of_mut!(*win), &mut cp) },
+            1
+        );
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut().current_sctx.sc_sid },
+            7
+        );
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().emsg_off }, 2);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().sandbox }, 3);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().textlock }, 4);
+
+        unsafe {
+            crate::globals::GLOBALS.get_mut().current_sctx = old_sctx;
+            crate::globals::GLOBALS.get_mut().emsg_off = old_emsg_off;
+            crate::globals::GLOBALS.get_mut().sandbox = old_sandbox;
+            crate::globals::GLOBALS.get_mut().textlock = old_textlock;
+        }
     }
 
     #[test]
