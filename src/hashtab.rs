@@ -30,12 +30,6 @@
 //!   `message.c` (phase 15); `hash_add` still returns `FAIL` correctly, it
 //!   just doesn't print anything yet.
 //!
-//! `hash_find`/`hash_find_len` collapse into a single function here: both
-//! exist in the original only because C string keys aren't
-//! length-prefixed, so a NUL-terminated-vs-explicit-length distinction is
-//! needed; a Rust `&[u8]` slice always carries its own length, so there is
-//! nothing left to distinguish.
-
 use crate::ascii_defs::NUL;
 use crate::hashtab_defs::{HashArray, HashT, HashitemT, HashtabT, HT_INIT_SIZE};
 use crate::vim_defs::{FAIL, OK};
@@ -98,8 +92,7 @@ impl HashtabT {
         }
     }
 
-    /// Find item for given `key` in the hashtable (`hash_find`/`hash_find_len`
-    /// - see module docs for why they're unified).
+    /// Find item for the NUL-terminated `key` in the hashtable (`hash_find`).
     ///
     /// Returns the hash item corresponding to the given key. If not found,
     /// returns the empty item that would be used for that key.
@@ -107,6 +100,15 @@ impl HashtabT {
     /// WARNING: the returned reference becomes invalid as soon as the hash
     /// table is changed in any way (matches the original's warning).
     pub fn hash_find(&mut self, key: &[u8]) -> &mut HashitemT {
+        let len = key.iter().position(|&byte| byte == NUL).unwrap_or(key.len());
+        let key = &key[..len];
+        let hash = hash_hash(key);
+        self.hash_lookup(key, hash)
+    }
+
+    /// Like [`HashtabT::hash_find`], but `key` is length-bounded rather than
+    /// NUL-terminated (`hash_find_len`).
+    pub fn hash_find_len(&mut self, key: &[u8]) -> &mut HashitemT {
         let hash = hash_hash_len(key);
         self.hash_lookup(key, hash)
     }
@@ -406,8 +408,7 @@ impl HashtabT {
     }
 }
 
-/// Get the hash number for a key (`hash_hash`/`hash_hash_len` - unified for
-/// the same reason as `hash_find`/`hash_find_len`, see module docs).
+/// Get the hash number for a length-bounded key (`hash_hash_len`).
 ///
 /// If you think you know a better hash function: run a script that uses
 /// hashtables a lot with both algorithms and compare. This is a simplistic
@@ -421,12 +422,19 @@ pub fn hash_hash_len(key: &[u8]) -> HashT {
         return 0;
     }
     for &b in &key[1..] {
-        if b == NUL {
-            break;
-        }
         hash = hash.wrapping_mul(101).wrapping_add(b as HashT);
     }
     hash
+}
+
+/// Hash a NUL-terminated key (`hash_hash`).
+#[must_use]
+pub fn hash_hash(key: &[u8]) -> HashT {
+    let len = key
+        .iter()
+        .position(|&byte| byte == NUL)
+        .unwrap_or(key.len());
+    hash_hash_len(&key[..len])
 }
 
 #[cfg(test)]
@@ -442,6 +450,26 @@ mod tests {
         assert_eq!(hash_hash_len(b""), 0);
         // Single byte: hash == first byte, no cycle needed.
         assert_eq!(hash_hash_len(b"a"), b'a' as HashT);
+    }
+
+    #[test]
+    fn hash_hash_stops_at_the_first_nul() {
+        assert_eq!(hash_hash(b""), 0);
+        assert_eq!(hash_hash(b"alpha\0ignored"), hash_hash_len(b"alpha"));
+        assert_ne!(
+            hash_hash_len(b"alpha\0ignored"),
+            hash_hash_len(b"alpha")
+        );
+    }
+
+    #[test]
+    fn hash_find_distinguishes_nul_terminated_and_bounded_keys() {
+        let mut ht = HashtabT::hash_init();
+        let key = std::ffi::CString::new("alpha").unwrap();
+
+        assert_eq!(unsafe { ht.hash_add(key_ptr(&key)) }, OK);
+        assert!(!hashitem_empty(ht.hash_find(b"alpha\0ignored")));
+        assert!(hashitem_empty(ht.hash_find_len(b"alpha\0ignored")));
     }
 
     #[test]
