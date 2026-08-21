@@ -578,6 +578,69 @@ pub unsafe fn eval_expr(
     unsafe { eval_expr_ext(arg, eap, false) }
 }
 
+struct EmsgOffGuard;
+
+impl EmsgOffGuard {
+    unsafe fn new() -> Self {
+        // SAFETY: callers serialize access to GLOBALS.emsg_off.
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_off += 1 };
+        Self
+    }
+}
+
+impl Drop for EmsgOffGuard {
+    fn drop(&mut self) {
+        // SAFETY: construction's caller serialized access to
+        // GLOBALS.emsg_off for this guard's full lifetime.
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_off -= 1 };
+    }
+}
+
+/// Evaluate an expression silently and return its number value
+/// (`eval_to_number`).
+///
+/// `use_simple_function = true` still needs `may_call_simple_func`.
+/// Like the original, ordinary evaluation accepts whatever prefix
+/// [`eval1`] recognizes without checking for trailing text.
+///
+/// # Safety
+/// Forwarded from [`eval1`] and
+/// [`crate::eval::typval::tv_clear_simple`]. Callers must serialize
+/// access to `GLOBALS.emsg_off`.
+#[must_use]
+pub unsafe fn eval_to_number(
+    expr: &[u8],
+    use_simple_function: bool,
+) -> VarnumberT {
+    if use_simple_function {
+        unimplemented!(
+            "eval_to_number: use_simple_function=true needs may_call_simple_func"
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let emsg_off = unsafe { EmsgOffGuard::new() };
+    let start = skipwhite(expr);
+    let mut rettv = TypvalT::default();
+    let mut evalarg = EvalargT {
+        eval_flags: EVAL_EVALUATE,
+        ..EvalargT::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (result, _) =
+        unsafe { eval1(&expr[start..], &mut rettv, Some(&mut evalarg)) };
+    let value = if result == FAIL {
+        -1
+    } else {
+        let value = crate::eval::typval::tv_get_number_chk(&rettv, None);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+        value
+    };
+    drop(emsg_off);
+    value
+}
+
 /// Initialize global/`v:` variables and the function table
 /// (`eval_init`).
 ///
@@ -9098,8 +9161,8 @@ mod tests {
     }
 
     // --- fill_evalarg_from_eap / eval_to_bool / eval_expr /
-    //     eval1_emsg / eval_expr_string / eval_expr_typval /
-    //     eval_expr_to_bool ---
+    //     eval_to_number / eval1_emsg / eval_expr_string /
+    //     eval_expr_typval / eval_expr_to_bool ---
 
     #[test]
     fn fill_evalarg_from_eap_sets_evaluate_and_skip_flags() {
@@ -9286,6 +9349,58 @@ mod tests {
     #[should_panic(expected = "eval0_simple_funccal")]
     fn eval_expr_ext_simple_function_mode_is_unimplemented() {
         let _ = unsafe { eval_expr_ext(b"len([])", None, true) };
+    }
+
+    #[test]
+    fn eval_to_number_evaluates_arithmetic_and_leading_whitespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { eval_to_number(b"6 * 7", false) }, 42);
+        assert_eq!(unsafe { eval_to_number(b"   20 + 2", false) }, 22);
+    }
+
+    #[test]
+    fn eval_to_number_returns_minus_one_for_a_parse_failure() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { eval_to_number(b")", false) }, -1);
+    }
+
+    #[test]
+    fn eval_to_number_accepts_a_valid_expression_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { eval_to_number(b"4 trailing text", false) },
+            4
+        );
+    }
+
+    #[test]
+    fn eval_to_number_releases_a_non_numeric_list_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        assert_eq!(unsafe { eval_to_number(b"[1]", false) }, -1);
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn eval_to_number_restores_emsg_off_when_evaluation_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = unsafe { crate::globals::GLOBALS.get_mut().emsg_off };
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_off = 6 };
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = unsafe { eval_to_number(b"{x -> x}", false) };
+        });
+        assert!(result.is_err());
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().emsg_off }, 6);
+
+        unsafe { crate::globals::GLOBALS.get_mut().emsg_off = old };
+    }
+
+    #[test]
+    #[should_panic(expected = "may_call_simple_func")]
+    fn eval_to_number_simple_function_mode_is_unimplemented() {
+        let _ = unsafe { eval_to_number(b"len([])", true) };
     }
 
     #[test]
