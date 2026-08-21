@@ -34,7 +34,6 @@ pub fn have_dollars(files: &[Vec<u8>]) -> bool {
 }
 
 /// Return the byte length of one shell word (`word_length`).
-#[allow(dead_code)]
 #[must_use]
 fn word_length(string: &[u8]) -> usize {
     let mut pos = 0;
@@ -54,6 +53,22 @@ fn word_length(string: &[u8]) -> usize {
         pos += 1;
     }
     pos
+}
+
+/// Split a shell command into quote-aware words (`tokenize`).
+#[allow(dead_code)]
+#[must_use]
+fn tokenize(mut string: &[u8]) -> Vec<Vec<u8>> {
+    let mut argv = Vec::new();
+    while !string.is_empty() {
+        let len = word_length(string);
+        argv.push(crate::strings::vim_strnsave_unquoted(
+            &string[..len],
+        ));
+        let whitespace = crate::charset::skipwhite(&string[len..]);
+        string = &string[len + whitespace..];
+    }
+    argv
 }
 
 /// The size of the buffer `shell_argv_to_str` formats into, including
@@ -144,6 +159,39 @@ mod tests {
     fn word_length_consumes_unterminated_quotes_and_empty_input() {
         assert_eq!(word_length(br#""unterminated word"#), 18);
         assert_eq!(word_length(b""), 0);
+    }
+
+    #[test]
+    fn tokenize_splits_unquoted_words() {
+        assert_eq!(
+            tokenize(b"shell -c command"),
+            [b"shell".to_vec(), b"-c".to_vec(), b"command".to_vec()]
+        );
+    }
+
+    #[test]
+    fn tokenize_removes_quotes_and_quoted_escapes() {
+        assert_eq!(
+            tokenize(br#""C:\Program Files\shell" "a\" b""#),
+            [
+                br#"C:\Program Files\shell"#.to_vec(),
+                br#"a" b"#.to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_preserves_the_original_leading_whitespace_quirk() {
+        assert_eq!(
+            tokenize(b"  shell"),
+            [Vec::<u8>::new(), b"shell".to_vec()]
+        );
+        assert_eq!(tokenize(b"  "), [Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn tokenize_of_an_empty_string_is_empty() {
+        assert_eq!(tokenize(b""), Vec::<Vec<u8>>::new());
     }
 
     #[test]
