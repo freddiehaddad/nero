@@ -213,6 +213,58 @@ pub unsafe fn remove_tail(
     }
 }
 
+/// Discover `$VIM` or `$VIMRUNTIME` from `'helpfile'` or
+/// `v:progpath` (the fallback core inside `vim_getenv`).
+///
+/// # Safety
+/// Reads shared option and `v:` state and forwards [`remove_tail`]'s
+/// filename-comparison requirement.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn discover_vim_path(vimruntime: bool) -> Option<Vec<u8>> {
+    let helpfile = unsafe {
+        (*crate::option_vars::OPTION_VARS.as_ptr())
+            .p_hf
+            .clone()
+            .filter(|path| !path.contains(&b'$'))
+    };
+    let (mut path, from_helpfile) = if let Some(helpfile) = helpfile {
+        (helpfile, true)
+    } else {
+        let mut executable_prefix =
+            unsafe { vim_get_prefix_from_exepath() };
+        if !crate::path::append_path(
+            &mut executable_prefix,
+            b"share/nvim/runtime/",
+            crate::os::os_defs::MAXPATHL as usize,
+        ) {
+            return None;
+        }
+        (executable_prefix, false)
+    };
+
+    let mut end = crate::path::path_tail(&path);
+    if from_helpfile {
+        end = unsafe { remove_tail(&path, end, b"doc") };
+    }
+    if !vimruntime {
+        end = unsafe {
+            remove_tail(
+                &path,
+                end,
+                crate::vim_defs::RUNTIME_DIRNAME.as_bytes(),
+            )
+        };
+    }
+    if end > 0 && crate::path::after_pathsep(&path, end) {
+        end -= 1;
+    }
+    path.truncate(end);
+    let path_text = std::str::from_utf8(&path).ok()?;
+    crate::os::fs::os_isdir(std::path::Path::new(path_text))
+        .then_some(path)
+}
+
 /// Derive the installation prefix from `v:progpath`
 /// (`vim_get_prefix_from_exepath`).
 ///
@@ -1104,6 +1156,57 @@ pub(crate) mod tests {
         }
     }
 
+    struct HelpfileGuard(Option<Vec<u8>>);
+
+    impl HelpfileGuard {
+        unsafe fn set(value: Option<&[u8]>) -> Self {
+            let options =
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let previous = Self(options.p_hf.clone());
+            options.p_hf = value.map(<[u8]>::to_vec);
+            previous
+        }
+    }
+
+    impl Drop for HelpfileGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::option_vars::OPTION_VARS.get_mut().p_hf =
+                    self.0.take();
+            }
+        }
+    }
+
+    struct ProgpathGuard(Vec<u8>);
+
+    impl ProgpathGuard {
+        unsafe fn set(value: &[u8]) -> Self {
+            let previous = unsafe {
+                crate::eval::vars::get_vim_var_str(
+                    crate::eval::vars::VimVarIndex::Progpath,
+                )
+            };
+            unsafe {
+                crate::eval::vars::set_vim_var_string(
+                    crate::eval::vars::VimVarIndex::Progpath,
+                    Some(value),
+                )
+            };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ProgpathGuard {
+        fn drop(&mut self) {
+            unsafe {
+                crate::eval::vars::set_vim_var_string(
+                    crate::eval::vars::VimVarIndex::Progpath,
+                    Some(&self.0),
+                )
+            };
+        }
+    }
+
     // --- vim_get_prefix_from_exepath ---
 
     #[test]
@@ -1572,6 +1675,70 @@ pub(crate) mod tests {
     fn remove_tail_keeps_the_suffix_when_there_is_not_enough_prefix() {
         let _lock = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { remove_tail(b"help.txt", 0, b"doc") }, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn discover_vim_path_uses_the_helpfile_layout() {
+        let _lock = crate::globals::global_state_test_lock();
+        let scratch = RuntimeDirScratch::new();
+        let runtime = scratch
+            .0
+            .join(crate::vim_defs::RUNTIME_DIRNAME);
+        let doc = runtime.join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        let helpfile = doc.join("help.txt");
+        std::fs::write(&helpfile, b"help").unwrap();
+        let helpfile_bytes =
+            helpfile.to_string_lossy().into_owned().into_bytes();
+        let _helpfile =
+            unsafe { HelpfileGuard::set(Some(&helpfile_bytes)) };
+
+        assert_eq!(
+            unsafe { discover_vim_path(true) },
+            Some(
+                runtime
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes()
+            )
+        );
+        assert_eq!(
+            unsafe { discover_vim_path(false) },
+            Some(scratch.bytes())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn discover_vim_path_uses_the_executable_layout() {
+        let _lock = crate::globals::global_state_test_lock();
+        let scratch = RuntimeDirScratch::new();
+        let install = scratch.0.join("share").join("nvim");
+        let runtime =
+            install.join(crate::vim_defs::RUNTIME_DIRNAME);
+        std::fs::create_dir_all(&runtime).unwrap();
+        let executable = scratch.0.join("bin").join("nvim");
+        let executable_bytes =
+            executable.to_string_lossy().into_owned().into_bytes();
+        let _helpfile = unsafe { HelpfileGuard::set(None) };
+        let _progpath =
+            unsafe { ProgpathGuard::set(&executable_bytes) };
+        let mut expected_runtime = scratch.bytes();
+        expected_runtime.push(std::path::MAIN_SEPARATOR as u8);
+        expected_runtime.extend_from_slice(b"share/nvim/runtime");
+        let mut expected_install = scratch.bytes();
+        expected_install.push(std::path::MAIN_SEPARATOR as u8);
+        expected_install.extend_from_slice(b"share/nvim");
+
+        assert_eq!(
+            unsafe { discover_vim_path(true) },
+            Some(expected_runtime)
+        );
+        assert_eq!(
+            unsafe { discover_vim_path(false) },
+            Some(expected_install)
+        );
     }
 
     #[test]
