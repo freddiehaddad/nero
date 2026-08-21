@@ -18,8 +18,7 @@
 //! `"$NVIM_APPNAME[-data]"` before joining) is likewise replaced with
 //! a plain local `Vec<u8>`, matching the same established preference.
 //!
-//! Deferred: `stdpaths_user_data_subpath`/
-//! `stdpaths_user_state_subpath`.
+//! Deferred: `stdpaths_user_state_subpath`.
 
 use crate::memory::memchrsub;
 use crate::os::env::os_getenv;
@@ -255,6 +254,18 @@ pub unsafe fn stdpaths_user_cache_subpath(fname: &[u8]) -> Vec<u8> {
 pub unsafe fn stdpaths_user_conf_subpath(fname: &[u8]) -> Vec<u8> {
     let home = unsafe { get_xdg_home(XdgVarType::ConfigHome) }
         .expect("config home always has a platform default");
+    concat_fnames(home, fname)
+}
+
+/// Return `$XDG_DATA_HOME/$NVIM_APPNAME[-data]/{fname}`
+/// (`stdpaths_user_data_subpath`).
+///
+/// # Safety
+/// Forwarded from [`get_xdg_home`]'s own safety doc.
+#[must_use]
+pub unsafe fn stdpaths_user_data_subpath(fname: &[u8]) -> Vec<u8> {
+    let home = unsafe { get_xdg_home(XdgVarType::DataHome) }
+        .expect("data home always has a platform default");
     concat_fnames(home, fname)
 }
 
@@ -521,6 +532,28 @@ pub(crate) mod tests {
         );
         assert_eq!(
             unsafe { stdpaths_user_conf_subpath(b"init.lua") },
+            expected
+        );
+    }
+
+    #[test]
+    fn data_subpath_appends_platform_appname_and_file_name() {
+        let _lock = xdg_test_lock();
+        let _guard = XdgEnvGuard::set(&[
+            ("XDG_DATA_HOME", Some("/data")),
+            ("NVIM_APPNAME", Some("nero-test")),
+        ]);
+        let appname: &[u8] = if cfg!(windows) {
+            b"nero-test-data"
+        } else {
+            b"nero-test"
+        };
+        let expected = concat_fnames(
+            concat_fnames(b"/data".to_vec(), appname),
+            b"site",
+        );
+        assert_eq!(
+            unsafe { stdpaths_user_data_subpath(b"site") },
             expected
         );
     }
