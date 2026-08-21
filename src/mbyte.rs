@@ -795,6 +795,41 @@ pub unsafe fn mb_copy_char(source: &mut &[u8], destination: &mut Vec<u8>) {
     *source = &source[len..];
 }
 
+/// Convert a NUL-terminated UTF-8 string to UTF-16 (`utf8_to_utf16`).
+///
+/// The redundant second terminator byte allocated by the C implementation is
+/// omitted; the returned vector still contains the same observable single NUL
+/// terminator.
+#[cfg(windows)]
+#[must_use]
+pub fn utf8_to_utf16(utf8: &[u8]) -> Option<Vec<u16>> {
+    const CP_UTF8: u32 = 65_001;
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            input: *const std::os::raw::c_char,
+            input_len: i32,
+            output: *mut u16,
+            output_len: i32,
+        ) -> i32;
+    }
+
+    let len = utf8.iter().position(|&byte| byte == 0).unwrap_or(utf8.len());
+    let mut terminated = utf8[..len].to_vec();
+    terminated.push(0);
+    let input = terminated.as_ptr().cast();
+    let required =
+        unsafe { MultiByteToWideChar(CP_UTF8, 0, input, -1, std::ptr::null_mut(), 0) };
+    if required == 0 {
+        return None;
+    }
+    let mut output = vec![0u16; required as usize];
+    let written =
+        unsafe { MultiByteToWideChar(CP_UTF8, 0, input, -1, output.as_mut_ptr(), required) };
+    (written != 0).then_some(output)
+}
+
 /// Build a `schar_T` from `buf`, prefixing a space when the sequence
 /// begins with a composing character (`schar_from_buf_first`).
 ///
@@ -3418,6 +3453,14 @@ mod tests {
 
         assert_eq!(destination, "e\u{0301}".as_bytes());
         assert_eq!(source, b"x\0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf8_to_utf16_converts_and_nul_terminates_text() {
+        assert_eq!(utf8_to_utf16(b"hello"), Some("hello\0".encode_utf16().collect()));
+        assert_eq!(utf8_to_utf16("日本".as_bytes()), Some("日本\0".encode_utf16().collect()));
+        assert_eq!(utf8_to_utf16(b"one\0two"), Some("one\0".encode_utf16().collect()));
     }
 
     #[test]
