@@ -28,10 +28,6 @@
 //! step of trying `try_to_free_memory()` before giving up; that retry is
 //! deferred along with `try_to_free_memory` itself, per above.
 //!
-//! `xstrnlen` is skipped: the original only defines it
-//! `#ifndef HAVE_STRNLEN`, a fallback for libcs lacking `strnlen()`
-//! (`auto/config.h` feature detection) - dead code on every modern target.
-
 use crate::ascii_defs::NUL;
 
 /// Round an arena offset up to the alignment required for pointers and
@@ -207,6 +203,17 @@ pub fn xstrlcat(dst: &mut [u8], src: &[u8], dsize: usize) -> usize {
         }
     }
     slen + dlen
+}
+
+/// Return the smaller of `n` and the first NUL position (`xstrnlen`).
+///
+/// Neovim compiles this fallback only when the platform libc lacks
+/// `strnlen`; Rust uses the same portable implementation on every target.
+#[inline]
+#[must_use]
+pub fn xstrnlen(s: &[u8], n: usize) -> usize {
+    let n = n.min(s.len());
+    s[..n].iter().position(|&byte| byte == NUL).unwrap_or(n)
 }
 
 /// Replaces every instance of `c` with `x` in length-bounded `data`
@@ -442,6 +449,14 @@ mod tests {
         let mut data = b"a.b.c".to_vec();
         memchrsub(&mut data, b'.', b'-');
         assert_eq!(&data, b"a-b-c");
+    }
+
+    #[test]
+    fn xstrnlen_stops_at_nul_or_the_supplied_bound() {
+        assert_eq!(xstrnlen(b"abc\0def", 7), 3);
+        assert_eq!(xstrnlen(b"abcdef", 3), 3);
+        assert_eq!(xstrnlen(b"abc", usize::MAX), 3);
+        assert_eq!(xstrnlen(b"", 5), 0);
     }
 
     #[test]
