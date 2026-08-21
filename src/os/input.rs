@@ -109,6 +109,49 @@ pub unsafe fn push_event_key(buf: &mut [u8]) -> usize {
     written
 }
 
+/// Detect the newest Ctrl-C in buffered input (`process_ctrl_c`).
+///
+/// Earlier unread bytes are discarded by advancing the read cursor to
+/// the interrupt byte, matching Neovim's typeahead handling.
+///
+/// # Safety
+/// Mutates shared raw-input and global interrupt state.
+#[allow(dead_code)]
+unsafe fn process_ctrl_c() {
+    let globals = crate::globals::GLOBALS.as_ptr();
+    if !unsafe { (*globals).ctrl_c_interrupts } {
+        return;
+    }
+
+    let input = unsafe { INPUT_BUFFER.get_mut() };
+    let available = input.write_pos - input.read_pos;
+    let mut found = None;
+    for index in (0..available).rev() {
+        let absolute = input.read_pos + index;
+        let byte = input.data[absolute];
+        let modified_ctrl_c = byte == b'C'
+            && index >= 3
+            && input.data[absolute - 3]
+                == crate::keycodes_defs::K_SPECIAL
+            && input.data[absolute - 2]
+                == crate::keycodes_defs::KS_MODIFIER
+            && input.data[absolute - 1]
+                == crate::keycodes_defs::MOD_MASK_CTRL as u8;
+        if byte == crate::ascii_defs::CTRL_C || modified_ctrl_c {
+            input.data[absolute] = crate::ascii_defs::CTRL_C;
+            unsafe { (*globals).got_int = true };
+            found = Some(index);
+            break;
+        }
+    }
+
+    if unsafe { (*globals).got_int }
+        && let Some(index @ 1..) = found
+    {
+        input.read_pos += index;
+    }
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -275,6 +318,96 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let _index = unsafe { EventKeyIndexGuard::reset() };
         let _ = unsafe { push_event_key(&mut []) };
+    }
+
+    #[test]
+    fn process_ctrl_c_keeps_the_newest_interrupt_and_discards_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _interrupts = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.ctrl_c_interrupts,
+                true,
+            )
+        };
+        let _got_int = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.got_int,
+                false,
+            )
+        };
+        unsafe {
+            input_enqueue_raw(&[
+                crate::ascii_defs::CTRL_C,
+                b'x',
+                crate::ascii_defs::CTRL_C,
+                b'y',
+            ]);
+            process_ctrl_c();
+        }
+
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(input.read_pos, 2);
+        assert_eq!(input.data[input.read_pos], crate::ascii_defs::CTRL_C);
+        assert!(unsafe { (*crate::globals::GLOBALS.as_ptr()).got_int });
+    }
+
+    #[test]
+    fn process_ctrl_c_recognizes_a_modified_ctrl_c_sequence() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _interrupts = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.ctrl_c_interrupts,
+                true,
+            )
+        };
+        let _got_int = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.got_int,
+                false,
+            )
+        };
+        unsafe {
+            input_enqueue_raw(&[
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_MODIFIER,
+                crate::keycodes_defs::MOD_MASK_CTRL as u8,
+                b'C',
+            ]);
+            process_ctrl_c();
+        }
+
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(input.read_pos, 3);
+        assert_eq!(input.data[3], crate::ascii_defs::CTRL_C);
+        assert!(unsafe { (*crate::globals::GLOBALS.as_ptr()).got_int });
+    }
+
+    #[test]
+    fn process_ctrl_c_respects_the_interrupts_disabled_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _buffer = unsafe { InputBufferGuard::reset() };
+        let _interrupts = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.ctrl_c_interrupts,
+                false,
+            )
+        };
+        let _got_int = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.got_int,
+                false,
+            )
+        };
+        unsafe {
+            input_enqueue_raw(&[b'a', crate::ascii_defs::CTRL_C]);
+            process_ctrl_c();
+        }
+
+        let input = unsafe { INPUT_BUFFER.get_mut() };
+        assert_eq!(input.read_pos, 0);
+        assert!(!unsafe { (*crate::globals::GLOBALS.as_ptr()).got_int });
     }
 
     #[test]
