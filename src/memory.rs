@@ -209,10 +209,8 @@ pub fn xstrlcat(dst: &mut [u8], src: &[u8], dsize: usize) -> usize {
     slen + dlen
 }
 
-/// Replaces every instance of `c` with `x` (`strchrsub`/`memchrsub` are
-/// unified here: Rust slices already carry their length, so there is no
-/// separate "NUL-terminated string" overload needed - callers pass the
-/// exact byte range to operate on).
+/// Replaces every instance of `c` with `x` in length-bounded `data`
+/// (`memchrsub`).
 #[inline]
 pub fn memchrsub(data: &mut [u8], c: u8, x: u8) {
     for b in data.iter_mut() {
@@ -222,8 +220,17 @@ pub fn memchrsub(data: &mut [u8], c: u8, x: u8) {
     }
 }
 
-/// Counts the number of occurrences of byte `c` in `data` (`strcnt`/`memcnt`
-/// unified for the same reason as `memchrsub` above).
+/// Replaces every instance of `c` before the first NUL with `x`
+/// (`strchrsub`).
+#[inline]
+pub fn strchrsub(data: &mut [u8], c: u8, x: u8) {
+    assert_ne!(c, NUL);
+    let len = data.iter().position(|&byte| byte == NUL).unwrap_or(data.len());
+    memchrsub(&mut data[..len], c, x);
+}
+
+/// Counts the number of occurrences of byte `c` in length-bounded `data`
+/// (`memcnt`).
 #[inline]
 pub fn memcnt(data: &[u8], c: u8) -> usize {
     data.iter().filter(|&&b| b == c).count()
@@ -426,6 +433,16 @@ mod tests {
         let mut data = b"a.b.c".to_vec();
         memchrsub(&mut data, b'.', b'-');
         assert_eq!(&data, b"a-b-c");
+    }
+
+    #[test]
+    fn strchrsub_stops_at_the_first_nul() {
+        let mut data = b"a.b\0.c".to_vec();
+        strchrsub(&mut data, b'.', b'-');
+        assert_eq!(&data, b"a-b\0.c");
+
+        memchrsub(&mut data, b'.', b'-');
+        assert_eq!(&data, b"a-b\0-c");
     }
 
     #[test]
