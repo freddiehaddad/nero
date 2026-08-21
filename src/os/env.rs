@@ -769,9 +769,17 @@ pub unsafe fn home_replace_save(
     if let Some(home) = &mut env_home {
         crate::path::path_to_slash(home);
         if home.first() == Some(&b'~') {
-            unimplemented!(
-                "home_replace_save: a HOME value beginning with '~' needs modify_fname(:p)"
-            );
+            let expanded = unsafe { expand_env_save(home) };
+            *home = crate::path::full_name_save(
+                Some(&expanded),
+                true,
+            )
+            .unwrap_or(expanded);
+            if home.len() > 1
+                && crate::path::after_pathsep(home, home.len())
+            {
+                home.pop();
+            }
         }
     }
 
@@ -1356,6 +1364,25 @@ pub(crate) mod tests {
         }
     }
 
+    struct HomedirValueGuard(Option<Vec<u8>>);
+
+    impl HomedirValueGuard {
+        unsafe fn set(value: Option<&[u8]>) -> Self {
+            Self(unsafe {
+                std::mem::replace(
+                    HOMEDIR.get_mut(),
+                    value.map(<[u8]>::to_vec),
+                )
+            })
+        }
+    }
+
+    impl Drop for HomedirValueGuard {
+        fn drop(&mut self) {
+            unsafe { *HOMEDIR.get_mut() = self.0.take() };
+        }
+    }
+
     // --- vim_get_prefix_from_exepath ---
 
     #[test]
@@ -1517,6 +1544,29 @@ pub(crate) mod tests {
         unsafe { *HOMEDIR.get_mut() = old_home };
         assert_eq!(replaced, b"~/project/file");
         assert_eq!(boundary, b"/home/nerox/file");
+    }
+
+    #[test]
+    fn home_replace_save_expands_a_tilde_home_value() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _cwd_lock = crate::os::fs::cwd_test_lock();
+        let resolved: &[u8] = if cfg!(windows) {
+            b"C:/Users/nero"
+        } else {
+            b"/home/nero"
+        };
+        let _homedir =
+            unsafe { HomedirValueGuard::set(Some(resolved)) };
+        let _environment =
+            EnvVarGuard::set(&[("HOME", Some("~/nested/"))]);
+        let mut source = resolved.to_vec();
+        source.extend_from_slice(b"/nested/project");
+
+        assert_eq!(
+            unsafe { home_replace_save(None, Some(&source)) },
+            b"~/nested/project"
+        );
     }
 
     #[test]
