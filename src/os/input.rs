@@ -152,6 +152,31 @@ unsafe fn process_ctrl_c() {
     }
 }
 
+/// Whether a file descriptor refers to a terminal (`os_isatty`).
+#[must_use]
+pub fn os_isatty(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(fd) != 0 }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "ucrt")]
+        unsafe extern "C" {
+            fn _isatty(fd: i32) -> i32;
+        }
+        unsafe { _isatty(fd) != 0 }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = fd;
+        false
+    }
+}
+
 /// Whether the main loop is blocked waiting for input
 /// (`input_blocking`).
 ///
@@ -408,6 +433,18 @@ mod tests {
         let input = unsafe { INPUT_BUFFER.get_mut() };
         assert_eq!(input.read_pos, 0);
         assert!(!unsafe { (*crate::globals::GLOBALS.as_ptr()).got_int });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call isatty FFI")]
+    fn os_isatty_rejects_an_invalid_descriptor() {
+        assert!(!os_isatty(-1));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call isatty FFI")]
+    fn os_isatty_accepts_a_real_descriptor_without_panicking() {
+        let _ = os_isatty(1);
     }
 
     #[test]
