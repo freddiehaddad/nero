@@ -276,12 +276,10 @@
 //! [`LvalT`] modeling `lval_T`) - the lvalue-resolution engine behind
 //! `islocked()`/`remove()`/`:let`/`:unlet` (only `islocked()`,
 //! `eval/funcs.rs`'s `f_islocked`, is wired up as a real caller so
-//! far). Two genuinely-unreached-today branches `unimplemented!()`:
-//! a magic brace (`{...}`) detected in the variable name (needs
-//! `make_expanded_name`, not yet translated - covers `get_lval`'s
-//! `skip: true` fast path too, since `find_name_end`'s own translation
-//! doesn't model `FNE_INCL_BR` yet either, and no caller passes
-//! `skip: true` yet regardless); and assigning through a scope
+//! far). The parse-only `skip: true` path is complete through
+//! `find_name_end(FNE_INCL_BR)`. Two substantive branches remain: a
+//! magic brace (`{...}`) detected in an evaluated variable name (needs
+//! `make_expanded_name`) and assigning through a scope
 //! dictionary (`rettv: Some(_)` inside `get_lval_dict_item`, needs
 //! `var_wrong_func_name`/`function_exists`/`trans_function_name`, the
 //! last of which is a substantial separate undertaking) - `islocked()`
@@ -3185,12 +3183,8 @@ pub fn handle_subscript(
 /// there (`namespace_char`).
 const NAMESPACE_CHAR: &[u8] = b"abglstvw";
 
-/// `eval.h`'s `find_name_end`/[`find_name_end`] flag: include `[`/`.`
-/// in the name scan (used only by `get_lval`'s lvalue-resolution
-/// `skip: true` fast path, itself `unimplemented!()` - see
-/// [`find_name_end`]'s own doc comment for why it's not modeled here)
-/// (`FNE_INCL_BR`).
-#[allow(dead_code)]
+/// `eval.h`'s `find_name_end`/[`find_name_end`] flag: include `[` and
+/// valid `.key` components in the name scan (`FNE_INCL_BR`).
 const FNE_INCL_BR: i32 = 1;
 /// `eval.h`'s `find_name_end` flag: check that the name starts with a
 /// valid character (`FNE_CHECK_START`).
@@ -3236,12 +3230,6 @@ pub fn get_id_len(arg: &[u8]) -> (usize, usize) {
 /// original's character-aware walk would, for any well-formed UTF-8
 /// input (same reasoning as `eval_lit_string`'s own doc comment).
 ///
-/// `FNE_INCL_BR` (letting `[`/`.` continue the name scan, used only
-/// by `get_lval`'s lvalue-resolution code) is NOT modeled - `flags` is
-/// only ever checked against `FNE_CHECK_START` here, since nothing
-/// in this crate can pass `FNE_INCL_BR` yet ([`get_name_len`], the
-/// only real caller, never does).
-///
 /// Returns `(end, magic_braces)`: `end` is the byte offset just past
 /// the name (`0` if there is no valid name at all - matching the
 /// original's own "return arg unchanged"); `magic_braces`, if
@@ -3267,7 +3255,18 @@ pub fn find_name_end(arg: &[u8], flags: i32) -> (usize, Option<(usize, usize)>) 
     let mut p = 0;
     while p < arg.len() {
         let c = arg[p];
-        if !(eval_isnamec(i32::from(c)) || c == b'{' || mb_nest != 0 || br_nest != 0) {
+        let included_subscript = flags & FNE_INCL_BR != 0
+            && (c == b'['
+                || (c == b'.'
+                    && arg
+                        .get(p + 1)
+                        .is_some_and(|&next| eval_isdictc(i32::from(next)))));
+        if !(eval_isnamec(i32::from(c))
+            || c == b'{'
+            || included_subscript
+            || mb_nest != 0
+            || br_nest != 0)
+        {
             break;
         }
 
@@ -5474,8 +5473,7 @@ pub fn check_luafunc_name(str: &[u8], paren: bool) -> usize {
 /// explains why that's provably unreached by `islocked()`, the only
 /// real caller so far).
 ///
-/// See this module's own doc comment for why the `skip: true` fast
-/// path and a magic-brace (`{...}`) name both `unimplemented!()`.
+/// A magic-brace (`{...}`) name still requires `make_expanded_name`.
 ///
 /// Returns the byte offset just past the name, including any index,
 /// or `None` for a parsing error - matching [`find_name_end`]'s own
@@ -5501,10 +5499,7 @@ pub unsafe fn get_lval<'a>(
     if skip {
         // When skipping just find the end of the name.
         lp.ll_name = Some(name);
-        unimplemented!(
-            "get_lval: skip=true needs find_name_end's FNE_INCL_BR support, not yet \
-             translated - see this module's own doc comment"
-        );
+        return Some(find_name_end(name, FNE_INCL_BR | fne_flags).0);
     }
 
     // Find the end of the name.
@@ -9215,6 +9210,37 @@ mod tests {
         assert_eq!(end, 15);
     }
 
+    #[test]
+    fn find_name_end_fne_incl_br_includes_dot_and_bracket_subscripts() {
+        let input = b"dict.list[1].key rest";
+        assert_eq!(
+            find_name_end(input, FNE_INCL_BR),
+            (b"dict.list[1].key".len(), None)
+        );
+    }
+
+    #[test]
+    fn find_name_end_fne_incl_br_preserves_nested_bracket_scanning() {
+        let input = b"list[dict['key'][1]].tail rest";
+        assert_eq!(
+            find_name_end(input, FNE_INCL_BR),
+            (b"list[dict['key'][1]].tail".len(), None)
+        );
+    }
+
+    #[test]
+    fn find_name_end_fne_incl_br_stops_before_an_invalid_dot_key() {
+        assert_eq!(find_name_end(b"dict.-bad", FNE_INCL_BR), (4, None));
+    }
+
+    #[test]
+    fn find_name_end_fne_incl_br_honors_fne_check_start() {
+        assert_eq!(
+            find_name_end(b"1bad[0]", FNE_INCL_BR | FNE_CHECK_START),
+            (0, None)
+        );
+    }
+
     // --- get_name_len ---
 
     #[test]
@@ -11777,6 +11803,50 @@ mod tests {
         assert!(lv.ll_tv.is_null());
 
         reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_skip_only_scans_the_complete_lvalue_name() {
+        let cases: &[(&[u8], usize)] = &[
+            (b"name trailing", 4),
+            (b"dict.key trailing", 8),
+            (b"list[expr] trailing", 10),
+            (b"dict.list[1].key trailing", 16),
+            (b"dict.-bad", 4),
+        ];
+
+        for &(input, expected_end) in cases {
+            let mut lv = LvalT::default();
+            let end = unsafe {
+                get_lval(
+                    input,
+                    None,
+                    &mut lv,
+                    false,
+                    true,
+                    GLV_NO_AUTOLOAD | GLV_READ_ONLY,
+                    FNE_CHECK_START,
+                )
+            };
+            assert_eq!(end, Some(expected_end), "input: {input:?}");
+            assert_eq!(lv.ll_name, Some(input), "input: {input:?}");
+            assert!(lv.ll_tv.is_null(), "input: {input:?}");
+        }
+
+        let mut lv = LvalT::default();
+        let end = unsafe {
+            get_lval(
+                b"1bad[0]",
+                None,
+                &mut lv,
+                false,
+                true,
+                GLV_NO_AUTOLOAD | GLV_READ_ONLY,
+                FNE_CHECK_START,
+            )
+        };
+        assert_eq!(end, Some(0));
+        assert_eq!(lv.ll_name, Some(&b"1bad[0]"[..]));
     }
 
     #[test]
