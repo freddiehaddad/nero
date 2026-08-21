@@ -668,6 +668,29 @@ pub unsafe fn check_text_locked(
     true
 }
 
+/// Check text, current-buffer, and all-buffer locks
+/// (`check_text_or_curbuf_locked`).
+///
+/// # Safety
+/// Forwarded from [`check_text_locked`],
+/// [`crate::ex_getln::curbuf_locked`], and [`clearop`].
+#[must_use]
+pub unsafe fn check_text_or_curbuf_locked(
+    oap: Option<&mut crate::normal_defs::OpargT>,
+) -> bool {
+    let mut oap = oap;
+    if unsafe { check_text_locked(oap.as_deref_mut()) } {
+        return true;
+    }
+    if !unsafe { crate::ex_getln::curbuf_locked() } {
+        return false;
+    }
+    if let Some(oap) = oap {
+        unsafe { clearop(oap) };
+    }
+    true
+}
+
 /// Swap the ends of the Visual selection (`v_swap_corners`).
 ///
 /// For `O` in blockwise Visual mode this swaps the LEFT/RIGHT corners
@@ -2391,6 +2414,95 @@ mod tests {
             )
         };
         assert!(unsafe { check_text_locked(None) });
+    }
+
+    #[test]
+    fn check_text_or_curbuf_locked_clears_buffer_locked_operator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_ro_locked: 1,
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.textlock,
+                0,
+            )
+        };
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.expr_map_lock,
+                0,
+            )
+        };
+        let _all = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.allbuf_lock,
+                0,
+            )
+        };
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            ..Default::default()
+        };
+
+        assert!(unsafe {
+            check_text_or_curbuf_locked(Some(&mut oap))
+        });
+        assert_eq!(
+            oap.op_type,
+            crate::ops_defs::OpType::Nop as i32
+        );
+    }
+
+    #[test]
+    fn check_text_or_curbuf_locked_is_false_when_all_locks_are_clear() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.curbuf,
+                buf_ptr,
+            )
+        };
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.textlock,
+                0,
+            )
+        };
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.expr_map_lock,
+                0,
+            )
+        };
+        let _all = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.allbuf_lock,
+                0,
+            )
+        };
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            ..Default::default()
+        };
+
+        assert!(!unsafe {
+            check_text_or_curbuf_locked(Some(&mut oap))
+        });
+        assert_eq!(
+            oap.op_type,
+            crate::ops_defs::OpType::Delete as i32
+        );
     }
 
     #[test]
