@@ -367,6 +367,33 @@ pub fn concat_str(str1: &[u8], str2: &[u8]) -> Vec<u8> {
     dest
 }
 
+/// Read one numeric formatter argument and advance its one-based index
+/// (`tv_nr`).
+///
+/// Message display for a missing or invalid argument remains deferred with
+/// the formatter; the source's zero fallback and index advancement are
+/// preserved.
+#[allow(dead_code)]
+fn tv_nr(
+    tvs: &[crate::eval::typval_defs::TypvalT],
+    idx: &mut usize,
+) -> crate::eval::typval_defs::VarnumberT {
+    let Some(index) = idx.checked_sub(1) else {
+        return 0;
+    };
+    let Some(tv) = tvs.get(index) else {
+        return 0;
+    };
+    if matches!(&tv.value, crate::eval::typval_defs::TypvalValue::Unknown) {
+        return 0;
+    }
+
+    *idx += 1;
+    let mut error = false;
+    let number = crate::eval::typval::tv_get_number_chk(tv, Some(&mut error));
+    if error { 0 } else { number }
+}
+
 /// ASCII lower-to-upper case translation, language independent, in
 /// place (`vim_strup`).
 ///
@@ -970,6 +997,35 @@ mod tests {
     #[test]
     fn concat_str_joins_without_separator() {
         assert_eq!(concat_str(b"foo", b"bar"), b"foobar");
+    }
+
+    #[test]
+    fn tv_nr_reads_one_based_arguments_and_advances() {
+        let tvs = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(42),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT::default(),
+        ];
+        let mut index = 1;
+
+        assert_eq!(tv_nr(&tvs, &mut index), 42);
+        assert_eq!(index, 2);
+        assert_eq!(tv_nr(&tvs, &mut index), 0);
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn tv_nr_advances_past_an_invalid_non_unknown_argument() {
+        let tvs = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::List(std::ptr::null_mut()),
+            v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+        }];
+        let mut index = 1;
+
+        assert_eq!(tv_nr(&tvs, &mut index), 0);
+        assert_eq!(index, 2);
     }
 
     #[test]
