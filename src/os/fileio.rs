@@ -61,7 +61,8 @@ fn open_flags(flags: i32) -> (i32, bool) {
             | file_open_flags::CREATE_ONLY
             | file_open_flags::TRUNCATE
             | file_open_flags::APPEND
-            | file_open_flags::WRITE_ONLY)
+            | file_open_flags::WRITE_ONLY
+            | file_open_flags::MKDIR)
         != 0;
     assert!(
         !write || flags & file_open_flags::READ_ONLY == 0,
@@ -87,11 +88,27 @@ fn open_flags(flags: i32) -> (i32, bool) {
         assert_eq!(flags & file_open_flags::CREATE_ONLY, 0);
         system |= libc::O_APPEND;
     }
+    if flags & file_open_flags::MKDIR != 0 {
+        assert_eq!(flags & file_open_flags::CREATE_ONLY, 0);
+        system |= libc::O_CREAT;
+    }
     #[cfg(unix)]
     if flags & file_open_flags::NO_SYMLINK != 0 {
         system |= libc::O_NOFOLLOW;
     }
+
     (system, write)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(path: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(path.to_vec()).into()
+}
+
+#[cfg(windows)]
+fn path_from_bytes(path: &[u8]) -> Option<std::path::PathBuf> {
+    std::str::from_utf8(path).ok().map(Into::into)
 }
 
 #[cfg(unix)]
@@ -364,8 +381,16 @@ pub fn file_open(
     mode: i32,
 ) -> i32 {
     if flags & file_open_flags::MKDIR != 0 {
-        let path = String::from_utf8_lossy(filename);
-        if std::fs::create_dir_all(path.as_ref()).is_err() {
+        #[cfg(unix)]
+        let path = path_from_bytes(filename);
+        #[cfg(windows)]
+        let Some(path) = path_from_bytes(filename) else {
+            return -libc::EINVAL;
+        };
+        let Some(parent) = path.parent() else {
+            return -1;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
             return -1;
         }
     }
@@ -847,5 +872,34 @@ mod tests {
         assert!(!descriptor.write);
         assert!(descriptor.non_blocking);
         assert_eq!(file_close(&mut descriptor, false), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call filesystem/open FFI")]
+    fn file_mkdir_flag_creates_parent_directories_and_file() {
+        let root = std::env::temp_dir().join(format!(
+            "nero_os_fileio_mkdir_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("one").join("two").join("file.txt");
+        let path_text = path.to_string_lossy();
+        let mut descriptor = FileDescriptor::default();
+
+        assert_eq!(
+            file_open(
+                &mut descriptor,
+                path_text.as_bytes(),
+                file_open_flags::MKDIR,
+                0o600,
+            ),
+            0
+        );
+        assert!(descriptor.write);
+        assert_eq!(file_write(&mut descriptor, b"value"), 5);
+        assert_eq!(file_close(&mut descriptor, false), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"value");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
