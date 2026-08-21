@@ -24,6 +24,14 @@
 
 use crate::context_defs::{CtxSwitch, CtxSwitchMode, CtxWin};
 
+/// Every serializable context component (`kCtxAll`).
+pub const K_CTX_ALL: i32 = crate::context_defs::ctx_state_flags::REGS
+    | crate::context_defs::ctx_state_flags::JUMPS
+    | crate::context_defs::ctx_state_flags::BUFS
+    | crate::context_defs::ctx_state_flags::GVARS
+    | crate::context_defs::ctx_state_flags::SFUNCS
+    | crate::context_defs::ctx_state_flags::FUNCS;
+
 /// The `ctx_win[]` pool of temporary "autocmd window" scratch windows
 /// (`ctx_win_vec`, `context.h`'s `kvec_t(CtxWin)` - modeled as a plain
 /// growable `Vec`, matching this crate's own established idiom for a
@@ -156,6 +164,11 @@ mod ctx_free_tests {
         };
 
         ctx_free(context);
+    }
+
+    #[test]
+    fn k_ctx_all_contains_every_context_state_flag() {
+        assert_eq!(K_CTX_ALL, 63);
     }
 }
 
