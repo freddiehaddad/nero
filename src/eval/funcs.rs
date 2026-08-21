@@ -3557,12 +3557,20 @@ unsafe fn f_islocked(argvars: &[TypvalT], rettv: &mut TypvalT) {
         )
     };
 
-    if let (Some(end), true) = (end, lv.ll_name.is_some()) {
-        if end != name.len() {
+    if let (Some(end), Some(effective_name)) =
+        (end, lv.ll_name.as_deref())
+    {
+        if end != effective_name.len() {
             // semsg(...) omitted - see this function's own doc comment.
         } else if lv.ll_tv.is_null() {
             // SAFETY: forwarded from this function's own safety doc.
-            let (di, _ht) = unsafe { crate::eval::vars::find_var(&name[..lv.ll_name_len], false, true) };
+            let (di, _ht) = unsafe {
+                crate::eval::vars::find_var(
+                    &effective_name[..lv.ll_name_len],
+                    false,
+                    true,
+                )
+            };
             if let Some(di) = di {
                 let (di_flags, di_tv): (u8, *const TypvalT) = match di {
                     crate::eval::typval_defs::DictitemVariant::Dict(p) => unsafe {
@@ -12915,6 +12923,44 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(1));
 
         unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_expands_magic_braces_in_the_variable_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            crate::eval::vars::vars_clear(
+                &mut *crate::eval::vars::get_globvar_dict(),
+            )
+        };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(
+            b"nero_test_islocked2",
+        );
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Number(1);
+            (*item).di_flags |=
+                crate::eval::typval_defs::dict_item_flags::LOCK;
+            crate::eval::typval::tv_dict_add(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                item,
+            );
+        }
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_islocked(
+                &[string(b"g:nero_test_islocked{1 + 1}")],
+                &mut rettv,
+            )
+        };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe {
+            crate::eval::vars::vars_clear(
+                &mut *crate::eval::vars::get_globvar_dict(),
+            )
+        };
     }
 
     #[test]

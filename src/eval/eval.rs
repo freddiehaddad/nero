@@ -276,11 +276,10 @@
 //! [`LvalT`] modeling `lval_T`) - the lvalue-resolution engine behind
 //! `islocked()`/`remove()`/`:let`/`:unlet` (only `islocked()`,
 //! `eval/funcs.rs`'s `f_islocked`, is wired up as a real caller so
-//! far). The parse-only `skip: true` path is complete through
-//! `find_name_end(FNE_INCL_BR)`. Two substantive `get_lval` branches
-//! remain: applying an already-translated magic-brace expansion to
-//! `LvalT`'s borrowed-name representation, and assigning through a scope
-//! dictionary (`rettv: Some(_)` inside `get_lval_dict_item`, needs
+//! far). The parse-only `skip: true` path and magic-brace name
+//! expansion are complete. One substantive `get_lval` branch remains:
+//! assigning through a scope dictionary (`rettv: Some(_)` inside
+//! `get_lval_dict_item`, needs
 //! `var_wrong_func_name`/`function_exists`/`trans_function_name`, the
 //! last of which is a substantial separate undertaking) - `islocked()`
 //! always calls with `rettv: None`, so this is provably unreached by
@@ -5464,14 +5463,9 @@ pub const GLV_READ_ONLY: i32 = 16;
 
 /// Lvalue definition, filled in by [`get_lval`] (`lval_T`).
 ///
-/// `ll_name`/`ll_name_len` mirror the original, except `ll_name`
-/// always borrows directly from [`get_lval`]'s own `name` argument -
-/// the original's separate `ll_exp_name` (a separately-allocated
-/// expanded name, used only when `name` contains a magic brace, e.g.
-/// `foo{expr}bar`) isn't modeled at all: only `make_expanded_name`
-/// (not yet translated) would ever populate it, and [`get_lval`]
-/// `unimplemented!()`s before ever reaching that path (see this
-/// module's own doc comment).
+/// `ll_name` combines the original's `ll_name`/`ll_exp_name` pair as
+/// a [`std::borrow::Cow`]: ordinary names borrow from [`get_lval`]'s
+/// input, while magic-brace-expanded names own their allocated bytes.
 ///
 /// The raw pointers here (`ll_tv`/`ll_li`/`ll_list`/`ll_dict`/`ll_di`/
 /// `ll_blob`) match this crate's established convention for the
@@ -5481,7 +5475,7 @@ pub const GLV_READ_ONLY: i32 = 16;
 #[derive(Default)]
 pub struct LvalT<'a> {
     /// Start of variable name, `None` if invalid (`ll_name`).
-    pub ll_name: Option<&'a [u8]>,
+    pub ll_name: Option<std::borrow::Cow<'a, [u8]>>,
     /// Length of `ll_name` actually used as the name (`ll_name_len`).
     pub ll_name_len: usize,
     /// Typval of the item being used, if any (`ll_tv`).
@@ -5510,14 +5504,17 @@ pub struct LvalT<'a> {
 
 /// Clear lval `lp` that was filled by [`get_lval`] (`clear_lval`).
 ///
-/// The original frees `ll_exp_name`/`ll_newkey`. `ll_exp_name` isn't
-/// modeled at all (see [`LvalT`]'s own doc comment); `ll_newkey` is an
-/// owned `Option<Vec<u8>>`, freed automatically when the `LvalT` is
-/// dropped. Kept as a real, explicit function anyway (rather than
-/// omitted outright) purely so future translated callers have the
-/// same direct, literal call site as the original - it does nothing
-/// today.
-pub fn clear_lval(_lp: &mut LvalT) {}
+/// The original frees `ll_exp_name`/`ll_newkey`; dropping the owned
+/// `Cow`/`Vec` values is their direct Rust equivalent.
+pub fn clear_lval(lp: &mut LvalT) {
+    if matches!(
+        lp.ll_name.as_ref(),
+        Some(std::borrow::Cow::Owned(_))
+    ) {
+        lp.ll_name = None;
+    }
+    lp.ll_newkey = None;
+}
 
 /// Whether `partial` is the special `v:lua` value used for calling
 /// Lua functions (`is_luafunc`).
@@ -5585,8 +5582,6 @@ pub fn check_luafunc_name(str: &[u8], paren: bool) -> usize {
 /// explains why that's provably unreached by `islocked()`, the only
 /// real caller so far).
 ///
-/// A magic-brace (`{...}`) name still requires `make_expanded_name`.
-///
 /// Returns the byte offset just past the name, including any index,
 /// or `None` for a parsing error - matching [`find_name_end`]'s own
 /// established `usize`-offset-instead-of-pointer convention.
@@ -5610,26 +5605,32 @@ pub unsafe fn get_lval<'a>(
 
     if skip {
         // When skipping just find the end of the name.
-        lp.ll_name = Some(name);
+        lp.ll_name = Some(std::borrow::Cow::Borrowed(name));
         return Some(find_name_end(name, FNE_INCL_BR | fne_flags).0);
     }
 
     // Find the end of the name.
-    let (p, magic_braces) = find_name_end(name, fne_flags);
-    if magic_braces.is_some() {
-        // Don't expand the name when we already know there is an error,
-        // and reporting an invalid expression in braces both need
-        // make_expanded_name - see this module's own doc comment.
-        unimplemented!(
-            "get_lval: a magic brace ('{{...}}') in the variable name needs \
-             make_expanded_name, not yet translated"
-        );
-    }
-    lp.ll_name = Some(name);
+    let (source_end, magic_braces) = find_name_end(name, fne_flags);
+    let (effective_name, p) = if let Some((expr_start, expr_end)) = magic_braces {
+        // SAFETY: every range came directly from find_name_end above.
+        let expanded = unsafe {
+            make_expanded_name(
+                name,
+                expr_start,
+                expr_end,
+                source_end,
+            )
+        }?;
+        let len = expanded.len();
+        (std::borrow::Cow::Owned(expanded), len)
+    } else {
+        (std::borrow::Cow::Borrowed(name), source_end)
+    };
     lp.ll_name_len = p;
 
     // Without [idx] or .key we are done.
-    if !matches!(name.get(p), Some(&b'[') | Some(&b'.')) {
+    if !matches!(effective_name.get(p), Some(&b'[') | Some(&b'.')) {
+        lp.ll_name = Some(effective_name);
         return Some(p);
     }
 
@@ -5638,11 +5639,13 @@ pub unsafe fn get_lval<'a>(
     let want_ht = (flags & GLV_READ_ONLY) == 0;
     let no_autoload = (flags & GLV_NO_AUTOLOAD) != 0;
     // SAFETY: forwarded from this function's own safety doc.
-    let (v, _ht) = unsafe { crate::eval::vars::find_var(&name[..p], want_ht, no_autoload) };
+    let (v, _ht) =
+        unsafe { crate::eval::vars::find_var(&effective_name[..p], want_ht, no_autoload) };
     let Some(v) = v else {
         // semsg(_("E121: Undefined variable: %.*s"), ...) omitted when
         // !quiet - message display, not tractable; the identical None
         // (matching the original's NULL) is kept regardless of quiet.
+        lp.ll_name = Some(effective_name);
         return None;
     };
 
@@ -5656,12 +5659,16 @@ pub unsafe fn get_lval<'a>(
         // For v:lua just return a pointer to the "." after the "v:lua".
         // If the caller is trans_function_name() it will check for a
         // Lua function name.
+        lp.ll_name = Some(effective_name);
         return Some(p);
     }
 
     // If the next character is a "." or a "[", then process the subitem.
     // SAFETY: forwarded from this function's own safety doc.
-    let end = unsafe { get_lval_subscript(lp, p, name, rettv, unlet, flags) }?;
+    let end =
+        unsafe { get_lval_subscript(lp, p, &effective_name, rettv, unlet, flags) };
+    lp.ll_name = Some(effective_name);
+    let end = end?;
     lp.ll_name_len = end;
     Some(end)
 }
@@ -11965,13 +11972,25 @@ mod tests {
     }
 
     #[test]
-    fn clear_lval_does_nothing_observable() {
-        let mut lv = LvalT { ll_newkey: Some(b"x".to_vec()), ..Default::default() };
+    fn clear_lval_releases_owned_name_and_new_key() {
+        let mut lv = LvalT {
+            ll_name: Some(std::borrow::Cow::Owned(b"expanded".to_vec())),
+            ll_newkey: Some(b"x".to_vec()),
+            ..Default::default()
+        };
         clear_lval(&mut lv);
-        // ll_newkey is untouched (freed for real once `lv` itself drops,
-        // per this function's own doc comment) - this only checks the
-        // call itself doesn't panic/mutate anything observable.
-        assert_eq!(lv.ll_newkey, Some(b"x".to_vec()));
+        assert!(lv.ll_name.is_none());
+        assert!(lv.ll_newkey.is_none());
+    }
+
+    #[test]
+    fn clear_lval_keeps_a_borrowed_name() {
+        let mut lv = LvalT {
+            ll_name: Some(std::borrow::Cow::Borrowed(b"name")),
+            ..Default::default()
+        };
+        clear_lval(&mut lv);
+        assert_eq!(lv.ll_name.as_deref(), Some(&b"name"[..]));
     }
 
     // --- skip_luafunc_name / check_luafunc_name ---
@@ -12028,10 +12047,49 @@ mod tests {
         let mut lv = LvalT::default();
         let end = unsafe { get_lval(b"g:x", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
         assert_eq!(end, Some(3));
-        assert_eq!(lv.ll_name, Some(&b"g:x"[..]));
+        assert_eq!(lv.ll_name.as_deref(), Some(&b"g:x"[..]));
         assert_eq!(lv.ll_name_len, 3);
         assert!(lv.ll_tv.is_null());
 
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_expands_magic_braces_in_a_plain_variable_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"answer2");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(42) };
+        unsafe {
+            crate::eval::typval::tv_dict_add(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                item,
+            )
+        };
+
+        let mut lv = LvalT::default();
+        let end = unsafe {
+            get_lval(
+                b"g:answer{1 + 1}",
+                None,
+                &mut lv,
+                false,
+                false,
+                GLV_NO_AUTOLOAD | GLV_READ_ONLY,
+                FNE_CHECK_START,
+            )
+        };
+        assert_eq!(end, Some(b"g:answer2".len()));
+        assert_eq!(lv.ll_name.as_deref(), Some(&b"g:answer2"[..]));
+        assert!(matches!(
+            lv.ll_name.as_ref(),
+            Some(std::borrow::Cow::Owned(_))
+        ));
+        assert_eq!(lv.ll_name_len, b"g:answer2".len());
+        assert!(lv.ll_tv.is_null());
+
+        clear_lval(&mut lv);
         reset_globals_for_test();
     }
 
@@ -12059,7 +12117,11 @@ mod tests {
                 )
             };
             assert_eq!(end, Some(expected_end), "input: {input:?}");
-            assert_eq!(lv.ll_name, Some(input), "input: {input:?}");
+            assert_eq!(
+                lv.ll_name.as_deref(),
+                Some(input),
+                "input: {input:?}"
+            );
             assert!(lv.ll_tv.is_null(), "input: {input:?}");
         }
 
@@ -12076,7 +12138,7 @@ mod tests {
             )
         };
         assert_eq!(end, Some(0));
-        assert_eq!(lv.ll_name, Some(&b"1bad[0]"[..]));
+        assert_eq!(lv.ll_name.as_deref(), Some(&b"1bad[0]"[..]));
     }
 
     #[test]
