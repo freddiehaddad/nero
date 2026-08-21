@@ -1884,28 +1884,22 @@ pub unsafe fn eval_variable(name: &[u8], rettv: Option<&mut TypvalT>, _verbose: 
 
 /// Check if variable `var` exists (`var_exists`).
 ///
-/// Only the common "plain name, no subscript" case is modeled -
-/// mirrors the original's own call to `get_name_len(&var, &tofree,
-/// true, false)` with `evaluate = true` exactly (so magic-brace name
-/// expansion, e.g. `exists('foo{expr}bar')`, correctly panics via
-/// [`crate::eval::eval::get_name_len`]'s own `unimplemented!()`,
-/// rather than silently giving a wrong answer), followed by
-/// [`crate::eval::eval::handle_subscript`] for any `.`/`[`/`(`/`->`
-/// continuation (which similarly panics for anything beyond "nothing
-/// follows" - see its own doc comment). Both panics match this
-/// crate's established "translate the common path faithfully, panic
-/// loudly on a genuinely untranslated-but-reached path" convention.
+/// Mirrors the original's `get_name_len(&var, &tofree, true, false)`
+/// call, including magic-brace name expansion, followed by
+/// [`crate::eval::eval::handle_subscript`] for any continuation. The
+/// latter still has documented function/method-call gaps.
 ///
 /// # Safety
 /// Forwarded from [`eval_variable`]'s own safety doc.
 #[must_use]
 pub unsafe fn var_exists(var: &[u8]) -> bool {
-    let (name_len, consumed) = crate::eval::eval::get_name_len(var, true);
+    let (name_len, consumed, alias) =
+        crate::eval::eval::get_name_len(var, true);
     let mut n = false;
     let mut rest = &var[consumed.min(var.len())..];
 
     if name_len > 0 {
-        let name = &var[..name_len];
+        let name = alias.as_deref().unwrap_or(&var[..name_len]);
         let mut tv = TypvalT::default();
         // SAFETY: forwarded from this function's own safety doc.
         n = unsafe { eval_variable(name, Some(&mut tv), false, true) } == crate::vim_defs::OK;
@@ -4497,6 +4491,25 @@ mod find_var_ht_dict_tests {
         unsafe { crate::eval::typval::tv_dict_add(&mut *get_globvar_dict(), item) };
 
         assert!(unsafe { var_exists(b"g:count") });
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn var_exists_expands_magic_braces_in_the_variable_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"count2");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(7) };
+        unsafe {
+            crate::eval::typval::tv_dict_add(
+                &mut *get_globvar_dict(),
+                item,
+            )
+        };
+
+        assert!(unsafe { var_exists(b"g:count{1 + 1}") });
 
         reset_shared_state();
     }

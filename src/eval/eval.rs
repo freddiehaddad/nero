@@ -277,9 +277,9 @@
 //! `islocked()`/`remove()`/`:let`/`:unlet` (only `islocked()`,
 //! `eval/funcs.rs`'s `f_islocked`, is wired up as a real caller so
 //! far). The parse-only `skip: true` path is complete through
-//! `find_name_end(FNE_INCL_BR)`. Two substantive branches remain: a
-//! magic brace (`{...}`) detected in an evaluated variable name (needs
-//! `make_expanded_name`) and assigning through a scope
+//! `find_name_end(FNE_INCL_BR)`. Two substantive `get_lval` branches
+//! remain: applying an already-translated magic-brace expansion to
+//! `LvalT`'s borrowed-name representation, and assigning through a scope
 //! dictionary (`rettv: Some(_)` inside `get_lval_dict_item`, needs
 //! `var_wrong_func_name`/`function_exists`/`trans_function_name`, the
 //! last of which is a substantial separate undertaking) - `islocked()`
@@ -3412,14 +3412,9 @@ unsafe fn make_expanded_name(
 /// Only the name itself is recognized - does not handle `.key` or
 /// `[idx]` (that's [`handle_subscript`]'s own job, afterward).
 ///
-/// Magic-braces name expansion (`foo{expr}bar`) is detected (via
-/// [`find_name_end`]) but only actually EXPANDED when `evaluate` is
-/// `false` (where the original itself doesn't need to expand
-/// anything - it only needs to know how much input the whole
-/// construct occupies syntactically, via `find_name_end`'s own end
-/// position). When `evaluate` is `true`, expanding it for real needs
-/// `make_expanded_name`, not yet translated - `unimplemented!()`s in
-/// that specific case only.
+/// Magic-braces names (`foo{expr}bar`) are expanded when `evaluate` is
+/// true and returned as the optional owned alias. Parse-only callers
+/// receive no alias and only advance over the original construct.
 ///
 /// The original's `K_SPECIAL`/`KS_EXTRA`/`KE_SNR` hard-coded-`<SNR>`-
 /// byte-sequence fast path (an internal representation used by
@@ -3427,38 +3422,49 @@ unsafe fn make_expanded_name(
 /// Vimscript source text contains) is not modeled - unreachable today
 /// since nothing in this crate constructs such a byte sequence yet.
 ///
-/// Returns `(name_len, consumed)`: `name_len` is the length of the
-/// name itself (`arg[0..name_len]`, e.g. all 5 bytes of `"s:foo"`, but
-/// NOT including trailing whitespace); `consumed` is how far to
-/// advance the overall parse position (name length plus any trailing
-/// whitespace) - `(0, 0)` if no valid name is found at all (`len <= 0`
-/// in the original; the original's own `semsg(_(e_invexpr2), *arg)` in
-/// that case, gated on `verbose`, is omitted - message display, not
-/// tractable).
+/// Returns `(name_len, consumed, alias)`: `name_len` is the length of
+/// the effective name (the owned alias when present, otherwise
+/// `arg[0..name_len]`); `consumed` advances over the original source
+/// name and trailing whitespace. `(0, 0, None)` means no valid name or
+/// a failed expansion (`len <= 0` in the original; its optional error
+/// display is omitted).
 #[must_use]
-pub fn get_name_len(arg: &[u8], evaluate: bool) -> (usize, usize) {
+pub fn get_name_len(arg: &[u8], evaluate: bool) -> (usize, usize, Option<Vec<u8>>) {
     let script_len = crate::eval::userfunc::eval_fname_script(arg);
     let after_script = &arg[script_len..];
 
     let flags = if script_len > 0 { 0 } else { FNE_CHECK_START };
     let (end, magic) = find_name_end(after_script, flags);
-    if magic.is_some() {
+    if let Some((expr_start, expr_end)) = magic {
         if !evaluate {
             let ws = skipwhite(&after_script[end..]);
-            return (script_len + end, script_len + end + ws);
+            return (script_len + end, script_len + end + ws, None);
         }
-        unimplemented!(
-            "get_name_len: magic-braces name expansion (foo{{expr}}bar) needs \
-             make_expanded_name, not yet translated"
+        // SAFETY: every range came directly from find_name_end above.
+        let Some(alias) = (unsafe {
+            make_expanded_name(
+                arg,
+                script_len + expr_start,
+                script_len + expr_end,
+                script_len + end,
+            )
+        }) else {
+            return (0, 0, None);
+        };
+        let ws = skipwhite(&after_script[end..]);
+        return (
+            alias.len(),
+            script_len + end + ws,
+            Some(alias),
         );
     }
 
     let (id_len, id_consumed) = get_id_len(after_script);
     let name_len = script_len + id_len;
     if name_len == 0 {
-        return (0, 0);
+        return (0, 0, None);
     }
-    (name_len, script_len + id_consumed)
+    (name_len, script_len + id_consumed, None)
 }
 
 /// Get the key for `#{key: val}` into `tv` (`get_literal_key`).
@@ -4152,11 +4158,14 @@ pub unsafe fn eval7(
         // anything that doesn't even start like a name - e.g. trailing
         // garbage or an unbalanced closing delimiter).
         _ => {
-            let (name_len, name_consumed) = get_name_len(&arg[pos..], evaluate);
+            let (name_len, name_consumed, alias) =
+                get_name_len(&arg[pos..], evaluate);
             if name_len == 0 {
                 ret = FAIL;
             } else {
-                let name = &arg[pos..pos + name_len];
+                let name = alias
+                    .as_deref()
+                    .unwrap_or(&arg[pos..pos + name_len]);
                 pos += name_consumed;
 
                 if arg.get(pos) == Some(&b'(') {
@@ -9436,31 +9445,40 @@ mod tests {
 
     #[test]
     fn get_name_len_plain_global_scoped_name() {
-        assert_eq!(get_name_len(b"g:foo ", true), (5, 6));
+        assert_eq!(get_name_len(b"g:foo ", true), (5, 6, None));
     }
 
     #[test]
     fn get_name_len_script_prefixed_name() {
-        assert_eq!(get_name_len(b"s:myvar", true), (7, 7));
+        assert_eq!(get_name_len(b"s:myvar", true), (7, 7, None));
     }
 
     #[test]
     fn get_name_len_no_valid_name_is_zero() {
-        assert_eq!(get_name_len(b")", true), (0, 0));
-        assert_eq!(get_name_len(b"", true), (0, 0));
+        assert_eq!(get_name_len(b")", true), (0, 0, None));
+        assert_eq!(get_name_len(b"", true), (0, 0, None));
     }
 
     #[test]
     fn get_name_len_magic_braces_when_not_evaluating_is_real() {
-        let (name_len, consumed) = get_name_len(b"foo{expr}bar(", false);
+        let (name_len, consumed, alias) =
+            get_name_len(b"foo{expr}bar(", false);
         assert_eq!(name_len, 12);
         assert_eq!(consumed, 12);
+        assert_eq!(alias, None);
     }
 
     #[test]
-    fn get_name_len_magic_braces_when_evaluating_is_unimplemented() {
-        let result = std::panic::catch_unwind(|| get_name_len(b"foo{expr}bar", true));
-        assert!(result.is_err(), "expected a panic (make_expanded_name not yet translated)");
+    fn get_name_len_expands_magic_braces_when_evaluating() {
+        assert_eq!(
+            get_name_len(b"foo{1 + 1}bar rest", true),
+            (7, 14, Some(b"foo2bar".to_vec()))
+        );
+    }
+
+    #[test]
+    fn get_name_len_magic_brace_failure_returns_zero() {
+        assert_eq!(get_name_len(b"foo{)}bar", true), (0, 0, None));
     }
 
     // --- find_option_var_end / eval_option ---
@@ -9807,6 +9825,27 @@ mod tests {
         unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
 
         assert_eq!(eval_str(b"g:x + 5").1.value, TypvalValue::Number(15));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_magic_brace_variable_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"answer2");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(42) };
+        unsafe {
+            crate::eval::typval::tv_dict_add(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                item,
+            )
+        };
+
+        let (ret, tv) = eval_str(b"g:answer{1 + 1}");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(42));
 
         reset_globals_for_test();
     }
