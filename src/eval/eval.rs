@@ -525,6 +525,59 @@ pub unsafe fn eval_to_bool(
     retval
 }
 
+/// Evaluate an expression and return its value (`eval_expr_ext`).
+///
+/// Rust returns the allocated result by value instead of exposing the
+/// original's heap pointer. `use_simple_function = true` still needs
+/// `eval0_simple_funccal`.
+///
+/// # Safety
+/// Forwarded from [`eval0`].
+#[must_use]
+pub unsafe fn eval_expr_ext(
+    arg: &[u8],
+    mut eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+    use_simple_function: bool,
+) -> Option<TypvalT> {
+    if use_simple_function {
+        unimplemented!(
+            "eval_expr_ext: use_simple_function=true needs eval0_simple_funccal"
+        );
+    }
+
+    let skip = eap.as_deref().is_some_and(|e| e.skip);
+    let mut evalarg = EvalargT::default();
+    fill_evalarg_from_eap(&mut evalarg, eap.as_deref(), skip);
+
+    let mut tv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe {
+        eval0(
+            arg,
+            &mut tv,
+            eap.as_deref_mut(),
+            Some(&mut evalarg),
+        )
+    };
+    clear_evalarg(Some(&mut evalarg), eap);
+
+    (result != FAIL).then_some(tv)
+}
+
+/// [`eval_expr_ext`] without the simple-function optimization
+/// (`eval_expr`).
+///
+/// # Safety
+/// Forwarded from [`eval_expr_ext`].
+#[must_use]
+pub unsafe fn eval_expr(
+    arg: &[u8],
+    eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+) -> Option<TypvalT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { eval_expr_ext(arg, eap, false) }
+}
+
 /// Initialize global/`v:` variables and the function table
 /// (`eval_init`).
 ///
@@ -9044,8 +9097,9 @@ mod tests {
         assert_eq!(eap.arg, Some(b"new_line".to_vec()));
     }
 
-    // --- fill_evalarg_from_eap / eval_to_bool / eval1_emsg /
-    //     eval_expr_string / eval_expr_typval / eval_expr_to_bool ---
+    // --- fill_evalarg_from_eap / eval_to_bool / eval_expr /
+    //     eval1_emsg / eval_expr_string / eval_expr_typval /
+    //     eval_expr_to_bool ---
 
     #[test]
     fn fill_evalarg_from_eap_sets_evaluate_and_skip_flags() {
@@ -9178,6 +9232,60 @@ mod tests {
         let _ = unsafe {
             eval_to_bool(b"len([])", &mut error, None, false, true)
         };
+    }
+
+    #[test]
+    fn eval_expr_returns_the_expression_value() {
+        assert_eq!(
+            unsafe { eval_expr(b"6 * 7", None) }.map(|tv| tv.value),
+            Some(TypvalValue::Number(42))
+        );
+    }
+
+    #[test]
+    fn eval_expr_returns_none_for_a_parse_failure() {
+        assert!(unsafe { eval_expr(b")", None) }.is_none());
+    }
+
+    #[test]
+    fn eval_expr_returns_and_releases_an_allocated_list_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        let tv = unsafe { eval_expr(b"[1, 2]", None) }
+            .expect("list expression should evaluate");
+        let TypvalValue::List(list) = tv.value else {
+            panic!("expected a List result");
+        };
+        assert!(!list.is_null());
+        assert!(!crate::eval::typval::gc_first_list_is_empty());
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn eval_expr_ext_parse_only_returns_an_unknown_value() {
+        let mut eap =
+            crate::ex_cmds_defs::ExargT { skip: true, ..Default::default() };
+        let tv = unsafe { eval_expr_ext(b"1 + 2", Some(&mut eap), false) }
+            .expect("parse-only evaluation should succeed");
+        assert_eq!(tv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn eval_expr_updates_exarg_nextcmd() {
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        let tv = unsafe { eval_expr(b"3 | echo", Some(&mut eap)) }
+            .expect("expression should evaluate");
+        assert_eq!(tv.value, TypvalValue::Number(3));
+        assert_eq!(eap.nextcmd, Some(b" echo".to_vec()));
+    }
+
+    #[test]
+    #[should_panic(expected = "eval0_simple_funccal")]
+    fn eval_expr_ext_simple_function_mode_is_unimplemented() {
+        let _ = unsafe { eval_expr_ext(b"len([])", None, true) };
     }
 
     #[test]
