@@ -859,6 +859,93 @@ pub unsafe fn eval_foldexpr(
     retval as i32
 }
 
+/// Evaluate a window's `'foldtext'` (`eval_foldtext`).
+///
+/// List results become API Arrays; every other successful result uses
+/// ordinary Vimscript string conversion. Failure returns an empty
+/// String object, matching `STRING_OBJ(NULL_STRING)`.
+///
+/// # Safety
+/// `wp` must point to a live window. Forwarded from
+/// [`crate::option::was_set_insecurely`],
+/// [`crate::eval::userfunc::save_funccal`],
+/// [`eval0_simple_funccal`], and
+/// [`crate::eval::typval::tv_clear_simple`]. Callers must serialize
+/// the touched global state.
+#[must_use]
+pub unsafe fn eval_foldtext(
+    wp: *mut crate::buffer_defs::WinT,
+) -> crate::api::private::defs::Object {
+    debug_assert!(!wp.is_null());
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let use_sandbox = unsafe {
+        crate::option::was_set_insecurely(
+            wp,
+            crate::option_defs::OptIndex::Foldtext,
+            crate::option_defs::opt_set_flags::OPT_LOCAL,
+        )
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let expression = unsafe {
+        (*wp)
+            .w_onebuf_opt
+            .wo_fdt
+            .clone()
+            .unwrap_or_default()
+    };
+
+    let mut entry = crate::eval::userfunc::FuncCalEntryT::default();
+    // SAFETY: `entry` outlives the restore guard created immediately
+    // afterward.
+    unsafe {
+        crate::eval::userfunc::save_funccal(
+            std::ptr::addr_of_mut!(entry),
+        )
+    };
+    let _funccal = SafeEvalFunccalGuard;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if use_sandbox {
+            crate::globals::GLOBALS.get_mut().sandbox += 1;
+        }
+        crate::globals::GLOBALS.get_mut().textlock += 1;
+    }
+    let _state = SafeEvalStateGuard { use_sandbox };
+
+    let mut tv = TypvalT::default();
+    let mut evalarg = EvalargT {
+        eval_flags: EVAL_EVALUATE,
+        ..EvalargT::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe {
+        eval0_simple_funccal(
+            &expression,
+            &mut tv,
+            None,
+            Some(&mut evalarg),
+        )
+    } == FAIL
+    {
+        clear_evalarg(Some(&mut evalarg), None);
+        return crate::api::private::defs::Object::String(Vec::new());
+    }
+
+    let result = if matches!(tv.value, TypvalValue::List(_)) {
+        crate::api::private::converter::vim_to_object(&tv)
+    } else {
+        crate::api::private::defs::Object::String(
+            crate::eval::typval::tv_get_string(&tv),
+        )
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+    clear_evalarg(Some(&mut evalarg), None);
+    result
+}
+
 /// Initialize global/`v:` variables and the function table
 /// (`eval_init`).
 ///
@@ -9965,6 +10052,95 @@ mod tests {
             crate::globals::GLOBALS.get_mut().sandbox = old_sandbox;
             crate::globals::GLOBALS.get_mut().textlock = old_textlock;
         }
+    }
+
+    fn foldtext_window(expr: &[u8]) -> Box<crate::buffer_defs::WinT> {
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_onebuf_opt.wo_fdt = Some(expr.to_vec());
+        win
+    }
+
+    #[test]
+    fn eval_foldtext_returns_a_string_object() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldtext_window(b"'fold text'");
+        let result =
+            unsafe { eval_foldtext(std::ptr::addr_of_mut!(*win)) };
+        let crate::api::private::defs::Object::String(text) = result
+        else {
+            panic!("expected a String object");
+        };
+        assert_eq!(text, b"fold text");
+    }
+
+    #[test]
+    fn eval_foldtext_converts_a_list_to_an_api_array() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let mut win = foldtext_window(b"[1, 'x']");
+        let result =
+            unsafe { eval_foldtext(std::ptr::addr_of_mut!(*win)) };
+        let crate::api::private::defs::Object::Array(items) = result
+        else {
+            panic!("expected an Array object");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            items.first(),
+            Some(crate::api::private::defs::Object::Integer(1))
+        ));
+        assert!(matches!(
+            items.get(1),
+            Some(crate::api::private::defs::Object::String(text))
+                if text == b"x"
+        ));
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn eval_foldtext_failure_returns_an_empty_string_object() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldtext_window(b")");
+        let result =
+            unsafe { eval_foldtext(std::ptr::addr_of_mut!(*win)) };
+        let crate::api::private::defs::Object::String(text) = result
+        else {
+            panic!("expected a String object");
+        };
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn eval_foldtext_restores_funccal_and_lock_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = foldtext_window(b"'ok'");
+        win.w_onebuf_opt.wo_fdt_flags =
+            crate::option_defs::opt_flags::INSECURE;
+
+        let mut fc =
+            Box::new(crate::eval::typval_defs::FunccallT::default());
+        let fc_ptr = std::ptr::addr_of_mut!(*fc);
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+        let old_sandbox =
+            unsafe { crate::globals::GLOBALS.get_mut().sandbox };
+        let old_textlock =
+            unsafe { crate::globals::GLOBALS.get_mut().textlock };
+        unsafe {
+            crate::globals::GLOBALS.get_mut().sandbox = 3;
+            crate::globals::GLOBALS.get_mut().textlock = 4;
+        }
+
+        let _ = unsafe { eval_foldtext(std::ptr::addr_of_mut!(*win)) };
+        assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().sandbox }, 3);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().textlock }, 4);
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe {
+            crate::globals::GLOBALS.get_mut().sandbox = old_sandbox;
+            crate::globals::GLOBALS.get_mut().textlock = old_textlock;
+        }
+        drop(fc);
     }
 
     #[test]
