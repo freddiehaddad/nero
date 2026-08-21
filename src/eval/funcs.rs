@@ -3722,40 +3722,13 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
             status == crate::vim_defs::OK && rest[ws..].is_empty()
         }
         Some(b'*') => {
-            let mut name = &p[1..];
+            let name = &p[1..];
             if name.starts_with(b"v:lua.") {
                 unimplemented!(
                     "exists(): '*v:lua.' needs nlua_func_exists"
                 );
             }
-            let end = name
-                .iter()
-                .position(|&byte| {
-                    crate::ascii_defs::ascii_iswhite(i32::from(byte))
-                        || byte == b'('
-                })
-                .unwrap_or(name.len());
-            let tail = &name[end..];
-            let tail = &tail[crate::charset::skipwhite(tail)..];
-            if !tail.is_empty() && tail.first() != Some(&b'(') {
-                false
-            } else {
-                name = &name[..end];
-                let resolved = if let Some(global) = name.strip_prefix(b"g:") {
-                    Some(global.to_vec())
-                } else if name.starts_with(b"s:")
-                    || name.starts_with(b"<SID>")
-                {
-                    crate::eval::userfunc::fname_trans_sid(name).ok()
-                } else {
-                    Some(name.to_vec())
-                };
-                resolved.is_some_and(|name| {
-                    crate::eval::userfunc::translated_function_exists(
-                        &name,
-                    )
-                })
-            }
+            crate::eval::userfunc::function_exists(name, false)
         }
         Some(b':') => {
             unsafe { crate::ex_docmd::cmd_exists(&p[1..]) != 0 }
