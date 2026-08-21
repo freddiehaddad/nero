@@ -28,3 +28,5 @@ pub mod unix_defs;
 pub mod users;
 #[cfg(windows)]
 pub mod win_defs;
+#[cfg(windows)]
+pub mod os_win_console;
