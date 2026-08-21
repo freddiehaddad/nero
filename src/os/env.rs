@@ -816,7 +816,21 @@ pub unsafe fn vim_getenv(name: &[u8]) -> Option<Vec<u8>> {
         return Some(value);
     }
 
-    if name == b"VIM" || name == b"VIMRUNTIME" {
+    let vimruntime = name == b"VIMRUNTIME";
+    if vimruntime
+        && let Some(vim) = os_getenv(b"VIM")
+    {
+        let runtime =
+            vim_runtime_dir(Some(&vim)).unwrap_or(vim);
+        unsafe { os_setenv(b"VIMRUNTIME", &runtime, 1) };
+        unsafe {
+            (*crate::globals::GLOBALS.as_ptr()).didset_vimruntime =
+                true;
+        }
+        return Some(runtime);
+    }
+
+    if name == b"VIM" || vimruntime {
         // When expanding $VIM/$VIMRUNTIME fails via a real
         // environment variable, the original falls back to
         // discovering the runtime directory relative to the nvim
@@ -1757,6 +1771,42 @@ pub(crate) mod tests {
         assert_eq!(
             unsafe { vim_getenv(b"NERO_TEST_ENV_VIM_GETENV_NOSLASH") },
             Some(br"C:\foo\bar".to_vec())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot access the real filesystem")]
+    fn vim_getenv_vimruntime_uses_the_runtime_child_of_vim() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _didset = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.didset_vimruntime,
+                false,
+            )
+        };
+        let scratch = RuntimeDirScratch::new();
+        let root = scratch.bytes();
+        let root_text = std::str::from_utf8(&root).unwrap();
+        let _environment = EnvVarGuard::set(&[
+            ("VIM", Some(root_text)),
+            ("VIMRUNTIME", None),
+        ]);
+        let expected = crate::path::concat_fnames(
+            &root,
+            crate::vim_defs::RUNTIME_DIRNAME.as_bytes(),
+            true,
+        );
+
+        assert_eq!(
+            unsafe { vim_getenv(b"VIMRUNTIME") },
+            Some(expected.clone())
+        );
+        assert_eq!(os_getenv(b"VIMRUNTIME"), Some(expected));
+        assert!(
+            unsafe {
+                (*crate::globals::GLOBALS.as_ptr()).didset_vimruntime
+            }
         );
     }
 
