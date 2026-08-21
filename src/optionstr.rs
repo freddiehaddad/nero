@@ -425,6 +425,73 @@ unsafe fn illegal_char(c: i32) -> Vec<u8> {
     message
 }
 
+/// Ensure every buffer string option has a non-null value
+/// (`check_buf_options`).
+pub fn check_buf_options(buf: &mut crate::buffer_defs::BufT) {
+    fn check(option: &mut Option<Vec<u8>>) {
+        option.get_or_insert_with(Vec::new);
+    }
+
+    check(&mut buf.b_p_bh);
+    check(&mut buf.b_p_bt);
+    check(&mut buf.b_p_fenc);
+    check(&mut buf.b_p_ff);
+    check(&mut buf.b_p_def);
+    check(&mut buf.b_p_inc);
+    check(&mut buf.b_p_inex);
+    check(&mut buf.b_p_inde);
+    check(&mut buf.b_p_indk);
+    check(&mut buf.b_p_fp);
+    check(&mut buf.b_p_fex);
+    check(&mut buf.b_p_kp);
+    check(&mut buf.b_p_mps);
+    check(&mut buf.b_p_fo);
+    check(&mut buf.b_p_flp);
+    check(&mut buf.b_p_isk);
+    check(&mut buf.b_p_com);
+    check(&mut buf.b_p_cms);
+    check(&mut buf.b_p_nf);
+    check(&mut buf.b_p_qe);
+    check(&mut buf.b_p_syn);
+    check(&mut buf.b_s.b_syn_isk);
+    check(&mut buf.b_s.b_p_spc);
+    check(&mut buf.b_s.b_p_spf);
+    check(&mut buf.b_s.b_p_spl);
+    check(&mut buf.b_s.b_p_spo);
+    check(&mut buf.b_p_sua);
+    check(&mut buf.b_p_cink);
+    check(&mut buf.b_p_cino);
+    crate::indent_c::parse_cino(buf);
+    check(&mut buf.b_p_lop);
+    check(&mut buf.b_p_ft);
+    check(&mut buf.b_p_cinw);
+    check(&mut buf.b_p_cinsd);
+    check(&mut buf.b_p_cot);
+    check(&mut buf.b_p_cpt);
+    check(&mut buf.b_p_cfu);
+    check(&mut buf.b_p_ofu);
+    check(&mut buf.b_p_keymap);
+    check(&mut buf.b_p_gefm);
+    check(&mut buf.b_p_gp);
+    check(&mut buf.b_p_mp);
+    check(&mut buf.b_p_efm);
+    check(&mut buf.b_p_ep);
+    check(&mut buf.b_p_path);
+    check(&mut buf.b_p_tags);
+    check(&mut buf.b_p_ffu);
+    check(&mut buf.b_p_tfu);
+    check(&mut buf.b_p_tc);
+    check(&mut buf.b_p_dict);
+    check(&mut buf.b_p_dia);
+    check(&mut buf.b_p_tsr);
+    check(&mut buf.b_p_tsrfu);
+    check(&mut buf.b_p_lw);
+    check(&mut buf.b_p_bkc);
+    check(&mut buf.b_p_menc);
+    check(&mut buf.b_p_vsts);
+    check(&mut buf.b_p_vts);
+}
+
 /// Whether `val` contains an illegal character for an option flagged
 /// `NFNAME`/`NDNAME` (`check_illegal_path_names`, `optionstr.c`) -
 /// used to reject dangerous characters (e.g. a literal `;`/`&`/`|`
@@ -4699,6 +4766,80 @@ mod tests {
 
         assert_eq!(unsafe { illegal_char(i32::from(b'X')) }, b"E539: Illegal character <X>");
         assert_eq!(unsafe { illegal_char(1) }, b"E539: Illegal character <^A>");
+    }
+
+    #[test]
+    fn check_buf_options_initializes_all_string_fields_and_preserves_values() {
+        let mut buffer = crate::buffer_defs::BufT {
+            b_p_bh: Some(b"hide".to_vec()),
+            ..Default::default()
+        };
+
+        check_buf_options(&mut buffer);
+
+        assert_eq!(buffer.b_p_bh.as_deref(), Some(&b"hide"[..]));
+        assert!(
+            [
+                buffer.b_p_bt.as_ref(),
+                buffer.b_p_fenc.as_ref(),
+                buffer.b_p_ff.as_ref(),
+                buffer.b_p_def.as_ref(),
+                buffer.b_p_inc.as_ref(),
+                buffer.b_p_inex.as_ref(),
+                buffer.b_p_inde.as_ref(),
+                buffer.b_p_indk.as_ref(),
+                buffer.b_p_fp.as_ref(),
+                buffer.b_p_fex.as_ref(),
+                buffer.b_p_kp.as_ref(),
+                buffer.b_p_mps.as_ref(),
+                buffer.b_p_fo.as_ref(),
+                buffer.b_p_flp.as_ref(),
+                buffer.b_p_isk.as_ref(),
+                buffer.b_p_com.as_ref(),
+                buffer.b_p_cms.as_ref(),
+                buffer.b_p_nf.as_ref(),
+                buffer.b_p_qe.as_ref(),
+                buffer.b_p_syn.as_ref(),
+                buffer.b_s.b_syn_isk.as_ref(),
+                buffer.b_s.b_p_spc.as_ref(),
+                buffer.b_s.b_p_spf.as_ref(),
+                buffer.b_s.b_p_spl.as_ref(),
+                buffer.b_s.b_p_spo.as_ref(),
+                buffer.b_p_sua.as_ref(),
+                buffer.b_p_cink.as_ref(),
+                buffer.b_p_cino.as_ref(),
+                buffer.b_p_lop.as_ref(),
+                buffer.b_p_ft.as_ref(),
+                buffer.b_p_cinw.as_ref(),
+                buffer.b_p_cinsd.as_ref(),
+                buffer.b_p_cot.as_ref(),
+                buffer.b_p_cpt.as_ref(),
+                buffer.b_p_cfu.as_ref(),
+                buffer.b_p_ofu.as_ref(),
+                buffer.b_p_keymap.as_ref(),
+                buffer.b_p_gefm.as_ref(),
+                buffer.b_p_gp.as_ref(),
+                buffer.b_p_mp.as_ref(),
+                buffer.b_p_efm.as_ref(),
+                buffer.b_p_ep.as_ref(),
+                buffer.b_p_path.as_ref(),
+                buffer.b_p_tags.as_ref(),
+                buffer.b_p_ffu.as_ref(),
+                buffer.b_p_tfu.as_ref(),
+                buffer.b_p_tc.as_ref(),
+                buffer.b_p_dict.as_ref(),
+                buffer.b_p_dia.as_ref(),
+                buffer.b_p_tsr.as_ref(),
+                buffer.b_p_tsrfu.as_ref(),
+                buffer.b_p_lw.as_ref(),
+                buffer.b_p_bkc.as_ref(),
+                buffer.b_p_menc.as_ref(),
+                buffer.b_p_vsts.as_ref(),
+                buffer.b_p_vts.as_ref(),
+            ]
+            .into_iter()
+            .all(|option| option.is_some())
+        );
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
