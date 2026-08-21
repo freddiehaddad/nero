@@ -446,6 +446,46 @@ fn tv_str(
     }
 }
 
+/// Read one formatter argument's raw pointer identity and advance its
+/// one-based index (`tv_ptr`).
+///
+/// Pointer-bearing values expose their real allocation address. Scalar
+/// values preserve the original typval union's raw-bit interpretation.
+#[allow(dead_code)]
+pub(crate) fn tv_ptr(
+    tvs: &[crate::eval::typval_defs::TypvalT],
+    idx: &mut usize,
+) -> usize {
+    let Some(index) = idx.checked_sub(1) else {
+        return 0;
+    };
+    let Some(tv) = tvs.get(index) else {
+        return 0;
+    };
+    if matches!(&tv.value, crate::eval::typval_defs::TypvalValue::Unknown) {
+        return 0;
+    }
+
+    *idx += 1;
+    match &tv.value {
+        crate::eval::typval_defs::TypvalValue::Unknown => 0,
+        crate::eval::typval_defs::TypvalValue::Number(value) => *value as usize,
+        crate::eval::typval_defs::TypvalValue::String(value)
+        | crate::eval::typval_defs::TypvalValue::Func(value) => {
+            value.as_ref().map_or(0, |bytes| bytes.as_ptr() as usize)
+        }
+        crate::eval::typval_defs::TypvalValue::List(value) => *value as usize,
+        crate::eval::typval_defs::TypvalValue::Dict(value) => *value as usize,
+        crate::eval::typval_defs::TypvalValue::Float(value) => {
+            value.to_bits() as usize
+        }
+        crate::eval::typval_defs::TypvalValue::Bool(value) => *value as usize,
+        crate::eval::typval_defs::TypvalValue::Special(value) => *value as usize,
+        crate::eval::typval_defs::TypvalValue::Partial(value) => *value as usize,
+        crate::eval::typval_defs::TypvalValue::Blob(value) => *value as usize,
+    }
+}
+
 /// Value categories accepted by the portable formatter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormatType {
@@ -1543,6 +1583,55 @@ mod tests {
         let mut missing_index = 2;
         assert_eq!(tv_str(&tvs, &mut missing_index), None);
         assert_eq!(missing_index, 2);
+    }
+
+    #[test]
+    fn tv_ptr_reads_pointer_and_scalar_identity_bits() {
+        let list = std::ptr::NonNull::<crate::eval::typval_defs::ListT>::dangling().as_ptr();
+        let values = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(-1),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Float(1.5),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(list),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+        ];
+        let mut index = 1;
+
+        assert_eq!(tv_ptr(&values, &mut index), usize::MAX);
+        assert_eq!(tv_ptr(&values, &mut index), 1.5f64.to_bits() as usize);
+        assert_eq!(tv_ptr(&values, &mut index), list as usize);
+        assert_eq!(index, 4);
+    }
+
+    #[test]
+    fn tv_ptr_uses_string_storage_and_does_not_advance_past_unknown() {
+        let values = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(
+                    b"value".to_vec(),
+                )),
+                v_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+            },
+            crate::eval::typval_defs::TypvalT::default(),
+        ];
+        let expected = match &values[0].value {
+            crate::eval::typval_defs::TypvalValue::String(Some(bytes)) => {
+                bytes.as_ptr() as usize
+            }
+            _ => unreachable!(),
+        };
+        let mut index = 1;
+
+        assert_eq!(tv_ptr(&values, &mut index), expected);
+        assert_eq!(tv_ptr(&values, &mut index), 0);
+        assert_eq!(index, 2);
     }
 
     #[test]
