@@ -65,6 +65,16 @@ pub fn _hash_key_removed() -> *mut std::os::raw::c_char {
     hi_key_removed()
 }
 
+/// Free a hash table's own array without freeing its contained values
+/// (`hash_clear`).
+///
+/// Consuming the table models the original's requirement that callers either
+/// discard it or immediately call `hash_init()` before using that storage
+/// again. Key storage remains caller-owned.
+pub fn hash_clear(ht: HashtabT) {
+    drop(ht);
+}
+
 /// Reads the NUL-terminated bytes at a raw `hi_key` pointer, for comparing
 /// against a candidate key. `hi_key` must be non-null and not
 /// [`hi_key_removed`] (checked by every caller below via [`hashitem_empty`]
@@ -470,6 +480,28 @@ mod tests {
         assert_eq!(unsafe { ht.hash_add(key_ptr(&key)) }, OK);
         assert!(!hashitem_empty(ht.hash_find(b"alpha\0ignored")));
         assert!(hashitem_empty(ht.hash_find_len(b"alpha\0ignored")));
+    }
+
+    #[test]
+    fn hash_clear_drops_only_the_table_storage() {
+        let key = std::ffi::CString::new("key").unwrap();
+        let mut items = vec![HashitemT::default(); HT_INIT_SIZE * 2];
+        items[0].hi_key = key_ptr(&key);
+        let ht = HashtabT {
+            ht_mask: items.len() - 1,
+            ht_used: 1,
+            ht_filled: 1,
+            ht_changed: 1,
+            ht_locked: 0,
+            ht_array: HashArray::Large(items),
+        };
+
+        hash_clear(ht);
+        assert_eq!(key.to_bytes(), b"key");
+
+        let replacement = HashtabT::hash_init();
+        assert!(replacement.ht_array.is_small());
+        assert_eq!(replacement.ht_used, 0);
     }
 
     #[test]
