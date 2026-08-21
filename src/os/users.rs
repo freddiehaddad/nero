@@ -195,12 +195,17 @@ pub fn os_get_usernames() -> Vec<Vec<u8>> {
     }
 }
 
+/// Initialize and return the cached username list (`init_users`).
+fn init_users() -> &'static [Vec<u8>] {
+    USERS.as_slice()
+}
+
 /// Return cached username `idx` for shell completion (`get_users`).
 #[must_use]
 pub fn get_users(idx: i32) -> Option<&'static [u8]> {
     usize::try_from(idx)
         .ok()
-        .and_then(|idx| USERS.get(idx))
+        .and_then(|idx| init_users().get(idx))
         .map(Vec::as_slice)
 }
 
@@ -220,7 +225,7 @@ fn match_user_in(users: &[Vec<u8>], name: &[u8]) -> i32 {
 /// Match `name` against cached system usernames (`match_user`).
 #[must_use]
 pub fn match_user(name: &[u8]) -> i32 {
-    match_user_in(&USERS, name)
+    match_user_in(init_users(), name)
 }
 
 /// Gets the home directory of the user named `name`, or `None`
@@ -286,6 +291,14 @@ mod tests {
         source[0] = b'X';
 
         assert_eq!(users, vec![b"existing".to_vec(), b"new-user".to_vec()]);
+    }
+
+    #[test]
+    fn init_users_returns_the_same_process_lifetime_cache() {
+        let first = init_users();
+        let second = init_users();
+
+        assert!(std::ptr::eq(first, second));
     }
 
     #[test]
