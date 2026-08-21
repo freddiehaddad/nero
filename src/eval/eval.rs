@@ -3330,6 +3330,82 @@ pub fn find_name_end(arg: &[u8], flags: i32) -> (usize, Option<(usize, usize)>) 
     (p, expr_start.map(|s| (s, expr_end.unwrap_or(0))))
 }
 
+/// Expand magic `{expr}` components in a variable/function name
+/// (`make_expanded_name`).
+///
+/// `expr_start`/`expr_end` identify the first brace pair and `in_end`
+/// is the end returned by [`find_name_end`]. Further brace pairs
+/// introduced by either the original suffix or an evaluated
+/// expression are expanded in turn, matching the original's recursive
+/// call.
+///
+/// Returns `None` for an unterminated brace expression, an invalid
+/// range, or an expression-evaluation failure.
+///
+/// # Safety
+/// Forwarded from [`eval_to_string`].
+#[allow(dead_code)]
+unsafe fn make_expanded_name(
+    in_start: &[u8],
+    expr_start: usize,
+    expr_end: usize,
+    in_end: usize,
+) -> Option<Vec<u8>> {
+    if expr_end == 0
+        || expr_start >= expr_end
+        || expr_end >= in_end
+        || in_end > in_start.len()
+    {
+        return None;
+    }
+
+    let mut current = in_start[..in_end].to_vec();
+    let mut current_start = expr_start;
+    let mut current_end = expr_end;
+    let mut current_name_end = in_end;
+
+    loop {
+        if current_start >= current_end
+            || current_end >= current_name_end
+            || current_name_end > current.len()
+        {
+            return None;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let result = unsafe {
+            eval_to_string(
+                &current[current_start + 1..current_end],
+                false,
+                false,
+            )
+        }?;
+
+        let mut expanded = Vec::with_capacity(
+            current_start
+                + result.len()
+                + current_name_end
+                - current_end
+                - 1,
+        );
+        expanded.extend_from_slice(&current[..current_start]);
+        expanded.extend_from_slice(&result);
+        expanded.extend_from_slice(&current[current_end + 1..current_name_end]);
+
+        let (name_end, magic) = find_name_end(&expanded, 0);
+        let Some((next_start, next_end)) = magic else {
+            return Some(expanded);
+        };
+        if next_end == 0 {
+            return None;
+        }
+
+        current = expanded;
+        current_start = next_start;
+        current_end = next_end;
+        current_name_end = name_end;
+    }
+}
+
 /// Get the length of the name of a variable or function
 /// (`get_name_len`).
 ///
@@ -9303,6 +9379,57 @@ mod tests {
             find_name_end(b"1bad[0]", FNE_INCL_BR | FNE_CHECK_START),
             (0, None)
         );
+    }
+
+    // --- make_expanded_name ---
+
+    unsafe fn expand_magic_name(input: &[u8]) -> Option<Vec<u8>> {
+        let (end, magic) = find_name_end(input, 0);
+        let (expr_start, expr_end) = magic?;
+        // SAFETY: the ranges came directly from find_name_end above.
+        unsafe { make_expanded_name(input, expr_start, expr_end, end) }
+    }
+
+    #[test]
+    fn make_expanded_name_replaces_a_numeric_expression() {
+        assert_eq!(
+            unsafe { expand_magic_name(b"foo{1 + 1}bar") },
+            Some(b"foo2bar".to_vec())
+        );
+    }
+
+    #[test]
+    fn make_expanded_name_replaces_a_string_expression() {
+        assert_eq!(
+            unsafe { expand_magic_name(b"foo{'key'}bar") },
+            Some(b"fookeybar".to_vec())
+        );
+    }
+
+    #[test]
+    fn make_expanded_name_expands_multiple_brace_pairs() {
+        assert_eq!(
+            unsafe { expand_magic_name(b"foo{1 + 1}{2 + 2}") },
+            Some(b"foo24".to_vec())
+        );
+    }
+
+    #[test]
+    fn make_expanded_name_expands_braces_produced_by_an_expression() {
+        assert_eq!(
+            unsafe { expand_magic_name(b"foo{'{1 + 1}'}bar") },
+            Some(b"foo2bar".to_vec())
+        );
+    }
+
+    #[test]
+    fn make_expanded_name_fails_for_an_invalid_expression() {
+        assert_eq!(unsafe { expand_magic_name(b"foo{)}bar") }, None);
+    }
+
+    #[test]
+    fn make_expanded_name_fails_for_unterminated_braces() {
+        assert_eq!(unsafe { expand_magic_name(b"foo{1 + 1") }, None);
     }
 
     // --- get_name_len ---
