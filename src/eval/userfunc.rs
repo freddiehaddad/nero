@@ -818,6 +818,38 @@ pub fn translated_function_exists(name: &[u8]) -> bool {
     }
 }
 
+/// Check whether a function name exists (`function_exists`).
+///
+/// Direct, global (`g:`), and script-local (`s:`/`<SID>`) names are
+/// resolved. Funcref-variable dereferencing has no effect until
+/// expression-held function references can participate in
+/// `trans_function_name`; `no_deref` is retained for signature
+/// fidelity.
+#[must_use]
+pub fn function_exists(name: &[u8], _no_deref: bool) -> bool {
+    let end = name
+        .iter()
+        .position(|&byte| {
+            crate::ascii_defs::ascii_iswhite(i32::from(byte))
+                || byte == b'('
+        })
+        .unwrap_or(name.len());
+    let tail = &name[end..];
+    let tail = &tail[crate::charset::skipwhite(tail)..];
+    if !tail.is_empty() && tail.first() != Some(&b'(') {
+        return false;
+    }
+    let name = &name[..end];
+    let resolved = if let Some(global) = name.strip_prefix(b"g:") {
+        Some(global.to_vec())
+    } else if name.starts_with(b"s:") || name.starts_with(b"<SID>") {
+        fname_trans_sid(name).ok()
+    } else {
+        Some(name.to_vec())
+    };
+    resolved.is_some_and(|name| translated_function_exists(&name))
+}
+
 /// Get the number of required/optional arguments a function takes,
 /// and whether it accepts a variable number (`get_func_arity`).
 ///
@@ -4117,6 +4149,19 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         func_init();
         assert!(!translated_function_exists(b"NoSuchUserFunctionAtAll"));
+    }
+
+    #[test]
+    fn function_exists_resolves_builtin_global_and_trailing_forms() {
+        assert!(function_exists(b"len", false));
+        assert!(function_exists(b"g:len", false));
+        assert!(function_exists(b"len(", false));
+        assert!(function_exists(b"len   (", true));
+        assert!(!function_exists(b"len garbage", false));
+        assert!(!function_exists(
+            b"NeroDefinitelyMissingFunction",
+            false,
+        ));
     }
 
     #[test]
