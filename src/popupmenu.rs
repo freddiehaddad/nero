@@ -32,9 +32,8 @@
 //! `false` today" treatment) and [`pum_get_height`] (via a new
 //! `PUM_HEIGHT` file-static - only ever set by
 //! `pum_compute_vertical_placement`/`pum_show_popupmenu`, neither
-//! translated, so it stays `0` today; its own `ui_pum_get_height()`
-//! branch, gated on `PUM_EXTERNAL`, is `unimplemented!()` -
-//! unreachable today since nothing can set `PUM_EXTERNAL` true yet).
+//! translated, so it stays `0` today. The external-UI height query is
+//! translated through `ui_pum_get_height` with the original fallback.
 //!
 //! Also [`pum_set_event_info`] (`pum_getpos()`'s own real backend) -
 //! its own FIRST check is `!pum_visible()`, always true today, so it
@@ -361,19 +360,15 @@ pub fn pum_drawn() -> bool {
 /// Get the height (number of visible entries) of the popup menu -
 /// only meaningful when [`pum_visible`] returns `true` (`pum_get_height`).
 ///
-/// # Panics
-/// If `PUM_EXTERNAL` is ever `true` (unreachable today - nothing in
-/// this crate can currently set it - since that branch needs
-/// `ui_pum_get_height()`'s real UI-attach/ext-popupmenu event
-/// dispatch, not yet translated).
 #[must_use]
 pub fn pum_get_height() -> i32 {
     // SAFETY: a plain read through one exclusive borrow.
     if unsafe { *PUM_EXTERNAL.get_mut() } {
-        unimplemented!(
-            "pum_get_height: the ui_pum_get_height() branch needs the real UI-attach/ \
-             ext-popupmenu event dispatch, not yet translated"
-        );
+        // SAFETY: UI registry access is serialized with editor state.
+        let ui_height = unsafe { crate::ui::ui_pum_get_height() };
+        if ui_height != 0 {
+            return ui_height;
+        }
     }
     // SAFETY: a plain read through one exclusive borrow.
     unsafe { *PUM_HEIGHT.get_mut() }
@@ -871,10 +866,7 @@ pub(crate) mod tests {
         set_pum_external(prev_ext);
     }
 
-    /// Restores `PUM_EXTERNAL` to its previous value on drop, even
-    /// through a panic - needed since `pum_get_height`'s own
-    /// `#[should_panic]` test deliberately triggers a panic while
-    /// `PUM_EXTERNAL` is temporarily set `true`.
+    /// Restores `PUM_EXTERNAL` to its previous value on drop.
     struct PumExternalGuard {
         previous: bool,
     }
@@ -892,11 +884,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ui_pum_get_height")]
-    fn pum_get_height_panics_when_external() {
+    fn pum_get_height_falls_back_when_external_uis_report_zero() {
         let _lock = crate::globals::global_state_test_lock();
         let _guard = PumExternalGuard::set(true);
-        let _ = pum_get_height();
+        let previous = set_pum_height(6);
+        assert_eq!(pum_get_height(), 6);
+        set_pum_height(previous);
     }
 
     // ---- pum_border_width ----
