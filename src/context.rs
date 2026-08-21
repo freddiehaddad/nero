@@ -84,6 +84,61 @@ pub unsafe fn array_to_string(
     output.unwrap_or_default()
 }
 
+/// Convert a Context snapshot to its API Dict representation
+/// (`ctx_to_dict`).
+#[must_use]
+pub fn ctx_to_dict(
+    context: &crate::context_defs::Context,
+) -> crate::api::private::defs::Dict {
+    use crate::api::private::defs::{KeyValuePair, Object};
+
+    [
+        (
+            b"regs".as_slice(),
+            Object::Array(
+                crate::api::private::helpers::string_to_array(
+                    context.regs.as_deref().unwrap_or_default(),
+                    false,
+                ),
+            ),
+        ),
+        (
+            b"jumps".as_slice(),
+            Object::Array(
+                crate::api::private::helpers::string_to_array(
+                    context.jumps.as_deref().unwrap_or_default(),
+                    false,
+                ),
+            ),
+        ),
+        (
+            b"bufs".as_slice(),
+            Object::Array(
+                crate::api::private::helpers::string_to_array(
+                    context.bufs.as_deref().unwrap_or_default(),
+                    false,
+                ),
+            ),
+        ),
+        (
+            b"gvars".as_slice(),
+            Object::Array(
+                crate::api::private::helpers::string_to_array(
+                    context.gvars.as_deref().unwrap_or_default(),
+                    false,
+                ),
+            ),
+        ),
+        (b"funcs".as_slice(), Object::Array(context.funcs.clone())),
+    ]
+    .into_iter()
+    .map(|(key, value)| KeyValuePair {
+        key: key.to_vec(),
+        value,
+    })
+    .collect()
+}
+
 #[cfg(test)]
 unsafe fn reset_ctx_win_pool_for_test() {
     let entries = std::mem::take(unsafe { CTX_WIN_VEC.get_mut() });
@@ -655,6 +710,58 @@ mod tests {
             error.msg.as_deref(),
             Some("E474: Failed to convert list to msgpack string buffer")
         );
+    }
+
+    #[test]
+    fn ctx_to_dict_exports_serialized_fields_and_functions() {
+        let context = crate::context_defs::Context {
+            regs: Some(b"one\ntwo\n".to_vec()),
+            jumps: None,
+            bufs: Some(b"buffer".to_vec()),
+            gvars: Some(Vec::new()),
+            funcs: vec![crate::api::private::defs::Object::String(
+                b"function body".to_vec(),
+            )],
+        };
+        let dictionary = ctx_to_dict(&context);
+        assert_eq!(dictionary.len(), 5);
+
+        let regs = dictionary
+            .iter()
+            .find(|item| item.key == b"regs")
+            .unwrap();
+        let crate::api::private::defs::Object::Array(regs) =
+            &regs.value
+        else {
+            panic!("expected regs Array");
+        };
+        let values: Vec<&[u8]> = regs
+            .iter()
+            .map(|object| {
+                let crate::api::private::defs::Object::String(value) =
+                    object
+                else {
+                    panic!("expected String");
+                };
+                value.as_slice()
+            })
+            .collect();
+        assert_eq!(values, [b"one".as_slice(), b"two", b""]);
+
+        let functions = dictionary
+            .iter()
+            .find(|item| item.key == b"funcs")
+            .unwrap();
+        let crate::api::private::defs::Object::Array(functions) =
+            &functions.value
+        else {
+            panic!("expected funcs Array");
+        };
+        assert!(matches!(
+            functions.first(),
+            Some(crate::api::private::defs::Object::String(value))
+                if value == b"function body"
+        ));
     }
 
     // --- ctx_saved_curwin / ctx_restore_curwin ---
