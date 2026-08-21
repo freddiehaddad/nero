@@ -229,6 +229,50 @@ pub fn os_dup_cloexec(
     os_dup(file)
 }
 
+fn dup_stdin_fd() -> i32 {
+    loop {
+        #[cfg(unix)]
+        let descriptor = unsafe { libc::dup(0) };
+        #[cfg(windows)]
+        let descriptor = {
+            #[link(name = "ucrt")]
+            unsafe extern "C" {
+                fn _dup(fd: i32) -> i32;
+            }
+            unsafe { _dup(0) }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let descriptor = -1;
+
+        if descriptor >= 0 {
+            return descriptor;
+        }
+        if std::io::Error::last_os_error().kind()
+            != std::io::ErrorKind::Interrupted
+        {
+            return -1;
+        }
+    }
+}
+
+/// Open the descriptor used for stdin (`os_open_stdin_fd`).
+///
+/// # Safety
+/// Reads shared startup state and, on Windows when no descriptor was
+/// supplied, replaces process stdin with `CONIN$`.
+#[must_use]
+pub unsafe fn os_open_stdin_fd() -> i32 {
+    let configured =
+        unsafe { (*crate::globals::GLOBALS.as_ptr()).stdin_fd };
+    if configured > 0 {
+        return configured;
+    }
+    let descriptor = dup_stdin_fd();
+    #[cfg(windows)]
+    crate::os::os_win_console::os_redirect_stdin_to_conin();
+    descriptor
+}
+
 /// Changes the current directory to `path` (`os_chdir`).
 ///
 /// The original also does verbose-logging (`smsg`, gated on
@@ -1674,6 +1718,34 @@ mod tests {
             );
             assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
         }
+    }
+
+    #[test]
+    fn os_open_stdin_fd_reuses_the_configured_descriptor() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stdin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.stdin_fd,
+                42,
+            )
+        };
+        assert_eq!(unsafe { os_open_stdin_fd() }, 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call dup/close FFI")]
+    fn os_open_stdin_fd_duplicates_standard_input_on_unix() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stdin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.stdin_fd,
+                -1,
+            )
+        };
+        let descriptor = unsafe { os_open_stdin_fd() };
+        assert!(descriptor >= 0);
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
     }
 
     #[cfg(unix)]
