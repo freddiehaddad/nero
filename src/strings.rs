@@ -486,6 +486,30 @@ pub(crate) fn tv_ptr(
     }
 }
 
+/// Render one pointer exactly as the platform C library's `%p` conversion
+/// used by Neovim (`vim_vsnprintf_typval`'s pointer branch).
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn format_pointer(pointer: usize) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        format!(
+            "{pointer:0width$X}",
+            width = std::mem::size_of::<usize>() * 2
+        )
+        .into_bytes()
+    }
+
+    #[cfg(not(windows))]
+    {
+        if pointer == 0 {
+            b"(nil)".to_vec()
+        } else {
+            format!("0x{pointer:x}").into_bytes()
+        }
+    }
+}
+
 /// Value categories accepted by the portable formatter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormatType {
@@ -1632,6 +1656,21 @@ mod tests {
         assert_eq!(tv_ptr(&values, &mut index), expected);
         assert_eq!(tv_ptr(&values, &mut index), 0);
         assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn format_pointer_matches_the_platform_percent_p_shape() {
+        #[cfg(windows)]
+        {
+            assert_eq!(format_pointer(0), b"0000000000000000");
+            assert_eq!(format_pointer(0x12ab), b"00000000000012AB");
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(format_pointer(0), b"(nil)");
+            assert_eq!(format_pointer(0x12ab), b"0x12ab");
+        }
     }
 
     #[test]
