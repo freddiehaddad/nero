@@ -6505,6 +6505,62 @@ pub unsafe fn prompt_trim_scrollback(
     unsafe { crate::cursor::check_cursor_col(curwin) };
 }
 
+/// Submit the current prompt-buffer input (`prompt_invoke_callback`).
+///
+/// The no-callback path is complete. A configured callback still needs
+/// `callback_call`/the full `funcexe_T` dispatch path.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin` and all state required by
+/// [`prompt_get_input`], [`crate::memline::ml_append`],
+/// [`crate::change::appended_lines_mark`],
+/// [`crate::undo::u_clearallandblockfree`], and
+/// [`prompt_trim_scrollback`] must be valid.
+pub unsafe fn prompt_invoke_callback() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(user_input) = (unsafe { prompt_get_input(curbuf) }) else {
+        return;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { (*curbuf).b_ml.ml_line_count };
+
+    // Add the next prompt line before invoking the callback.
+    let _ = unsafe { crate::memline::ml_append(lnum, b"\0", 0, false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::change::appended_lines_mark(lnum, 1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+    unsafe {
+        (*curwin).w_cursor.lnum = lnum + 1;
+        (*curwin).w_cursor.col = 0;
+        (*curbuf).b_prompt_start.mark.lnum = lnum + 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if !matches!(
+        unsafe { &(*curbuf).b_prompt_callback },
+        crate::eval::typval_defs::Callback::None
+    ) {
+        let _ = user_input;
+        unimplemented!(
+            "prompt_invoke_callback: configured callbacks need callback_call"
+        );
+    }
+    drop(user_input);
+
+    // Clear undo history on submit.
+    crate::undo::u_clearallandblockfree(unsafe { &mut *curbuf });
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*curbuf).b_prompt_start.mark.lnum =
+            (*curbuf).b_ml.ml_line_count;
+        (*curbuf).b_prompt_append_new_line = true;
+        prompt_trim_scrollback(curbuf);
+    }
+}
+
 /// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
 /// `"dict['key']"`), list item (`"list[expr]"`), or list slice
 /// (`"list[expr:expr]"`) (`get_lval`).
@@ -13972,6 +14028,89 @@ mod tests {
             unsafe { prompt_get_input(buf_ptr) },
             Some(b"short".to_vec())
         );
+        close_prompt_input_buffer(buf);
+    }
+
+    #[test]
+    fn prompt_invoke_callback_returns_for_a_non_prompt_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        unsafe { crate::globals::GLOBALS.get_mut().curbuf = buf_ptr };
+
+        unsafe { prompt_invoke_callback() };
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 0);
+
+        unsafe { crate::globals::GLOBALS.get_mut().curbuf = old_curbuf };
+    }
+
+    #[test]
+    fn prompt_invoke_callback_without_callback_starts_the_next_prompt() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let old_curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+        let old_firstwin =
+            unsafe { crate::globals::GLOBALS.get_mut().firstwin };
+        let old_lastwin =
+            unsafe { crate::globals::GLOBALS.get_mut().lastwin };
+        let old_first_tabpage =
+            unsafe { crate::globals::GLOBALS.get_mut().first_tabpage };
+        let old_curtab = unsafe { crate::globals::GLOBALS.get_mut().curtab };
+
+        let mut buf = prompt_input_buffer(&[b"> answer\0"], 2);
+        buf.b_u_synced = true;
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT {
+                lnum: 1,
+                col: 8,
+                coladd: 0,
+            },
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let mut tab = Box::new(crate::buffer_defs::TabpageT {
+            tp_firstwin: win_ptr,
+            tp_lastwin: win_ptr,
+            tp_curwin: win_ptr,
+            ..Default::default()
+        });
+        let tab_ptr = std::ptr::addr_of_mut!(*tab);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = buf_ptr;
+            crate::globals::GLOBALS.get_mut().curwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().firstwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().lastwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().first_tabpage = tab_ptr;
+            crate::globals::GLOBALS.get_mut().curtab = tab_ptr;
+        }
+
+        unsafe { prompt_invoke_callback() };
+
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 2);
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) },
+            b"\0"
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 2);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+        assert_eq!(unsafe { (*buf_ptr).b_prompt_start.mark.lnum }, 2);
+        assert!(unsafe { (*buf_ptr).b_prompt_append_new_line });
+
+        crate::undo::u_clearall(unsafe { &mut *buf_ptr });
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
+            crate::globals::GLOBALS.get_mut().curwin = old_curwin;
+            crate::globals::GLOBALS.get_mut().firstwin = old_firstwin;
+            crate::globals::GLOBALS.get_mut().lastwin = old_lastwin;
+            crate::globals::GLOBALS.get_mut().first_tabpage =
+                old_first_tabpage;
+            crate::globals::GLOBALS.get_mut().curtab = old_curtab;
+        }
+        drop(tab);
+        drop(win);
         close_prompt_input_buffer(buf);
     }
 
