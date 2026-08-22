@@ -115,13 +115,9 @@
 //! the actual garbage collector that would walk it is a much later
 //! phase, so that phase won't need to retrofit this bookkeeping later.
 //!
-//! `watchers`/`lua_table_ref` are left inert: `DictT` has no
-//! `watchers` field at all yet (needs a `QUEUE` intrusive-linked-list
-//! translation first - see `typval_defs.rs`; `ListT`'s own `lv_watch`
-//! chain *is* translated, since it's a plain raw-pointer singly-linked
-//! list already modeled directly on `ListwatchT`, not a `QUEUE`), and
-//! every `lua_table_ref` is always `LUA_NOREF` (the Lua host, phase
-//! 13, isn't started).
+//! Dictionary `watchers` and List `lv_watch` iteration state are fully
+//! modeled. Every `lua_table_ref` remains `LUA_NOREF` because the Lua
+//! host (phase 13) is not started.
 //!
 //! Also translated: the complete `Callback` conversion/lifecycle
 //! family and Dictionary watcher storage, matching, notification, and

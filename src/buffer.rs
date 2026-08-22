@@ -802,20 +802,13 @@ pub fn buf_get_changedtick(buf: &BufT) -> crate::eval::typval_defs::VarnumberT {
 /// builds in the original (`buf_set_changedtick`).
 ///
 /// # Deferred
-/// The original also notifies any dict watchers on `buf->b_vars` of
-/// the change (`tv_dict_watcher_notify`) - not done here. `dict_T`
-/// itself is real now (as [`crate::eval::typval_defs::DictT`]), but
-/// its `watchers` field (a `QUEUE` of dict-key watchers set by user
-/// code, e.g. `dictwatcheradd()`) is still deferred - needs a `QUEUE`
-/// intrusive-linked-list translation first, see `DictT`'s own doc
-/// comment. `b_vars` itself is also always null in this crate so far
-/// (nothing allocates a real per-buffer dict yet - see
-/// [`buf_init_changedtick`]'s own doc comment for the further
-/// complication even once it is). The underlying value itself is
-/// still set correctly, and every other C-level accessor in this
-/// crate reads it directly (not through the dict), so this gap only
-/// affects Vimscript-visible `b:changedtick` watchers, not this
-/// crate's own internal bookkeeping.
+/// The original also notifies dict watchers on `buf->b_vars`. Watcher
+/// machinery is real, but `buf_init_changedtick` still cannot register
+/// the separately-typed embedded [`crate::eval::typval_defs::ChangedtickDictItem`]
+/// in [`crate::eval::typval_defs::DictT::dv_index`]; until that layout
+/// issue is resolved, notifying a `b:changedtick` watcher here would
+/// expose an entry that the same Dictionary cannot look up. The
+/// underlying value remains correct for every C-level accessor.
 pub fn buf_set_changedtick(buf: &mut BufT, changedtick: crate::eval::typval_defs::VarnumberT) {
     buf.changedtick_di.di_tv.value = crate::eval::typval_defs::TypvalValue::Number(changedtick);
 }

@@ -266,10 +266,9 @@
 //! `set_ref_in_ht`/`set_ref_in_item_dict` take `*mut DictT` rather than
 //! the original's bare `*mut hashtab_T`, matching `vars_clear_ext`'s
 //! own already-established precedent (`eval/vars.rs`) for the exact
-//! same `dv_index`-vs-`TV_DICT_HI2DI` reason. The original's
-//! `QUEUE_FOREACH` dict-watcher notification inside
-//! `set_ref_in_item_dict` is omitted - `DictT` has no `watchers` field
-//! yet (the same accepted gap already documented on `DictT` itself).
+//! same `dv_index`-vs-`TV_DICT_HI2DI` reason. Dictionary watcher
+//! callbacks are included in the mark phase through
+//! [`set_ref_in_callback`].
 //!
 //! Also translated: `get_lval`/`clear_lval`/`get_lval_subscript`/
 //! `get_lval_dict_item`/`get_lval_blob`/`get_lval_list` (plus a new
@@ -1571,12 +1570,6 @@ pub unsafe fn set_ref_in_list_items(
 /// Mark the dict `dd` with `copy_id` (`set_ref_in_item_dict`). Also
 /// see [`set_ref_in_item`].
 ///
-/// The original's `QUEUE_FOREACH(w, &dd->watchers, ...)` dict-watcher
-/// notification is omitted - `DictT` has no `watchers` field at all
-/// yet (needs a `QUEUE` intrusive-linked-list translation first, the
-/// same accepted gap already documented on `DictT` itself in
-/// `eval/typval_defs.rs`).
-///
 /// # Safety
 /// `dd`, if non-null, must be a valid pointer to a live
 /// [`crate::eval::typval_defs::DictT`]. `ht_stack`, if non-null, must
@@ -1605,6 +1598,19 @@ unsafe fn set_ref_in_item_dict(
     let newitem = Box::into_raw(Box::new(HtStackT { ht: dd, prev: unsafe { *ht_stack } }));
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *ht_stack = newitem };
+
+    // SAFETY: every watcher belongs to `dd`, and its callback satisfies
+    // this function's transitive reachability contract.
+    for watcher in unsafe { &(*dd).watchers } {
+        let _ = unsafe {
+            set_ref_in_callback(
+                &watcher.callback,
+                copy_id,
+                ht_stack,
+                list_stack,
+            )
+        };
+    }
 
     false
 }
@@ -9311,6 +9317,51 @@ mod tests {
         assert!(!aborted);
 
         unsafe { crate::eval::typval::partial_unref(pt) };
+    }
+
+    #[test]
+    fn set_ref_in_ht_marks_dict_watcher_partial_references() {
+        let _lock = crate::globals::global_state_test_lock();
+        let bound = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*bound).dv_refcount = 1 };
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_dict: bound,
+                ..Default::default()
+            },
+        ));
+        let watched = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*watched).dv_refcount = 1;
+            crate::eval::typval::tv_dict_watcher_add(
+                watched,
+                b"*",
+                Callback::Partial(partial),
+            );
+        }
+        let root = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"watched");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Dict(watched);
+            crate::eval::typval::tv_dict_add(&mut *root, item);
+        }
+        let mut list_stack = std::ptr::null_mut();
+
+        let aborted = unsafe {
+            set_ref_in_ht(
+                root,
+                73,
+                std::ptr::from_mut(&mut list_stack),
+            )
+        };
+
+        assert!(!aborted);
+        assert!(list_stack.is_null());
+        assert_eq!(unsafe { (*watched).dv_copy_id }, 73);
+        assert_eq!(unsafe { (*partial).pt_copy_id }, 73);
+        assert_eq!(unsafe { (*bound).dv_copy_id }, 73);
+        unsafe { crate::eval::typval::tv_dict_free(root) };
     }
 
     #[test]

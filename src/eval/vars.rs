@@ -23,10 +23,8 @@
 //! result into the script item at `id` via
 //! `crate::runtime::script_item`.
 //!
-//! The original's `QUEUE_INIT(&dict->watchers)` is omitted - `DictT`
-//! has no `watchers` field at all yet (needs a `QUEUE` intrusive-
-//! linked-list translation first, same accepted gap as documented on
-//! `DictT` itself in `eval/typval_defs.rs`).
+//! The original's `QUEUE_INIT(&dict->watchers)` needs no explicit call:
+//! [`DictT`]'s owned watcher `Vec` is already empty when constructed.
 //!
 //! Also translated: the `v:` special-variable storage layer -
 //! `eval_defs.h`'s `VimVarIndex` enum (embedded here directly, since
@@ -276,8 +274,8 @@ pub fn init_var_dict(dict: &mut DictT, dict_var: &mut ScopeDictDictItem, scope: 
     dict_var.di_tv.v_lock = VarLockStatus::Fixed;
     dict_var.di_flags = dict_item_flags::RO | dict_item_flags::FIX;
     dict_var.di_key = vec![0]; // empty NUL-terminated key, matching di_key[0] = NUL
-    // QUEUE_INIT(&dict->watchers) omitted - see this module's own doc
-    // comment.
+    // The owned watcher Vec is already empty, replacing
+    // QUEUE_INIT(&dict->watchers).
 }
 
 /// Allocate a new hashtab for a sourced script. It will be used while
@@ -5049,12 +5047,9 @@ pub unsafe fn set_var(name: &[u8], tv: &mut TypvalT, copy: bool) {
 /// String/List/Dict/Blob value.
 pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const: bool) {
     let (ht, varname, dict) = find_var_ht_dict(name);
-    // `watched` is always false: DictT has no `watchers` field at all
-    // yet (needs a QUEUE intrusive-linked-list translation first,
-    // matching this crate's own already-documented gap for DictT
-    // itself) - tv_dict_is_watched's real contract
-    // (`d && !QUEUE_EMPTY(&d->watchers)`) can never be true for any
-    // dict this crate can construct today.
+    // SAFETY: `tv_dict_is_watched` accepts null and `dict`, when
+    // non-null, satisfies this function's own safety contract.
+    let watched = unsafe { crate::eval::typval::tv_dict_is_watched(dict) };
 
     if ht.is_null() || varname.is_empty() {
         // semsg(_(e_illvar), name) omitted (message display, not
@@ -5081,6 +5076,7 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
     }
 
     let di_tv: *mut TypvalT;
+    let mut oldtv = TypvalT::default();
 
     match found {
         Some(variant) => {
@@ -5107,6 +5103,10 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
             let lock = unsafe { (*tv_ptr).v_lock };
             if var_check_ro(flags) || value_check_lock(lock, None) || var_check_lock(flags) {
                 return;
+            }
+            if watched {
+                // SAFETY: `tv_ptr` points to the live existing item.
+                unsafe { crate::eval::typval::tv_copy(&*tv_ptr, &mut oldtv) };
             }
             // existing variable, need to clear the value.
             // SAFETY: forwarded from this function's own safety doc.
@@ -5159,6 +5159,21 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
         // tv_init(tv) - already done by mem::take above, which leaves
         // *tv at its Default (Unknown), matching tv_init's own
         // memset-to-zero contract.
+    }
+
+    if watched {
+        // SAFETY: `dict` and `di_tv` remain live through notification;
+        // `oldtv` owns the copied previous value, or is Unknown for a
+        // newly-created variable.
+        unsafe {
+            crate::eval::typval::tv_dict_watcher_notify(
+                dict,
+                varname,
+                Some(&*di_tv),
+                Some(&oldtv),
+            );
+            crate::eval::typval::tv_clear_simple(&oldtv);
+        }
     }
 
     if is_const {
@@ -6052,6 +6067,43 @@ mod set_var_tests {
     use super::get_var_from_tests::TestFixture;
     use super::*;
 
+    struct WatcherCleanup {
+        dict: *mut DictT,
+        key: Vec<u8>,
+    }
+
+    impl WatcherCleanup {
+        unsafe fn install(dict: *mut DictT, key: &[u8]) -> Self {
+            unsafe {
+                crate::eval::typval::tv_dict_watcher_add(
+                    dict,
+                    key,
+                    crate::eval::typval_defs::Callback::None,
+                );
+                (&mut (*dict).watchers)
+                    .last_mut()
+                    .expect("watcher was just added")
+                    .needs_free = true;
+            }
+            Self {
+                dict,
+                key: key.to_vec(),
+            }
+        }
+    }
+
+    impl Drop for WatcherCleanup {
+        fn drop(&mut self) {
+            while unsafe {
+                crate::eval::typval::tv_dict_watcher_remove(
+                    self.dict,
+                    &self.key,
+                    &crate::eval::typval_defs::Callback::None,
+                )
+            } {}
+        }
+    }
+
     fn reset_shared_state() {
         crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
         unsafe { vars_clear(GLOBVARDICT.get_mut()) };
@@ -6123,6 +6175,76 @@ mod set_var_tests {
 
         unsafe { crate::eval::typval::tv_list_unref(l) };
         reset_shared_state();
+    }
+
+    #[test]
+    fn set_var_notifies_watchers_when_adding_a_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let dict = get_globvar_dict();
+        let watcher = unsafe { WatcherCleanup::install(dict, b"watched") };
+        let mut tv = TypvalT {
+            value: TypvalValue::Number(1),
+            ..TypvalT::default()
+        };
+
+        unsafe { set_var(b"g:watched", &mut tv, true) };
+
+        let notified = !unsafe { crate::eval::typval::tv_dict_is_watched(dict) };
+        drop(watcher);
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                eval_variable(
+                    b"g:watched",
+                    Some(&mut rettv),
+                    true,
+                    false,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        reset_shared_state();
+        assert!(notified);
+    }
+
+    #[test]
+    fn set_var_notifies_watchers_when_replacing_a_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let mut initial = TypvalT {
+            value: TypvalValue::Number(1),
+            ..TypvalT::default()
+        };
+        unsafe { set_var(b"g:watched", &mut initial, true) };
+
+        let dict = get_globvar_dict();
+        let watcher = unsafe { WatcherCleanup::install(dict, b"watched") };
+        let mut replacement = TypvalT {
+            value: TypvalValue::Number(2),
+            ..TypvalT::default()
+        };
+
+        unsafe { set_var(b"g:watched", &mut replacement, true) };
+
+        let notified = !unsafe { crate::eval::typval::tv_dict_is_watched(dict) };
+        drop(watcher);
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                eval_variable(
+                    b"g:watched",
+                    Some(&mut rettv),
+                    true,
+                    false,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        reset_shared_state();
+        assert!(notified);
     }
 
     #[test]
