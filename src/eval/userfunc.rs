@@ -81,6 +81,9 @@
 //! `func_has_ended` (the last needing a new `aborted_in_try` in
 //! `crate::ex_eval`, itself trivial - just reads the already-real
 //! `GLOBALS.force_abort`).
+//! `free_all_functions` completes the upstream `#ifdef EXITFREE`
+//! teardown path here without a compile-time gate, clearing active and
+//! saved calls before mutation-safe two-phase registry cleanup.
 //!
 //! Also translated: `func_is_global`/`cat_func_name`/
 //! `printable_func_name`/`function_list_modified` - small name-
@@ -2209,6 +2212,89 @@ pub fn set_current_funccal(fc: *mut FunccallT) {
     unsafe { *CURRENT_FUNCCAL.get_mut() = fc };
 }
 
+/// Release active function calls and all non-refcounted registered
+/// functions during final evaluator teardown (`free_all_functions`).
+///
+/// Contents are cleared in a first pass that restarts whenever
+/// clearing mutates the function table. A second pass frees one
+/// function at a time and restarts from the table beginning, preserving
+/// the original's mutation-safe EXITFREE algorithm. Numbered/lambda
+/// functions remain registered because their lifetimes are reference
+/// counted independently.
+///
+/// # Safety
+/// Active Funccalls and every registered non-refcounted function must
+/// be heap allocations satisfying [`cleanup_function_call`],
+/// [`func_clear`], and [`func_free`]. Saved funccal-stack entries must
+/// remain live until restored.
+pub unsafe fn free_all_functions() {
+    while !get_current_funccal().is_null() {
+        let current = get_current_funccal();
+        // SAFETY: non-null current Funccall is live by contract.
+        let rettv = unsafe { (*current).fc_rettv };
+        if !rettv.is_null() {
+            // SAFETY: result belongs to the live current call.
+            unsafe {
+                crate::eval::typval::tv_clear_simple(&*rettv);
+                *rettv = TypvalT::default();
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { cleanup_function_call(current) };
+        if get_current_funccal().is_null()
+            && !unsafe { *FUNCCAL_STACK.get_mut() }.is_null()
+        {
+            restore_funccal();
+        }
+    }
+
+    loop {
+        // SAFETY: table and registered functions are live by contract.
+        let functions = unsafe { func_tbl_values() };
+        let mut restart = false;
+        for fp in functions {
+            // SAFETY: pointer came from the unchanged function table.
+            if func_name_refcount(unsafe { &(*fp).uf_name }) {
+                continue;
+            }
+            let changed = unsafe { (*func_tbl_get()).ht_changed };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { func_clear(fp, true) };
+            if changed != unsafe { (*func_tbl_get()).ht_changed } {
+                restart = true;
+                break;
+            }
+        }
+        if !restart {
+            break;
+        }
+    }
+
+    loop {
+        // SAFETY: table and registered functions are live by contract.
+        let functions = unsafe { func_tbl_values() };
+        let mut skipped = 0usize;
+        let mut freed = false;
+        for fp in functions {
+            // SAFETY: pointer came from the unchanged function table.
+            if func_name_refcount(unsafe { &(*fp).uf_name }) {
+                skipped += 1;
+                continue;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { func_free(fp) };
+            freed = true;
+            break;
+        }
+        if !freed {
+            if skipped == 0 {
+                func_init();
+            }
+            break;
+        }
+    }
+}
+
 /// Whether currently inside a function call (`can_add_defer`).
 ///
 /// The original's `semsg(_(e_str_not_inside_function), "defer")` on
@@ -2272,7 +2358,6 @@ unsafe fn free_funccal(fc: *mut FunccallT) {
 /// Recursion-free "have we made lots of copies lately" counter for
 /// [`cleanup_function_call`] - matches the original's own function-
 /// local `static int made_copy`.
-#[allow(dead_code)] // no real translated caller yet (cleanup_function_call's own only real caller, call_user_func, isn't translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
 static CLEANUP_FUNCTION_CALL_MADE_COPY: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 
@@ -2288,7 +2373,6 @@ static CLEANUP_FUNCTION_CALL_MADE_COPY: crate::globals::GlobalCell<i32> =
 /// `free_fc` ends up `false`), satisfy [`crate::eval::typval::tv_copy`]'s
 /// own safety contract; if `fc` ends up freed, it must satisfy
 /// [`free_funccal`]'s own safety contract.
-#[allow(dead_code)] // no real translated caller yet (call_user_func, its only real caller, isn't translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
 unsafe fn cleanup_function_call(fc: *mut FunccallT) {
     // SAFETY: forwarded from this function's own safety doc.
     let fc_ref = unsafe { &mut *fc };
@@ -2401,9 +2485,8 @@ unsafe fn cleanup_function_call(fc: *mut FunccallT) {
 /// Free `fc` and what it contains (`free_funccal_contents`).
 ///
 /// Can be called only when `fc` is kept beyond the period it was
-/// called, i.e. after [`cleanup_function_call`] (its real caller,
-/// `call_user_func`, isn't translated yet, so nothing currently
-/// constructs a `FunccallT` this way in practice).
+/// called, i.e. after [`cleanup_function_call`]. Teardown may reach it
+/// through [`free_all_functions`]/`func_clear`/`funccal_unref`.
 ///
 /// # Safety
 /// Same as [`free_funccal`], plus every item in `fc.fc_l_vars`/
@@ -7002,6 +7085,131 @@ mod tests {
 
         set_current_funccal(std::ptr::null_mut());
         assert!(get_current_funccal().is_null());
+    }
+
+    #[test]
+    fn free_all_functions_frees_ordinary_and_keeps_refcounted_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_current_funccal(std::ptr::null_mut());
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+        func_init();
+        let ordinary = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"OrdinaryFunction\0".to_vec(),
+            ..Default::default()
+        }));
+        let lambda = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"<lambda>1\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        }));
+        unsafe {
+            func_hashtab_add(ordinary);
+            func_hashtab_add(lambda);
+        }
+        let _registry = FuncRegistryReset;
+
+        unsafe { free_all_functions() };
+
+        let ordinary_freed = find_func(b"OrdinaryFunction").is_null();
+        let lambda_retained = find_func(b"<lambda>1") == lambda;
+        let lambda_uncleared = !unsafe { (*lambda).uf_cleared };
+        unsafe {
+            func_remove(lambda);
+            drop(Box::from_raw(lambda));
+        }
+
+        assert!(ordinary_freed);
+        assert!(lambda_retained);
+        assert!(lambda_uncleared);
+    }
+
+    #[test]
+    fn free_all_functions_unwinds_active_and_saved_funccalls() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_current_funccal(std::ptr::null_mut());
+        unsafe {
+            *FUNCCAL_STACK.get_mut() = std::ptr::null_mut();
+            *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut();
+        }
+        func_init();
+        let function = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"ActiveFunction\0".to_vec(),
+            ..Default::default()
+        }));
+        let mut outer_result = TypvalT::default();
+        let outer = unsafe {
+            create_funccal(
+                function,
+                std::ptr::from_mut(&mut outer_result),
+            )
+        };
+        unsafe {
+            (*outer).fc_l_vars.dv_refcount =
+                crate::eval::typval_defs::DO_NOT_FREE_CNT;
+            (*outer).fc_l_avars.dv_refcount =
+                crate::eval::typval_defs::DO_NOT_FREE_CNT;
+            (*outer).fc_l_varlist.lv_refcount =
+                crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        }
+        let mut entry = FuncCalEntryT::default();
+        unsafe { save_funccal(std::ptr::from_mut(&mut entry)) };
+        let mut inner_result = TypvalT::default();
+        let inner = unsafe {
+            create_funccal(
+                function,
+                std::ptr::from_mut(&mut inner_result),
+            )
+        };
+        unsafe {
+            (*inner).fc_l_vars.dv_refcount =
+                crate::eval::typval_defs::DO_NOT_FREE_CNT;
+            (*inner).fc_l_avars.dv_refcount =
+                crate::eval::typval_defs::DO_NOT_FREE_CNT;
+            (*inner).fc_l_varlist.lv_refcount =
+                crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        }
+        assert_eq!(get_current_funccal(), inner);
+        assert_ne!(outer, inner);
+
+        unsafe { free_all_functions() };
+
+        assert!(get_current_funccal().is_null());
+        assert!(unsafe { *FUNCCAL_STACK.get_mut() }.is_null());
+        assert!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }.is_null());
+        assert_eq!(
+            unsafe { (*func_tbl_get()).ht_used },
+            0
+        );
+    }
+
+    #[test]
+    fn free_all_functions_clears_a_populated_ordinary_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_current_funccal(std::ptr::null_mut());
+        unsafe {
+            *FUNCCAL_STACK.get_mut() = std::ptr::null_mut();
+            *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut();
+        }
+        func_init();
+        let first = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"FirstOrdinary\0".to_vec(),
+            ..Default::default()
+        }));
+        let second = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"SecondOrdinary\0".to_vec(),
+            ..Default::default()
+        }));
+        unsafe {
+            func_hashtab_add(first);
+            func_hashtab_add(second);
+        }
+        let _registry = FuncRegistryReset;
+        assert_eq!(unsafe { (*func_tbl_get()).ht_used }, 2);
+
+        unsafe { free_all_functions() };
+
+        assert_eq!(unsafe { (*func_tbl_get()).ht_used }, 0);
+        assert!(unsafe { func_tbl_values() }.is_empty());
     }
 
     #[test]
