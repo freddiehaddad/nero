@@ -123,14 +123,10 @@
 //! every `lua_table_ref` is always `LUA_NOREF` (the Lua host, phase
 //! 13, isn't started).
 //!
-//! Also translated: `callback_from_typval`/`callback_free` (`eval.c`/
-//! `eval/typval.c`) - the `Callback` conversion/lifecycle functions
-//! used directly by `prompt_setcallback()`/`prompt_setinterrupt()`
-//! (`eval/buffer.rs`), and a real step toward (but not the whole of)
-//! the dict-watcher subsystem, which still additionally needs the
-//! `QUEUE`-as-`Vec` `DictWatcher` design and `tv_dict_watcher_add`/
-//! `_remove`/`_notify` themselves. `callback_put`/`callback_copy`/
-//! `callback_to_string`/`tv_callback_equal` are also complete.
+//! Also translated: the complete `Callback` conversion/lifecycle
+//! family and Dictionary watcher storage, matching, notification, and
+//! cleanup machinery. `dictwatcheradd()`/`dictwatcherdel()` expose the
+//! watcher subsystem through `eval/funcs.rs`.
 //!
 //! # Deferred
 //! - `tv_clear`/`tv_free` themselves: `tv_clear`'s *real* behavior is

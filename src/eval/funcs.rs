@@ -382,6 +382,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
+        m.insert(&b"dictwatcheradd"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_NONE, func: f_dictwatcheradd });
+        m.insert(&b"dictwatcherdel"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_NONE, func: f_dictwatcherdel });
         m.insert(&b"filter"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_filter });
         m.insert(&b"foreach"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_foreach });
         m.insert(&b"map"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_map });
@@ -2662,6 +2664,87 @@ unsafe fn f_deepcopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let copy_id = if noref == 0 { crate::eval::eval::get_copy_id() } else { 0 };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::eval::var_item_copy(std::ptr::null(), &argvars[0], rettv, true, copy_id) };
+}
+
+/// `dictwatcheradd({dict}, {pattern}, {callback})` - watch matching
+/// Dictionary keys (`f_dictwatcheradd`).
+///
+/// # Safety
+/// A non-null Dictionary/Partial argument must point to a live value.
+/// The function registry and `GLOBALS` secure-mode state must not be
+/// mutated concurrently.
+unsafe fn f_dictwatcheradd(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let TypvalValue::Dict(dict) = argvars[0].value else {
+        return;
+    };
+    if dict.is_null()
+        || !matches!(
+            argvars[1].value,
+            TypvalValue::String(_) | TypvalValue::Number(_)
+        )
+    {
+        return;
+    }
+
+    let Some(key_pattern) = crate::eval::typval::tv_get_string_chk(&argvars[1]) else {
+        return;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(callback) = (unsafe { crate::eval::typval::callback_from_typval(&argvars[2]) }) else {
+        return;
+    };
+
+    // SAFETY: `dict` is live by contract and owns `callback` from here.
+    unsafe { crate::eval::typval::tv_dict_watcher_add(dict, &key_pattern, callback) };
+}
+
+/// `dictwatcherdel({dict}, {pattern}, {callback})` - remove one exact
+/// Dictionary watcher (`f_dictwatcherdel`).
+///
+/// # Safety
+/// A non-null Dictionary argument must point to a live value. The
+/// function registry and `GLOBALS` secure-mode state must not be
+/// mutated concurrently.
+unsafe fn f_dictwatcherdel(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let TypvalValue::Dict(dict) = argvars[0].value else {
+        return;
+    };
+    if !matches!(
+        argvars[2].value,
+        TypvalValue::Func(_) | TypvalValue::String(_)
+    ) {
+        return;
+    }
+
+    let Some(key_pattern) = crate::eval::typval::tv_get_string_chk(&argvars[1]) else {
+        return;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(mut callback) =
+        (unsafe { crate::eval::typval::callback_from_typval(&argvars[2]) })
+    else {
+        return;
+    };
+
+    // SAFETY: `dict`, if non-null, is live by contract.
+    let _ = unsafe {
+        crate::eval::typval::tv_dict_watcher_remove(
+            dict,
+            &key_pattern,
+            &callback,
+        )
+    };
+    crate::eval::typval::callback_free(&mut callback);
 }
 
 /// `filter({expr1}, {expr2})` - remove items from `{expr1}` (a `List`,
@@ -9042,6 +9125,381 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(5));
     }
 
+    // --- f_dictwatcheradd / f_dictwatcherdel ---
+
+    #[test]
+    fn dictwatcheradd_rejects_non_dict_and_null_dict_before_callback_conversion() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                0,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        let mut partial = crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            ..Default::default()
+        };
+        let partial_ptr = std::ptr::from_mut(&mut partial);
+        let callback = || TypvalT {
+            value: TypvalValue::Partial(partial_ptr),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcheradd(
+                &[num(1), string(b"*"), callback()],
+                &mut rettv,
+            );
+            f_dictwatcheradd(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Dict(std::ptr::null_mut()),
+                        ..Default::default()
+                    },
+                    string(b"*"),
+                    callback(),
+                ],
+                &mut rettv,
+            );
+        }
+
+        assert_eq!(
+            partial.pt_refcount, 1,
+            "neither rejected call may acquire the callback"
+        );
+    }
+
+    #[test]
+    fn dictwatcheradd_converts_number_keys_and_owns_partial_callbacks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                0,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcheradd(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                    num(42),
+                    TypvalT {
+                        value: TypvalValue::Partial(partial),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            );
+            assert_eq!((&(*dict).watchers)[0].key_pattern, b"42");
+            assert!(matches!(
+                (&(*dict).watchers)[0].callback,
+                crate::eval::typval_defs::Callback::Partial(ptr)
+                    if ptr == partial
+            ));
+            assert_eq!((*partial).pt_refcount, 2);
+
+            crate::eval::typval::tv_dict_free(dict);
+            assert_eq!((*partial).pt_refcount, 1);
+            crate::eval::typval::partial_unref(partial);
+        }
+    }
+
+    #[test]
+    fn dictwatcheradd_rejects_invalid_keys_and_callbacks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                0,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let mut partial = crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            ..Default::default()
+        };
+        let partial_ptr = std::ptr::from_mut(&mut partial);
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcheradd(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                    TypvalT {
+                        value: TypvalValue::Float(1.0),
+                        ..Default::default()
+                    },
+                    TypvalT {
+                        value: TypvalValue::Partial(partial_ptr),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            );
+            f_dictwatcheradd(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                    string(b"*"),
+                    num(1),
+                ],
+                &mut rettv,
+            );
+            assert!((*dict).watchers.is_empty());
+            crate::eval::typval::tv_dict_free(dict);
+        }
+        assert_eq!(partial.pt_refcount, 1);
+    }
+
+    #[test]
+    fn dictwatcherdel_removes_a_matching_watcher_and_balances_callback_refs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                0,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        crate::eval::userfunc::func_init();
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_refcount: 1,
+            uf_name: b"77\0".to_vec(),
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::from_mut(&mut function);
+        unsafe { crate::eval::userfunc::func_hashtab_add(function_ptr) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let dict_arg = || TypvalT {
+            value: TypvalValue::Dict(dict),
+            ..Default::default()
+        };
+        let callback = || TypvalT {
+            value: TypvalValue::Func(Some(b"77".to_vec())),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcheradd(
+                &[dict_arg(), string(b"key"), callback()],
+                &mut rettv,
+            );
+        }
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 2);
+        assert_eq!(unsafe { (*dict).watchers.len() }, 1);
+
+        unsafe {
+            f_dictwatcherdel(
+                &[dict_arg(), string(b"key"), callback()],
+                &mut rettv,
+            );
+        }
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 1);
+        assert!(unsafe { (*dict).watchers.is_empty() });
+
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
+        crate::eval::userfunc::func_init();
+    }
+
+    #[test]
+    fn dictwatcherdel_missing_or_null_dict_frees_its_temporary_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                0,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        crate::eval::userfunc::func_init();
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_refcount: 1,
+            uf_name: b"78\0".to_vec(),
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::from_mut(&mut function);
+        unsafe { crate::eval::userfunc::func_hashtab_add(function_ptr) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcherdel(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                    string(b"missing"),
+                    TypvalT {
+                        value: TypvalValue::Func(Some(b"78".to_vec())),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            );
+            f_dictwatcherdel(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Dict(std::ptr::null_mut()),
+                        ..Default::default()
+                    },
+                    string(b"missing"),
+                    TypvalT {
+                        value: TypvalValue::Func(Some(b"78".to_vec())),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            );
+        }
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 1);
+        assert!(unsafe { (*dict).watchers.is_empty() });
+
+        unsafe { crate::eval::typval::tv_dict_free(dict) };
+        crate::eval::userfunc::func_init();
+    }
+
+    #[test]
+    fn dictwatcherdel_rejects_partial_callbacks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                0,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                ..Default::default()
+            },
+        ));
+        let dict_arg = || TypvalT {
+            value: TypvalValue::Dict(dict),
+            ..Default::default()
+        };
+        let callback = || TypvalT {
+            value: TypvalValue::Partial(partial),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcheradd(
+                &[dict_arg(), string(b"key"), callback()],
+                &mut rettv,
+            );
+            f_dictwatcherdel(
+                &[dict_arg(), string(b"key"), callback()],
+                &mut rettv,
+            );
+            assert_eq!((*dict).watchers.len(), 1);
+            assert_eq!((*partial).pt_refcount, 2);
+
+            crate::eval::typval::tv_dict_free(dict);
+            crate::eval::typval::partial_unref(partial);
+        }
+    }
+
+    #[test]
+    fn dictwatcher_builtins_do_nothing_in_secure_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _secure = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.secure,
+                1,
+            )
+        };
+        let _sandbox = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |globals| &mut globals.sandbox,
+                0,
+            )
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_watcher_add(
+                dict,
+                b"key",
+                crate::eval::typval_defs::Callback::None,
+            );
+        }
+        let dict_arg = || TypvalT {
+            value: TypvalValue::Dict(dict),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_dictwatcheradd(
+                &[dict_arg(), string(b"other"), string(b"get")],
+                &mut rettv,
+            );
+            f_dictwatcherdel(
+                &[dict_arg(), string(b"key"), string(b"")],
+                &mut rettv,
+            );
+            assert_eq!((*dict).watchers.len(), 1);
+            assert_eq!(crate::globals::GLOBALS.get_mut().secure, 2);
+            crate::eval::typval::tv_dict_free(dict);
+        }
+    }
+
     // --- f_len ---
 
     #[test]
@@ -9871,6 +10329,8 @@ mod tests {
             "count",
             "copy",
             "deepcopy",
+            "dictwatcheradd",
+            "dictwatcherdel",
             "filter",
             "foreach",
             "map",
