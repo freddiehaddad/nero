@@ -256,8 +256,9 @@ pub struct DictitemT {
 /// `eval/typval.rs`.
 ///
 /// `watchers` replaces the original's intrusive `QUEUE` with an owned
-/// `Vec<DictWatcher>`; watcher order and deferred-removal behavior are
-/// preserved without pointer-to-container recovery.
+/// `Vec<Box<DictWatcher>>`; watcher order, stable node addresses, and
+/// deferred-removal behavior are preserved without pointer-to-container
+/// recovery.
 pub struct DictT {
     /// Whole dictionary lock status (`dv_lock`).
     pub dv_lock: VarLockStatus,
@@ -276,7 +277,7 @@ pub struct DictT {
     /// Copied dict used by `deepcopy()` (`dv_copydict`).
     pub dv_copydict: *mut DictT,
     /// Dictionary key watchers (`watchers`).
-    pub watchers: Vec<DictWatcher>,
+    pub watchers: Vec<Box<DictWatcher>>,
     /// Next dictionary in used dictionaries list (`dv_used_next`).
     pub dv_used_next: *mut DictT,
     /// Previous dictionary in used dictionaries list (`dv_used_prev`).
