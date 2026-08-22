@@ -130,8 +130,7 @@
 //! the dict-watcher subsystem, which still additionally needs the
 //! `QUEUE`-as-`Vec` `DictWatcher` design and `tv_dict_watcher_add`/
 //! `_remove`/`_notify` themselves. `callback_put`/`callback_copy`/
-//! `callback_to_string`/`tv_callback_equal` remain untranslated -
-//! none has a real caller among currently-translated code yet.
+//! `callback_to_string`/`tv_callback_equal` are also complete.
 //!
 //! # Deferred
 //! - `tv_clear`/`tv_free` themselves: `tv_clear`'s *real* behavior is
@@ -1591,6 +1590,62 @@ pub unsafe fn callback_put(callback: &Callback, tv: &mut TypvalT) {
             TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null)
         }
     };
+}
+
+/// Generate a textual callback description (`callback_to_string`).
+///
+/// The original writes into a 100-byte buffer, leaving room for its
+/// trailing NUL; the returned logical bytes are therefore truncated to
+/// at most 99 bytes. Lua callbacks remain at the Lua-host boundary.
+///
+/// # Safety
+/// A Partial callback must contain a valid, live pointer.
+#[must_use]
+pub unsafe fn callback_to_string(callback: &Callback) -> Vec<u8> {
+    let mut result = match callback {
+        Callback::Funcref(name) => {
+            let len = name
+                .iter()
+                .position(|&byte| byte == crate::ascii_defs::NUL)
+                .unwrap_or(name.len());
+            let mut text = b"<vim function: ".to_vec();
+            text.extend_from_slice(&name[..len]);
+            text.push(b'>');
+            text
+        }
+        Callback::Partial(partial) => {
+            assert!(!partial.is_null(), "callback_to_string: null partial");
+            // SAFETY: forwarded from this function's own safety doc.
+            let name = unsafe { &(**partial).pt_name };
+            let name = name.as_deref().unwrap_or_default();
+            let len = name
+                .iter()
+                .position(|&byte| byte == crate::ascii_defs::NUL)
+                .unwrap_or(name.len());
+            let mut text = b"<vim partial: ".to_vec();
+            text.extend_from_slice(&name[..len]);
+            text.push(b'>');
+            text
+        }
+        Callback::Lua(_) => {
+            unimplemented!(
+                "callback_to_string: Lua callbacks need nlua_funcref_str"
+            )
+        }
+        Callback::None => Vec::new(),
+    };
+    result.truncate(99);
+    result
+}
+
+/// Whether two callbacks are equal (`tv_callback_equal`).
+///
+/// [`Callback`]'s derived equality exactly matches the original:
+/// function-name bytes, Partial pointer identity, LuaRef value, or two
+/// None callbacks.
+#[must_use]
+pub fn tv_callback_equal(cb1: &Callback, cb2: &Callback) -> bool {
+    cb1 == cb2
 }
 
 /// Get a function from a dictionary, storing it into `result`, and
@@ -6883,6 +6938,95 @@ mod tests {
         assert!(ok, "a missing key is a real success, matching the original's own `return true;`");
         assert_eq!(result.kind(), CallbackType::None, "must be reset even on the not-found path");
         unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn callback_to_string_formats_funcref_partial_and_none() {
+        assert_eq!(
+            unsafe {
+                callback_to_string(&Callback::Funcref(
+                    b"MyFunc".to_vec(),
+                ))
+            },
+            b"<vim function: MyFunc>"
+        );
+
+        let mut partial = PartialT {
+            pt_name: Some(b"BoundFunc".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                callback_to_string(&Callback::Partial(
+                    std::ptr::addr_of_mut!(partial),
+                ))
+            },
+            b"<vim partial: BoundFunc>"
+        );
+        assert_eq!(
+            unsafe { callback_to_string(&Callback::None) },
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn callback_to_string_uses_c_string_bounds_and_truncates() {
+        assert_eq!(
+            unsafe {
+                callback_to_string(&Callback::Funcref(
+                    b"Name\0ignored".to_vec(),
+                ))
+            },
+            b"<vim function: Name>"
+        );
+        let text = unsafe {
+            callback_to_string(&Callback::Funcref(vec![b'x'; 200]))
+        };
+        assert_eq!(text.len(), 99);
+        assert!(text.starts_with(b"<vim function: "));
+    }
+
+    #[test]
+    #[should_panic(expected = "nlua_funcref_str")]
+    fn callback_to_string_lua_needs_the_lua_host() {
+        let _ = unsafe { callback_to_string(&Callback::Lua(7)) };
+    }
+
+    #[test]
+    fn tv_callback_equal_matches_each_callback_variant() {
+        assert!(tv_callback_equal(&Callback::None, &Callback::None));
+        assert!(!tv_callback_equal(
+            &Callback::None,
+            &Callback::Funcref(Vec::new())
+        ));
+        assert!(tv_callback_equal(
+            &Callback::Funcref(b"Func".to_vec()),
+            &Callback::Funcref(b"Func".to_vec())
+        ));
+        assert!(!tv_callback_equal(
+            &Callback::Funcref(b"Func".to_vec()),
+            &Callback::Funcref(b"Other".to_vec())
+        ));
+
+        let mut first = PartialT::default();
+        let mut second = PartialT::default();
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        assert!(tv_callback_equal(
+            &Callback::Partial(first_ptr),
+            &Callback::Partial(first_ptr)
+        ));
+        assert!(!tv_callback_equal(
+            &Callback::Partial(first_ptr),
+            &Callback::Partial(std::ptr::addr_of_mut!(second))
+        ));
+        assert!(tv_callback_equal(
+            &Callback::Lua(4),
+            &Callback::Lua(4)
+        ));
+        assert!(!tv_callback_equal(
+            &Callback::Lua(4),
+            &Callback::Lua(5)
+        ));
     }
 
     #[test]
