@@ -968,40 +968,41 @@ pub fn check_user_func_argcount(fp: &UfuncT, argcount: i32) -> FnameTransError {
 /// Deref a function name if it's a variable holding a `Funcref`/
 /// `Partial` value (`deref_func_name`).
 ///
-/// Returns `(name, found_var)`: `name` is an owned copy of the
+/// Returns `(name, found_var, partial)`: `name` is an owned copy of the
 /// ORIGINAL bytes when `name` doesn't resolve to such a variable, or
-/// the underlying function name when it does.
-///
-/// Drops the original's `partialp` out-parameter (a `Partial`'s own
-/// bound arguments/dictionary self-binding, `pt_argc`/`pt_dict`) -
-/// nothing in this crate can construct a `Partial` with those set yet
-/// (needs `function()`/`funcref()`, not yet translated), so there is
-/// no observable difference yet between "this call went through a
-/// partial" and "this call used the resolved name directly"; add the
-/// out-parameter back if/when a real caller needs it.
+/// the underlying function name when it does; `partial` preserves bound
+/// arguments and Dictionary state for a Partial variable.
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::vars::find_var`]'s own safety doc.
 #[must_use]
-pub unsafe fn deref_func_name(name: &[u8], no_autoload: bool) -> (Vec<u8>, bool) {
+pub unsafe fn deref_func_name(
+    name: &[u8],
+    no_autoload: bool,
+) -> (Vec<u8>, bool, *mut PartialT) {
     // SAFETY: forwarded from this function's own safety doc.
     let (item, _ht) = unsafe { crate::eval::vars::find_var(name, false, no_autoload) };
     let Some(variant) = item else {
-        return (name.to_vec(), false);
+        return (name.to_vec(), false, std::ptr::null_mut());
     };
     let tv_ptr: *const TypvalT = match variant {
         crate::eval::typval_defs::DictitemVariant::Dict(p) => unsafe { &(*p).di_tv },
         crate::eval::typval_defs::DictitemVariant::Scope(p) => unsafe { &(*p).di_tv },
     };
     // SAFETY: forwarded from this function's own safety doc.
-    let resolved = match unsafe { &(*tv_ptr).value } {
-        TypvalValue::Func(Some(s)) => s.clone(),
-        TypvalValue::Func(None) => Vec::new(),
+    let (resolved, partial) = match unsafe { &(*tv_ptr).value } {
+        TypvalValue::Func(Some(s)) => (s.clone(), std::ptr::null_mut()),
+        TypvalValue::Func(None) => (Vec::new(), std::ptr::null_mut()),
         // SAFETY: forwarded from this function's own safety doc.
-        TypvalValue::Partial(p) => unsafe { crate::eval::eval::partial_name(*p) }.unwrap_or_default(),
-        _ => name.to_vec(),
+        TypvalValue::Partial(p) if !p.is_null() => (
+            unsafe { crate::eval::eval::partial_name(*p) }
+                .unwrap_or_default(),
+            *p,
+        ),
+        TypvalValue::Partial(_) => (Vec::new(), std::ptr::null_mut()),
+        _ => (name.to_vec(), std::ptr::null_mut()),
     };
-    (resolved, true)
+    (resolved, true, partial)
 }
 
 /// Parse a function-call's argument list: `(arg1, arg2, ...)`
@@ -1010,9 +1011,7 @@ pub unsafe fn deref_func_name(name: &[u8], no_autoload: bool) -> (Vec<u8>, bool)
 /// `arg` must point to the opening `(`. Returns `(status, consumed,
 /// argvars)` - `argvars` never holds more than `MAX_FUNC_ARGS`
 /// `- partial_argc` entries, matching the original's own fixed-size
-/// limit (`partial_argc` is always `0` from every real caller in this
-/// crate today - nothing can construct a `Partial` with bound
-/// arguments yet, see [`deref_func_name`]'s own doc comment).
+/// limit.
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::eval::eval1`]'s own safety doc.
@@ -1283,22 +1282,30 @@ pub unsafe fn call_simple_func(
 /// does this final release, so this is safe for every builtin so far.
 ///
 /// # Safety
-/// Forwarded from [`get_func_arguments`]/[`call_func`]'s own safety
-/// docs.
+/// Forwarded from [`get_func_arguments`]/[`call_func_with_state`]'s
+/// own safety docs.
 #[must_use]
-pub unsafe fn get_func_tv(
+pub unsafe fn get_func_tv_with_state(
     name: &[u8],
     rettv: &mut TypvalT,
     arg: &[u8],
     evalarg: Option<&mut crate::eval::eval::EvalargT>,
-    evaluate: bool,
+    funcexe: &mut FuncexeT,
 ) -> (i32, usize) {
+    let partial_argc = if funcexe.fe_partial.is_null() {
+        0
+    } else {
+        // SAFETY: non-null Partial is live by this function's contract.
+        unsafe { (*funcexe.fe_partial).pt_argv.len() }
+    };
     // SAFETY: forwarded from this function's own safety doc.
-    let (ret, mut pos, argvars) = unsafe { get_func_arguments(arg, evalarg, 0) };
+    let (ret, mut pos, argvars) =
+        unsafe { get_func_arguments(arg, evalarg, partial_argc) };
 
     let ret = if ret == OK {
         // SAFETY: forwarded from this function's own safety doc.
-        let error = unsafe { call_func(name, rettv, &argvars, evaluate) };
+        let error =
+            unsafe { call_func_with_state(name, rettv, &argvars, funcexe) };
         if error == FnameTransError::None { OK } else { FAIL }
     } else {
         FAIL
@@ -1311,6 +1318,34 @@ pub unsafe fn get_func_tv(
 
     pos += crate::charset::skipwhite(&arg[pos..]);
     (ret, pos)
+}
+
+/// [`get_func_tv_with_state`] without Partial/self/base state.
+///
+/// # Safety
+/// Forwarded from [`get_func_tv_with_state`].
+#[must_use]
+pub unsafe fn get_func_tv(
+    name: &[u8],
+    rettv: &mut TypvalT,
+    arg: &[u8],
+    evalarg: Option<&mut crate::eval::eval::EvalargT>,
+    evaluate: bool,
+) -> (i32, usize) {
+    let mut funcexe = FuncexeT {
+        fe_evaluate: evaluate,
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        get_func_tv_with_state(
+            name,
+            rettv,
+            arg,
+            evalarg,
+            &mut funcexe,
+        )
+    }
 }
 
 /// Expand a `s:`/`<SID>`-prefixed function name into its real,
@@ -4474,9 +4509,11 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
 
-        let (resolved, found_var) = unsafe { deref_func_name(b"g:NoSuchVar", false) };
+        let (resolved, found_var, partial) =
+            unsafe { deref_func_name(b"g:NoSuchVar", false) };
         assert_eq!(resolved, b"g:NoSuchVar");
         assert!(!found_var);
+        assert!(partial.is_null());
     }
 
     #[test]
@@ -4488,11 +4525,52 @@ mod tests {
         unsafe { (*item).di_tv.value = TypvalValue::Func(Some(b"len".to_vec())) };
         unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
 
-        let (resolved, found_var) = unsafe { deref_func_name(b"g:MyFuncRef", false) };
+        let (resolved, found_var, partial) =
+            unsafe { deref_func_name(b"g:MyFuncRef", false) };
         assert_eq!(resolved, b"len");
         assert!(found_var);
+        assert!(partial.is_null());
 
         unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn deref_func_name_preserves_a_partial_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            crate::eval::vars::vars_clear(
+                &mut *crate::eval::vars::get_globvar_dict(),
+            )
+        };
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"pow".to_vec()),
+            pt_argv: vec![TypvalT {
+                value: TypvalValue::Float(2.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        let item = crate::eval::typval::tv_dict_item_alloc(b"MyPartial");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Partial(partial);
+            crate::eval::typval::tv_dict_add(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                item,
+            );
+        }
+
+        let (resolved, found_var, found_partial) =
+            unsafe { deref_func_name(b"g:MyPartial", false) };
+
+        assert_eq!(resolved, b"pow");
+        assert!(found_var);
+        assert_eq!(found_partial, partial);
+        unsafe {
+            crate::eval::vars::vars_clear(
+                &mut *crate::eval::vars::get_globvar_dict(),
+            )
+        };
     }
 
     #[test]
@@ -4504,9 +4582,11 @@ mod tests {
         unsafe { (*item).di_tv.value = TypvalValue::Func(None) };
         unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
 
-        let (resolved, found_var) = unsafe { deref_func_name(b"g:EmptyRef", false) };
+        let (resolved, found_var, partial) =
+            unsafe { deref_func_name(b"g:EmptyRef", false) };
         assert_eq!(resolved, Vec::<u8>::new());
         assert!(found_var);
+        assert!(partial.is_null());
 
         unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
     }
@@ -4520,9 +4600,11 @@ mod tests {
         unsafe { (*item).di_tv.value = TypvalValue::Number(5) };
         unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
 
-        let (resolved, found_var) = unsafe { deref_func_name(b"g:NotAFunc", false) };
+        let (resolved, found_var, partial) =
+            unsafe { deref_func_name(b"g:NotAFunc", false) };
         assert_eq!(resolved, b"g:NotAFunc");
         assert!(found_var);
+        assert!(partial.is_null());
 
         unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
     }

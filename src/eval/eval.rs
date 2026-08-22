@@ -4788,10 +4788,33 @@ pub unsafe fn eval_func(
     // If "name" is a variable of type Funcref/Partial, use its
     // contents instead.
     // SAFETY: forwarded from this function's own safety doc.
-    let (resolved_name, _found_var) = unsafe { crate::eval::userfunc::deref_func_name(name, !evaluate) };
+    let (resolved_name, found_var, partial) =
+        unsafe { crate::eval::userfunc::deref_func_name(name, !evaluate) };
 
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+    let line = if curwin.is_null() {
+        0
+    } else {
+        unsafe { (*curwin).w_cursor.lnum }
+    };
+    let mut funcexe = crate::eval::userfunc::FuncexeT {
+        fe_firstline: line,
+        fe_lastline: line,
+        fe_evaluate: evaluate,
+        fe_partial: partial,
+        fe_found_var: found_var,
+        ..Default::default()
+    };
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { crate::eval::userfunc::get_func_tv(&resolved_name, rettv, arg, evalarg, evaluate) }
+    unsafe {
+        crate::eval::userfunc::get_func_tv_with_state(
+            &resolved_name,
+            rettv,
+            arg,
+            evalarg,
+            &mut funcexe,
+        )
+    }
 }
 
 /// Recursion depth counter for [`eval7`] - the original's own
@@ -12489,6 +12512,41 @@ mod tests {
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::Number(5));
 
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_partial_variable_call_preserves_bound_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"pow".to_vec()),
+                pt_argv: vec![TypvalT {
+                    value: TypvalValue::Float(2.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ));
+        let item =
+            crate::eval::typval::tv_dict_item_alloc(b"BoundPow");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Partial(partial);
+            crate::eval::typval::tv_dict_add(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                item,
+            );
+        }
+
+        let (ret, tv) = eval_str(b"g:BoundPow(3.0)");
+
+        assert_eq!(ret, OK);
+        let TypvalValue::Float(result) = tv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
         reset_globals_for_test();
     }
 
