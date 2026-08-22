@@ -12507,6 +12507,29 @@ mod tests {
     }
 
     #[test]
+    fn e2e_reduce_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        let TypvalValue::Float(first) =
+            eval_str(b"reduce([2, 3], 'pow')").1.value
+        else {
+            panic!("expected a Float result");
+        };
+        assert!((first - 8.0).abs() < 1e-9);
+        let TypvalValue::Float(second) =
+            eval_str(b"reduce([3, 2], 'pow', 2)").1.value
+        else {
+            panic!("expected a Float result");
+        };
+        assert!((second - 64.0).abs() < 1e-9);
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        reset_globals_for_test();
+    }
+
+    #[test]
     fn e2e_join_builtin_function_calls() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();

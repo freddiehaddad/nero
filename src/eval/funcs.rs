@@ -392,6 +392,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"extendnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extendnew });
         m.insert(&b"range"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_range });
         m.insert(&b"repeat"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_repeat });
+        m.insert(&b"reduce"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_reduce });
         m.insert(&b"sort"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_sort });
         m.insert(&b"uniq"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_uniq });
         m.insert(&b"slice"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::eval::f_slice });
@@ -3251,6 +3252,282 @@ unsafe fn f_repeat(argvars: &[TypvalT], rettv: &mut TypvalT) {
             unsafe { repeat_blob(&argvars[0], n, rettv) };
         }
         _ => repeat_string(&argvars[0], n, rettv),
+    }
+}
+
+struct ReduceListLockGuard {
+    list: *mut crate::eval::typval_defs::ListT,
+    previous: crate::eval::typval_defs::VarLockStatus,
+}
+
+impl Drop for ReduceListLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: construction's caller guarantees `list` stays live
+        // for this guard's lifetime.
+        unsafe {
+            crate::eval::typval::tv_list_set_lock(
+                self.list,
+                self.previous,
+            )
+        };
+    }
+}
+
+/// List implementation of `reduce()` (`reduce_list`).
+///
+/// # Safety
+/// Every non-null List/container pointer in `argvars` must be live.
+unsafe fn reduce_list(
+    argvars: &[TypvalT],
+    expr: &TypvalT,
+    rettv: &mut TypvalT,
+) {
+    let TypvalValue::List(list) = argvars[0].value else {
+        unreachable!("reduce_list requires a List");
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let called_emsg = unsafe { crate::globals::GLOBALS.get_mut().called_emsg };
+
+    let mut item = if argvars.len() <= 2 {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::typval::tv_list_len(list) } == 0 {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let first = unsafe { crate::eval::typval::tv_list_first(list) };
+        // SAFETY: first is non-null because the List length is nonzero.
+        unsafe { crate::eval::typval::tv_copy(&(*first).li_tv, rettv) };
+        // SAFETY: as above.
+        unsafe { (*first).li_next }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_copy(&argvars[2], rettv) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_first(list) }
+    };
+
+    if list.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let previous = unsafe { crate::eval::typval::tv_list_locked(list) };
+    unsafe {
+        crate::eval::typval::tv_list_set_lock(
+            list,
+            crate::eval::typval_defs::VarLockStatus::Fixed,
+        )
+    };
+    let _guard = ReduceListLockGuard { list, previous };
+
+    while !item.is_null() {
+        let accumulator = std::mem::take(rettv);
+        // SAFETY: item belongs to the still-live, fixed List.
+        let current = unsafe { (*item).li_tv.clone() };
+        let mut argv = [accumulator, current];
+        // SAFETY: forwarded from this function's own safety doc.
+        let result = unsafe {
+            crate::eval::eval::eval_expr_typval(
+                expr,
+                true,
+                &mut argv,
+                rettv,
+            )
+        };
+        // SAFETY: argv[0] owns the previous accumulator.
+        unsafe { crate::eval::typval::tv_clear_simple(&argv[0]) };
+        if result == crate::vim_defs::FAIL
+            || unsafe { crate::globals::GLOBALS.get_mut().called_emsg }
+                != called_emsg
+        {
+            break;
+        }
+        // SAFETY: item remains in the fixed List.
+        item = unsafe { (*item).li_next };
+    }
+}
+
+/// String implementation of `reduce()` (`reduce_string`).
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::utfc_ptr2len`] and
+/// [`crate::eval::eval::eval_expr_typval`].
+unsafe fn reduce_string(
+    argvars: &[TypvalT],
+    expr: &TypvalT,
+    rettv: &mut TypvalT,
+) {
+    let text = crate::eval::typval::tv_get_string(&argvars[0]);
+    let text_len = text
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(text.len());
+    let called_emsg =
+        unsafe { crate::globals::GLOBALS.get_mut().called_emsg };
+    let mut pos = 0;
+
+    if argvars.len() <= 2 {
+        if text_len == 0 {
+            return;
+        }
+        // SAFETY: pos is on a character boundary in text.
+        let len = (unsafe { crate::mbyte::utfc_ptr2len(&text) } as usize)
+            .max(1)
+            .min(text_len);
+        rettv.value =
+            TypvalValue::String(Some(text[..len].to_vec()));
+        pos = len;
+    } else {
+        if !matches!(argvars[2].value, TypvalValue::String(_)) {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_copy(&argvars[2], rettv) };
+    }
+
+    while pos < text_len {
+        // SAFETY: pos advances by complete characters below.
+        let len =
+            (unsafe { crate::mbyte::utfc_ptr2len(&text[pos..]) } as usize)
+                .max(1)
+                .min(text_len - pos);
+        let accumulator = std::mem::take(rettv);
+        let current = TypvalT {
+            value: TypvalValue::String(Some(
+                text[pos..pos + len].to_vec(),
+            )),
+            ..TypvalT::default()
+        };
+        let mut argv = [accumulator, current];
+        // SAFETY: forwarded from this function's own safety doc.
+        let result = unsafe {
+            crate::eval::eval::eval_expr_typval(
+                expr,
+                true,
+                &mut argv,
+                rettv,
+            )
+        };
+        // SAFETY: argv owns both temporary String values.
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&argv[0]);
+            crate::eval::typval::tv_clear_simple(&argv[1]);
+        }
+        if result == crate::vim_defs::FAIL
+            || unsafe { crate::globals::GLOBALS.get_mut().called_emsg }
+                != called_emsg
+        {
+            break;
+        }
+        pos += len;
+    }
+}
+
+/// Blob implementation of `reduce()` (`reduce_blob`).
+///
+/// # Safety
+/// The Blob pointer and every accumulator container returned by the
+/// callback must be live.
+unsafe fn reduce_blob(
+    argvars: &[TypvalT],
+    expr: &TypvalT,
+    rettv: &mut TypvalT,
+) {
+    let TypvalValue::Blob(blob) = argvars[0].value else {
+        unreachable!("reduce_blob requires a Blob");
+    };
+    let called_emsg =
+        unsafe { crate::globals::GLOBALS.get_mut().called_emsg };
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { crate::eval::typval::tv_blob_len(blob) };
+    let mut i = 0;
+
+    if argvars.len() <= 2 {
+        if len == 0 {
+            return;
+        }
+        rettv.value = TypvalValue::Number(i64::from(unsafe {
+            crate::eval::typval::tv_blob_get(blob, 0)
+        }));
+        i = 1;
+    } else {
+        if !matches!(argvars[2].value, TypvalValue::Number(_)) {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_copy(&argvars[2], rettv) };
+    }
+
+    while i < len {
+        let accumulator = std::mem::take(rettv);
+        let current = TypvalT {
+            // SAFETY: i is within the Blob's logical length.
+            value: TypvalValue::Number(i64::from(unsafe {
+                crate::eval::typval::tv_blob_get(blob, i)
+            })),
+            ..TypvalT::default()
+        };
+        let mut argv = [accumulator, current];
+        // SAFETY: forwarded from this function's own safety doc.
+        let result = unsafe {
+            crate::eval::eval::eval_expr_typval(
+                expr,
+                true,
+                &mut argv,
+                rettv,
+            )
+        };
+        if result == crate::vim_defs::FAIL
+            || unsafe { crate::globals::GLOBALS.get_mut().called_emsg }
+                != called_emsg
+        {
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// `reduce({object}, {func} [, {initial}])` (`f_reduce`).
+///
+/// # Safety
+/// Forwarded from [`reduce_list`], [`reduce_string`], and
+/// [`reduce_blob`].
+unsafe fn f_reduce(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if !matches!(
+        argvars[0].value,
+        TypvalValue::String(_)
+            | TypvalValue::List(_)
+            | TypvalValue::Blob(_)
+    ) {
+        return;
+    }
+
+    let name = match &argvars[1].value {
+        TypvalValue::Func(name) => name.clone().unwrap_or_default(),
+        TypvalValue::Partial(partial) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::eval::partial_name(*partial) }
+                .unwrap_or_default()
+        }
+        _ => crate::eval::typval::tv_get_string(&argvars[1]),
+    };
+    if name.is_empty() {
+        return;
+    }
+
+    match argvars[0].value {
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::List(_) => unsafe {
+            reduce_list(argvars, &argvars[1], rettv)
+        },
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::String(_) => unsafe {
+            reduce_string(argvars, &argvars[1], rettv)
+        },
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::Blob(_) => unsafe {
+            reduce_blob(argvars, &argvars[1], rettv)
+        },
+        _ => unreachable!(),
     }
 }
 
@@ -9583,6 +9860,7 @@ mod tests {
             "extendnew",
             "range",
             "repeat",
+            "reduce",
             "join",
             "flatten",
             "flattennew",
@@ -12482,6 +12760,115 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_blob_len(b), 0);
             crate::eval::typval::tv_blob_free(b);
         }
+    }
+
+    // --- f_reduce ---
+
+    #[test]
+    fn reduce_list_uses_first_item_as_the_default_initial_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 2);
+            crate::eval::typval::tv_list_append_number(list, 3);
+            crate::eval::typval::tv_list_set_lock(
+                list,
+                crate::eval::typval_defs::VarLockStatus::Locked,
+            );
+        }
+        let args = [
+            TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            },
+            string(b"pow"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_reduce(&args, &mut rettv) };
+        let TypvalValue::Float(value) = rettv.value else {
+            panic!("expected a Float result");
+        };
+        assert!((value - 8.0).abs() < 1e-9);
+        assert_eq!(
+            unsafe { (*list).lv_lock },
+            crate::eval::typval_defs::VarLockStatus::Locked
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn reduce_list_honors_an_explicit_initial_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 3);
+            crate::eval::typval::tv_list_append_number(list, 2);
+        }
+        let args = [
+            TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            },
+            string(b"pow"),
+            num(2),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_reduce(&args, &mut rettv) };
+        let TypvalValue::Float(value) = rettv.value else {
+            panic!("expected a Float result");
+        };
+        assert!((value - 64.0).abs() < 1e-9);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn reduce_string_processes_complete_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = [string(b"11"), string(b"and")];
+        let mut rettv = TypvalT::default();
+        unsafe { f_reduce(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn reduce_blob_uses_each_byte_as_a_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![2, 3];
+            (*blob).bv_ga.ga_len = 2;
+        }
+        let args = [
+            TypvalT {
+                value: TypvalValue::Blob(blob),
+                ..Default::default()
+            },
+            string(b"pow"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_reduce(&args, &mut rettv) };
+        let TypvalValue::Float(value) = rettv.value else {
+            panic!("expected a Float result");
+        };
+        assert!((value - 8.0).abs() < 1e-9);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn reduce_empty_object_without_initial_leaves_unknown() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let args = [
+            TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            },
+            string(b"pow"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_reduce(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 
     // --- f_join ---
