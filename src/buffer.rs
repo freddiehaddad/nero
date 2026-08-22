@@ -798,25 +798,76 @@ pub fn buf_get_changedtick(buf: &BufT) -> crate::eval::typval_defs::VarnumberT {
     }
 }
 
-/// Set `b:changedtick`, also checking `b:` for consistency in debug
-/// builds in the original (`buf_set_changedtick`).
+struct ChangedtickLockGuard(*mut BufT);
+
+impl Drop for ChangedtickLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: constructed only for a live buffer whose b_locked was
+        // incremented exactly once.
+        unsafe { (*self.0).b_locked -= 1 };
+    }
+}
+
+/// Set `b:changedtick` and notify `b:` Dictionary watchers
+/// (`buf_set_changedtick`).
 ///
-/// # Deferred
-/// The original also notifies dict watchers on `buf->b_vars`. Watcher
-/// machinery is real, but `buf_init_changedtick` still cannot register
-/// the separately-typed embedded [`crate::eval::typval_defs::ChangedtickDictItem`]
-/// in [`crate::eval::typval_defs::DictT::dv_index`]; until that layout
-/// issue is resolved, notifying a `b:changedtick` watcher here would
-/// expose an entry that the same Dictionary cannot look up. The
-/// underlying value remains correct for every C-level accessor.
-pub fn buf_set_changedtick(buf: &mut BufT, changedtick: crate::eval::typval_defs::VarnumberT) {
-    buf.changedtick_di.di_tv.value = crate::eval::typval_defs::TypvalValue::Number(changedtick);
+/// The original's debug-only assertion that `changedtick_di` is also
+/// registered in `b_vars` remains deferred with [`buf_init_changedtick`]'s
+/// embedded-item layout issue. Notification itself does not depend on
+/// that lookup and is complete.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live Buffer; its
+/// `changedtick_di.di_tv` must be Number-typed, and its non-null
+/// `b_vars` must point to a live Dictionary.
+pub unsafe fn buf_set_changedtick(
+    buf: *mut BufT,
+    changedtick: crate::eval::typval_defs::VarnumberT,
+) {
+    debug_assert!(!buf.is_null());
+    // Keep callback inputs independent from `buf`, so a reentrant
+    // callback may touch the same Buffer without aliasing a live Rust
+    // reference into it.
+    let old_val = unsafe { (*buf).changedtick_di.di_tv.clone() };
+    let new_val = crate::eval::typval_defs::TypvalT {
+        v_lock: unsafe { (*buf).changedtick_di.di_tv.v_lock },
+        value: crate::eval::typval_defs::TypvalValue::Number(changedtick),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf).changedtick_di.di_tv.value =
+        crate::eval::typval_defs::TypvalValue::Number(changedtick) };
+
+    // SAFETY: forwarded from this function's own safety doc;
+    // tv_dict_is_watched accepts null.
+    let vars = unsafe { (*buf).b_vars };
+    if unsafe { crate::eval::typval::tv_dict_is_watched(vars) } {
+        // Clone the key before callback dispatch for the same reentrancy
+        // reason as the typvals above.
+        let key = unsafe { (*buf).changedtick_di.di_key.clone() };
+        unsafe { (*buf).b_locked += 1 };
+        let _locked = ChangedtickLockGuard(buf);
+        // SAFETY: vars is watched, therefore non-null and live.
+        unsafe {
+            crate::eval::typval::tv_dict_watcher_notify(
+                vars,
+                &key,
+                Some(&new_val),
+                Some(&old_val),
+            )
+        };
+    }
 }
 
 /// Increment `b:changedtick` value. Also checks `b:` for consistency
 /// in debug builds in the original (`buf_inc_changedtick`).
-pub fn buf_inc_changedtick(buf: &mut BufT) {
-    buf_set_changedtick(buf, buf_get_changedtick(buf) + 1);
+///
+/// # Safety
+/// Same as [`buf_set_changedtick`].
+pub unsafe fn buf_inc_changedtick(buf: *mut BufT) {
+    debug_assert!(!buf.is_null());
+    let changedtick = unsafe { buf_get_changedtick(&*buf) } + 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_set_changedtick(buf, changedtick) };
 }
 
 /// Initialize `buf.changedtick_di` (`buf_init_changedtick`,
@@ -838,8 +889,7 @@ pub fn buf_inc_changedtick(buf: &mut BufT) {
 /// `*mut ChangedtickDictItem` even if the cast were sound). A real
 /// fix needs its own design pass (e.g. a shared trait, an untyped
 /// `dv_index` value, or a different lookup mechanism entirely) -
-/// deliberately not attempted here. `b_vars` is also always null in
-/// this crate so far, so there is nothing to insert into yet either.
+/// deliberately not attempted here.
 /// [`buf_get_changedtick`]/[`buf_set_changedtick`] (this crate's own
 /// C-level accessors) already read/write the real value directly,
 /// independent of this dict registration.
@@ -1185,23 +1235,30 @@ mod tests {
     #[test]
     fn buf_set_and_get_changedtick_roundtrip() {
         let mut buf = BufT::default();
-        buf_set_changedtick(&mut buf, 5);
-        assert_eq!(buf_get_changedtick(&buf), 5);
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        unsafe { buf_set_changedtick(buf_ptr, 5) };
+        assert_eq!(unsafe { buf_get_changedtick(&*buf_ptr) }, 5);
     }
 
     #[test]
     fn buf_inc_changedtick_increments_by_one() {
         let mut buf = BufT::default();
-        buf_set_changedtick(&mut buf, 5);
-        buf_inc_changedtick(&mut buf);
-        assert_eq!(buf_get_changedtick(&buf), 6);
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        unsafe {
+            buf_set_changedtick(buf_ptr, 5);
+            buf_inc_changedtick(buf_ptr);
+            assert_eq!(buf_get_changedtick(&*buf_ptr), 6);
+        }
     }
 
     #[test]
     fn buf_inc_changedtick_from_default_starts_at_one() {
         let mut buf = BufT::default();
-        buf_inc_changedtick(&mut buf);
-        assert_eq!(buf_get_changedtick(&buf), 1);
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        unsafe {
+            buf_inc_changedtick(buf_ptr);
+            assert_eq!(buf_get_changedtick(&*buf_ptr), 1);
+        }
     }
 
     #[test]
@@ -1224,9 +1281,40 @@ mod tests {
     #[test]
     fn buf_init_changedtick_preserves_a_prior_value() {
         let mut buf = BufT::default();
-        buf_set_changedtick(&mut buf, 42);
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        unsafe { buf_set_changedtick(buf_ptr, 42) };
+        buf_init_changedtick(unsafe { &mut *buf_ptr });
+        assert_eq!(unsafe { buf_get_changedtick(&*buf_ptr) }, 42);
+    }
+
+    #[test]
+    fn buf_set_changedtick_notifies_watchers_and_restores_b_locked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let vars = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*vars).dv_refcount = 1 };
+        let mut buf = BufT {
+            b_vars: vars,
+            ..Default::default()
+        };
         buf_init_changedtick(&mut buf);
-        assert_eq!(buf_get_changedtick(&buf), 42);
+        let buf_ptr = std::ptr::from_mut(&mut buf);
+        unsafe {
+            crate::eval::typval::tv_dict_watcher_add(
+                vars,
+                b"changedtick",
+                crate::eval::typval_defs::Callback::None,
+            );
+            (&mut (*vars).watchers)[0].needs_free = true;
+            buf_set_changedtick(buf_ptr, 9);
+        }
+
+        assert_eq!(unsafe { buf_get_changedtick(&*buf_ptr) }, 9);
+        assert_eq!(unsafe { (*buf_ptr).b_locked }, 0);
+        assert!(!unsafe { crate::eval::typval::tv_dict_is_watched(vars) });
+        unsafe {
+            (*buf_ptr).b_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_unref(vars);
+        }
     }
 
     fn buf_with_bt(bt: &str) -> BufT {

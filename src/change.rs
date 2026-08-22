@@ -1409,7 +1409,7 @@ pub unsafe fn changed(buf: *mut BufT) {
         unsafe { changed_internal(buf) };
     }
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { crate::buffer::buf_inc_changedtick(&mut *buf) };
+    unsafe { crate::buffer::buf_inc_changedtick(buf) };
 
     // If a pattern is highlighted, the position may now be invalid.
     unsafe { crate::globals::GLOBALS.get_mut() }.Search.hl_match = false;
@@ -1475,14 +1475,14 @@ pub unsafe fn unchanged(buf: *mut BufT, ff: bool, always_inc_changedtick: bool) 
         unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = true;
         unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = true;
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { crate::buffer::buf_inc_changedtick(&mut *buf) };
+        unsafe { crate::buffer::buf_inc_changedtick(buf) };
         if was_changed {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { crate::autocmd::aucmd_defer_modified(buf, false) };
         }
     } else if always_inc_changedtick {
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { crate::buffer::buf_inc_changedtick(&mut *buf) };
+        unsafe { crate::buffer::buf_inc_changedtick(buf) };
     }
 }
 
