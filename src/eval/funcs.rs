@@ -2270,12 +2270,10 @@ unsafe fn indexof_list(
 /// item/byte in `{object}` (a `List`/`Blob`) for which `{expr}`
 /// evaluates truthy (`f_indexof`).
 ///
-/// Only a `String`-typed `{expr}` is supported - a `Funcref`/`Partial`
-/// needs `eval_expr_partial`/`eval_expr_func` (the whole function-CALL
-/// machinery, not yet translated) - `unimplemented!()`s if either is
-/// ever passed (via `eval_expr_typval`'s own already-established
-/// gap). `{opts}`'s own `"startidx"` key is supported; no other key is
-/// meaningful for `indexof()` in the original either.
+/// String expressions, named Funcrefs, and bound Partials are
+/// supported through `eval_expr_typval`. `{opts}`'s own `"startidx"`
+/// key is supported; no other key is meaningful for `indexof()` in
+/// the original either.
 ///
 /// The original's own `did_emsg`/`called_emsg` save-restore-and-abort-
 /// on-error dance (detecting a genuine runtime error inside `{expr}`
@@ -11858,7 +11856,55 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 
-    // --- f_foreach ---
+    // --- Partial collection callbacks ---
+
+    #[test]
+    fn map_executes_a_partial_with_bound_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 1);
+            crate::eval::typval::tv_list_append_number(list, 2);
+        }
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"strpart".to_vec()),
+                pt_argv: vec![string(b"abcd")],
+                ..Default::default()
+            },
+        ));
+        let args = [
+            TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::Partial(partial),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_map(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::List(list));
+        let first = unsafe { crate::eval::typval::tv_list_first(list) };
+        assert_eq!(
+            unsafe { &(*first).li_tv.value },
+            &TypvalValue::String(Some(b"a".to_vec()))
+        );
+        assert_eq!(
+            unsafe { &(*(*first).li_next).li_tv.value },
+            &TypvalValue::String(Some(b"bc".to_vec()))
+        );
+        unsafe {
+            crate::eval::typval::partial_unref(partial);
+            crate::eval::typval::tv_list_unref(list);
+        }
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
 
     #[test]
     fn foreach_funcref_visits_a_list_without_changing_it() {
@@ -11908,6 +11954,68 @@ mod tests {
             rettv.value,
             TypvalValue::String(Some(b"23".to_vec()))
         );
+    }
+
+    #[test]
+    fn foreach_executes_a_partial_callback() {
+        struct RegisterGuard;
+
+        impl Drop for RegisterGuard {
+            fn drop(&mut self) {
+                unsafe { crate::register::clear_registers() };
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::register::clear_registers() };
+        let _registers = RegisterGuard;
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_str(
+                &mut *dict,
+                b"q",
+                Some(b"visited"),
+            )
+        };
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"setreg".to_vec()),
+                ..Default::default()
+            },
+        ));
+        let args = [
+            TypvalT {
+                value: TypvalValue::Dict(dict),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::Partial(partial),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_foreach(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Dict(dict));
+        assert_eq!(
+            unsafe {
+                crate::register::get_reg_contents(
+                    i32::from(b'q'),
+                    crate::register_defs::greg_flags::EXPR_SRC,
+                )
+            },
+            Some(crate::register_defs::RegContents::Str(
+                b"visited".to_vec(),
+            ))
+        );
+        unsafe {
+            crate::eval::typval::partial_unref(partial);
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
     }
 
     // --- indexof_eval_expr / indexof_blob / indexof_list / f_indexof ---
@@ -14204,6 +14312,47 @@ mod tests {
         };
         assert!((value - 64.0).abs() < 1e-9);
         unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn reduce_executes_a_partial_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 2);
+            crate::eval::typval::tv_list_append_number(list, 3);
+        }
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"pow".to_vec()),
+                ..Default::default()
+            },
+        ));
+        let args = [
+            TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::Partial(partial),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_reduce(&args, &mut rettv) };
+
+        let TypvalValue::Float(value) = rettv.value else {
+            panic!("expected a Float result");
+        };
+        assert!((value - 8.0).abs() < 1e-9);
+        unsafe {
+            crate::eval::typval::partial_unref(partial);
+            crate::eval::typval::tv_list_unref(list);
+        }
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 
     #[test]
