@@ -6359,6 +6359,100 @@ pub unsafe fn set_argv_var(argv: &[Vec<u8>]) {
     };
 }
 
+/// Trim lines above a prompt to enforce `'scrollback'`
+/// (`prompt_trim_scrollback`).
+///
+/// # Safety
+/// `buf` and every window/tabpage reached from the global lists must
+/// be live. Forwarded from [`crate::memline::ml_delete_buf`],
+/// [`crate::mark::mark_adjust_buf`],
+/// [`crate::change::deleted_lines_buf`], and
+/// [`crate::cursor::check_cursor_col`].
+pub unsafe fn prompt_trim_scrollback(
+    buf: *mut crate::buffer_defs::BufT,
+) {
+    debug_assert!(!buf.is_null());
+    // SAFETY: forwarded from this function's own safety doc.
+    let scrollback = unsafe { (*buf).b_p_scbk };
+    if scrollback <= 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let prompt_line = unsafe { (*buf).b_prompt_start.mark.lnum };
+    let above_prompt = prompt_line - 1;
+    if i64::from(above_prompt) <= scrollback {
+        return;
+    }
+    let scrollback = i32::try_from(scrollback)
+        .expect("positive scrollback below above_prompt must fit i32");
+    let to_delete = above_prompt - scrollback;
+
+    for _ in 0..to_delete {
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ =
+            unsafe { crate::memline::ml_delete_buf(&mut *buf, 1, false) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::mark::mark_adjust_buf(
+            buf,
+            1,
+            to_delete,
+            crate::pos_defs::MAXLNUM,
+            -to_delete,
+            true,
+            crate::mark_defs::MarkAdjustMode::Normal,
+            crate::extmark_defs::ExtmarkOp::Undo,
+        );
+        crate::change::deleted_lines_buf(buf, 1, to_delete);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let first_tabpage =
+        unsafe { crate::globals::GLOBALS.get_mut().first_tabpage };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { crate::globals::GLOBALS.get_mut().curtab };
+    // SAFETY: forwarded from this function's own safety doc.
+    let firstwin = unsafe { crate::globals::GLOBALS.get_mut().firstwin };
+    let mut tp = first_tabpage;
+    while !tp.is_null() {
+        let mut wp = if tp == curtab {
+            firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*tp).tp_firstwin }
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { (*wp).w_buffer } == buf {
+                // SAFETY: forwarded from this function's own safety doc.
+                let cursor_lnum = unsafe { (*wp).w_cursor.lnum };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    (*wp).w_cursor.lnum = if cursor_lnum <= to_delete {
+                        1
+                    } else {
+                        cursor_lnum - to_delete
+                    };
+                    if (*wp).w_cursor.lnum > (*buf).b_ml.ml_line_count {
+                        (*wp).w_cursor.lnum =
+                            (*buf).b_ml.ml_line_count;
+                    }
+                }
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { (*wp).w_next };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { (*tp).tp_next };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+    unsafe { crate::cursor::check_cursor_col(curwin) };
+}
+
 /// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
 /// `"dict['key']"`), list item (`"list[expr]"`), or list slice
 /// (`"list[expr:expr]"`) (`get_lval`).
@@ -13731,6 +13825,136 @@ mod tests {
             );
             crate::eval::typval::tv_list_unref(list);
         }
+    }
+
+    #[test]
+    fn prompt_trim_scrollback_returns_for_disabled_or_in_range_limits() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_prompt_start: crate::mark_defs::FmarkT {
+                mark: crate::pos_defs::PosT {
+                    lnum: 10,
+                    col: 0,
+                    coladd: 0,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe { prompt_trim_scrollback(std::ptr::addr_of_mut!(buf)) };
+        assert_eq!(buf.b_prompt_start.mark.lnum, 10);
+
+        buf.b_p_scbk = 10;
+        buf.b_prompt_start.mark.lnum = 5;
+        unsafe { prompt_trim_scrollback(std::ptr::addr_of_mut!(buf)) };
+        assert_eq!(buf.b_prompt_start.mark.lnum, 5);
+    }
+
+    #[test]
+    fn prompt_trim_scrollback_deletes_old_lines_and_adjusts_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let old_curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+        let old_firstwin =
+            unsafe { crate::globals::GLOBALS.get_mut().firstwin };
+        let old_lastwin =
+            unsafe { crate::globals::GLOBALS.get_mut().lastwin };
+        let old_first_tabpage =
+            unsafe { crate::globals::GLOBALS.get_mut().first_tabpage };
+        let old_curtab = unsafe { crate::globals::GLOBALS.get_mut().curtab };
+        let old_firstbuf =
+            unsafe { crate::globals::GLOBALS.get_mut().firstbuf };
+        let old_lastbuf =
+            unsafe { crate::globals::GLOBALS.get_mut().lastbuf };
+
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_scbk: 2,
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_u_synced: true,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT {
+                lnum: 6,
+                col: 0,
+                coladd: 0,
+            },
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let mut tab = Box::new(crate::buffer_defs::TabpageT {
+            tp_firstwin: win_ptr,
+            tp_lastwin: win_ptr,
+            tp_curwin: win_ptr,
+            ..Default::default()
+        });
+        let tab_ptr = std::ptr::addr_of_mut!(*tab);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = buf_ptr;
+            crate::globals::GLOBALS.get_mut().curwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().firstwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().lastwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().first_tabpage = tab_ptr;
+            crate::globals::GLOBALS.get_mut().curtab = tab_ptr;
+            crate::globals::GLOBALS.get_mut().firstbuf = buf_ptr;
+            crate::globals::GLOBALS.get_mut().lastbuf = buf_ptr;
+        }
+
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut *buf_ptr) },
+            OK
+        );
+        for line in [
+            &b"two\0"[..],
+            &b"three\0"[..],
+            &b"four\0"[..],
+            &b"prompt\0"[..],
+            &b"input\0"[..],
+        ] {
+            let lnum = unsafe { (*buf_ptr).b_ml.ml_line_count };
+            assert_eq!(
+                unsafe {
+                    crate::memline::ml_append_buf(
+                        &mut *buf_ptr,
+                        lnum,
+                        line,
+                        0,
+                        false,
+                    )
+                },
+                OK
+            );
+        }
+        unsafe { (*buf_ptr).b_prompt_start.mark.lnum = 5 };
+
+        unsafe { prompt_trim_scrollback(buf_ptr) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 4);
+        assert_eq!(unsafe { (*buf_ptr).b_prompt_start.mark.lnum }, 3);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 4);
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) },
+            b"three\0"
+        );
+
+        crate::undo::u_clearall(unsafe { &mut *buf_ptr });
+        unsafe {
+            let mfp = Box::from_raw((*buf_ptr).b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+            crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
+            crate::globals::GLOBALS.get_mut().curwin = old_curwin;
+            crate::globals::GLOBALS.get_mut().firstwin = old_firstwin;
+            crate::globals::GLOBALS.get_mut().lastwin = old_lastwin;
+            crate::globals::GLOBALS.get_mut().first_tabpage =
+                old_first_tabpage;
+            crate::globals::GLOBALS.get_mut().curtab = old_curtab;
+            crate::globals::GLOBALS.get_mut().firstbuf = old_firstbuf;
+            crate::globals::GLOBALS.get_mut().lastbuf = old_lastbuf;
+        }
+        drop(tab);
+        drop(win);
+        drop(buf);
     }
 
     // --- skip_luafunc_name / check_luafunc_name ---
