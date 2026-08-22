@@ -1370,6 +1370,10 @@ impl FreeWorklist {
             std::mem::take(&mut dict_ref.dv_index)
                 .into_values()
                 .collect();
+        for watcher in &mut dict_ref.watchers {
+            tv_dict_watcher_free(watcher);
+        }
+        dict_ref.watchers.clear();
         dict_ref.dv_hashtab = crate::hashtab_defs::HashtabT::hash_init();
         for item in items {
             unsafe { self.clear_value(&(*item).di_tv) };
@@ -1646,6 +1650,108 @@ pub unsafe fn callback_to_string(callback: &Callback) -> Vec<u8> {
 #[must_use]
 pub fn tv_callback_equal(cb1: &Callback, cb2: &Callback) -> bool {
     cb1 == cb2
+}
+
+fn tv_dict_watcher_free(
+    watcher: &mut crate::eval::typval_defs::DictWatcher,
+) {
+    callback_free(&mut watcher.callback);
+}
+
+/// Add a key watcher to a Dictionary (`tv_dict_watcher_add`).
+///
+/// A null Dictionary is a no-op, matching the original.
+///
+/// # Safety
+/// `dict`, if non-null, must point to a live Dictionary. The callback
+/// must own the reference established by [`callback_from_typval`] or
+/// [`callback_copy`].
+pub unsafe fn tv_dict_watcher_add(
+    dict: *mut DictT,
+    key_pattern: &[u8],
+    callback: Callback,
+) {
+    if dict.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut (*dict).watchers }.push(
+        crate::eval::typval_defs::DictWatcher {
+            callback,
+            key_pattern: key_pattern.to_vec(),
+            busy: false,
+            needs_free: false,
+        },
+    );
+}
+
+/// Remove a matching watcher from a Dictionary
+/// (`tv_dict_watcher_remove`).
+///
+/// Removal is deferred when any watcher encountered before the match is
+/// busy, preserving the original queue walk's behavior.
+///
+/// # Safety
+/// `dict`, if non-null, must point to a live Dictionary.
+pub unsafe fn tv_dict_watcher_remove(
+    dict: *mut DictT,
+    key_pattern: &[u8],
+    callback: &Callback,
+) -> bool {
+    if dict.is_null() {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let watchers = unsafe { &mut (*dict).watchers };
+    let mut queue_is_busy = false;
+    let mut found = None;
+    for (idx, watcher) in watchers.iter().enumerate() {
+        if watcher.busy {
+            queue_is_busy = true;
+        }
+        if tv_callback_equal(&watcher.callback, callback)
+            && watcher.key_pattern == key_pattern
+        {
+            found = Some(idx);
+            break;
+        }
+    }
+
+    let Some(idx) = found else {
+        return false;
+    };
+    if queue_is_busy {
+        watchers[idx].needs_free = true;
+    } else {
+        let mut watcher = watchers.remove(idx);
+        tv_dict_watcher_free(&mut watcher);
+    }
+    true
+}
+
+/// Whether `key` matches a watcher's exact/prefix pattern
+/// (`tv_dict_watcher_matches`).
+#[must_use]
+pub fn tv_dict_watcher_matches(
+    watcher: &crate::eval::typval_defs::DictWatcher,
+    key: &[u8],
+) -> bool {
+    if watcher.key_pattern.last() == Some(&b'*') {
+        key.starts_with(
+            &watcher.key_pattern[..watcher.key_pattern.len() - 1],
+        )
+    } else {
+        key == watcher.key_pattern
+    }
+}
+
+/// Whether a Dictionary has any key watchers (`tv_dict_is_watched`).
+///
+/// # Safety
+/// `dict`, if non-null, must point to a live Dictionary.
+#[must_use]
+pub unsafe fn tv_dict_is_watched(dict: *const DictT) -> bool {
+    !dict.is_null() && !unsafe { &(*dict).watchers }.is_empty()
 }
 
 /// Get a function from a dictionary, storing it into `result`, and
@@ -1944,6 +2050,7 @@ pub fn tv_dict_alloc() -> *mut DictT {
         dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
         dv_index: std::collections::HashMap::new(),
         dv_copydict: std::ptr::null_mut(),
+        watchers: Vec::new(),
         dv_used_next: std::ptr::null_mut(),
         dv_used_prev: std::ptr::null_mut(),
         lua_table_ref: LUA_NOREF,
@@ -7022,6 +7129,96 @@ mod tests {
             &Callback::Lua(4),
             &Callback::Lua(5)
         ));
+    }
+
+    #[test]
+    fn dict_watcher_add_match_and_remove_round_trip() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        let callback = Callback::Funcref(b"Watcher".to_vec());
+        unsafe {
+            tv_dict_watcher_add(dict, b"prefix*", callback.clone());
+        }
+        assert!(unsafe { tv_dict_is_watched(dict) });
+        assert_eq!(unsafe { (*dict).watchers.len() }, 1);
+        assert!(tv_dict_watcher_matches(
+            unsafe { &(&(*dict).watchers)[0] },
+            b"prefix_key"
+        ));
+        assert!(!tv_dict_watcher_matches(
+            unsafe { &(&(*dict).watchers)[0] },
+            b"other"
+        ));
+        assert!(unsafe {
+            tv_dict_watcher_remove(dict, b"prefix*", &callback)
+        });
+        assert!(!unsafe { tv_dict_is_watched(dict) });
+        unsafe { tv_dict_free(dict) };
+    }
+
+    #[test]
+    fn dict_watcher_exact_pattern_does_not_match_a_longer_key() {
+        let watcher = crate::eval::typval_defs::DictWatcher {
+            callback: Callback::None,
+            key_pattern: b"key".to_vec(),
+            busy: false,
+            needs_free: false,
+        };
+        assert!(tv_dict_watcher_matches(&watcher, b"key"));
+        assert!(!tv_dict_watcher_matches(&watcher, b"key_more"));
+    }
+
+    #[test]
+    fn dict_watcher_remove_defers_while_the_queue_is_busy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        unsafe {
+            tv_dict_watcher_add(
+                dict,
+                b"first",
+                Callback::Funcref(b"First".to_vec()),
+            );
+            tv_dict_watcher_add(
+                dict,
+                b"second",
+                Callback::Funcref(b"Second".to_vec()),
+            );
+            (&mut (*dict).watchers)[0].busy = true;
+        }
+        assert!(unsafe {
+            tv_dict_watcher_remove(
+                dict,
+                b"second",
+                &Callback::Funcref(b"Second".to_vec()),
+            )
+        });
+        assert_eq!(unsafe { (*dict).watchers.len() }, 2);
+        assert!(unsafe { (&(*dict).watchers)[1].needs_free });
+        unsafe { tv_dict_free(dict) };
+    }
+
+    #[test]
+    fn dict_free_contents_releases_watcher_callbacks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 2,
+            ..Default::default()
+        }));
+        unsafe {
+            tv_dict_watcher_add(
+                dict,
+                b"*",
+                Callback::Partial(partial),
+            );
+            tv_dict_free_contents(dict);
+        }
+        assert_eq!(unsafe { (*partial).pt_refcount }, 1);
+        assert!(!unsafe { tv_dict_is_watched(dict) });
+        unsafe {
+            partial_unref(partial);
+            tv_dict_free_dict(dict);
+        }
     }
 
     #[test]

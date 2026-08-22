@@ -272,6 +272,7 @@ mod tests {
                 dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
                 dv_index: std::collections::HashMap::new(),
                 dv_copydict: std::ptr::null_mut(),
+                watchers: Vec::new(),
                 dv_used_next: std::ptr::null_mut(),
                 dv_used_prev: std::ptr::null_mut(),
                 lua_table_ref: -1,

@@ -255,10 +255,9 @@ pub struct DictitemT {
 /// depopulated in lockstep with `dv_hashtab` by every insert/remove in
 /// `eval/typval.rs`.
 ///
-/// `watchers` (the original's `QUEUE` of dict-key watchers set by user
-/// code, e.g. `dictwatcheradd()`) is deferred - needs a `QUEUE`
-/// intrusive-linked-list translation first, and has no caller yet
-/// among the functions translated so far.
+/// `watchers` replaces the original's intrusive `QUEUE` with an owned
+/// `Vec<DictWatcher>`; watcher order and deferred-removal behavior are
+/// preserved without pointer-to-container recovery.
 pub struct DictT {
     /// Whole dictionary lock status (`dv_lock`).
     pub dv_lock: VarLockStatus,
@@ -276,6 +275,8 @@ pub struct DictT {
     pub dv_index: std::collections::HashMap<usize, *mut DictitemT>,
     /// Copied dict used by `deepcopy()` (`dv_copydict`).
     pub dv_copydict: *mut DictT,
+    /// Dictionary key watchers (`watchers`).
+    pub watchers: Vec<DictWatcher>,
     /// Next dictionary in used dictionaries list (`dv_used_next`).
     pub dv_used_next: *mut DictT,
     /// Previous dictionary in used dictionaries list (`dv_used_prev`).
@@ -558,6 +559,7 @@ impl Default for FunccallT {
                 dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
                 dv_index: std::collections::HashMap::new(),
                 dv_copydict: std::ptr::null_mut(),
+                watchers: Vec::new(),
                 dv_used_next: std::ptr::null_mut(),
                 dv_used_prev: std::ptr::null_mut(),
                 lua_table_ref: -1,
@@ -571,6 +573,7 @@ impl Default for FunccallT {
                 dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
                 dv_index: std::collections::HashMap::new(),
                 dv_copydict: std::ptr::null_mut(),
+                watchers: Vec::new(),
                 dv_used_next: std::ptr::null_mut(),
                 dv_used_prev: std::ptr::null_mut(),
                 lua_table_ref: -1,
@@ -742,6 +745,21 @@ pub enum Callback {
     Partial(*mut PartialT),
     /// `kCallbackLua` (`LuaRef luaref`).
     Lua(LuaRef),
+}
+
+/// A Dictionary key watcher (`DictWatcher`).
+#[derive(Debug)]
+pub struct DictWatcher {
+    /// Callback invoked on changes (`callback`).
+    pub callback: Callback,
+    /// Key pattern, with an optional trailing `*` prefix wildcard
+    /// (`key_pattern`/`key_pattern_len`).
+    pub key_pattern: Vec<u8>,
+    /// Prevent recursive invocation (`busy`).
+    pub busy: bool,
+    /// Deferred removal requested while the queue is busy
+    /// (`needs_free`).
+    pub needs_free: bool,
 }
 
 impl Default for Callback {
