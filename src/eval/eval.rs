@@ -12551,6 +12551,27 @@ mod tests {
     }
 
     #[test]
+    fn e2e_function_constructs_callable_funcrefs_and_partials() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        let (ret, tv) = eval_str(b"function(\"len\")(\"abcd\")");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(4));
+
+        let (ret, tv) =
+            eval_str(b"function(\"pow\", [2.0])(3.0)");
+        assert_eq!(ret, OK);
+        let TypvalValue::Float(result) = tv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        reset_globals_for_test();
+    }
+
+    #[test]
     fn e2e_type_builtin_function_call_on_a_number() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();
