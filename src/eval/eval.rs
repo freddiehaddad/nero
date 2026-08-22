@@ -6359,6 +6359,58 @@ pub unsafe fn set_argv_var(argv: &[Vec<u8>]) {
     };
 }
 
+/// Get the current user input from a prompt buffer
+/// (`prompt_get_input`).
+///
+/// Returns `None` for a non-prompt buffer. The returned bytes exclude
+/// memline's trailing NUL and join continuation lines with newline
+/// bytes.
+///
+/// # Safety
+/// `buf` must point to a live buffer. Forwarded from
+/// [`crate::memline::ml_get_buf`].
+#[must_use]
+pub unsafe fn prompt_get_input(
+    buf: *mut crate::buffer_defs::BufT,
+) -> Option<Vec<u8>> {
+    debug_assert!(!buf.is_null());
+    // SAFETY: forwarded from this function's own safety doc.
+    if !crate::buffer::bt_prompt(Some(unsafe { &*buf })) {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum_start = unsafe { (*buf).b_prompt_start.mark.lnum };
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum_last = unsafe { (*buf).b_ml.ml_line_count };
+    // SAFETY: forwarded from this function's own safety doc.
+    let first = unsafe { crate::memline::ml_get_buf(&mut *buf, lnum_start) };
+    let first_len = first
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(first.len());
+    // SAFETY: forwarded from this function's own safety doc.
+    let prompt_col = unsafe { (*buf).b_prompt_start.mark.col };
+    let first_start = if first_len >= prompt_col as usize {
+        prompt_col as usize
+    } else {
+        0
+    };
+    let mut result = first[first_start..first_len].to_vec();
+
+    for lnum in lnum_start + 1..=lnum_last {
+        result.push(crate::ascii_defs::NL);
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf, lnum) };
+        let len = line
+            .iter()
+            .position(|&byte| byte == crate::ascii_defs::NUL)
+            .unwrap_or(line.len());
+        result.extend_from_slice(&line[..len]);
+    }
+    Some(result)
+}
+
 /// Trim lines above a prompt to enforce `'scrollback'`
 /// (`prompt_trim_scrollback`).
 ///
@@ -13825,6 +13877,102 @@ mod tests {
             );
             crate::eval::typval::tv_list_unref(list);
         }
+    }
+
+    fn prompt_input_buffer(
+        lines: &[&[u8]],
+        prompt_col: i32,
+    ) -> Box<crate::buffer_defs::BufT> {
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            ..Default::default()
+        });
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, OK);
+        if let Some(first) = lines.first() {
+            assert_eq!(
+                unsafe {
+                    crate::memline::ml_replace_buf_len(
+                        &mut buf,
+                        1,
+                        first,
+                    )
+                },
+                OK
+            );
+        }
+        for line in lines.iter().skip(1) {
+            let lnum = buf.b_ml.ml_line_count;
+            assert_eq!(
+                unsafe {
+                    crate::memline::ml_append_buf(
+                        &mut buf,
+                        lnum,
+                        line,
+                        0,
+                        false,
+                    )
+                },
+                OK
+            );
+        }
+        buf.b_prompt_start.mark.lnum = 1;
+        buf.b_prompt_start.mark.col = prompt_col;
+        buf
+    }
+
+    fn close_prompt_input_buffer(buf: Box<crate::buffer_defs::BufT>) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn prompt_get_input_returns_none_for_a_non_prompt_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(
+            unsafe { prompt_get_input(std::ptr::addr_of_mut!(buf)) },
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_get_input_strips_the_prompt_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = prompt_input_buffer(&[b"> answer\0"], 2);
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        assert_eq!(
+            unsafe { prompt_get_input(buf_ptr) },
+            Some(b"answer".to_vec())
+        );
+        close_prompt_input_buffer(buf);
+    }
+
+    #[test]
+    fn prompt_get_input_joins_continuation_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = prompt_input_buffer(
+            &[b"> first\0", b"second\0", b"third\0"],
+            2,
+        );
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        assert_eq!(
+            unsafe { prompt_get_input(buf_ptr) },
+            Some(b"first\nsecond\nthird".to_vec())
+        );
+        close_prompt_input_buffer(buf);
+    }
+
+    #[test]
+    fn prompt_get_input_keeps_the_whole_line_when_col_is_past_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = prompt_input_buffer(&[b"short\0"], 99);
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        assert_eq!(
+            unsafe { prompt_get_input(buf_ptr) },
+            Some(b"short".to_vec())
+        );
+        close_prompt_input_buffer(buf);
     }
 
     #[test]
