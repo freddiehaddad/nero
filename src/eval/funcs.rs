@@ -383,6 +383,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
         m.insert(&b"filter"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_filter });
+        m.insert(&b"foreach"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_foreach });
         m.insert(&b"map"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_map });
         m.insert(&b"mapnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_mapnew });
         m.insert(&b"add"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_add });
@@ -2676,6 +2677,26 @@ unsafe fn f_deepcopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
 unsafe fn f_filter(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::typval::filter_map(argvars, rettv, crate::eval::typval::FilterMapT::Filter) };
+}
+
+/// `foreach({expr1}, {expr2})` - invoke a callback for each item,
+/// returning the original container unchanged (`f_foreach`,
+/// `eval/list.c`).
+///
+/// Funcref callbacks are complete. Raw command Strings remain at the
+/// Ex-command execution boundary documented by `filter_map_one`.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::filter_map`].
+unsafe fn f_foreach(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::eval::typval::filter_map(
+            argvars,
+            rettv,
+            crate::eval::typval::FilterMapT::Foreach,
+        )
+    };
 }
 
 /// `map({expr1}, {expr2})` - replace each item in `{expr1}` (a `List`,
@@ -9851,6 +9872,7 @@ mod tests {
             "copy",
             "deepcopy",
             "filter",
+            "foreach",
             "map",
             "mapnew",
             "add",
@@ -11030,6 +11052,58 @@ mod tests {
         let args = [TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() }, num(1)];
         unsafe { f_index(&args, &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_foreach ---
+
+    #[test]
+    fn foreach_funcref_visits_a_list_without_changing_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(list, 2);
+            crate::eval::typval::tv_list_append_number(list, 3);
+        }
+        let args = [
+            TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::Func(Some(b"pow".to_vec())),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_foreach(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::List(list));
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_list_find_nr(list, 0, None) },
+            2
+        );
+        assert_eq!(
+            unsafe { crate::eval::typval::tv_list_find_nr(list, 1, None) },
+            3
+        );
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn foreach_funcref_returns_an_unchanged_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = [
+            string(b"23"),
+            TypvalT {
+                value: TypvalValue::Func(Some(b"pow".to_vec())),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_foreach(&args, &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"23".to_vec()))
+        );
     }
 
     // --- indexof_eval_expr / indexof_blob / indexof_list / f_indexof ---

@@ -3665,15 +3665,9 @@ pub enum FilterMapT {
 /// Handle one item for `map()`/`filter()`/`foreach()`. Sets `v:val` to
 /// `tv`. Caller must set `v:key` (`filter_map_one`).
 ///
-/// Only the shared, non-`Foreach`-with-a-`String`-expr path is
-/// modeled: `foreach()` given a raw command STRING (as opposed to a
-/// `Funcref`/expression to call/evaluate) needs `do_cmdline_cmd` (the
-/// whole Ex-command execution engine) - `unimplemented!()`s if
-/// actually reached (i.e. only when `filtermap == Foreach` AND
-/// `expr.value` is `TypvalValue::String`; every other combination,
-/// including `foreach()` given a `Funcref`, falls through to the
-/// shared `eval_expr_typval` call below, which has its own separate,
-/// already-documented gap for non-`String` expressions).
+/// `foreach()` given a raw command String needs `do_cmdline_cmd` (the
+/// Ex-command execution engine) and remains explicit at that boundary.
+/// Funcref callbacks use the real `eval_expr_typval` path.
 ///
 /// Returns `(status, remove)` - `remove` is only meaningful for
 /// [`FilterMapT::Filter`] (whether `{expr2}` evaluated to zero/falsy).
@@ -3702,17 +3696,18 @@ pub unsafe fn filter_map_one(
         );
     }
 
-    // The original does `argv[0] = *get_vim_var_tv(VV_KEY); argv[1] =
-    // *get_vim_var_tv(VV_VAL);` here (a plain struct COPY, purely to
-    // build the argument array a Partial/Funcref callback would
-    // receive) - this crate's own eval_expr_typval only has a real
-    // (String-expr) branch today, which never reads argv at all, so
-    // an empty slice is passed instead of duplicating v:key/v:val's
-    // OWN storage (which would otherwise create two independent
-    // "owners" of the same heap-allocated value with no refcount bump,
-    // a real double-free hazard were argv itself ever cleared).
+    // The original copies v:key/v:val into a two-item argument array
+    // without incrementing references. TypvalT::clone duplicates
+    // owned String bytes while preserving the same borrowed pointer
+    // semantics for container variants; this array is never cleared
+    // as an owner by the callback dispatcher.
+    let mut argv = [
+        unsafe { (&*get_vim_var_tv(VimVarIndex::Key)).clone() },
+        unsafe { (&*get_vim_var_tv(VimVarIndex::Val)).clone() },
+    ];
     // SAFETY: forwarded from this function's own safety doc.
-    let ret = unsafe { eval_expr_typval(expr, false, &mut [], &mut newtv) };
+    let ret =
+        unsafe { eval_expr_typval(expr, false, &mut argv, &mut newtv) };
     if ret == FAIL {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { tv_clear_simple(&*get_vim_var_tv(VimVarIndex::Val)) };
