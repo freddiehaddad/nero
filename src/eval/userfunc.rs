@@ -116,7 +116,8 @@
 //! one already-bounded slice scan) and `check_user_func_argcount`
 //! (validates a call's argument count against `fp`'s own arity),
 //! plus a new [`FnameTransError`] enum (`eval/userfunc.h`'s small,
-//! 9-variant `FnameTransError`).
+//! 9-variant `FnameTransError`), plus [`FuncexeT`] (`funcexe_T`) and
+//! its exact all-zero `FUNCEXE_INIT` default.
 //!
 //! Also translated: `save_funccal`/`restore_funccal`/
 //! `get_current_funccal`/`set_current_funccal` - a save/restore stack
@@ -253,8 +254,8 @@
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
-    DictT, DictitemT, FunccallT, ScopeDictDictItem, TypvalT, TypvalValue, UfuncT, VarLockStatus,
-    VarnumberT, dict_item_flags,
+    DictT, DictitemT, FunccallT, PartialT, ScopeDictDictItem, TypvalT, TypvalValue, UfuncT,
+    VarLockStatus, VarnumberT, dict_item_flags,
 };
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
@@ -895,6 +896,56 @@ pub enum FnameTransError {
     Deleted = 7,
     /// Function cannot be used as a method (`FCERR_NOTMETHOD`).
     NotMethod = 8,
+}
+
+/// Deferred argument filler used by [`FuncexeT`] (`ArgvFunc`).
+pub type ArgvFuncT = unsafe fn(
+    current_argcount: i32,
+    argv: *mut TypvalT,
+    partial_argcount: i32,
+    called_func: *mut UfuncT,
+) -> i32;
+
+/// State passed through function-call execution (`funcexe_T`).
+#[derive(Clone, Copy)]
+pub struct FuncexeT {
+    /// Deferred argument filler (`fe_argv_func`).
+    pub fe_argv_func: Option<ArgvFuncT>,
+    /// First line of a supplied range (`fe_firstline`).
+    pub fe_firstline: crate::pos_defs::LinenrT,
+    /// Last line of a supplied range (`fe_lastline`).
+    pub fe_lastline: crate::pos_defs::LinenrT,
+    /// Optional output flag: whether the function handled the range
+    /// (`fe_doesrange`).
+    pub fe_doesrange: *mut bool,
+    /// Whether expressions should actually be evaluated (`fe_evaluate`).
+    pub fe_evaluate: bool,
+    /// Bound Partial, if any (`fe_partial`).
+    pub fe_partial: *mut PartialT,
+    /// Dictionary bound as `self`, if any (`fe_selfdict`).
+    pub fe_selfdict: *mut DictT,
+    /// Method-call base value, if any (`fe_basetv`).
+    pub fe_basetv: *mut TypvalT,
+    /// Whether name lookup found a non-callable variable
+    /// (`fe_found_var`).
+    pub fe_found_var: bool,
+}
+
+impl Default for FuncexeT {
+    /// `FUNCEXE_INIT`.
+    fn default() -> Self {
+        Self {
+            fe_argv_func: None,
+            fe_firstline: 0,
+            fe_lastline: 0,
+            fe_doesrange: std::ptr::null_mut(),
+            fe_evaluate: false,
+            fe_partial: std::ptr::null_mut(),
+            fe_selfdict: std::ptr::null_mut(),
+            fe_basetv: std::ptr::null_mut(),
+            fe_found_var: false,
+        }
+    }
 }
 
 /// Check the argument count for user function `fp`
@@ -2630,6 +2681,20 @@ pub unsafe fn func_ptr_unref(fp: *mut UfuncT) {
 mod tests {
     use super::*;
     use crate::vim_defs::FAIL;
+
+    #[test]
+    fn funcexe_default_matches_funcexe_init() {
+        let state = FuncexeT::default();
+        assert!(state.fe_argv_func.is_none());
+        assert_eq!(state.fe_firstline, 0);
+        assert_eq!(state.fe_lastline, 0);
+        assert!(state.fe_doesrange.is_null());
+        assert!(!state.fe_evaluate);
+        assert!(state.fe_partial.is_null());
+        assert!(state.fe_selfdict.is_null());
+        assert!(state.fe_basetv.is_null());
+        assert!(!state.fe_found_var);
+    }
 
     #[test]
     fn func_ptr_ref_null_is_noop() {
