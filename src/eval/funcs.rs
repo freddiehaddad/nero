@@ -2373,11 +2373,8 @@ unsafe fn f_reverse(argvars: &[TypvalT], rettv: &mut TypvalT) {
 
 /// `sort({list} [, {func} [, {dict}]])` builtin (`f_sort`).
 ///
-/// Only the default comparator (no `{func}`) is real - a `{func}`
-/// naming/being a custom comparator `unimplemented!()`s the moment
-/// [`crate::eval::typval::do_sort_uniq`] would actually need to CALL
-/// it (needs the full `call_func`/`funcexe_T` machinery, not yet
-/// translated).
+/// Default, named-Funcref, and Partial comparators are supported via
+/// [`crate::eval::typval::do_sort_uniq`].
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::typval::do_sort_uniq`]'s own safety
@@ -2389,8 +2386,7 @@ unsafe fn f_sort(argvars: &[TypvalT], rettv: &mut TypvalT) {
 
 /// `uniq({list} [, {func} [, {dict}]])` builtin (`f_uniq`).
 ///
-/// See [`f_sort`]'s own doc comment for the same custom-comparator
-/// gap.
+/// See [`f_sort`]'s own custom-comparator support.
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::typval::do_sort_uniq`]'s own safety

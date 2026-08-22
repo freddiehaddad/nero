@@ -3575,15 +3575,16 @@ struct SortInfo {
     item_compare_numeric: bool,
     item_compare_numbers: bool,
     item_compare_float: bool,
-    /// `true` when a custom comparator (a `Funcref`/`Partial`, or an
-    /// unrecognized non-empty string naming a function) was
-    /// requested. [`do_sort`]/[`do_uniq`] `unimplemented!()` the
-    /// moment they would actually need to CALL it (needs the full
-    /// `call_func`/`funcexe_T` machinery, not yet translated) rather
-    /// than here at parse time - matching the original's own exact
-    /// timing (a custom comparator is only ever invoked lazily, once
-    /// per comparison, never during argument parsing itself).
-    has_custom_comparator: bool,
+    item_compare_func: Option<Vec<u8>>,
+    item_compare_partial: *mut PartialT,
+    item_compare_selfdict: *mut DictT,
+}
+
+impl SortInfo {
+    fn has_custom_comparator(&self) -> bool {
+        self.item_compare_func.is_some()
+            || !self.item_compare_partial.is_null()
+    }
 }
 
 /// Parse the optional 2nd/3rd arguments to `sort()`/`uniq()`
@@ -3603,8 +3604,11 @@ fn parse_sort_uniq_args(argvars: &[TypvalT]) -> Result<SortInfo, ()> {
     }
 
     match &arg1.value {
-        TypvalValue::Func(_) | TypvalValue::Partial(_) => {
-            info.has_custom_comparator = true;
+        TypvalValue::Func(name) => {
+            info.item_compare_func = name.clone();
+        }
+        TypvalValue::Partial(partial) => {
+            info.item_compare_partial = *partial;
         }
         TypvalValue::Number(nr) => {
             if *nr == 1 {
@@ -3640,7 +3644,7 @@ fn parse_sort_uniq_args(argvars: &[TypvalT]) -> Result<SortInfo, ()> {
                 } else if s == b"l" {
                     info.item_compare_lc = true;
                 } else {
-                    info.has_custom_comparator = true;
+                    info.item_compare_func = Some(s);
                 }
             }
         }
@@ -3654,6 +3658,10 @@ fn parse_sort_uniq_args(argvars: &[TypvalT]) -> Result<SortInfo, ()> {
         if tv_check_for_dict_arg(argvars, 2) == FAIL {
             return Err(());
         }
+        let TypvalValue::Dict(dict) = argvars[2].value else {
+            unreachable!();
+        };
+        info.item_compare_selfdict = dict;
     }
 
     Ok(info)
@@ -3741,6 +3749,90 @@ fn item_compare(tv1: &TypvalT, tv2: &TypvalT, info: &SortInfo) -> i32 {
     }
 }
 
+struct ComparatorArgs([TypvalT; 2]);
+
+impl Drop for ComparatorArgs {
+    fn drop(&mut self) {
+        for value in &self.0 {
+            // SAFETY: both entries were created by tv_copy and are
+            // released exactly once here.
+            unsafe { tv_clear_simple(value) };
+        }
+    }
+}
+
+/// Call a custom `sort()`/`uniq()` comparator (`item_compare2`).
+///
+/// # Safety
+/// Pointer-bearing values and `SortInfo`'s non-null callback/self
+/// pointers must remain valid for the call.
+unsafe fn item_compare2(
+    tv1: &TypvalT,
+    tv2: &TypvalT,
+    info: &SortInfo,
+) -> Result<i32, ()> {
+    let (name, partial) = if info.item_compare_partial.is_null() {
+        (
+            info.item_compare_func.clone().unwrap_or_default(),
+            std::ptr::null_mut(),
+        )
+    } else {
+        // SAFETY: non-null comparator Partial is live by contract.
+        let Some(name) = (unsafe {
+            crate::eval::eval::partial_name(info.item_compare_partial)
+        }) else {
+            return Err(());
+        };
+        (name, info.item_compare_partial)
+    };
+    if name.is_empty() {
+        return Err(());
+    }
+
+    let mut args = ComparatorArgs(std::array::from_fn(|_| {
+        TypvalT::default()
+    }));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        tv_copy(tv1, &mut args.0[0]);
+        tv_copy(tv2, &mut args.0[1]);
+    }
+    let mut rettv = TypvalT::default();
+    let mut funcexe = crate::eval::userfunc::FuncexeT {
+        fe_evaluate: true,
+        fe_partial: partial,
+        fe_selfdict: info.item_compare_selfdict,
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let error = unsafe {
+        crate::eval::userfunc::call_func_with_state(
+            &name,
+            &mut rettv,
+            &args.0,
+            &mut funcexe,
+        )
+    };
+
+    let result = if error != crate::eval::userfunc::FnameTransError::None {
+        Err(())
+    } else {
+        let mut conversion_error = false;
+        let number = tv_get_number_chk(
+            &rettv,
+            Some(&mut conversion_error),
+        );
+        if conversion_error {
+            Err(())
+        } else {
+            Ok(number.signum() as i32)
+        }
+    };
+    // SAFETY: `rettv` is locally owned.
+    unsafe { tv_clear_simple(&rettv) };
+    result
+}
+
 /// Sort a list in place using `info`'s comparison rules (`do_sort`).
 ///
 /// The original's own array-of-pointers + `qsort` + rebuild-the-
@@ -3755,13 +3847,6 @@ fn item_compare(tv1: &TypvalT, tv2: &TypvalT, info: &SortInfo) -> i32 {
 /// # Safety
 /// `l` must be a valid, non-null pointer to a live `ListT`.
 unsafe fn do_sort(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
-    if info.has_custom_comparator {
-        unimplemented!(
-            "do_sort: calling a user-supplied comparator (Funcref/Partial/named function - \
-             item_compare2, needs the full call_func/funcexe_T machinery) is not yet translated"
-        );
-    }
-
     let mut items: Vec<*mut crate::eval::typval_defs::ListitemT> = Vec::new();
     // SAFETY: forwarded from this function's own safety doc.
     let mut cur = unsafe { tv_list_first(l) };
@@ -3771,15 +3856,34 @@ unsafe fn do_sort(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
         cur = unsafe { (*cur).li_next };
     }
 
+    let custom = info.has_custom_comparator();
+    let mut comparator_failed = false;
     items.sort_by(|&a, &b| {
         // SAFETY: both are live items currently linked into `l`.
         let (tv1, tv2) = unsafe { (&(*a).li_tv, &(*b).li_tv) };
-        match item_compare(tv1, tv2, info) {
+        let comparison = if comparator_failed {
+            0
+        } else if custom {
+            // SAFETY: forwarded from this function's own safety doc.
+            match unsafe { item_compare2(tv1, tv2, info) } {
+                Ok(value) => value,
+                Err(()) => {
+                    comparator_failed = true;
+                    0
+                }
+            }
+        } else {
+            item_compare(tv1, tv2, info)
+        };
+        match comparison {
             n if n < 0 => std::cmp::Ordering::Less,
             0 => std::cmp::Ordering::Equal,
             _ => std::cmp::Ordering::Greater,
         }
     });
+    if comparator_failed {
+        return;
+    }
 
     // SAFETY: forwarded from this function's own safety doc.
     unsafe {
@@ -3803,13 +3907,6 @@ unsafe fn do_sort(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
 /// # Safety
 /// `l` must be a valid, non-null pointer to a live `ListT`.
 unsafe fn do_uniq(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
-    if info.has_custom_comparator {
-        unimplemented!(
-            "do_uniq: calling a user-supplied comparator (Funcref/Partial/named function - \
-             item_compare2, needs the full call_func/funcexe_T machinery) is not yet translated"
-        );
-    }
-
     // SAFETY: forwarded from this function's own safety doc.
     let first = unsafe { tv_list_first(l) };
     if first.is_null() {
@@ -3821,7 +3918,27 @@ unsafe fn do_uniq(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
         // SAFETY: `li` is live and non-first, so it has a predecessor.
         let prev_li = unsafe { (*li).li_prev };
         // SAFETY: both are live items currently linked into `l`.
-        let equal = unsafe { item_compare(&(*prev_li).li_tv, &(*li).li_tv, info) } == 0;
+        let comparison = if info.has_custom_comparator() {
+            match unsafe {
+                item_compare2(
+                    &(*prev_li).li_tv,
+                    &(*li).li_tv,
+                    info,
+                )
+            } {
+                Ok(value) => value,
+                Err(()) => break,
+            }
+        } else {
+            unsafe {
+                item_compare(
+                    &(*prev_li).li_tv,
+                    &(*li).li_tv,
+                    info,
+                )
+            }
+        };
+        let equal = comparison == 0;
         if equal {
             // SAFETY: forwarded from this function's own safety doc.
             li = unsafe { tv_list_item_remove(l, li) };
@@ -9909,6 +10026,27 @@ mod tests {
 
     // ---- do_sort_uniq (sort()/uniq()) ------------------------------------
 
+    fn string_list_of(values: &[&[u8]]) -> *mut ListT {
+        let list = tv_list_alloc(values.len() as isize);
+        for value in values {
+            unsafe { tv_list_append_string(list, Some(value)) };
+        }
+        list
+    }
+
+    fn collect_strings(list: *mut ListT) -> Vec<Vec<u8>> {
+        let mut values = Vec::new();
+        let mut item = unsafe { tv_list_first(list) };
+        while !item.is_null() {
+            let TypvalValue::String(value) = (unsafe { &(*item).li_tv.value }) else {
+                panic!("expected a String");
+            };
+            values.push(value.clone().unwrap_or_default());
+            item = unsafe { (*item).li_next };
+        }
+        values
+    }
+
     #[test]
     fn do_sort_uniq_default_comparison_is_by_string_form() {
         // Default (no flag) comparison is BY STRING FORM, not numeric:
@@ -10001,18 +10139,83 @@ mod tests {
     }
 
     #[test]
-    fn do_sort_uniq_custom_comparator_funcref_panics() {
+    fn do_sort_uniq_custom_funcref_comparator_sorts_the_list() {
         let _lock = crate::globals::global_state_test_lock();
-        let l = int_list_of(&[3, 1, 2]);
+        let l = string_list_of(&[b"ba", b"a"]);
         let mut rettv = TypvalT::default();
         let argvars = [
             TypvalT { value: TypvalValue::List(l), ..Default::default() },
-            TypvalT { value: TypvalValue::Func(Some(b"SomeComparator".to_vec())), ..Default::default() },
+            TypvalT { value: TypvalValue::Func(Some(b"stridx".to_vec())), ..Default::default() },
         ];
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            do_sort_uniq(&argvars, &mut rettv, true)
-        }));
-        assert!(result.is_err(), "expected a panic (item_compare2/call_func not yet translated)");
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        assert_eq!(collect_strings(l), vec![b"a".to_vec(), b"ba".to_vec()]);
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_custom_partial_comparator_sorts_the_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = string_list_of(&[b"ba", b"a"]);
+        let mut partial = PartialT {
+            pt_name: Some(b"stridx".to_vec()),
+            ..Default::default()
+        };
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT {
+                value: TypvalValue::Partial(std::ptr::from_mut(
+                    &mut partial,
+                )),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+
+        assert_eq!(collect_strings(l), vec![b"a".to_vec(), b"ba".to_vec()]);
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_unknown_comparator_leaves_the_list_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let l = string_list_of(&[b"ba", b"a"]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT {
+                value: TypvalValue::Func(Some(
+                    b"NeroMissingComparator".to_vec(),
+                )),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+
+        assert_eq!(collect_strings(l), vec![b"ba".to_vec(), b"a".to_vec()]);
+        crate::eval::userfunc::func_init();
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_custom_comparator_removes_adjacent_duplicates() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = string_list_of(&[b"a", b"a", b"ba"]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT {
+                value: TypvalValue::Func(Some(b"stridx".to_vec())),
+                ..Default::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+
+        unsafe { do_sort_uniq(&argvars, &mut rettv, false) };
+
+        assert_eq!(collect_strings(l), vec![b"a".to_vec(), b"ba".to_vec()]);
         unsafe { tv_list_free(l) };
     }
 
