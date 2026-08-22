@@ -5524,23 +5524,52 @@ unsafe fn eval_expr_string(expr: &TypvalT, rettv: &mut TypvalT) -> i32 {
     OK
 }
 
+/// Evaluate an expression as a function name (`eval_expr_func`).
+///
+/// Builtin and ordinary named-function dispatch is delegated to the
+/// real [`crate::eval::userfunc::call_func`] path. Bound Partial state
+/// is handled separately by `eval_expr_partial`.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::call_func`].
+unsafe fn eval_expr_func(
+    expr: &TypvalT,
+    argv: &[TypvalT],
+    rettv: &mut TypvalT,
+) -> i32 {
+    let name = match &expr.value {
+        TypvalValue::Func(name) => name.clone().unwrap_or_default(),
+        _ => {
+            let Some(name) = crate::eval::typval::tv_get_string_chk(expr)
+            else {
+                return FAIL;
+            };
+            name
+        }
+    };
+    if name.is_empty() {
+        return FAIL;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let error =
+        unsafe { crate::eval::userfunc::call_func(&name, rettv, argv, true) };
+    i32::from(error == crate::eval::userfunc::FnameTransError::None)
+}
+
 /// Evaluate an expression which can be a function, partial, or string.
 /// Pass arguments `argv[..argc]` (`eval_expr_typval`).
 ///
-/// Only the [`TypvalValue::String`] (with `want_func == false`) case is
-/// modeled: a [`TypvalValue::Partial`]/[`TypvalValue::Func`] value, or
-/// `want_func == true`, needs `eval_expr_partial`/`eval_expr_func` (the
-/// whole function-CALL machinery - `call_partial`/`call_func`), a
-/// substantial, separate undertaking not yet translated - `panic!()`s
-/// with a clear, specific message if either is ever reached, rather
-/// than silently mishandling it.
+/// String-expression and named Funcref dispatch are complete. A bound
+/// [`TypvalValue::Partial`] still needs `eval_expr_partial`/
+/// `call_partial`.
 ///
 /// # Safety
 /// Forwarded from `eval_expr_string`'s own safety doc.
 pub unsafe fn eval_expr_typval(
     expr: &TypvalT,
     want_func: bool,
-    _argv: &mut [TypvalT],
+    argv: &mut [TypvalT],
     rettv: &mut TypvalT,
 ) -> i32 {
     if matches!(expr.value, TypvalValue::Partial(_)) {
@@ -5550,10 +5579,8 @@ pub unsafe fn eval_expr_typval(
         );
     }
     if matches!(expr.value, TypvalValue::Func(_)) || want_func {
-        unimplemented!(
-            "eval_expr_typval: a Funcref callback needs eval_expr_func (call_func), not yet \
-             translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { eval_expr_func(expr, argv, rettv) };
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { eval_expr_string(expr, rettv) }
@@ -10726,11 +10753,74 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "eval_expr_func")]
-    fn eval_expr_typval_panics_on_want_func_even_for_a_string() {
-        let expr = TypvalT { value: TypvalValue::String(Some(b"foo".to_vec())), ..TypvalT::default() };
+    fn eval_expr_typval_calls_a_string_function_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let expr = TypvalT {
+            value: TypvalValue::String(Some(b"len".to_vec())),
+            ..TypvalT::default()
+        };
+        let mut argv = [TypvalT {
+            value: TypvalValue::String(Some(b"hello".to_vec())),
+            ..TypvalT::default()
+        }];
         let mut rettv = TypvalT::default();
-        unsafe { eval_expr_typval(&expr, true, &mut [], &mut rettv) };
+        assert_eq!(
+            unsafe {
+                eval_expr_typval(&expr, true, &mut argv, &mut rettv)
+            },
+            OK
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn eval_expr_typval_calls_a_funcref_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let expr = TypvalT {
+            value: TypvalValue::Func(Some(b"len".to_vec())),
+            ..TypvalT::default()
+        };
+        let mut argv = [TypvalT {
+            value: TypvalValue::String(Some(b"abc".to_vec())),
+            ..TypvalT::default()
+        }];
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                eval_expr_typval(&expr, false, &mut argv, &mut rettv)
+            },
+            OK
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn eval_expr_typval_fails_for_empty_and_unknown_function_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let empty = TypvalT {
+            value: TypvalValue::Func(None),
+            ..TypvalT::default()
+        };
+        assert_eq!(
+            unsafe {
+                eval_expr_typval(&empty, false, &mut [], &mut rettv)
+            },
+            FAIL
+        );
+
+        let missing = TypvalT {
+            value: TypvalValue::String(Some(
+                b"NeroMissingCallback".to_vec(),
+            )),
+            ..TypvalT::default()
+        };
+        assert_eq!(
+            unsafe {
+                eval_expr_typval(&missing, true, &mut [], &mut rettv)
+            },
+            FAIL
+        );
     }
 
     // --- eval0-eval7 end-to-end ---
