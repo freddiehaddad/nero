@@ -1188,9 +1188,16 @@ pub unsafe fn call_func_with_state(
     }
 
     if !funcexe.fe_basetv.is_null() {
-        unimplemented!(
-            "call_func_with_state: method-call bases need call_internal_method"
-        );
+        // SAFETY: non-null base pointer is live by this function's
+        // contract.
+        return unsafe {
+            crate::eval::funcs::call_internal_method(
+                &name,
+                argvars,
+                rettv,
+                &*funcexe.fe_basetv,
+            )
+        };
     }
 
     // Find the function name in the table, call its implementation.
@@ -4679,6 +4686,39 @@ mod tests {
         let mut state = FuncexeT {
             fe_evaluate: true,
             fe_partial: partial_ptr,
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        let error = unsafe {
+            call_func_with_state(
+                b"pow",
+                &mut rettv,
+                &[TypvalT {
+                    value: TypvalValue::Float(3.0),
+                    ..Default::default()
+                }],
+                &mut state,
+            )
+        };
+
+        assert_eq!(error, FnameTransError::None);
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn call_func_with_state_dispatches_a_builtin_method() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut base = TypvalT {
+            value: TypvalValue::Float(2.0),
+            ..Default::default()
+        };
+        let mut state = FuncexeT {
+            fe_evaluate: true,
+            fe_basetv: std::ptr::from_mut(&mut base),
             ..Default::default()
         };
         let mut rettv = TypvalT::default();

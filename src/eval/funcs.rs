@@ -41,10 +41,8 @@
 //! micro-optimization, not business logic" reasoning.
 //!
 //! `base_arg` (which argument position, if any, a function can be
-//! called on via `expr->name()` method-call syntax) is stored for
-//! future fidelity but not yet acted on - `call_internal_method`
-//! (`handle_subscript`'s own "->name()" real caller) isn't translated
-//! yet either.
+//! called on via `expr->name()` method-call syntax) is enforced by
+//! [`call_internal_method`].
 //!
 //! Also translated: a full cluster of `float_op_wrapper`-style pure-
 //! float builtins - `sin()`/`cos()`/`tan()`/`asin()`/`acos()`/`atan()`/
@@ -652,6 +650,52 @@ pub unsafe fn call_internal_func(fname: &[u8], argvars: &[TypvalT], rettv: &mut 
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { (fdef.func)(argvars, rettv) };
+    FnameTransError::None
+}
+
+/// Invoke a builtin as `base->method(args)` (`call_internal_method`).
+///
+/// The base value is inserted at the function definition's 1-indexed
+/// `base_arg`, or appended for [`BASE_LAST`].
+///
+/// # Safety
+/// Forwarded from the selected [`VimLFuncT`]'s own safety contract.
+#[must_use]
+pub unsafe fn call_internal_method(
+    fname: &[u8],
+    argvars: &[TypvalT],
+    rettv: &mut TypvalT,
+    basetv: &TypvalT,
+) -> FnameTransError {
+    let Some(fdef) = find_internal_func(fname) else {
+        return FnameTransError::Unknown;
+    };
+    if fdef.base_arg == BASE_NONE {
+        return FnameTransError::NotMethod;
+    }
+    let total = argvars.len() + 1;
+    if total < fdef.min_argc as usize {
+        return FnameTransError::TooFew;
+    }
+    if total > fdef.max_argc as usize {
+        return FnameTransError::TooMany;
+    }
+
+    let base_index = if fdef.base_arg == BASE_LAST {
+        argvars.len()
+    } else {
+        usize::from(fdef.base_arg - 1)
+    };
+    if argvars.len() < base_index {
+        return FnameTransError::TooFew;
+    }
+
+    let mut argv = Vec::with_capacity(total);
+    argv.extend_from_slice(&argvars[..base_index]);
+    argv.push(basetv.clone());
+    argv.extend_from_slice(&argvars[base_index..]);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (fdef.func)(&argv, rettv) };
     FnameTransError::None
 }
 
@@ -9119,6 +9163,88 @@ mod tests {
         let result = unsafe { call_internal_func(b"len", &args, &mut rettv) };
         assert_eq!(result, FnameTransError::None);
         assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn call_internal_method_inserts_the_base_argument() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let error = unsafe {
+            call_internal_method(
+                b"pow",
+                &[TypvalT {
+                    value: TypvalValue::Float(3.0),
+                    ..Default::default()
+                }],
+                &mut rettv,
+                &TypvalT {
+                    value: TypvalValue::Float(2.0),
+                    ..Default::default()
+                },
+            )
+        };
+
+        assert_eq!(error, FnameTransError::None);
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn call_internal_method_rejects_unknown_and_non_method_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                call_internal_method(
+                    b"NeroMissingMethod",
+                    &[],
+                    &mut rettv,
+                    &num(1),
+                )
+            },
+            FnameTransError::Unknown
+        );
+        assert_eq!(
+            unsafe {
+                call_internal_method(
+                    b"hostname",
+                    &[],
+                    &mut rettv,
+                    &num(1),
+                )
+            },
+            FnameTransError::NotMethod
+        );
+    }
+
+    #[test]
+    fn call_internal_method_enforces_arity_with_the_base_included() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                call_internal_method(
+                    b"pow",
+                    &[],
+                    &mut rettv,
+                    &num(2),
+                )
+            },
+            FnameTransError::TooFew
+        );
+        assert_eq!(
+            unsafe {
+                call_internal_method(
+                    b"pow",
+                    &[num(2), num(3)],
+                    &mut rettv,
+                    &num(4),
+                )
+            },
+            FnameTransError::TooMany
+        );
     }
 
     // --- f_dictwatcheradd / f_dictwatcherdel ---
