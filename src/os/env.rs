@@ -1790,6 +1790,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
     fn os_getenvname_at_index_enumerates_environment_names() {
+        let _env_lock = homedir_test_lock();
         let mut names = Vec::new();
         let mut reached_end = false;
         for index in 0..10_000 {
@@ -1808,6 +1809,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
     fn get_env_name_copies_into_expand_scratch_space() {
+        let _env_lock = homedir_test_lock();
         let expected = os_getenvname_at_index(0).expect("environment");
         let mut xp = crate::cmdexpand_defs::ExpandT::default();
         let copied = get_env_name(&mut xp, 0).unwrap().to_vec();
@@ -1820,6 +1822,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot enumerate the host environment")]
     fn get_env_name_returns_none_past_the_environment() {
+        let _env_lock = homedir_test_lock();
         let mut xp = crate::cmdexpand_defs::ExpandT::default();
         assert_eq!(get_env_name(&mut xp, i32::MAX), None);
     }

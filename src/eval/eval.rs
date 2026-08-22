@@ -6615,8 +6615,8 @@ pub unsafe fn prompt_trim_scrollback(
 
 /// Submit the current prompt-buffer input (`prompt_invoke_callback`).
 ///
-/// The no-callback path is complete. A configured callback still needs
-/// `callback_call`/the full `funcexe_T` dispatch path.
+/// None and named Funcref callbacks are complete; Partial/Lua callbacks
+/// inherit [`callback_call`]'s documented boundaries.
 ///
 /// # Safety
 /// `GLOBALS.curbuf`/`curwin` and all state required by
@@ -6647,16 +6647,20 @@ pub unsafe fn prompt_invoke_callback() {
     }
 
     // SAFETY: forwarded from this function's own safety doc.
-    if !matches!(
-        unsafe { &(*curbuf).b_prompt_callback },
-        crate::eval::typval_defs::Callback::None
-    ) {
-        let _ = user_input;
-        unimplemented!(
-            "prompt_invoke_callback: configured callbacks need callback_call"
-        );
+    let callback = unsafe { (*curbuf).b_prompt_callback.clone() };
+    if !matches!(callback, crate::eval::typval_defs::Callback::None) {
+        let argv = [TypvalT {
+            value: TypvalValue::String(Some(user_input)),
+            ..TypvalT::default()
+        }];
+        let mut rettv = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe { callback_call(&callback, &argv, &mut rettv) };
+        // SAFETY: the callback result is owned by this function.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    } else {
+        drop(user_input);
     }
-    drop(user_input);
 
     // Clear undo history on submit.
     crate::undo::u_clearallandblockfree(unsafe { &mut *curbuf });
@@ -6672,8 +6676,9 @@ pub unsafe fn prompt_invoke_callback() {
 /// Invoke the current prompt buffer's interrupt callback
 /// (`invoke_prompt_interrupt`).
 ///
-/// Returns false when no callback is configured. Actual callback
-/// execution still needs `callback_call`/the full `funcexe_T` path.
+/// Returns false when no callback is configured or invocation fails.
+/// Partial/Lua callbacks inherit [`callback_call`]'s documented
+/// boundaries.
 ///
 /// # Safety
 /// `GLOBALS.curbuf` must point to a live buffer. Callers must
@@ -6684,19 +6689,20 @@ pub unsafe fn invoke_prompt_interrupt() -> bool {
     let curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
     debug_assert!(!curbuf.is_null());
     // SAFETY: forwarded from this function's own safety doc.
-    if matches!(
-        unsafe { &(*curbuf).b_prompt_interrupt },
-        crate::eval::typval_defs::Callback::None
-    ) {
+    let callback = unsafe { (*curbuf).b_prompt_interrupt.clone() };
+    if matches!(callback, crate::eval::typval_defs::Callback::None) {
         return false;
     }
 
     // Don't skip commands while running the interrupt callback.
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::globals::GLOBALS.get_mut().got_int = false };
-    unimplemented!(
-        "invoke_prompt_interrupt: configured callbacks need callback_call"
-    );
+    let mut rettv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe { callback_call(&callback, &[], &mut rettv) };
+    // SAFETY: the callback result is owned by this function.
+    unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    result
 }
 
 /// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
@@ -14393,7 +14399,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_invoke_callback_without_callback_starts_the_next_prompt() {
+    fn prompt_invoke_callback_starts_next_prompts_with_and_without_funcref() {
         let _lock = crate::globals::global_state_test_lock();
         let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
         let old_curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
@@ -14446,6 +14452,18 @@ mod tests {
         assert_eq!(unsafe { (*buf_ptr).b_prompt_start.mark.lnum }, 2);
         assert!(unsafe { (*buf_ptr).b_prompt_append_new_line });
 
+        unsafe {
+            (*buf_ptr).b_prompt_callback =
+                crate::eval::typval_defs::Callback::Funcref(
+                    b"len".to_vec(),
+                );
+            (*buf_ptr).b_prompt_start.mark.col = 0;
+            prompt_invoke_callback();
+        }
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 3);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 3);
+        assert_eq!(unsafe { (*buf_ptr).b_prompt_start.mark.lnum }, 3);
+
         crate::undo::u_clearall(unsafe { &mut *buf_ptr });
         unsafe {
             crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
@@ -14483,13 +14501,13 @@ mod tests {
     }
 
     #[test]
-    fn invoke_prompt_interrupt_clears_interrupt_before_callback_boundary() {
+    fn invoke_prompt_interrupt_calls_a_funcref_and_clears_interrupt() {
         let _lock = crate::globals::global_state_test_lock();
         let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
         let old_got_int = unsafe { crate::globals::GLOBALS.get_mut().got_int };
         let mut buf = crate::buffer_defs::BufT {
             b_prompt_interrupt: crate::eval::typval_defs::Callback::Funcref(
-                b"Interrupt".to_vec(),
+                b"getpid".to_vec(),
             ),
             ..Default::default()
         };
@@ -14499,10 +14517,7 @@ mod tests {
             crate::globals::GLOBALS.get_mut().got_int = true;
         }
 
-        let result = std::panic::catch_unwind(|| unsafe {
-            invoke_prompt_interrupt()
-        });
-        assert!(result.is_err());
+        assert!(unsafe { invoke_prompt_interrupt() });
         assert!(!unsafe { crate::globals::GLOBALS.get_mut().got_int });
 
         unsafe {
