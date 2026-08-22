@@ -522,7 +522,13 @@ pub struct FunccallT {
     /// Top nesting level of executed function (`fc_level`).
     pub fc_level: i32,
     /// Functions to be called on return (`fc_defer`).
-    pub fc_defer: crate::garray_defs::GarrayT,
+    ///
+    /// A zero grow size is the original zero-initialized
+    /// `ga_itemsize == 0` sentinel; the first `add_defer` changes it to
+    /// 10, and `ga_clear` deliberately preserves that initialized
+    /// state.
+    pub fc_defer:
+        crate::garray_defs::TypedGarrayT<crate::eval::userfunc::DeferT>,
     /// Time spent in a child (`fc_prof_child`).
     pub fc_prof_child: crate::types_defs::ProftimeT,
     /// Calling function or null; or next funccal in the list pointed
@@ -604,7 +610,7 @@ impl Default for FunccallT {
             fc_breakpoint: 0,
             fc_dbg_tick: 0,
             fc_level: 0,
-            fc_defer: crate::garray_defs::GarrayT::default(),
+            fc_defer: crate::garray_defs::TypedGarrayT::new(0),
             fc_prof_child: 0,
             fc_caller: std::ptr::null_mut(),
             fc_refcount: 0,
@@ -1094,7 +1100,7 @@ mod tests {
         assert!(fc.fc_rettv.is_null());
         assert_eq!(fc.fc_breakpoint, 0);
         assert_eq!(fc.fc_level, 0);
-        assert_eq!(fc.fc_defer.ga_len, 0);
+        assert_eq!(fc.fc_defer.ga_len(), 0);
         assert_eq!(fc.fc_prof_child, 0);
         assert!(fc.fc_caller.is_null());
         assert_eq!(fc.fc_refcount, 0);

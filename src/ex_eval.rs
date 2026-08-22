@@ -142,6 +142,32 @@ pub unsafe fn exception_state_save(estate: &mut crate::ex_eval_defs::ExceptionSt
     estate.estate_did_emsg = g.did_emsg;
 }
 
+/// Restore the current exception state from `estate`
+/// (`exception_state_restore`).
+///
+/// Handling a new outstanding exception before restoration remains at
+/// the untranslated `handle_did_throw` boundary. The ordinary path
+/// restores every saved field exactly.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`; access must be serialized.
+pub unsafe fn exception_state_restore(
+    estate: &crate::ex_eval_defs::ExceptionStateT,
+) {
+    if unsafe { crate::globals::GLOBALS.get_mut() }.did_throw {
+        unimplemented!(
+            "exception_state_restore: outstanding exceptions need \
+             handle_did_throw"
+        );
+    }
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.current_exception = estate.estate_current_exception;
+    g.did_throw = estate.estate_did_throw;
+    g.need_rethrow = estate.estate_need_rethrow;
+    g.trylevel = estate.estate_trylevel;
+    g.did_emsg = estate.estate_did_emsg;
+}
+
 /// Clears the current exception state (`exception_state_clear`).
 ///
 /// Note this only drops the state; it does not discard the exception
@@ -417,10 +443,25 @@ mod tests {
             exception_state_clear();
 
             assert!(GLOBALS.get_mut().current_exception.is_null());
+            exception_state_restore(&estate);
+            assert_eq!(GLOBALS.get_mut().current_exception, marker);
+            assert_eq!(GLOBALS.get_mut().trylevel, 5);
         }
 
         assert_eq!(estate.estate_current_exception, marker);
         assert_eq!(estate.estate_trylevel, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "outstanding exceptions")]
+    fn exception_state_restore_stops_at_handle_did_throw_boundary() {
+        let _lock = global_state_test_lock();
+        let _g = ExceptionStateGuard::save();
+        let estate = crate::ex_eval_defs::ExceptionStateT::default();
+        unsafe {
+            GLOBALS.get_mut().did_throw = true;
+            exception_state_restore(&estate);
+        }
     }
 
     // --- cause_abort / update_force_abort ---

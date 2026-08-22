@@ -157,14 +157,14 @@
 //! layout than the real C `funccall_T` - a heuristic memory-pressure
 //! trip point, not a correctness-affecting value.
 //!
-//! Also translated: `can_add_defer` (whether currently inside a
-//! function call - layered directly on the already-real
-//! `get_current_funccal`). `add_defer`/`handle_defer_one`/
-//! `invoke_all_defer` (`:defer`'s own storage/invocation) are NOT
-//! translated - they need a new `DeferT` struct plus a change to
-//! `FunccallT.fc_defer`'s current bare `GarrayT` type, and ultimately
-//! the same `call_func` dispatch machinery most of this file's
-//! remaining functions need.
+//! Also translated: `can_add_defer`/`add_defer`/
+//! `handle_defer_one`/`invoke_all_defer`. `fc_defer` is now a typed
+//! growarray of owned [`DeferT`] values, arguments are consumed and
+//! released exactly once, calls run last-in-first-out across active
+//! and saved call chains, and exception state is saved/cleared/
+//! restored around each dispatch. A new outstanding exception still
+//! stops at `handle_did_throw`, which remains part of the exception
+//! engine.
 //!
 //! Also translated: `register_closure` - registers a `ufunc_T` (a
 //! lambda/closure) as scoped to the current funccall, unreffing
@@ -261,6 +261,31 @@ use crate::hashtab_defs::{HashitemT, HashtabT};
 use crate::vim_defs::{FAIL, OK};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+/// One deferred function call (`defer_T`).
+///
+/// Unlike the original teardown path, dropping a still-pending entry
+/// releases its owned arguments instead of leaking its raw garray.
+#[derive(Debug, Default)]
+pub struct DeferT {
+    /// Owned function name (`dr_name`); `None` while it is being
+    /// invoked.
+    pub dr_name: Option<Vec<u8>>,
+    /// Owned arguments consumed from the scheduling caller
+    /// (`dr_argvars` plus `dr_argcount`).
+    pub dr_argvars: Vec<TypvalT>,
+}
+
+impl Drop for DeferT {
+    fn drop(&mut self) {
+        for value in self.dr_argvars.iter_mut().rev() {
+            // SAFETY: add_defer transfers one owned value into every
+            // slot; each is released exactly once here.
+            unsafe { crate::eval::typval::tv_clear_simple(value) };
+            *value = TypvalT::default();
+        }
+    }
+}
 
 /// The function hash table (`func_hashtab`) plus this crate's own side
 /// index (`index`) - mirroring `DictT`'s `dv_hashtab`/`dv_index` pair
@@ -2439,16 +2464,162 @@ pub unsafe fn free_all_functions() {
 ///
 /// The original's `semsg(_(e_str_not_inside_function), "defer")` on
 /// `false` is omitted (message display, not tractable yet) - the
-/// boolean result itself is kept exactly. `add_defer`/
-/// `handle_defer_one`/`invoke_all_defer` (`:defer`'s own storage and
-/// invocation) are NOT translated here - they need a new `DeferT`
-/// struct plus a change to `FunccallT.fc_defer`'s current bare
-/// `GarrayT` type, and ultimately the same function-call dispatch
-/// machinery (`call_func`) most of this file's remaining functions
-/// need, so are left as part of that larger, separate undertaking.
+/// boolean result itself is kept exactly.
 #[must_use]
 pub fn can_add_defer() -> bool {
     !get_current_funccal().is_null()
+}
+
+/// Add a deferred call for `name`, consuming `argvars` (`add_defer`).
+///
+/// # Safety
+/// A current Funccall must exist. Every pointer-bearing argument must
+/// be a live owned value that can be transferred into the deferred
+/// call.
+pub unsafe fn add_defer(name: &[u8], argvars: &mut [TypvalT]) {
+    let current = get_current_funccal();
+    debug_assert!(!current.is_null());
+    if current.is_null() {
+        return;
+    }
+    // SAFETY: non-null current Funccall is live by contract.
+    let deferred = unsafe { &mut (*current).fc_defer };
+    if deferred.ga_growsize == 0 {
+        deferred.ga_growsize = 10;
+    }
+    let mut values = Vec::with_capacity(argvars.len());
+    for value in argvars {
+        values.push(std::mem::take(value));
+    }
+    deferred.items.push(DeferT {
+        dr_name: Some(name.to_vec()),
+        dr_argvars: values,
+    });
+}
+
+struct DeferredExceptionGuard {
+    saved: crate::ex_eval_defs::ExceptionStateT,
+}
+
+impl DeferredExceptionGuard {
+    /// Save and clear global exception state.
+    ///
+    /// # Safety
+    /// Callers must serialize all exception-state global access until
+    /// this guard is dropped.
+    unsafe fn new() -> Self {
+        let mut saved = crate::ex_eval_defs::ExceptionStateT::default();
+        unsafe {
+            crate::ex_eval::exception_state_save(&mut saved);
+            crate::ex_eval::exception_state_clear();
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for DeferredExceptionGuard {
+    fn drop(&mut self) {
+        // Avoid a second panic while unwinding through an untranslated
+        // call boundary. On the ordinary path, preserve the real
+        // handle_did_throw boundary in exception_state_restore.
+        if std::thread::panicking()
+            && unsafe { crate::globals::GLOBALS.get_mut() }.did_throw
+        {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.current_exception = self.saved.estate_current_exception;
+            g.did_throw = self.saved.estate_did_throw;
+            g.need_rethrow = self.saved.estate_need_rethrow;
+            g.trylevel = self.saved.estate_trylevel;
+            g.did_emsg = self.saved.estate_did_emsg;
+        } else {
+            // SAFETY: construction serialized global exception state.
+            unsafe {
+                crate::ex_eval::exception_state_restore(&self.saved)
+            };
+        }
+    }
+}
+
+/// Invoke one Funccall's deferred calls in reverse order
+/// (`handle_defer_one`).
+///
+/// # Safety
+/// `funccal` must be a valid, non-null live Funccall. Its deferred
+/// arguments and every callback referent must remain valid.
+unsafe fn handle_defer_one(funccal: *mut FunccallT) {
+    // Snapshot the original count, but re-derive the array on every
+    // iteration: a deferred call may recursively clear or grow it.
+    let mut idx = unsafe { (*funccal).fc_defer.items.len() };
+    while idx > 0 {
+        idx -= 1;
+        let mut call = {
+            // SAFETY: non-null Funccall is live by contract. This
+            // borrow ends before callback dispatch.
+            let deferred = unsafe { &mut (*funccal).fc_defer };
+            let Some(slot) = deferred.items.get_mut(idx) else {
+                continue;
+            };
+            std::mem::take(slot)
+        };
+        let Some(name) = call.dr_name.take() else {
+            continue;
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let exception = unsafe { DeferredExceptionGuard::new() };
+        let mut rettv = TypvalT::default();
+        let mut funcexe = FuncexeT {
+            fe_evaluate: true,
+            ..Default::default()
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe {
+            call_func_with_state(
+                &name,
+                &mut rettv,
+                &call.dr_argvars,
+                &mut funcexe,
+            )
+        };
+        drop(exception);
+        // SAFETY: locally-owned return value.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+    // SAFETY: re-derived after all callback dispatch.
+    unsafe { (*funccal).fc_defer.ga_clear() };
+}
+
+/// Invoke all deferred calls in active and saved Funccall chains
+/// (`invoke_all_defer`).
+///
+/// # Safety
+/// Every Funccall reachable from the current call and saved call stack
+/// must remain live and satisfy [`handle_defer_one`]'s contract.
+pub unsafe fn invoke_all_defer() {
+    let mut fc = get_current_funccal();
+    while !fc.is_null() {
+        // Capture the next link before dispatch: unlike C's for-loop
+        // increment, this remains valid if a callback mutates the
+        // current call.
+        let next = unsafe { (*fc).fc_caller };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { handle_defer_one(fc) };
+        fc = next;
+    }
+
+    let mut entry = unsafe { *FUNCCAL_STACK.get_mut() };
+    while !entry.is_null() {
+        // SAFETY: saved stack entry is live by contract.
+        let mut fc = unsafe { (*entry).top_funccal };
+        while !fc.is_null() {
+            // Same mutation-safe link capture as the active chain.
+            let next = unsafe { (*fc).fc_caller };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { handle_defer_one(fc) };
+            fc = next;
+        }
+        // SAFETY: saved stack entry is live by contract.
+        entry = unsafe { (*entry).next };
+    }
 }
 
 /// Free `fc` (`free_funccal`).
@@ -3670,6 +3841,53 @@ mod tests {
     impl Drop for FuncRegistryReset {
         fn drop(&mut self) {
             func_init();
+        }
+    }
+
+    struct TestFunccalState {
+        current: *mut FunccallT,
+        stack: *mut FuncCalEntryT,
+    }
+
+    impl TestFunccalState {
+        fn save() -> Self {
+            Self {
+                current: get_current_funccal(),
+                stack: unsafe { *FUNCCAL_STACK.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for TestFunccalState {
+        fn drop(&mut self) {
+            set_current_funccal(self.current);
+            unsafe { *FUNCCAL_STACK.get_mut() = self.stack };
+        }
+    }
+
+    struct TestExceptionState(
+        crate::ex_eval_defs::ExceptionStateT,
+    );
+
+    impl TestExceptionState {
+        unsafe fn save() -> Self {
+            let mut state =
+                crate::ex_eval_defs::ExceptionStateT::default();
+            unsafe {
+                crate::ex_eval::exception_state_save(&mut state)
+            };
+            Self(state)
+        }
+    }
+
+    impl Drop for TestExceptionState {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.current_exception = self.0.estate_current_exception;
+            g.did_throw = self.0.estate_did_throw;
+            g.need_rethrow = self.0.estate_need_rethrow;
+            g.trylevel = self.0.estate_trylevel;
+            g.did_emsg = self.0.estate_did_emsg;
         }
     }
 
@@ -7632,6 +7850,167 @@ mod tests {
         set_current_funccal(fc.as_mut() as *mut FunccallT);
         assert!(can_add_defer());
         set_current_funccal(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn add_defer_consumes_owned_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        {
+            let mut fc = Box::new(FunccallT::default());
+            let fc_ptr = std::ptr::addr_of_mut!(*fc);
+            let _state = TestFunccalState::save();
+            set_current_funccal(fc_ptr);
+            let list = crate::eval::typval::tv_list_alloc(0);
+            unsafe { (*list).lv_refcount = 1 };
+            let mut args = [
+                TypvalT {
+                    value: TypvalValue::List(list),
+                    ..Default::default()
+                },
+                TypvalT {
+                    value: TypvalValue::String(Some(b"text".to_vec())),
+                    ..Default::default()
+                },
+            ];
+
+            unsafe { add_defer(b"len", &mut args) };
+
+            assert!(args
+                .iter()
+                .all(|value| value.value == TypvalValue::Unknown));
+            assert_eq!(fc.fc_defer.ga_growsize, 10);
+            assert_eq!(fc.fc_defer.ga_len(), 1);
+            assert_eq!(
+                fc.fc_defer.items[0].dr_name.as_deref(),
+                Some(&b"len"[..])
+            );
+        }
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn handle_defer_one_restores_exception_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = std::ptr::addr_of_mut!(*fc);
+        let _state = TestFunccalState::save();
+        let mut marker_value =
+            crate::ex_eval_defs::ExceptT::default();
+        let marker = std::ptr::from_mut(&mut marker_value);
+        let _exception = unsafe { TestExceptionState::save() };
+        set_current_funccal(fc_ptr);
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*list).lv_refcount = 1 };
+        let mut args = [TypvalT {
+            value: TypvalValue::List(list),
+            ..Default::default()
+        }];
+        unsafe { add_defer(b"len", &mut args) };
+        let skipped = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*skipped).lv_refcount = 1 };
+        fc.fc_defer.items.push(DeferT {
+            dr_name: None,
+            dr_argvars: vec![TypvalT {
+                value: TypvalValue::List(skipped),
+                ..Default::default()
+            }],
+        });
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            g.current_exception = marker;
+            g.did_throw = false;
+            g.need_rethrow = true;
+            g.trylevel = 4;
+            g.did_emsg = 3;
+            handle_defer_one(fc_ptr);
+        }
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.current_exception, marker);
+        assert!(!g.did_throw);
+        assert!(g.need_rethrow);
+        assert_eq!(g.trylevel, 4);
+        assert_eq!(g.did_emsg, 3);
+        assert!(fc.fc_defer.is_empty());
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn invoke_all_defer_walks_current_then_saved_calls() {
+        struct RegisterGuard;
+
+        impl Drop for RegisterGuard {
+            fn drop(&mut self) {
+                unsafe { crate::register::clear_registers() };
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::register::clear_registers() };
+        let _register = RegisterGuard;
+        let mut outer = Box::new(FunccallT::default());
+        let outer_ptr = std::ptr::addr_of_mut!(*outer);
+        let mut inner = Box::new(FunccallT::default());
+        let inner_ptr = std::ptr::addr_of_mut!(*inner);
+        let mut entry = FuncCalEntryT::default();
+        let _state = TestFunccalState::save();
+        set_current_funccal(std::ptr::null_mut());
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+        set_current_funccal(outer_ptr);
+        let mut outer_first_args = [
+            TypvalT {
+                value: TypvalValue::String(Some(b"q".to_vec())),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::String(Some(b"first".to_vec())),
+                ..Default::default()
+            },
+        ];
+        unsafe { add_defer(b"setreg", &mut outer_first_args) };
+        let mut outer_args = [
+            TypvalT {
+                value: TypvalValue::String(Some(b"q".to_vec())),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::String(Some(b"outer".to_vec())),
+                ..Default::default()
+            },
+        ];
+        unsafe { add_defer(b"setreg", &mut outer_args) };
+
+        unsafe { save_funccal(std::ptr::from_mut(&mut entry)) };
+        set_current_funccal(inner_ptr);
+        let mut inner_args = [
+            TypvalT {
+                value: TypvalValue::String(Some(b"q".to_vec())),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::String(Some(b"inner".to_vec())),
+                ..Default::default()
+            },
+        ];
+        unsafe { add_defer(b"setreg", &mut inner_args) };
+
+        unsafe { invoke_all_defer() };
+
+        assert_eq!(
+            unsafe {
+                crate::register::get_reg_contents(
+                    i32::from(b'q'),
+                    crate::register_defs::greg_flags::EXPR_SRC,
+                )
+            },
+            Some(crate::register_defs::RegContents::Str(
+                b"first".to_vec(),
+            ))
+        );
+        assert!(inner.fc_defer.is_empty());
+        assert!(outer.fc_defer.is_empty());
     }
 
     #[test]
