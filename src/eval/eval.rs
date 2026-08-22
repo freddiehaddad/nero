@@ -204,9 +204,10 @@
 //! today (`find_func` finds nothing, since nothing parses `:function`
 //! yet) -
 //! genuinely correct, not a stub; only if `find_func` somehow ever
-//! returned a real, non-null `UfuncT` would `call_func` reach its own
-//! `unimplemented!()` (needs `call_user_func_check`, the whole
-//! Ex-command execution engine, still unattempted). A byte that
+//! returned a real, non-null `UfuncT` would `call_func` validate its
+//! deleted/range/arity/Dictionary state through
+//! `call_user_func_check`, then reach the still-untranslated
+//! `call_user_func` Ex-command execution engine. A byte that
 //! would make `get_name_len` itself report "no name here at all" (e.g.
 //! trailing garbage or an unbalanced closing delimiter) is instead a
 //! real, graceful `FAIL` - exactly matching `get_name_len`'s own
@@ -643,9 +644,11 @@ impl Drop for EmsgOffGuard {
 /// (`eval_to_number`).
 ///
 /// The original's `may_call_simple_func` fast path is a pure
-/// optimization for a no-argument user function; until
-/// `call_user_func_check` exists, both values of `use_simple_function`
-/// fall through to [`eval1`] with identical observable behavior.
+/// optimization for a no-argument user function. Its checker now
+/// exists, but valid user-function bodies still require the
+/// `call_user_func` Ex-command engine, so both values of
+/// `use_simple_function` continue through [`eval1`] with identical
+/// observable behavior.
 /// Like the original, evaluation accepts whatever prefix [`eval1`]
 /// recognizes without checking for trailing text.
 ///

@@ -974,6 +974,55 @@ pub fn check_user_func_argcount(fp: &UfuncT, argcount: i32) -> FnameTransError {
     }
 }
 
+/// Check and call a resolved user function (`call_user_func_check`).
+///
+/// Range reporting, arity validation, and Dictionary requirements are
+/// complete. Lua-backed functions remain at the Lua-host boundary, and
+/// a valid ordinary user-function body remains at the untranslated
+/// `call_user_func`/Ex-command execution boundary.
+///
+/// # Safety
+/// `fp` must point to a live function. Pointer-bearing arguments,
+/// `selfdict`, and every non-null pointer in `funcexe` must remain live.
+#[must_use]
+pub unsafe fn call_user_func_check(
+    fp: *mut UfuncT,
+    argvars: &[TypvalT],
+    rettv: &mut TypvalT,
+    funcexe: &mut FuncexeT,
+    selfdict: *mut DictT,
+) -> FnameTransError {
+    debug_assert!(!fp.is_null());
+    // SAFETY: non-null `fp` is live by contract.
+    let flags = unsafe { (*fp).uf_flags };
+    if flags & fc_flags::LUAREF != 0 {
+        unimplemented!(
+            "call_user_func_check: Lua-backed functions need the Lua host"
+        );
+    }
+    if flags & fc_flags::RANGE != 0
+        && !funcexe.fe_doesrange.is_null()
+    {
+        // SAFETY: non-null output pointer is valid by contract.
+        unsafe { *funcexe.fe_doesrange = true };
+    }
+    // SAFETY: non-null `fp` is live by contract.
+    let error =
+        check_user_func_argcount(unsafe { &*fp }, argvars.len() as i32);
+    if error != FnameTransError::Unknown {
+        return error;
+    }
+    if flags & fc_flags::DICT != 0 && selfdict.is_null() {
+        return FnameTransError::Dict;
+    }
+
+    let _ = (argvars, rettv, funcexe, selfdict);
+    unimplemented!(
+        "call_user_func_check: executing a valid user function needs \
+         call_user_func and the Ex-command engine"
+    );
+}
+
 /// Deref a function name if it's a variable holding a `Funcref`/
 /// `Partial` value (`deref_func_name`).
 ///
@@ -1377,10 +1426,11 @@ impl Drop for PartialCallArgs {
 /// `fe_selfdict` when `fe_selfdict` is null, or whenever the Partial's
 /// binding is explicit rather than automatic.
 ///
-/// Builtin dispatch is complete. Method-call bases still need
-/// `call_internal_method`, and executing an existing user function
-/// still needs `call_user_func_check`/the Ex-command execution engine.
-/// Lua functions remain at the Lua-host boundary.
+/// Builtin and method dispatch are complete. User-function deletion,
+/// range, arity, Dictionary, and base-argument checks are complete.
+/// `FuncUndefined` autocmd and script-autoload retries remain deferred;
+/// executing a valid body still needs `call_user_func`/the Ex-command
+/// engine. Lua functions remain at the Lua-host boundary.
 ///
 /// # Safety
 /// `funcexe`'s non-null pointers and every pointer-bearing argument
@@ -1471,11 +1521,36 @@ pub unsafe fn call_func_with_state(
             fp = find_func(rfname);
         }
         if !fp.is_null() {
-            let _ = selfdict;
-            unimplemented!(
-                "call_func_with_state: a real user-defined function needs \
-                 call_user_func_check, not yet translated"
-            );
+            // SAFETY: non-null `fp` was resolved from the registry or
+            // supplied by a live Partial.
+            if unsafe { (*fp).uf_flags } & fc_flags::DELETED != 0 {
+                return FnameTransError::Deleted;
+            }
+            if funcexe.fe_argv_func.is_some() {
+                unimplemented!(
+                    "call_func_with_state: deferred user-function \
+                     arguments need the user-function execution path"
+                );
+            }
+            let mut based = None;
+            if !funcexe.fe_basetv.is_null() {
+                let mut values = Vec::with_capacity(argvars.len() + 1);
+                // SAFETY: non-null base is live by contract.
+                values.push(unsafe { (&*funcexe.fe_basetv).clone() });
+                values.extend_from_slice(argvars);
+                based = Some(values);
+            }
+            let user_args = based.as_deref().unwrap_or(argvars);
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe {
+                call_user_func_check(
+                    fp,
+                    user_args,
+                    rettv,
+                    funcexe,
+                    selfdict,
+                )
+            };
         }
         return FnameTransError::Unknown;
     }
@@ -1650,8 +1725,9 @@ pub unsafe fn callback_call_retnr(
 /// (`call_simple_func`).
 ///
 /// Returns [`crate::vim_defs::NOTDONE`] when the function does not
-/// exist so the caller can fall back to the full parser. Executing a
-/// found, non-deleted function still needs `call_user_func_check`.
+/// exist so the caller can fall back to the full parser. Resolved
+/// functions are checked through [`call_user_func_check`]; a valid
+/// body still stops at its Ex-command execution boundary.
 ///
 /// # Safety
 /// A function returned by [`find_func`] must remain live for the call.
@@ -1679,9 +1755,25 @@ pub unsafe fn call_simple_func(
         return crate::vim_defs::FAIL;
     }
 
-    unimplemented!(
-        "call_simple_func: a found user function needs call_user_func_check"
-    );
+    let mut funcexe = FuncexeT {
+        fe_evaluate: true,
+        ..Default::default()
+    };
+    // SAFETY: non-null `fp` was found in the live function registry.
+    let error = unsafe {
+        call_user_func_check(
+            fp,
+            &[],
+            rettv,
+            &mut funcexe,
+            std::ptr::null_mut(),
+        )
+    };
+    if error == FnameTransError::None {
+        crate::vim_defs::OK
+    } else {
+        crate::vim_defs::FAIL
+    }
 }
 
 /// Call a function and put the result in `rettv` (`get_func_tv`).
@@ -3247,6 +3339,14 @@ pub unsafe fn func_ptr_unref(fp: *mut UfuncT) {
 mod tests {
     use super::*;
     use crate::vim_defs::FAIL;
+
+    struct FuncRegistryReset;
+
+    impl Drop for FuncRegistryReset {
+        fn drop(&mut self) {
+            func_init();
+        }
+    }
 
     #[test]
     fn funcexe_default_matches_funcexe_init() {
@@ -5461,6 +5561,125 @@ mod tests {
         assert_eq!(check_user_func_argcount(&fp, 10), FnameTransError::Unknown);
     }
 
+    #[test]
+    fn call_user_func_check_sets_range_before_reporting_arity() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut function = UfuncT {
+            uf_flags: fc_flags::RANGE,
+            uf_args: crate::garray_defs::GarrayT {
+                ga_len: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut doesrange = false;
+        let mut state = FuncexeT {
+            fe_doesrange: std::ptr::from_mut(&mut doesrange),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                call_user_func_check(
+                    std::ptr::from_mut(&mut function),
+                    &[TypvalT {
+                        value: TypvalValue::Number(1),
+                        ..Default::default()
+                    }],
+                    &mut rettv,
+                    &mut state,
+                    std::ptr::null_mut(),
+                )
+            },
+            FnameTransError::TooFew
+        );
+        assert!(doesrange);
+    }
+
+    #[test]
+    fn call_user_func_check_reports_too_many_and_missing_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fixed = UfuncT {
+            uf_args: crate::garray_defs::GarrayT {
+                ga_len: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut state = FuncexeT::default();
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                call_user_func_check(
+                    std::ptr::from_mut(&mut fixed),
+                    &[
+                        TypvalT::default(),
+                        TypvalT::default(),
+                    ],
+                    &mut rettv,
+                    &mut state,
+                    std::ptr::null_mut(),
+                )
+            },
+            FnameTransError::TooMany
+        );
+
+        let mut dict_function = UfuncT {
+            uf_flags: fc_flags::DICT,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                call_user_func_check(
+                    std::ptr::from_mut(&mut dict_function),
+                    &[],
+                    &mut rettv,
+                    &mut state,
+                    std::ptr::null_mut(),
+                )
+            },
+            FnameTransError::Dict
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "executing a valid user function")]
+    fn call_user_func_check_stops_at_the_body_execution_boundary() {
+        let mut function = UfuncT::default();
+        let mut state = FuncexeT::default();
+        let mut rettv = TypvalT::default();
+        unsafe {
+            let _ = call_user_func_check(
+                std::ptr::from_mut(&mut function),
+                &[],
+                &mut rettv,
+                &mut state,
+                std::ptr::null_mut(),
+            );
+        };
+    }
+
+    #[test]
+    #[should_panic(expected = "Lua-backed functions need the Lua host")]
+    fn call_user_func_check_stops_at_the_lua_boundary() {
+        let mut function = UfuncT {
+            uf_flags: fc_flags::LUAREF,
+            ..Default::default()
+        };
+        let mut state = FuncexeT::default();
+        let mut rettv = TypvalT::default();
+        unsafe {
+            let _ = call_user_func_check(
+                std::ptr::from_mut(&mut function),
+                &[],
+                &mut rettv,
+                &mut state,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
     // ---- deref_func_name / get_func_arguments / call_func / get_func_tv --
 
     #[test]
@@ -5650,6 +5869,30 @@ mod tests {
     }
 
     #[test]
+    fn call_simple_func_reports_user_function_arity_before_execution() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut function = UfuncT {
+            uf_name: b"SimpleRequired\0".to_vec(),
+            uf_args: crate::garray_defs::GarrayT {
+                ga_len: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::from_mut(&mut function);
+        unsafe { func_hashtab_add(function_ptr) };
+        let _registry = FuncRegistryReset;
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe { call_simple_func(b"SimpleRequired", &mut rettv) },
+            FAIL
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
     fn call_func_dispatches_to_a_builtin() {
         let mut rettv = TypvalT::default();
         let args = [TypvalT { value: TypvalValue::String(Some(b"hello".to_vec())), ..Default::default() }];
@@ -5677,6 +5920,112 @@ mod tests {
         assert_eq!(error, FnameTransError::Unknown);
 
         func_init();
+    }
+
+    #[test]
+    fn call_func_reports_user_function_checks_before_execution() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut deleted = UfuncT {
+            uf_name: b"DeletedCall\0".to_vec(),
+            uf_flags: fc_flags::DELETED,
+            ..Default::default()
+        };
+        let deleted_ptr = std::ptr::from_mut(&mut deleted);
+        let mut required = UfuncT {
+            uf_name: b"RequiredCall\0".to_vec(),
+            uf_args: crate::garray_defs::GarrayT {
+                ga_len: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let required_ptr = std::ptr::from_mut(&mut required);
+        let mut dict_method = UfuncT {
+            uf_name: b"DictMethodCall\0".to_vec(),
+            uf_flags: fc_flags::DICT,
+            uf_args: crate::garray_defs::GarrayT {
+                ga_len: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dict_method_ptr = std::ptr::from_mut(&mut dict_method);
+        unsafe {
+            func_hashtab_add(deleted_ptr);
+            func_hashtab_add(required_ptr);
+            func_hashtab_add(dict_method_ptr);
+        }
+        let _registry = FuncRegistryReset;
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe { call_func(b"DeletedCall", &mut rettv, &[], true) },
+            FnameTransError::Deleted
+        );
+        assert_eq!(
+            unsafe { call_func(b"RequiredCall", &mut rettv, &[], true) },
+            FnameTransError::TooFew
+        );
+
+        let mut base = TypvalT {
+            value: TypvalValue::Number(1),
+            ..Default::default()
+        };
+        let mut state = FuncexeT {
+            fe_evaluate: true,
+            fe_basetv: std::ptr::from_mut(&mut base),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                call_func_with_state(
+                    b"DictMethodCall",
+                    &mut rettv,
+                    &[],
+                    &mut state,
+                )
+            },
+            FnameTransError::Dict
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "deferred user-function arguments")]
+    fn call_func_stops_at_the_deferred_argument_boundary() {
+        unsafe fn fill_args(
+            current_argcount: i32,
+            _argv: *mut TypvalT,
+            _partial_argcount: i32,
+            _called_func: *mut UfuncT,
+        ) -> i32 {
+            current_argcount
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut function = UfuncT {
+            uf_name: b"DeferredArgsCall\0".to_vec(),
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::from_mut(&mut function);
+        unsafe { func_hashtab_add(function_ptr) };
+        let _registry = FuncRegistryReset;
+        let mut state = FuncexeT {
+            fe_evaluate: true,
+            fe_argv_func: Some(fill_args),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            let _ = call_func_with_state(
+                b"DeferredArgsCall",
+                &mut rettv,
+                &[],
+                &mut state,
+            );
+        }
     }
 
     #[test]
