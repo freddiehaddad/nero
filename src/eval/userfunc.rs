@@ -1058,66 +1058,166 @@ pub unsafe fn get_func_arguments(
     (OK, pos, argvars)
 }
 
-/// Call a function and put the result in `rettv` (`call_func`).
+struct PartialCallArgs {
+    values: Vec<TypvalT>,
+    /// Entries before this index are owned `tv_copy` results and must
+    /// be cleared. Entries at/after it are borrowed aliases of the
+    /// caller's explicit arguments and must never be cleared here.
+    copied: usize,
+}
+
+impl Drop for PartialCallArgs {
+    fn drop(&mut self) {
+        for value in self.values[..self.copied].iter().rev() {
+            // SAFETY: these entries were created by tv_copy below and
+            // are released exactly once here.
+            unsafe { crate::eval::typval::tv_clear_simple(value) };
+        }
+    }
+}
+
+/// Call a function with full [`FuncexeT`] state (`call_func`).
 ///
-/// Only the path reachable from [`crate::eval::eval::eval_func`]'s own
-/// real call site is modeled: no `partial` (a bound closure/method
-/// value - only method-call syntax, `handle_subscript`'s own
-/// "->name()" case, would ever pass one; not yet translated), no
-/// `basetv` (ditto). Given this, a REAL user-defined function is
-/// unreachable in practice: [`find_func`] only ever finds something if
-/// a function was previously defined, and nothing in this crate parses
-/// `:function`/defines one yet - so the "found a user function"
-/// branch `unimplemented!()`s if ever reached (kept for structural
-/// fidelity rather than silently ignored, documented as unreachable
-/// today), while the ACTUAL always-taken path for any user-function-
-/// shaped name (not found, and `apply_autocmds`/`script_autoload`
-/// can't find one either, since neither subsystem exists) correctly,
-/// faithfully resolves to "unknown function" - not a stub, but the
-/// genuinely correct answer given neither could ever locate one today.
+/// Partial-bound arguments are copied in front of explicit arguments,
+/// then released after the call, matching the original's `argv`/
+/// `argv_clear` temporary array. A Partial's Dictionary supersedes
+/// `fe_selfdict` when `fe_selfdict` is null, or whenever the Partial's
+/// binding is explicit rather than automatic.
 ///
-/// Lua functions (`is_luafunc`) are entirely out of scope - this crate
-/// has no Lua host integration (phase 13).
+/// Builtin dispatch is complete. Method-call bases still need
+/// `call_internal_method`, and executing an existing user function
+/// still needs `call_user_func_check`/the Ex-command execution engine.
+/// Lua functions remain at the Lua-host boundary.
 ///
 /// # Safety
-/// Forwarded from [`find_func`]/`crate::eval::funcs::call_internal_func`'s
-/// own safety docs.
+/// `funcexe`'s non-null pointers and every pointer-bearing argument
+/// must remain valid for the call. Forwarded from [`find_func`] and
+/// `crate::eval::funcs::call_internal_func`.
 #[must_use]
-pub unsafe fn call_func(funcname: &[u8], rettv: &mut TypvalT, argvars: &[TypvalT], evaluate: bool) -> FnameTransError {
+pub unsafe fn call_func_with_state(
+    funcname: &[u8],
+    rettv: &mut TypvalT,
+    argvars: &[TypvalT],
+    funcexe: &mut FuncexeT,
+) -> FnameTransError {
+    use crate::eval::typval_defs::MAX_FUNC_ARGS;
+
     rettv.value = TypvalValue::Unknown;
 
-    if !evaluate {
+    if !funcexe.fe_doesrange.is_null() {
+        // SAFETY: non-null output pointer is valid by contract.
+        unsafe { *funcexe.fe_doesrange = false };
+    }
+
+    let partial = funcexe.fe_partial;
+    // SAFETY: non-null Partial is live by contract.
+    let mut fp = if partial.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*partial).pt_func }
+    };
+    let name = if fp.is_null() {
+        let Ok(name) = fname_trans_sid(funcname) else {
+            return FnameTransError::Script;
+        };
+        name
+    } else {
+        funcname.to_vec()
+    };
+
+    let mut call_args = None;
+    if !partial.is_null() {
+        // SAFETY: non-null Partial is live by contract.
+        let bound = unsafe { &(*partial).pt_argv };
+        if bound.len() + argvars.len() > MAX_FUNC_ARGS {
+            return FnameTransError::TooMany;
+        }
+        if !bound.is_empty() {
+            let mut values = Vec::with_capacity(bound.len() + argvars.len());
+            for value in bound {
+                let mut copy = TypvalT::default();
+                // SAFETY: bound Partial arguments are live by contract.
+                unsafe { crate::eval::typval::tv_copy(value, &mut copy) };
+                values.push(copy);
+            }
+            values.extend_from_slice(argvars);
+            call_args = Some(PartialCallArgs {
+                values,
+                copied: bound.len(),
+            });
+        }
+    }
+    let argvars = call_args
+        .as_ref()
+        .map_or(argvars, |args| args.values.as_slice());
+
+    if !funcexe.fe_evaluate {
         return FnameTransError::None;
     }
 
-    let Ok(name) = fname_trans_sid(funcname) else {
-        return FnameTransError::Script;
-    };
-
     // Skip "g:" before a function name.
-    let is_global = name.first() == Some(&b'g') && name.get(1) == Some(&b':');
+    let is_global =
+        fp.is_null() && name.first() == Some(&b'g') && name.get(1) == Some(&b':');
     let rfname: &[u8] = if is_global { &name[2..] } else { &name[..] };
 
     rettv.value = TypvalValue::Number(0); // default rettv is number zero.
 
-    if !builtin_function(rfname) {
-        let fp = find_func(rfname);
+    let mut selfdict = funcexe.fe_selfdict;
+    if !partial.is_null() {
+        // SAFETY: non-null Partial is live by contract.
+        let partial_ref = unsafe { &*partial };
+        if !partial_ref.pt_dict.is_null()
+            && (selfdict.is_null() || !partial_ref.pt_auto)
+        {
+            selfdict = partial_ref.pt_dict;
+        }
+    }
+
+    if !fp.is_null() || !builtin_function(rfname) {
+        if fp.is_null() {
+            fp = find_func(rfname);
+        }
         if !fp.is_null() {
+            let _ = selfdict;
             unimplemented!(
-                "call_func: a real user-defined function needs call_user_func_check, not yet \
-                 translated"
+                "call_func_with_state: a real user-defined function needs \
+                 call_user_func_check, not yet translated"
             );
         }
-        // Matches the original's own FCERR_UNKNOWN: find_func found
-        // nothing, and apply_autocmds/script_autoload (not translated)
-        // couldn't have found one either, since neither subsystem
-        // exists to define one in the first place.
         return FnameTransError::Unknown;
+    }
+
+    if !funcexe.fe_basetv.is_null() {
+        unimplemented!(
+            "call_func_with_state: method-call bases need call_internal_method"
+        );
     }
 
     // Find the function name in the table, call its implementation.
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { crate::eval::funcs::call_internal_func(rfname, argvars, rettv) }
+    unsafe { crate::eval::funcs::call_internal_func(&name, argvars, rettv) }
+}
+
+/// Call a function without Partial/self/base state.
+///
+/// This preserves the previously-translated call sites while routing
+/// them through the full [`FuncexeT`] path.
+///
+/// # Safety
+/// Forwarded from [`call_func_with_state`].
+#[must_use]
+pub unsafe fn call_func(
+    funcname: &[u8],
+    rettv: &mut TypvalT,
+    argvars: &[TypvalT],
+    evaluate: bool,
+) -> FnameTransError {
+    let mut funcexe = FuncexeT {
+        fe_evaluate: evaluate,
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { call_func_with_state(funcname, rettv, argvars, &mut funcexe) }
 }
 
 /// Call a user function without arguments, partial, or Dictionary
@@ -4511,12 +4611,12 @@ mod tests {
     }
 
     #[test]
-    fn call_func_strips_a_leading_g_colon_before_builtin_dispatch() {
+    fn call_func_rejects_a_g_colon_prefixed_builtin_name() {
         let mut rettv = TypvalT::default();
         let args = [TypvalT { value: TypvalValue::String(Some(b"hi".to_vec())), ..Default::default() }];
         let error = unsafe { call_func(b"g:len", &mut rettv, &args, true) };
-        assert_eq!(error, FnameTransError::None);
-        assert_eq!(rettv.value, TypvalValue::Number(2));
+        assert_eq!(error, FnameTransError::Unknown);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 
     #[test]
@@ -4539,6 +4639,129 @@ mod tests {
         // rettv is reset to Unknown, not left at its old value nor
         // populated by an actual len() call - evaluate=false returns
         // before ever reaching the builtin dispatch.
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn call_func_with_state_clears_doesrange_without_evaluating() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut doesrange = true;
+        let mut state = FuncexeT {
+            fe_doesrange: std::ptr::from_mut(&mut doesrange),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT {
+            value: TypvalValue::Number(99),
+            ..Default::default()
+        };
+
+        let error = unsafe {
+            call_func_with_state(b"len", &mut rettv, &[], &mut state)
+        };
+
+        assert_eq!(error, FnameTransError::None);
+        assert!(!doesrange);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn call_func_with_state_prepends_partial_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut partial = PartialT {
+            pt_name: Some(b"pow".to_vec()),
+            pt_argv: vec![TypvalT {
+                value: TypvalValue::Float(2.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let partial_ptr = std::ptr::from_mut(&mut partial);
+        let mut state = FuncexeT {
+            fe_evaluate: true,
+            fe_partial: partial_ptr,
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        let error = unsafe {
+            call_func_with_state(
+                b"pow",
+                &mut rettv,
+                &[TypvalT {
+                    value: TypvalValue::Float(3.0),
+                    ..Default::default()
+                }],
+                &mut state,
+            )
+        };
+
+        assert_eq!(error, FnameTransError::None);
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn call_func_with_state_releases_copied_partial_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*list).lv_refcount = 1 };
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"len".to_vec()),
+            pt_argv: vec![TypvalT {
+                value: TypvalValue::List(list),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        let mut state = FuncexeT {
+            fe_evaluate: true,
+            fe_partial: partial,
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        let error =
+            unsafe { call_func_with_state(b"len", &mut rettv, &[], &mut state) };
+
+        assert_eq!(error, FnameTransError::None);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(
+            unsafe { (*list).lv_refcount },
+            1,
+            "the temporary argument copy must be released after the call"
+        );
+        unsafe { crate::eval::typval::partial_unref(partial) };
+    }
+
+    #[test]
+    fn call_func_with_state_rejects_too_many_partial_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut partial = PartialT {
+            pt_name: Some(b"len".to_vec()),
+            pt_argv: vec![
+                TypvalT {
+                    value: TypvalValue::Number(1),
+                    ..Default::default()
+                };
+                crate::eval::typval_defs::MAX_FUNC_ARGS + 1
+            ],
+            ..Default::default()
+        };
+        let mut state = FuncexeT {
+            fe_evaluate: true,
+            fe_partial: std::ptr::from_mut(&mut partial),
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+
+        let error = unsafe {
+            call_func_with_state(b"len", &mut rettv, &[], &mut state)
+        };
+
+        assert_eq!(error, FnameTransError::TooMany);
         assert_eq!(rettv.value, TypvalValue::Unknown);
     }
 
