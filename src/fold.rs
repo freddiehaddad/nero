@@ -2068,6 +2068,125 @@ pub unsafe fn foldlevel_diff(flp: &mut FlineT) {
     flp.lvl = i32::from(infold);
 }
 
+struct FoldexprContextGuard {
+    saved_win: *mut WinT,
+    saved_keytyped: bool,
+}
+
+impl Drop for FoldexprContextGuard {
+    fn drop(&mut self) {
+        // SAFETY: construction's caller serialized access to these
+        // GLOBALS fields and guaranteed saved_win stays live.
+        unsafe {
+            crate::globals::GLOBALS.get_mut().KeyTyped =
+                self.saved_keytyped;
+            crate::globals::GLOBALS.get_mut().curwin = self.saved_win;
+            crate::globals::GLOBALS.get_mut().curbuf =
+                (*self.saved_win).w_buffer;
+        }
+    }
+}
+
+/// Fold level for the `"expr"` method (`foldlevelExpr`).
+///
+/// Interprets `'foldexpr'` results using Neovim's `a`/`s`/`>`/`<`/`=`
+/// prefix convention and maintains the current/next fold levels.
+///
+/// # Safety
+/// `flp.wp` and the saved `GLOBALS.curwin` must point to live windows
+/// with live buffers. Forwarded from
+/// [`crate::eval::eval::eval_foldexpr`] and
+/// [`crate::eval::vars::set_vim_var_nr`].
+pub unsafe fn foldlevel_expr(flp: &mut FlineT) {
+    let lnum = flp.lnum + flp.off;
+    // SAFETY: forwarded from this function's own safety doc.
+    let saved_win = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+    debug_assert!(!saved_win.is_null());
+    debug_assert!(!flp.wp.is_null());
+    // SAFETY: forwarded from this function's own safety doc.
+    let saved_keytyped =
+        unsafe { crate::globals::GLOBALS.get_mut().KeyTyped };
+    let context = FoldexprContextGuard {
+        saved_win,
+        saved_keytyped,
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::globals::GLOBALS.get_mut().curwin = flp.wp;
+        crate::globals::GLOBALS.get_mut().curbuf = (*flp.wp).w_buffer;
+        crate::eval::vars::set_vim_var_nr(
+            crate::eval::vars::VimVarIndex::Lnum,
+            i64::from(lnum),
+        );
+    }
+
+    flp.start = 0;
+    flp.had_end = flp.end;
+    flp.end = MAX_LEVEL + 1;
+    if lnum <= 1 {
+        flp.lvl = 0;
+    }
+
+    let mut c = i32::from(crate::ascii_defs::NUL);
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { crate::eval::eval::eval_foldexpr(flp.wp, &mut c) };
+    match u8::try_from(c).unwrap_or(crate::ascii_defs::NUL) {
+        b'a' => {
+            if flp.lvl >= 0 {
+                flp.lvl = flp.lvl.wrapping_add(n);
+                flp.lvl_next = flp.lvl;
+            }
+            flp.start = n;
+        }
+        b's' => {
+            if flp.lvl >= 0 {
+                flp.lvl_next = if n > flp.lvl {
+                    0
+                } else {
+                    flp.lvl.wrapping_sub(n)
+                };
+                flp.end = flp.lvl_next.wrapping_add(1);
+            }
+        }
+        b'>' => {
+            flp.lvl = n;
+            flp.lvl_next = n;
+            flp.start = 1;
+        }
+        b'<' => {
+            flp.lvl_next = flp.lvl.min(n.wrapping_sub(1));
+            flp.end = n;
+        }
+        b'=' => {
+            flp.lvl_next = flp.lvl;
+        }
+        _ => {
+            flp.lvl_next = if n < 0 { flp.lvl } else { n };
+            flp.lvl = n;
+        }
+    }
+
+    if flp.lvl < 0 {
+        if lnum <= 1 {
+            flp.lvl = 0;
+            flp.lvl_next = 0;
+        }
+        // SAFETY: this function set curbuf from flp.wp above.
+        if lnum
+            == unsafe {
+                (*crate::globals::GLOBALS.get_mut().curbuf)
+                    .b_ml
+                    .ml_line_count
+            }
+        {
+            flp.lvl_next = 0;
+        }
+    }
+
+    drop(context);
+}
+
 /// Fold level for the `"marker"` method (`foldlevelMarker`).
 ///
 /// Scans the line for `'foldmarker'`'s start and end markers. A bare
@@ -3179,7 +3298,7 @@ pub enum LevelGetter {
     Indent,
     /// [`foldlevel_marker`].
     Marker,
-    /// `foldlevelExpr`, not yet translated.
+    /// [`foldlevel_expr`].
     Expr,
     /// `foldlevelSyntax`, not yet translated.
     Syntax,
@@ -3201,9 +3320,8 @@ impl LevelGetter {
             LevelGetter::Marker => unsafe { foldlevel_marker(flp) },
             // SAFETY: forwarded from this function's own safety doc.
             LevelGetter::Diff => unsafe { foldlevel_diff(flp) },
-            LevelGetter::Expr => unimplemented!(
-                "fold::LevelGetter::Expr: foldlevelExpr needs the eval engine, not yet translated"
-            ),
+            // SAFETY: forwarded from this function's own safety doc.
+            LevelGetter::Expr => unsafe { foldlevel_expr(flp) },
             LevelGetter::Syntax => unimplemented!(
                 "fold::LevelGetter::Syntax: foldlevelSyntax needs syn_get_foldlevel, not yet \
                  translated"
@@ -5273,13 +5391,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldlevelExpr")]
-    fn level_getter_expr_is_unimplemented() {
-        let mut flp = FlineT::default();
-        unsafe { LevelGetter::Expr.get(&mut flp) };
-    }
-
-    #[test]
     #[should_panic(expected = "foldlevelSyntax")]
     fn level_getter_syntax_is_unimplemented() {
         let mut flp = FlineT::default();
@@ -6490,6 +6601,183 @@ mod tests {
         drop(win);
         unsafe { *FOLD_MARKERS.get_mut() = None };
         close_indent_level_fixture(buf);
+    }
+
+    fn run_foldlevel_expr(
+        expression: &[u8],
+        line_count: crate::pos_defs::LinenrT,
+        mut flp: FlineT,
+    ) -> FlineT {
+        let old_curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let old_keytyped =
+            unsafe { crate::globals::GLOBALS.get_mut().KeyTyped };
+        let old_lnum = unsafe {
+            crate::eval::vars::get_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Lnum,
+            )
+        };
+
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = line_count;
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fde: Some(expression.to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().curbuf = buf_ptr;
+            crate::globals::GLOBALS.get_mut().KeyTyped = true;
+        }
+        flp.wp = win_ptr;
+
+        unsafe { foldlevel_expr(&mut flp) };
+        assert!(unsafe { crate::globals::GLOBALS.get_mut().KeyTyped });
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().curwin }, win_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut().curbuf }, buf_ptr);
+
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(
+                crate::eval::vars::VimVarIndex::Lnum,
+                old_lnum,
+            );
+            crate::globals::GLOBALS.get_mut().curwin = old_curwin;
+            crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
+            crate::globals::GLOBALS.get_mut().KeyTyped = old_keytyped;
+        }
+        flp
+    }
+
+    #[test]
+    fn foldlevel_expr_sets_a_numeric_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        let flp = run_foldlevel_expr(
+            b"3",
+            10,
+            FlineT {
+                lnum: 2,
+                lvl: 1,
+                end: 7,
+                ..Default::default()
+            },
+        );
+        assert_eq!(flp.lvl, 3);
+        assert_eq!(flp.lvl_next, 3);
+        assert_eq!(flp.start, 0);
+        assert_eq!(flp.had_end, 7);
+        assert_eq!(flp.end, MAX_LEVEL + 1);
+    }
+
+    #[test]
+    fn foldlevel_expr_handles_add_and_subtract_markers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let added = run_foldlevel_expr(
+            b"'a2'",
+            10,
+            FlineT { lnum: 2, lvl: 3, ..Default::default() },
+        );
+        assert_eq!(added.lvl, 5);
+        assert_eq!(added.lvl_next, 5);
+        assert_eq!(added.start, 2);
+
+        let subtracted = run_foldlevel_expr(
+            b"'s4'",
+            10,
+            FlineT { lnum: 2, lvl: 3, ..Default::default() },
+        );
+        assert_eq!(subtracted.lvl, 3);
+        assert_eq!(subtracted.lvl_next, 0);
+        assert_eq!(subtracted.end, 1);
+    }
+
+    #[test]
+    fn foldlevel_expr_handles_explicit_start_and_end_markers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let started = run_foldlevel_expr(
+            b"'>2'",
+            10,
+            FlineT { lnum: 2, lvl: 0, ..Default::default() },
+        );
+        assert_eq!(started.lvl, 2);
+        assert_eq!(started.lvl_next, 2);
+        assert_eq!(started.start, 1);
+
+        let ended = run_foldlevel_expr(
+            b"'<2'",
+            10,
+            FlineT { lnum: 2, lvl: 3, ..Default::default() },
+        );
+        assert_eq!(ended.lvl, 3);
+        assert_eq!(ended.lvl_next, 1);
+        assert_eq!(ended.end, 2);
+    }
+
+    #[test]
+    fn foldlevel_expr_handles_no_change_and_unknown_edges() {
+        let _lock = crate::globals::global_state_test_lock();
+        let unchanged = run_foldlevel_expr(
+            b"'='",
+            10,
+            FlineT { lnum: 2, lvl: 4, ..Default::default() },
+        );
+        assert_eq!(unchanged.lvl_next, 4);
+
+        let first = run_foldlevel_expr(
+            b"-1",
+            10,
+            FlineT { lnum: 1, lvl: -1, ..Default::default() },
+        );
+        assert_eq!(first.lvl, 0);
+        assert_eq!(first.lvl_next, 0);
+
+        let last = run_foldlevel_expr(
+            b"-1",
+            10,
+            FlineT { lnum: 10, lvl: 2, ..Default::default() },
+        );
+        assert_eq!(last.lvl, -1);
+        assert_eq!(last.lvl_next, 0);
+    }
+
+    #[test]
+    fn level_getter_expr_uses_foldlevel_expr() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fde: Some(b"2".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curwin = win_ptr;
+            crate::globals::GLOBALS.get_mut().curbuf = buf_ptr;
+        }
+        let mut flp = FlineT {
+            wp: win_ptr,
+            lnum: 2,
+            ..Default::default()
+        };
+        unsafe { LevelGetter::Expr.get(&mut flp) };
+        assert_eq!(flp.lvl, 2);
+
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curwin = old_curwin;
+            crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
+        }
     }
 
     #[test]
