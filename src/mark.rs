@@ -117,15 +117,9 @@
 //! nonzero yet), `fold.c`'s `foldMarkAdjust` (always a no-op today -
 //! nothing can create a fold), and `diff.c`'s `diff_mark_adjust`
 //! (always a no-op today - `diff_buf_idx` always returns `DB_COUNT`).
-//! `extmark.c`'s `extmark_adjust` (the fourth real dependency) is
-//! instead gated behind the caller-supplied `ExtmarkOp` parameter - a
-//! caller passing `ExtmarkOp::Noop` bypasses it entirely (matching
-//! the original's own `if (op != kExtmarkNOOP)` guard exactly), and
-//! every other part of this function works correctly end to end
-//! regardless; only a genuine non-`Noop` value reaches
-//! `unimplemented!()`. No real translated caller yet (needs
-//! `del_bytes`/`ins_char`/etc., same as `mark_col_adjust`) - harvested
-//! ahead of one, matching the established precedent.
+//! `extmark.c`'s `extmark_adjust` (the fourth real dependency) is now
+//! wired behind the caller-supplied `ExtmarkOp` guard, matching the
+//! original.
 //!
 //! Also translated: `mark_jumplist_iter`/`mark_global_iter` -
 //! re-examined after being stale-grouped below with functions needing
@@ -2290,12 +2284,8 @@ fn one_adjust_cursor(posp: &mut PosT, line1: LinenrT, line2: LinenrT, amount: Li
 /// [`MAXLNUM`]: the marks within this range are made invalid. If
 /// `amount_after` is non-zero, marks after `line2` are adjusted by it.
 ///
-/// `op`'s own real effect (`extmark_adjust`, `extmark.c`) is
-/// `unimplemented!()` whenever `op != ExtmarkOp::Noop` - `extmark.c`
-/// itself is not translated; a caller passing `ExtmarkOp::Noop`
-/// bypasses it entirely, exactly matching the original's own `if (op
-/// != kExtmarkNOOP)` guard, and every other part of this function
-/// works correctly end to end regardless of `op`.
+/// A non-Noop `op` also adjusts extmarks through
+/// [`crate::extmark::extmark_adjust`].
 ///
 /// # Safety
 /// `buf` must be a valid, non-null pointer to a live `BufT`.
@@ -2415,7 +2405,17 @@ pub unsafe fn mark_adjust_buf(
     }
 
     if op != ExtmarkOp::Noop {
-        unimplemented!("mark::mark_adjust_buf: extmark_adjust (extmark.c) is not yet translated");
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::extmark::extmark_adjust(
+                &mut *buf,
+                line1,
+                line2,
+                amount,
+                amount_after,
+                op,
+            )
+        };
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -5693,8 +5693,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "extmark_adjust (extmark.c) is not yet translated")]
-    fn mark_adjust_buf_panics_for_a_non_noop_extmark_op() {
+    fn mark_adjust_buf_routes_a_non_noop_extmark_op() {
         let mut buf = BufT::default();
         let buf_ptr = &mut buf as *mut BufT;
         let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
@@ -5703,7 +5702,41 @@ mod tests {
         let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
         let _firstwin_guard = FirstwinGuard::set(win_ptr);
 
-        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Undo) };
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut *buf_ptr) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe {
+                crate::memline::ml_append_buf(
+                    &mut *buf_ptr,
+                    1,
+                    b"second\0",
+                    0,
+                    false,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        unsafe {
+            mark_adjust_buf(
+                buf_ptr,
+                1,
+                MAXLNUM,
+                1,
+                0,
+                true,
+                MarkAdjustMode::Normal,
+                ExtmarkOp::NoUndo,
+            )
+        };
+
+        drop(_firstwin_guard);
+        drop(_guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 
     #[test]
@@ -6059,4 +6092,3 @@ mod tests {
         assert_eq!(unsafe { &*GLOBALS.get_mut().curbuf }.b_namedm[0].mark.lnum, 8);
     }
 }
-
