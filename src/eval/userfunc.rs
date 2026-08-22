@@ -1226,6 +1226,34 @@ pub unsafe fn call_func(
     unsafe { call_func_with_state(funcname, rettv, argvars, &mut funcexe) }
 }
 
+/// Call `callback` and convert its result to a Number
+/// (`callback_call_retnr`).
+///
+/// Returns `-2` when invoking the callback fails. The callback's
+/// return value is always released after conversion.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::callback_call`] and
+/// `crate::eval::typval::tv_clear_simple`.
+#[must_use]
+pub unsafe fn callback_call_retnr(
+    callback: &crate::eval::typval_defs::Callback,
+    argvars: &[TypvalT],
+) -> crate::eval::typval_defs::VarnumberT {
+    let mut rettv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe {
+        crate::eval::eval::callback_call(callback, argvars, &mut rettv)
+    } {
+        return -2;
+    }
+
+    let result = crate::eval::typval::tv_get_number_chk(&rettv, None);
+    // SAFETY: `rettv` owns the callback result.
+    unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    result
+}
+
 /// Call a user function without arguments, partial, or Dictionary
 /// (`call_simple_func`).
 ///
@@ -4729,6 +4757,96 @@ mod tests {
         // populated by an actual len() call - evaluate=false returns
         // before ever reaching the builtin dispatch.
         assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn callback_call_retnr_returns_minus_two_when_calling_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                callback_call_retnr(
+                    &crate::eval::typval_defs::Callback::None,
+                    &[],
+                )
+            },
+            -2
+        );
+    }
+
+    #[test]
+    fn callback_call_retnr_converts_a_funcref_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                callback_call_retnr(
+                    &crate::eval::typval_defs::Callback::Funcref(
+                        b"and".to_vec(),
+                    ),
+                    &[
+                        TypvalT {
+                            value: TypvalValue::Number(6),
+                            ..Default::default()
+                        },
+                        TypvalT {
+                            value: TypvalValue::Number(3),
+                            ..Default::default()
+                        },
+                    ],
+                )
+            },
+            2
+        );
+    }
+
+    #[test]
+    fn callback_call_retnr_executes_a_partial() {
+        let _lock = crate::globals::global_state_test_lock();
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"and".to_vec()),
+            ..Default::default()
+        }));
+
+        let result = unsafe {
+            callback_call_retnr(
+                &crate::eval::typval_defs::Callback::Partial(partial),
+                &[
+                    TypvalT {
+                        value: TypvalValue::Number(7),
+                        ..Default::default()
+                    },
+                    TypvalT {
+                        value: TypvalValue::Number(3),
+                        ..Default::default()
+                    },
+                ],
+            )
+        };
+
+        assert_eq!(result, 3);
+        unsafe { crate::eval::typval::partial_unref(partial) };
+    }
+
+    #[test]
+    fn callback_call_retnr_releases_the_callback_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        assert_eq!(
+            unsafe {
+                callback_call_retnr(
+                    &crate::eval::typval_defs::Callback::Funcref(
+                        b"range".to_vec(),
+                    ),
+                    &[TypvalT {
+                        value: TypvalValue::Number(3),
+                        ..Default::default()
+                    }],
+                )
+            },
+            -1
+        );
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 
     #[test]
