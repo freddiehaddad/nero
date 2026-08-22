@@ -5038,8 +5038,8 @@ pub unsafe fn set_var(name: &[u8], tv: &mut TypvalT, copy: bool) {
 ///
 /// # Panics
 /// Panics if `tv` holds a `Func`/`Partial` value - needs
-/// `var_wrong_func_name` -> `function_exists` ->
-/// `trans_function_name`, not yet translated. Also panics if `name`
+/// `var_wrong_func_name`; `function_exists`/`trans_function_name` are
+/// now real. Also panics if `name`
 /// resolves into the `v:` scope dict specifically - needs
 /// `before_set_vvar`, not yet translated. Neither is reached by
 /// `settabvar`/`setwinvar`/`setbufvar` (which only ever target
@@ -5059,8 +5059,8 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
 
     if crate::eval::typval::tv_is_func(tv) {
         unimplemented!(
-            "set_var_const: setting a Func/Partial value needs var_wrong_func_name -> \
-             function_exists -> trans_function_name, not yet translated - see this function's \
+            "set_var_const: setting a Func/Partial value needs var_wrong_func_name \
+             (function_exists/trans_function_name are real), not yet translated - see this function's \
              own doc comment"
         );
     }

@@ -4199,7 +4199,7 @@ unsafe fn f_islocked(argvars: &[TypvalT], rettv: &mut TypvalT) {
     if let (Some(end), Some(effective_name)) =
         (end, lv.ll_name.as_deref())
     {
-        if end != effective_name.len() {
+        if end != name.len() {
             // semsg(...) omitted - see this function's own doc comment.
         } else if lv.ll_tv.is_null() {
             // SAFETY: forwarded from this function's own safety doc.
@@ -15358,6 +15358,7 @@ mod tests {
 
     #[test]
     fn exists_function_branch_checks_builtins_and_unknown_names() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_exists(&[string(b"*len")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(1));

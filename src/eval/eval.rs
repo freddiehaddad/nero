@@ -279,10 +279,10 @@
 //! expansion are complete. One substantive `get_lval` branch remains:
 //! assigning through a scope dictionary (`rettv: Some(_)` inside
 //! `get_lval_dict_item`, needs
-//! `var_wrong_func_name`/`function_exists`/`trans_function_name`, the
-//! last of which is a substantial separate undertaking) - `islocked()`
-//! always calls with `rettv: None`, so this is provably unreached by
-//! today's one real caller. `get_lval_subscript`'s own `hashtab_T *ht`/
+//! `var_wrong_func_name`; `function_exists`/`trans_function_name` are
+//! now real) - `islocked()` always calls with `rettv: None`, so this
+//! is provably unreached by today's one real caller.
+//! `get_lval_subscript`'s own `hashtab_T *ht`/
 //! `dictitem_T *v` parameters, and `get_lval_list`'s own `flags`
 //! parameter, are dropped entirely: confirmed via direct inspection of
 //! the current upstream source that none of the three is ever actually
@@ -1208,7 +1208,11 @@ pub unsafe fn partial_name(pt: *const crate::eval::typval_defs::PartialT) -> Opt
     }
     if !pt.pt_func.is_null() {
         // SAFETY: forwarded from this function's own safety doc.
-        return Some(unsafe { &*pt.pt_func }.uf_name.clone());
+        let mut name = unsafe { &*pt.pt_func }.uf_name.clone();
+        if name.last() == Some(&crate::ascii_defs::NUL) {
+            name.pop();
+        }
+        return Some(name);
     }
     None
 }
@@ -4001,7 +4005,7 @@ const NAMESPACE_CHAR: &[u8] = b"abglstvw";
 
 /// `eval.h`'s `find_name_end`/[`find_name_end`] flag: include `[` and
 /// valid `.key` components in the name scan (`FNE_INCL_BR`).
-const FNE_INCL_BR: i32 = 1;
+pub(crate) const FNE_INCL_BR: i32 = 1;
 /// `eval.h`'s `find_name_end` flag: check that the name starts with a
 /// valid character (`FNE_CHECK_START`).
 pub const FNE_CHECK_START: i32 = 2;
@@ -7077,7 +7081,7 @@ pub unsafe fn get_lval<'a>(
 
     // Find the end of the name.
     let (source_end, magic_braces) = find_name_end(name, fne_flags);
-    let (effective_name, p) = if let Some((expr_start, expr_end)) = magic_braces {
+    let (effective_name, name_len) = if let Some((expr_start, expr_end)) = magic_braces {
         // SAFETY: every range came directly from find_name_end above.
         let expanded = unsafe {
             make_expanded_name(
@@ -7086,18 +7090,26 @@ pub unsafe fn get_lval<'a>(
                 expr_end,
                 source_end,
             )
-        }?;
+        };
+        let Some(expanded) = expanded else {
+            lp.ll_name = None;
+            lp.ll_name_len = 0;
+            if !crate::ex_eval::aborting() && flags & GLV_QUIET == 0 {
+                return None;
+            }
+            return Some(source_end);
+        };
         let len = expanded.len();
         (std::borrow::Cow::Owned(expanded), len)
     } else {
         (std::borrow::Cow::Borrowed(name), source_end)
     };
-    lp.ll_name_len = p;
+    lp.ll_name_len = name_len;
 
     // Without [idx] or .key we are done.
-    if !matches!(effective_name.get(p), Some(&b'[') | Some(&b'.')) {
+    if !matches!(name.get(source_end), Some(&b'[') | Some(&b'.')) {
         lp.ll_name = Some(effective_name);
-        return Some(p);
+        return Some(source_end);
     }
 
     // Only pass want_ht=true when we would write to the variable, it
@@ -7106,7 +7118,13 @@ pub unsafe fn get_lval<'a>(
     let no_autoload = (flags & GLV_NO_AUTOLOAD) != 0;
     // SAFETY: forwarded from this function's own safety doc.
     let (v, _ht) =
-        unsafe { crate::eval::vars::find_var(&effective_name[..p], want_ht, no_autoload) };
+        unsafe {
+            crate::eval::vars::find_var(
+                &effective_name[..name_len],
+                want_ht,
+                no_autoload,
+            )
+        };
     let Some(v) = v else {
         // semsg(_("E121: Undefined variable: %.*s"), ...) omitted when
         // !quiet - message display, not tractable; the identical None
@@ -7126,16 +7144,35 @@ pub unsafe fn get_lval<'a>(
         // If the caller is trans_function_name() it will check for a
         // Lua function name.
         lp.ll_name = Some(effective_name);
-        return Some(p);
+        return Some(source_end);
     }
 
     // If the next character is a "." or a "[", then process the subitem.
     // SAFETY: forwarded from this function's own safety doc.
     let end =
-        unsafe { get_lval_subscript(lp, p, &effective_name, rettv, unlet, flags) };
+        unsafe {
+            get_lval_subscript(
+                lp,
+                source_end,
+                name,
+                rettv,
+                unlet,
+                flags,
+            )
+        };
     lp.ll_name = Some(effective_name);
     let end = end?;
-    lp.ll_name_len = end;
+    if !matches!(
+        lp.ll_name.as_ref(),
+        Some(std::borrow::Cow::Owned(_))
+    ) {
+        lp.ll_name_len = end;
+    }
+    // Upstream subtracts the source-buffer `p` from the separately
+    // allocated `ll_exp_name` here. Rust cannot soundly reproduce that
+    // cross-allocation pointer arithmetic, so an expanded name retains
+    // its own logical length; callers use the returned source offset
+    // for cursor advancement.
     Some(end)
 }
 
@@ -7391,11 +7428,11 @@ unsafe fn get_lval_subscript(
 ///
 /// The `rettv: Some(_)` sub-branch (checking a function/variable name
 /// is valid before assigning through a scope dictionary)
-/// `unimplemented!()`s - needs `var_wrong_func_name`/`function_exists`/
-/// `trans_function_name` (a substantial separate undertaking); see
-/// this module's own doc comment for why this is provably unreached
-/// by `islocked()`, the only real caller so far (always passes
-/// `rettv: None`).
+/// `unimplemented!()`s - needs `var_wrong_func_name`
+/// (`function_exists`/`trans_function_name` are now real); see this
+/// module's own doc comment for why this is provably unreached by
+/// `islocked()`, the only real caller so far (always passes `rettv:
+/// None`).
 ///
 /// # Safety
 /// Same as [`get_lval`].
@@ -7446,7 +7483,7 @@ unsafe fn get_lval_dict_item(
     if rettv.is_some() && unsafe { (*lp.ll_dict).dv_scope } != crate::eval::typval_defs::ScopeType::NoScope {
         unimplemented!(
             "get_lval_dict_item: assigning through a scope dictionary needs \
-             var_wrong_func_name/function_exists/trans_function_name, not yet \
+             var_wrong_func_name (function_exists/trans_function_name are real), not yet \
              translated - see this function's own doc comment"
         );
     }
@@ -9356,7 +9393,10 @@ mod tests {
 
     #[test]
     fn partial_name_falls_back_to_pt_func_uf_name() {
-        let mut uf = crate::eval::typval_defs::UfuncT { uf_name: b"Underlying".to_vec(), ..Default::default() };
+        let mut uf = crate::eval::typval_defs::UfuncT {
+            uf_name: b"Underlying\0".to_vec(),
+            ..Default::default()
+        };
         let pt = crate::eval::typval_defs::PartialT {
             pt_name: None,
             pt_func: &mut uf as *mut _,
@@ -15434,7 +15474,7 @@ mod tests {
                 FNE_CHECK_START,
             )
         };
-        assert_eq!(end, Some(b"g:answer2".len()));
+        assert_eq!(end, Some(b"g:answer{1 + 1}".len()));
         assert_eq!(lv.ll_name.as_deref(), Some(&b"g:answer2"[..]));
         assert!(matches!(
             lv.ll_name.as_ref(),
@@ -15444,6 +15484,91 @@ mod tests {
         assert!(lv.ll_tv.is_null());
 
         clear_lval(&mut lv);
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_resolves_a_subscript_after_magic_brace_expansion() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let value = crate::eval::typval::tv_dict_item_alloc(b"value");
+        unsafe {
+            (*value).di_tv.value = TypvalValue::Number(42);
+            crate::eval::typval::tv_dict_add(&mut *dict, value);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                b"d2",
+                dict,
+            );
+        }
+
+        let input = b"g:d{1 + 1}.value";
+        let mut lv = LvalT::default();
+        let end = unsafe {
+            get_lval(
+                input,
+                None,
+                &mut lv,
+                false,
+                false,
+                GLV_NO_AUTOLOAD | GLV_READ_ONLY,
+                FNE_CHECK_START,
+            )
+        };
+
+        assert_eq!(end, Some(input.len()));
+        assert_eq!(lv.ll_name.as_deref(), Some(&b"g:d2"[..]));
+        assert_eq!(lv.ll_dict, dict);
+        assert_eq!(lv.ll_di, value);
+        assert_eq!(
+            unsafe { &(*lv.ll_tv).value },
+            &TypvalValue::Number(42)
+        );
+
+        clear_lval(&mut lv);
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_quiet_magic_expansion_failure_advances_source_cursor() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+        let input = b"Foo{)}bar";
+        let mut quiet = LvalT::default();
+
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    input,
+                    None,
+                    &mut quiet,
+                    false,
+                    false,
+                    GLV_QUIET | GLV_READ_ONLY,
+                    FNE_CHECK_START,
+                )
+            },
+            Some(input.len())
+        );
+        assert!(quiet.ll_name.is_none());
+
+        let mut noisy = LvalT::default();
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    input,
+                    None,
+                    &mut noisy,
+                    false,
+                    false,
+                    GLV_READ_ONLY,
+                    FNE_CHECK_START,
+                )
+            },
+            None
+        );
         reset_globals_for_test();
     }
 

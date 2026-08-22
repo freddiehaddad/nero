@@ -243,14 +243,9 @@
 //! ALREADY-RESOLVED name (a builtin verbatim, or a script-local
 //! function's own `<SNR>{sid}_{name}` form) genuinely exists, via
 //! `builtin_function` + `crate::eval::funcs::find_internal_func` +
-//! `find_func`. Its own real caller, `function_exists`, needs
-//! `trans_function_name` (a substantial name-resolution/scoping
-//! function built on `get_lval`, not yet translated) - correctly left
-//! deferred, but `translated_function_exists` itself needed no new
-//! infrastructure at all (every one of its own dependencies already
-//! existed), matching this crate's established "small,
-//! self-contained, no design freedom to get wrong" precedent for
-//! translating ahead of a real caller.
+//! `find_func`. Its caller [`function_exists`] and the full
+//! `trans_function_name` name-resolution/scoping engine are now real
+//! too, including lvalue/dictionary-member dereferencing.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -802,14 +797,9 @@ pub fn builtin_function(name: &[u8]) -> bool {
 ///
 /// `name` must already be in its "real" form (e.g. a builtin name
 /// verbatim, or `<SNR>{sid}_{name}` for a script-local user function);
-/// this function does no name resolution/scoping of its own, matching
-/// the original's own contract (its real caller, `function_exists`,
-/// does that resolution first via `trans_function_name`, not yet
-/// translated - a substantial, separate undertaking). Translated
-/// ahead of that real caller since every one of ITS OWN dependencies
-/// (`builtin_function`, `find_internal_func`, `find_func`) already
-/// exists, matching this crate's established "small, self-contained,
-/// no design freedom to get wrong" precedent for such functions.
+/// this function does no name resolution/scoping of its own. Its real
+/// caller [`function_exists`] resolves names first through
+/// [`trans_function_name`], matching the original's own split.
 #[must_use]
 pub fn translated_function_exists(name: &[u8]) -> bool {
     if builtin_function(name) {
@@ -821,34 +811,25 @@ pub fn translated_function_exists(name: &[u8]) -> bool {
 
 /// Check whether a function name exists (`function_exists`).
 ///
-/// Direct, global (`g:`), and script-local (`s:`/`<SID>`) names are
-/// resolved. Funcref-variable dereferencing has no effect until
-/// expression-held function references can participate in
-/// `trans_function_name`; `no_deref` is retained for signature
-/// fidelity.
+/// Direct/global/script-local names and Funcref/Partial variables or
+/// Dictionary members are resolved through [`trans_function_name`].
 #[must_use]
-pub fn function_exists(name: &[u8], _no_deref: bool) -> bool {
-    let end = name
-        .iter()
-        .position(|&byte| {
-            crate::ascii_defs::ascii_iswhite(i32::from(byte))
-                || byte == b'('
-        })
-        .unwrap_or(name.len());
-    let tail = &name[end..];
-    let tail = &tail[crate::charset::skipwhite(tail)..];
-    if !tail.is_empty() && tail.first() != Some(&b'(') {
-        return false;
+pub fn function_exists(name: &[u8], no_deref: bool) -> bool {
+    let mut flags = TFN_INT | TFN_QUIET | TFN_NO_AUTOLOAD;
+    if no_deref {
+        flags |= TFN_NO_DEREF;
     }
-    let name = &name[..end];
-    let resolved = if let Some(global) = name.strip_prefix(b"g:") {
-        Some(global.to_vec())
-    } else if name.starts_with(b"s:") || name.starts_with(b"<SID>") {
-        fname_trans_sid(name).ok()
-    } else {
-        Some(name.to_vec())
+    // SAFETY: no raw-pointer output is requested; the translator
+    // encapsulates its own lvalue/global lookups.
+    let (translated, consumed) = unsafe {
+        trans_function_name(name, false, flags, None, None)
     };
-    resolved.is_some_and(|name| translated_function_exists(&name))
+    let rest = &name[consumed.min(name.len())..];
+    let rest = &rest[crate::charset::skipwhite(rest)..];
+    translated.is_some()
+        && (rest.is_empty() || rest.first() == Some(&b'('))
+        && translated
+            .is_some_and(|name| translated_function_exists(&name))
 }
 
 /// Get the number of required/optional arguments a function takes,
@@ -896,6 +877,34 @@ pub enum FnameTransError {
     Deleted = 7,
     /// Function cannot be used as a method (`FCERR_NOTMETHOD`).
     NotMethod = 8,
+}
+
+/// `trans_function_name()` flag: internal/builtin function names are
+/// accepted (`TFN_INT`).
+pub const TFN_INT: i32 = 1;
+/// `trans_function_name()` flag: suppress diagnostics (`TFN_QUIET`).
+pub const TFN_QUIET: i32 = 2;
+/// `trans_function_name()` flag: do not trigger script autoloading
+/// (`TFN_NO_AUTOLOAD`).
+pub const TFN_NO_AUTOLOAD: i32 = 4;
+/// `trans_function_name()` flag: do not dereference a Funcref variable
+/// (`TFN_NO_DEREF`).
+pub const TFN_NO_DEREF: i32 = 8;
+/// `trans_function_name()` flag: caller will not modify the resolved
+/// variable (`TFN_READ_ONLY`).
+pub const TFN_READ_ONLY: i32 = 16;
+
+/// Dictionary binding information produced while translating a
+/// function name (`funcdict_T`).
+#[derive(Default)]
+pub struct FuncdictT {
+    /// Dictionary used by a `dict.Func` name (`fd_dict`).
+    pub fd_dict: *mut DictT,
+    /// New Dictionary key, when name resolution stopped at one
+    /// (`fd_newkey`).
+    pub fd_newkey: Option<Vec<u8>>,
+    /// Existing Dictionary item used by the name (`fd_di`).
+    pub fd_di: *mut crate::eval::typval_defs::DictitemT,
 }
 
 /// Deferred argument filler used by [`FuncexeT`] (`ArgvFunc`).
@@ -980,29 +989,283 @@ pub unsafe fn deref_func_name(
     name: &[u8],
     no_autoload: bool,
 ) -> (Vec<u8>, bool, *mut PartialT) {
+    let (name, found_var, partial, _did_deref) =
+        unsafe { deref_func_name_inner(name, no_autoload) };
+    (name, found_var, partial)
+}
+
+/// Internal form of [`deref_func_name`] that also reports whether the
+/// found variable was actually a Funcref/Partial.
+///
+/// # Safety
+/// Forwarded from [`deref_func_name`].
+unsafe fn deref_func_name_inner(
+    name: &[u8],
+    no_autoload: bool,
+) -> (Vec<u8>, bool, *mut PartialT, bool) {
     // SAFETY: forwarded from this function's own safety doc.
     let (item, _ht) = unsafe { crate::eval::vars::find_var(name, false, no_autoload) };
     let Some(variant) = item else {
-        return (name.to_vec(), false, std::ptr::null_mut());
+        return (name.to_vec(), false, std::ptr::null_mut(), false);
     };
     let tv_ptr: *const TypvalT = match variant {
         crate::eval::typval_defs::DictitemVariant::Dict(p) => unsafe { &(*p).di_tv },
         crate::eval::typval_defs::DictitemVariant::Scope(p) => unsafe { &(*p).di_tv },
     };
     // SAFETY: forwarded from this function's own safety doc.
-    let (resolved, partial) = match unsafe { &(*tv_ptr).value } {
-        TypvalValue::Func(Some(s)) => (s.clone(), std::ptr::null_mut()),
-        TypvalValue::Func(None) => (Vec::new(), std::ptr::null_mut()),
+    let (resolved, partial, did_deref) = match unsafe { &(*tv_ptr).value } {
+        TypvalValue::Func(Some(s)) => {
+            (s.clone(), std::ptr::null_mut(), true)
+        }
+        TypvalValue::Func(None) => {
+            (Vec::new(), std::ptr::null_mut(), true)
+        }
         // SAFETY: forwarded from this function's own safety doc.
         TypvalValue::Partial(p) if !p.is_null() => (
             unsafe { crate::eval::eval::partial_name(*p) }
                 .unwrap_or_default(),
             *p,
+            true,
         ),
-        TypvalValue::Partial(_) => (Vec::new(), std::ptr::null_mut()),
-        _ => (name.to_vec(), std::ptr::null_mut()),
+        TypvalValue::Partial(_) => {
+            (Vec::new(), std::ptr::null_mut(), true)
+        }
+        _ => (name.to_vec(), std::ptr::null_mut(), false),
     };
-    (resolved, true, partial)
+    (resolved, true, partial, did_deref)
+}
+
+/// Translate a function expression into its callable internal name
+/// (`trans_function_name`).
+///
+/// Returns `(name, consumed)`, replacing the original's allocated
+/// return string plus mutable `char **pp`. `consumed` is advanced only
+/// on the same successful/skip/error branches that update `*pp`
+/// upstream.
+///
+/// `LvalT`'s owned `Cow` is the Rust equivalent of a non-null
+/// `ll_exp_name`; `deref_func_name_inner`'s `did_deref` flag replaces
+/// the original's pointer-identity test for whether dereferencing
+/// changed the name.
+///
+/// Lua function names remain at the Lua-host boundary. Diagnostics are
+/// omitted while preserving the original success/failure and cursor
+/// advancement.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::get_lval`],
+/// [`deref_func_name`], and Partial/function-registry access.
+#[must_use]
+pub unsafe fn trans_function_name(
+    input: &[u8],
+    skip: bool,
+    flags: i32,
+    mut fdp: Option<&mut FuncdictT>,
+    mut partial: Option<&mut *mut PartialT>,
+) -> (Option<Vec<u8>>, usize) {
+    use crate::eval::eval::{
+        clear_lval, find_name_end, get_id_len, get_lval, LvalT,
+        FNE_CHECK_START, FNE_INCL_BR, GLV_READ_ONLY,
+    };
+
+    if let Some(fdp) = fdp.as_deref_mut() {
+        *fdp = FuncdictT::default();
+    }
+
+    // A hard-coded internal <SNR> prefix is already translated.
+    if input.starts_with(&[K_SPECIAL, KS_EXTRA, KE_SNR]) {
+        let (len, consumed) = get_id_len(&input[3..]);
+        return (
+            Some(input[..3 + len].to_vec()),
+            3 + consumed,
+        );
+    }
+
+    let mut lead = eval_fname_script(input);
+    let start_offset = if lead > 2 { lead } else { 0 };
+    let start = &input[start_offset..];
+    let mut lv = LvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let end = unsafe {
+        get_lval(
+            start,
+            None,
+            &mut lv,
+            false,
+            skip,
+            flags | GLV_READ_ONLY,
+            if lead > 2 { 0 } else { FNE_CHECK_START },
+        )
+    };
+
+    let expanded = matches!(
+        lv.ll_name.as_ref(),
+        Some(std::borrow::Cow::Owned(_))
+    );
+    let source_end = end;
+
+    if source_end == Some(0) {
+        clear_lval(&mut lv);
+        return (None, 0);
+    }
+    let invalid_lval = end.is_none()
+        || (!lv.ll_tv.is_null() && (lead > 2 || lv.ll_range));
+    if invalid_lval {
+        let consumed = if crate::ex_eval::aborting() {
+            start_offset + find_name_end(start, FNE_INCL_BR).0
+        } else {
+            0
+        };
+        clear_lval(&mut lv);
+        return (None, consumed);
+    }
+    let end = end.expect("validated above");
+    let source_end = source_end.expect("validated above");
+    let consumed = start_offset + source_end;
+
+    if !lv.ll_tv.is_null() {
+        let had_newkey = lv.ll_newkey.is_some();
+        if let Some(fdp) = fdp.as_deref_mut() {
+            fdp.fd_dict = lv.ll_dict;
+            fdp.fd_newkey = lv.ll_newkey.take();
+            fdp.fd_di = lv.ll_di;
+        }
+
+        // SAFETY: non-null ll_tv was produced by get_lval.
+        let (name, found_partial) = match unsafe { &(*lv.ll_tv).value } {
+            TypvalValue::Func(Some(name)) => {
+                (Some(name.clone()), std::ptr::null_mut())
+            }
+            TypvalValue::Partial(value) if !value.is_null() => {
+                if unsafe { crate::eval::eval::is_luafunc(*value) }
+                    && input.get(start_offset + end) == Some(&b'.')
+                {
+                    unimplemented!(
+                        "trans_function_name: v:lua names need the Lua host"
+                    );
+                }
+                (
+                    Some(
+                        unsafe { crate::eval::eval::partial_name(*value) }
+                            .unwrap_or_default(),
+                    ),
+                    *value,
+                )
+            }
+            _ => {
+                let advance = skip
+                    || flags & TFN_QUIET != 0
+                    || (fdp.is_some()
+                        && !lv.ll_dict.is_null()
+                        && had_newkey);
+                clear_lval(&mut lv);
+                return (
+                    None,
+                    if advance { consumed } else { 0 },
+                );
+            }
+        };
+        if let Some(out) = partial.as_mut()
+            && !found_partial.is_null()
+        {
+            **out = found_partial;
+        }
+        clear_lval(&mut lv);
+        return (name, consumed);
+    }
+
+    let Some(ll_name) = lv.ll_name.as_ref() else {
+        clear_lval(&mut lv);
+        return (None, consumed);
+    };
+
+    if expanded || flags & TFN_NO_DEREF == 0 {
+        let candidate: &[u8] = if expanded {
+            &ll_name[..lv.ll_name_len.min(ll_name.len())]
+        } else {
+            &input[..consumed.min(input.len())]
+        };
+        if let Some(out) = partial.as_mut() {
+            **out = std::ptr::null_mut();
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let (resolved, _found_var, found_partial, did_deref) = unsafe {
+            deref_func_name_inner(
+                candidate,
+                flags & TFN_NO_AUTOLOAD != 0,
+            )
+        };
+        if did_deref {
+            if let Some(out) = partial.as_mut() {
+                **out = found_partial;
+            }
+            let resolved = if resolved.starts_with(b"<SNR>") {
+                fname_trans_sid(&resolved).unwrap_or(resolved)
+            } else {
+                resolved
+            };
+            clear_lval(&mut lv);
+            return (Some(resolved), consumed);
+        }
+    }
+
+    let logical_len = if expanded {
+        lv.ll_name_len
+    } else {
+        source_end
+    };
+    let mut logical = &ll_name[..logical_len.min(ll_name.len())];
+    if expanded {
+        if lead <= 2 && logical.starts_with(b"s:") {
+            logical = &logical[2..];
+            lead = 2;
+        }
+    } else if lead == 2 || logical.starts_with(b"g:") {
+        logical = &logical[2..];
+    }
+
+    if skip {
+        lead = 0;
+    }
+
+    let mut result = Vec::new();
+    if !skip && lead > 0 {
+        result.extend_from_slice(&[K_SPECIAL, KS_EXTRA, KE_SNR]);
+        if (expanded && eval_fname_sid(ll_name))
+            || eval_fname_sid(input)
+        {
+            // SAFETY: reads the serialized global script context.
+            let sid =
+                unsafe { crate::globals::GLOBALS.get_mut() }
+                    .current_sctx
+                    .sc_sid;
+            if sid <= 0 {
+                clear_lval(&mut lv);
+                return (None, 0);
+            }
+            result.extend_from_slice(sid.to_string().as_bytes());
+            result.push(b'_');
+        }
+    } else if !skip
+        && flags & TFN_INT == 0
+        && builtin_function(logical)
+    {
+        clear_lval(&mut lv);
+        return (None, 0);
+    }
+
+    if !skip
+        && flags & TFN_QUIET == 0
+        && flags & TFN_NO_DEREF == 0
+        && logical.contains(&b':')
+    {
+        clear_lval(&mut lv);
+        return (None, 0);
+    }
+
+    result.extend_from_slice(logical);
+    clear_lval(&mut lv);
+    (Some(result), consumed)
 }
 
 /// Parse a function-call's argument list: `(arg1, arg2, ...)`
@@ -4326,6 +4589,459 @@ mod tests {
         assert_eq!(fname_trans_sid(b"s:Foo"), Err(FnameTransError::Script));
     }
 
+    // ---- trans_function_name --------------------------------------------
+
+    #[test]
+    fn trans_function_name_accepts_internal_names_only_with_tfn_int() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"len",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"len".to_vec()), 3)
+        );
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"len",
+                    false,
+                    TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (None, 0)
+        );
+    }
+
+    #[test]
+    fn trans_function_name_strips_a_global_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:GlobalFunc",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"GlobalFunc".to_vec()), 12)
+        );
+    }
+
+    #[test]
+    fn trans_function_name_encodes_script_local_prefixes() {
+        struct SctxGuard(crate::eval::typval_defs::SctxT);
+
+        impl Drop for SctxGuard {
+            fn drop(&mut self) {
+                unsafe { crate::globals::GLOBALS.get_mut() }
+                    .current_sctx = self.0;
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let saved =
+            unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        let _guard = SctxGuard(saved);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid =
+            7;
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"s:Foo",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (
+                Some(vec![
+                    K_SPECIAL, KS_EXTRA, KE_SNR, b'7', b'_', b'F',
+                    b'o', b'o',
+                ]),
+                5,
+            )
+        );
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"<SNR>123_Foo",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (
+                Some(vec![
+                    K_SPECIAL, KS_EXTRA, KE_SNR, b'1', b'2', b'3',
+                    b'_', b'F', b'o', b'o',
+                ]),
+                12,
+            )
+        );
+    }
+
+    #[test]
+    fn trans_function_name_skip_mode_uses_the_source_name_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"s:Foo",
+                    true,
+                    TFN_INT,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"Foo".to_vec()), 5)
+        );
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:Global",
+                    true,
+                    TFN_INT,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"Global".to_vec()), 8)
+        );
+    }
+
+    #[test]
+    fn trans_function_name_magic_braces_keep_the_source_consumed_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"Foo{1 + 1}",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"Foo2".to_vec()), 10)
+        );
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"{''}",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (Some(Vec::new()), 4)
+        );
+        let invalid = b"Foo{)}bar";
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    invalid,
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (None, invalid.len())
+        );
+    }
+
+    #[test]
+    fn trans_function_name_magic_sid_uses_the_raw_prefix() {
+        struct SctxGuard(crate::eval::typval_defs::SctxT);
+
+        impl Drop for SctxGuard {
+            fn drop(&mut self) {
+                unsafe { crate::globals::GLOBALS.get_mut() }
+                    .current_sctx = self.0;
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let saved =
+            unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        let _guard = SctxGuard(saved);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid =
+            7;
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"<SID>Foo{1}",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (
+                Some(vec![
+                    K_SPECIAL, KS_EXTRA, KE_SNR, b'7', b'_', b'F',
+                    b'o', b'o', b'1',
+                ]),
+                11,
+            )
+        );
+    }
+
+    #[test]
+    fn trans_function_name_keeps_an_internal_snr_name() {
+        let encoded = vec![
+            K_SPECIAL, KS_EXTRA, KE_SNR, b'1', b'2', b'_', b'F',
+            b'o', b'o',
+        ];
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    &encoded,
+                    false,
+                    TFN_INT,
+                    None,
+                    None,
+                )
+            },
+            (Some(encoded.clone()), encoded.len())
+        );
+    }
+
+    #[test]
+    fn trans_function_name_dereferences_funcref_variables() {
+        let _lock = crate::globals::global_state_test_lock();
+        let glob = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+        let item = crate::eval::typval::tv_dict_item_alloc(b"Ref");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Func(Some(b"len".to_vec()));
+            crate::eval::typval::tv_dict_add(&mut *glob, item);
+        }
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:Ref",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"len".to_vec()), 5)
+        );
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:Ref",
+                    false,
+                    TFN_INT | TFN_QUIET | TFN_NO_DEREF,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"Ref".to_vec()), 5)
+        );
+
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+    }
+
+    #[test]
+    fn trans_function_name_preserves_a_partial_output() {
+        let _lock = crate::globals::global_state_test_lock();
+        let glob = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+        let value = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"pow".to_vec()),
+            ..Default::default()
+        }));
+        let item = crate::eval::typval::tv_dict_item_alloc(b"Ref");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Partial(value);
+            crate::eval::typval::tv_dict_add(&mut *glob, item);
+        }
+        let mut partial = std::ptr::null_mut();
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:Ref",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    Some(&mut partial),
+                )
+            },
+            (Some(b"pow".to_vec()), 5)
+        );
+        assert_eq!(partial, value);
+
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+    }
+
+    #[test]
+    fn trans_function_name_resolves_a_dictionary_member() {
+        let _lock = crate::globals::global_state_test_lock();
+        let glob = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let callback = crate::eval::typval::tv_dict_item_alloc(b"cb");
+        unsafe {
+            (*callback).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            crate::eval::typval::tv_dict_add(&mut *dict, callback);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *glob,
+                b"d",
+                dict,
+            );
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *glob,
+                b"d2",
+                dict,
+            );
+        }
+        let mut fdp = FuncdictT::default();
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:d.cb",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    Some(&mut fdp),
+                    None,
+                )
+            },
+            (Some(b"len".to_vec()), 6)
+        );
+        assert_eq!(fdp.fd_dict, dict);
+        assert_eq!(fdp.fd_di, callback);
+        assert!(fdp.fd_newkey.is_none());
+        let magic = b"g:d{1 + 1}.cb";
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    magic,
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (Some(b"len".to_vec()), magic.len())
+        );
+
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+    }
+
+    #[test]
+    fn trans_function_name_wrong_type_advances_only_when_quiet() {
+        let _lock = crate::globals::global_state_test_lock();
+        let glob = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"value");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Number(7);
+            crate::eval::typval::tv_dict_add(&mut *dict, item);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *glob,
+                b"d",
+                dict,
+            );
+        }
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:d.value",
+                    false,
+                    TFN_INT,
+                    None,
+                    None,
+                )
+            },
+            (None, 0)
+        );
+        let mut fdp = FuncdictT::default();
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:d.value",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    Some(&mut fdp),
+                    None,
+                )
+            },
+            (None, 9)
+        );
+
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+    }
+
+    #[test]
+    fn trans_function_name_null_funcref_obeys_error_advancement() {
+        let _lock = crate::globals::global_state_test_lock();
+        let glob = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"cb");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Func(None);
+            crate::eval::typval::tv_dict_add(&mut *dict, item);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *glob,
+                b"d",
+                dict,
+            );
+        }
+
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:d.cb",
+                    false,
+                    TFN_INT,
+                    None,
+                    None,
+                )
+            },
+            (None, 0)
+        );
+        assert_eq!(
+            unsafe {
+                trans_function_name(
+                    b"g:d.cb",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                    None,
+                )
+            },
+            (None, 6)
+        );
+
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+    }
+
     #[test]
     fn printable_func_name_uses_uf_name_exp_when_set() {
         let fp = UfuncT {
@@ -4426,6 +5142,7 @@ mod tests {
 
     #[test]
     fn function_exists_resolves_builtin_global_and_trailing_forms() {
+        let _lock = crate::globals::global_state_test_lock();
         assert!(function_exists(b"len", false));
         assert!(function_exists(b"g:len", false));
         assert!(function_exists(b"len(", false));
@@ -4435,6 +5152,36 @@ mod tests {
             b"NeroDefinitelyMissingFunction",
             false,
         ));
+    }
+
+    #[test]
+    fn function_exists_dereferences_funcref_variables_and_dict_members() {
+        let _lock = crate::globals::global_state_test_lock();
+        let glob = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+
+        let reference = crate::eval::typval::tv_dict_item_alloc(b"Ref");
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let member = crate::eval::typval::tv_dict_item_alloc(b"cb");
+        unsafe {
+            (*reference).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            crate::eval::typval::tv_dict_add(&mut *glob, reference);
+            (*member).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            crate::eval::typval::tv_dict_add(&mut *dict, member);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *glob,
+                b"d",
+                dict,
+            );
+        }
+
+        assert!(function_exists(b"g:Ref", false));
+        assert!(!function_exists(b"g:Ref", true));
+        assert!(function_exists(b"g:d.cb", false));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *glob) };
     }
 
     #[test]
