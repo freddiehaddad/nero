@@ -1069,6 +1069,44 @@ pub unsafe fn call_func(funcname: &[u8], rettv: &mut TypvalT, argvars: &[TypvalT
     unsafe { crate::eval::funcs::call_internal_func(rfname, argvars, rettv) }
 }
 
+/// Call a user function without arguments, partial, or Dictionary
+/// (`call_simple_func`).
+///
+/// Returns [`crate::vim_defs::NOTDONE`] when the function does not
+/// exist so the caller can fall back to the full parser. Executing a
+/// found, non-deleted function still needs `call_user_func_check`.
+///
+/// # Safety
+/// A function returned by [`find_func`] must remain live for the call.
+#[must_use]
+pub unsafe fn call_simple_func(
+    funcname: &[u8],
+    rettv: &mut TypvalT,
+) -> i32 {
+    rettv.value = TypvalValue::Number(0);
+
+    let Ok(name) = fname_trans_sid(funcname) else {
+        return crate::vim_defs::FAIL;
+    };
+    let rfname = if name.starts_with(b"g:") {
+        &name[2..]
+    } else {
+        &name
+    };
+    let fp = find_func(rfname);
+    if fp.is_null() {
+        return crate::vim_defs::NOTDONE;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*fp).uf_flags } & fc_flags::DELETED != 0 {
+        return crate::vim_defs::FAIL;
+    }
+
+    unimplemented!(
+        "call_simple_func: a found user function needs call_user_func_check"
+    );
+}
+
 /// Call a function and put the result in `rettv` (`get_func_tv`).
 ///
 /// `arg` must point to the opening `(`. Returns `(status, consumed)`.
@@ -4362,6 +4400,40 @@ mod tests {
         assert_eq!(ret, FAIL);
         // The one parsed argument is still returned even on failure.
         assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn call_simple_func_returns_notdone_for_a_missing_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe { call_simple_func(b"NoSuchSimpleFunc", &mut rettv) },
+            crate::vim_defs::NOTDONE
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn call_simple_func_rejects_a_deleted_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp = Box::new(UfuncT {
+            uf_name: b"DeletedSimple\0".to_vec(),
+            uf_flags: fc_flags::DELETED,
+            ..Default::default()
+        });
+        let fp_ptr = std::ptr::addr_of_mut!(*fp);
+        unsafe { func_hashtab_add(fp_ptr) };
+
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe { call_simple_func(b"DeletedSimple", &mut rettv) },
+            FAIL
+        );
+
+        func_init();
+        drop(fp);
     }
 
     #[test]

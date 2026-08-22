@@ -5338,24 +5338,70 @@ pub unsafe fn eval0(
     ret
 }
 
+/// If `arg` is exactly a no-argument function call, try the direct
+/// user-function path (`may_call_simple_func`).
+///
+/// Builtins and missing functions return [`crate::vim_defs::NOTDONE`]
+/// and fall back to the full parser. `v:lua` remains at the Lua-host
+/// boundary.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::call_simple_func`].
+#[must_use]
+pub unsafe fn may_call_simple_func(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+) -> i32 {
+    let Some(parens) = arg.windows(2).position(|pair| pair == b"()")
+    else {
+        return crate::vim_defs::NOTDONE;
+    };
+    let trailing = parens + 2;
+    if trailing + skipwhite(&arg[trailing..]) != arg.len() {
+        return crate::vim_defs::NOTDONE;
+    }
+
+    if arg.starts_with(b"v:lua.") {
+        let start = b"v:lua.".len();
+        if start != parens
+            && skip_luafunc_name(&arg[start..parens]) == parens - start
+        {
+            unimplemented!(
+                "may_call_simple_func: v:lua calls need call_simple_luafunc"
+            );
+        }
+        return crate::vim_defs::NOTDONE;
+    }
+
+    let start = if arg.starts_with(b"<SNR>") {
+        b"<SNR>".len() + crate::charset::skipdigits(&arg[b"<SNR>".len()..])
+    } else {
+        0
+    };
+    if start + to_name_end(&arg[start..], true) != parens {
+        return crate::vim_defs::NOTDONE;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::userfunc::call_simple_func(&arg[..parens], rettv) }
+}
+
 /// Handle a top-level expression with the simple-function-call
 /// optimization (`eval0_simple_funccal`).
 ///
-/// The original first tries `may_call_simple_func` to bypass parser
-/// overhead for a no-argument user function, then falls back to
-/// [`eval0`]. That direct user-function path still needs
-/// `call_user_func_check`; calling [`eval0`] immediately is therefore
-/// behaviorally identical for every currently callable expression and
-/// preserves the fallback as a real source-level boundary.
-///
 /// # Safety
-/// Forwarded from [`eval0`].
+/// Forwarded from [`may_call_simple_func`] and [`eval0`].
 unsafe fn eval0_simple_funccal(
     arg: &[u8],
     rettv: &mut TypvalT,
     eap: Option<&mut crate::ex_cmds_defs::ExargT>,
     evalarg: Option<&mut EvalargT>,
 ) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let result = unsafe { may_call_simple_func(arg, rettv) };
+    if result != crate::vim_defs::NOTDONE {
+        return result;
+    }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { eval0(arg, rettv, eap, evalarg) }
 }
@@ -12838,6 +12884,65 @@ mod tests {
             unsafe { eval_to_string(b"len(\"hello\")", false, true) },
             Some(b"5".to_vec())
         );
+    }
+
+    #[test]
+    fn may_call_simple_func_returns_notdone_for_builtin_and_missing_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe { may_call_simple_func(b"len()", &mut rettv) },
+            crate::vim_defs::NOTDONE
+        );
+        assert_eq!(
+            unsafe {
+                may_call_simple_func(b"MissingSimple()", &mut rettv)
+            },
+            crate::vim_defs::NOTDONE
+        );
+    }
+
+    #[test]
+    fn may_call_simple_func_accepts_trailing_whitespace_only() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe { may_call_simple_func(b"MissingSimple()  ", &mut rettv) },
+            crate::vim_defs::NOTDONE
+        );
+        assert_eq!(
+            unsafe {
+                may_call_simple_func(
+                    b"MissingSimple() trailing",
+                    &mut rettv,
+                )
+            },
+            crate::vim_defs::NOTDONE
+        );
+    }
+
+    #[test]
+    fn may_call_simple_func_rejects_non_name_syntax() {
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe { may_call_simple_func(b"1name()", &mut rettv) },
+            crate::vim_defs::NOTDONE
+        );
+        assert_eq!(
+            unsafe { may_call_simple_func(b"MissingSimple(", &mut rettv) },
+            crate::vim_defs::NOTDONE
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "call_simple_luafunc")]
+    fn may_call_simple_func_v_lua_path_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        let _ =
+            unsafe { may_call_simple_func(b"v:lua.foo()", &mut rettv) };
     }
 
     #[test]
