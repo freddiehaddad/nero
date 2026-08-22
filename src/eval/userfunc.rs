@@ -1489,6 +1489,104 @@ pub unsafe fn call_func(
     unsafe { call_func_with_state(funcname, rettv, argvars, &mut funcexe) }
 }
 
+struct OwnedFuncCallArgs(Vec<TypvalT>);
+
+impl Drop for OwnedFuncCallArgs {
+    fn drop(&mut self) {
+        for value in self.0.iter().rev() {
+            // SAFETY: every entry was created by tv_copy in
+            // `func_call` and is released exactly once here.
+            unsafe { crate::eval::typval::tv_clear_simple(value) };
+        }
+    }
+}
+
+/// Call `name` with arguments copied from `args` (`func_call`).
+///
+/// The List items are copied into an owned temporary array before
+/// dispatch so call setup may change their locks without mutating the
+/// source List. Partial-bound arguments, `selfdict`, and current-line
+/// execution state are forwarded through [`FuncexeT`].
+///
+/// Returns [`FnameTransError::TooMany`] without dispatch when the List
+/// plus Partial-bound arguments exceeds `MAX_FUNC_ARGS`, preserving
+/// the original's E699 failure category while message display remains
+/// untranslated.
+///
+/// A null current Window yields line `0` for test/startup contexts;
+/// real editor execution maintains a live current Window and therefore
+/// forwards its cursor line exactly.
+///
+/// # Safety
+/// `args` must be a valid, non-null pointer to a live List. Non-null
+/// `partial`/`selfdict` and every pointer-bearing List item must remain
+/// live for the call.
+#[must_use]
+pub unsafe fn func_call(
+    name: &[u8],
+    args: *mut crate::eval::typval_defs::ListT,
+    partial: *mut PartialT,
+    selfdict: *mut DictT,
+    rettv: &mut TypvalT,
+) -> FnameTransError {
+    use crate::eval::typval_defs::MAX_FUNC_ARGS;
+
+    debug_assert!(!args.is_null());
+    let partial_argc = if partial.is_null() {
+        0
+    } else {
+        // SAFETY: non-null Partial is live by contract.
+        unsafe { (*partial).pt_argv.len() }
+    };
+    let explicit_limit = MAX_FUNC_ARGS.saturating_sub(partial_argc);
+    let mut argv = OwnedFuncCallArgs(Vec::with_capacity(
+        (unsafe { crate::eval::typval::tv_list_len(args) }
+            .max(0) as usize)
+            .min(explicit_limit),
+    ));
+    // SAFETY: non-null List is live by contract.
+    let mut item = unsafe { crate::eval::typval::tv_list_first(args) };
+    while !item.is_null() {
+        if argv.0.len() == explicit_limit {
+            return FnameTransError::TooMany;
+        }
+        let mut copy = TypvalT::default();
+        // SAFETY: item belongs to the live argument List.
+        unsafe {
+            crate::eval::typval::tv_copy(&(*item).li_tv, &mut copy);
+            item = (*item).li_next;
+        }
+        argv.0.push(copy);
+    }
+
+    // SAFETY: serialized global current-window state.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let line = if curwin.is_null() {
+        0
+    } else {
+        // SAFETY: a non-null current window is live by global-state
+        // contract.
+        unsafe { (*curwin).w_cursor.lnum }
+    };
+    let mut funcexe = FuncexeT {
+        fe_firstline: line,
+        fe_lastline: line,
+        fe_evaluate: true,
+        fe_partial: partial,
+        fe_selfdict: selfdict,
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        call_func_with_state(
+            name,
+            rettv,
+            &argv.0,
+            &mut funcexe,
+        )
+    }
+}
+
 /// Call `callback` and convert its result to a Number
 /// (`callback_call_retnr`).
 ///
@@ -5508,6 +5606,222 @@ mod tests {
         // populated by an actual len() call - evaluate=false returns
         // before ever reaching the builtin dispatch.
         assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn func_call_copies_list_arguments_and_releases_the_copies() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let inner = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*inner).lv_refcount = 1 };
+        let args = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                args,
+                TypvalT {
+                    value: TypvalValue::List(inner),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                func_call(
+                    b"len",
+                    args,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut rettv,
+                )
+            },
+            FnameTransError::None
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { (*inner).lv_refcount }, 1);
+
+        unsafe { crate::eval::typval::tv_list_free(args) };
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn func_call_forwards_partial_bound_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                args,
+                TypvalT {
+                    value: TypvalValue::Float(3.0),
+                    ..Default::default()
+                },
+            )
+        };
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"pow".to_vec()),
+            pt_argv: vec![TypvalT {
+                value: TypvalValue::Float(2.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        let mut rettv = TypvalT::default();
+
+        assert_eq!(
+            unsafe {
+                func_call(
+                    b"pow",
+                    args,
+                    partial,
+                    std::ptr::null_mut(),
+                    &mut rettv,
+                )
+            },
+            FnameTransError::None
+        );
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+
+        unsafe {
+            crate::eval::typval::partial_unref(partial);
+            crate::eval::typval::tv_list_free(args);
+        }
+    }
+
+    #[test]
+    fn func_call_rejects_too_many_list_arguments_before_dispatch() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = crate::eval::typval::tv_list_alloc(
+            crate::eval::typval_defs::MAX_FUNC_ARGS as isize + 1,
+        );
+        for value in 0..=crate::eval::typval_defs::MAX_FUNC_ARGS {
+            unsafe {
+                crate::eval::typval::tv_list_append_number(
+                    args,
+                    value as crate::eval::typval_defs::VarnumberT,
+                )
+            };
+        }
+        let mut rettv = TypvalT {
+            value: TypvalValue::Number(77),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                func_call(
+                    b"len",
+                    args,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut rettv,
+                )
+            },
+            FnameTransError::TooMany
+        );
+        assert_eq!(rettv.value, TypvalValue::Number(77));
+        unsafe { crate::eval::typval::tv_list_free(args) };
+    }
+
+    #[test]
+    fn func_call_accounts_for_partial_args_at_the_limit() {
+        let _lock = crate::globals::global_state_test_lock();
+        let bound = 2;
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"len".to_vec()),
+            pt_argv: vec![
+                TypvalT {
+                    value: TypvalValue::Number(1),
+                    ..Default::default()
+                };
+                bound
+            ],
+            ..Default::default()
+        }));
+        let exact_len =
+            crate::eval::typval_defs::MAX_FUNC_ARGS - bound;
+        let exact = crate::eval::typval::tv_list_alloc(
+            exact_len as isize,
+        );
+        for value in 0..exact_len {
+            unsafe {
+                crate::eval::typval::tv_list_append_number(
+                    exact,
+                    value as crate::eval::typval_defs::VarnumberT,
+                )
+            };
+        }
+        let mut exact_result = TypvalT {
+            value: TypvalValue::Number(77),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                func_call(
+                    b"len",
+                    exact,
+                    partial,
+                    std::ptr::null_mut(),
+                    &mut exact_result,
+                )
+            },
+            FnameTransError::TooMany
+        );
+        assert_eq!(exact_result.value, TypvalValue::Number(0));
+
+        let overflow = crate::eval::typval::tv_list_alloc(
+            exact_len as isize + 1,
+        );
+        let nested = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            (*nested).lv_refcount = 1;
+            crate::eval::typval::tv_list_append_owned_tv(
+                overflow,
+                TypvalT {
+                    value: TypvalValue::List(nested),
+                    ..Default::default()
+                },
+            );
+        }
+        for value in 1..=exact_len {
+            unsafe {
+                crate::eval::typval::tv_list_append_number(
+                    overflow,
+                    value as crate::eval::typval_defs::VarnumberT,
+                )
+            };
+        }
+        let mut overflow_result = TypvalT {
+            value: TypvalValue::Number(88),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                func_call(
+                    b"len",
+                    overflow,
+                    partial,
+                    std::ptr::null_mut(),
+                    &mut overflow_result,
+                )
+            },
+            FnameTransError::TooMany
+        );
+        assert_eq!(overflow_result.value, TypvalValue::Number(88));
+        assert_eq!(unsafe { (*nested).lv_refcount }, 1);
+
+        unsafe {
+            crate::eval::typval::tv_list_free(exact);
+            crate::eval::typval::tv_list_free(overflow);
+            crate::eval::typval::partial_unref(partial);
+        }
     }
 
     #[test]

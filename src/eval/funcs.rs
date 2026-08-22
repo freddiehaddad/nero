@@ -142,6 +142,12 @@
 //! `"dict.Func"`; that form remains deferred with the broader lvalue
 //! name-resolution machinery.
 //!
+//! Also translated: `call()` plus `eval/userfunc.c`'s `func_call` -
+//! invoke a String name, Funcref, or Partial with arguments copied
+//! from a List and an optional self Dictionary. String names use the
+//! real `trans_function_name` resolver; Lua table callables remain at
+//! the Lua-host boundary.
+//!
 //! Also translated: `filter()`/`map()`/`mapnew()` (from `eval/list.c`,
 //! via a new `crate::eval::typval::filter_map`/`filter_map_one`/
 //! `filter_map_list`/`filter_map_dict`/`filter_map_blob`/
@@ -388,6 +394,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
+        m.insert(&b"call"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_call });
         m.insert(&b"dictwatcheradd"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_NONE, func: f_dictwatcheradd });
         m.insert(&b"dictwatcherdel"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_NONE, func: f_dictwatcherdel });
         m.insert(&b"filter"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_filter });
@@ -2921,6 +2928,104 @@ unsafe fn f_function(argvars: &[TypvalT], rettv: &mut TypvalT) {
 unsafe fn f_funcref(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { common_function(argvars, rettv, true) };
+}
+
+/// `call({func}, {arglist} [, {dict}])`.
+///
+/// String function expressions are resolved through
+/// `trans_function_name`; Funcrefs and Partials retain their direct
+/// name/bound state. Lua table callables remain at the Lua-host
+/// boundary.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::trans_function_name`] and
+/// [`crate::eval::userfunc::func_call`].
+unsafe fn f_call(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_list_arg(argvars, 1)
+        == crate::vim_defs::FAIL
+    {
+        return;
+    }
+    let TypvalValue::List(args) = argvars[1].value else {
+        unreachable!();
+    };
+    if args.is_null() {
+        return;
+    }
+
+    let mut partial = std::ptr::null_mut();
+    let (mut name, translate) = match &argvars[0].value {
+        TypvalValue::Func(name) => {
+            (name.clone().unwrap_or_default(), false)
+        }
+        TypvalValue::Partial(value) => {
+            partial = *value;
+            (
+                unsafe { crate::eval::eval::partial_name(*value) }
+                    .unwrap_or_default(),
+                false,
+            )
+        }
+        TypvalValue::String(_) => (
+            crate::eval::typval::tv_get_string(&argvars[0]),
+            true,
+        ),
+        _ => (
+            crate::eval::typval::tv_get_string(&argvars[0]),
+            false,
+        ),
+    };
+    name.truncate(
+        name.iter()
+            .position(|&byte| byte == crate::ascii_defs::NUL)
+            .unwrap_or(name.len()),
+    );
+    if name.is_empty() {
+        return;
+    }
+
+    if translate {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (translated, _) = unsafe {
+            crate::eval::userfunc::trans_function_name(
+                &name,
+                false,
+                crate::eval::userfunc::TFN_INT
+                    | crate::eval::userfunc::TFN_QUIET,
+                None,
+                None,
+            )
+        };
+        let Some(translated) = translated else {
+            return;
+        };
+        name = translated;
+    }
+
+    let selfdict = if argvars.len() > 2 {
+        if crate::eval::typval::tv_check_for_dict_arg(argvars, 2)
+            == crate::vim_defs::FAIL
+        {
+            return;
+        }
+        let TypvalValue::Dict(dict) = argvars[2].value else {
+            unreachable!();
+        };
+        dict
+    } else {
+        std::ptr::null_mut()
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe {
+        crate::eval::userfunc::func_call(
+            &name,
+            args,
+            partial,
+            selfdict,
+            rettv,
+        )
+    };
 }
 
 /// `dictwatcheradd({dict}, {pattern}, {callback})` - watch matching
@@ -10671,6 +10776,7 @@ mod tests {
             "deepcopy",
             "function",
             "funcref",
+            "call",
             "dictwatcheradd",
             "dictwatcherdel",
             "filter",
@@ -13461,6 +13567,209 @@ mod tests {
         assert_eq!(builtin.value, TypvalValue::Unknown);
         assert_eq!(missing.value, TypvalValue::Unknown);
         crate::eval::userfunc::func_init();
+    }
+
+    // --- f_call ---
+
+    #[test]
+    fn call_invokes_a_named_builtin_with_list_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                args,
+                Some(b"abcd"),
+            )
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_call(
+                &[
+                    string(b"len"),
+                    TypvalT {
+                        value: TypvalValue::List(args),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            )
+        };
+
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+        unsafe { crate::eval::typval::tv_list_free(args) };
+    }
+
+    #[test]
+    fn call_resolves_a_funcref_variable_from_a_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+        let reference = crate::eval::typval::tv_dict_item_alloc(b"Ref");
+        unsafe {
+            (*reference).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            assert_eq!(
+                crate::eval::typval::tv_dict_add(global, reference),
+                crate::vim_defs::OK
+            );
+        }
+        let args = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                args,
+                Some(b"abc"),
+            )
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_call(
+                &[
+                    string(b"g:Ref"),
+                    TypvalT {
+                        value: TypvalValue::List(args),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            );
+            crate::eval::vars::vars_clear(&mut *global);
+            crate::eval::typval::tv_list_free(args);
+        }
+
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn call_invokes_a_partial_with_bound_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"pow".to_vec()),
+                pt_argv: vec![TypvalT {
+                    value: TypvalValue::Float(2.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ));
+        let args = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                args,
+                TypvalT {
+                    value: TypvalValue::Float(3.0),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut rettv = TypvalT::default();
+
+        unsafe {
+            f_call(
+                &[
+                    TypvalT {
+                        value: TypvalValue::Partial(partial),
+                        ..Default::default()
+                    },
+                    TypvalT {
+                        value: TypvalValue::List(args),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            )
+        };
+
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+        unsafe {
+            crate::eval::typval::partial_unref(partial);
+            crate::eval::typval::tv_list_free(args);
+        }
+    }
+
+    #[test]
+    fn call_rejects_non_list_and_null_list_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut wrong_type = TypvalT::default();
+        let mut null_list = TypvalT::default();
+
+        unsafe {
+            f_call(
+                &[string(b"len"), num(1)],
+                &mut wrong_type,
+            );
+            f_call(
+                &[
+                    string(b"len"),
+                    TypvalT {
+                        value: TypvalValue::List(
+                            std::ptr::null_mut(),
+                        ),
+                        ..Default::default()
+                    },
+                ],
+                &mut null_list,
+            );
+        }
+
+        assert_eq!(wrong_type.value, TypvalValue::Unknown);
+        assert_eq!(null_list.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn call_validates_and_accepts_the_optional_self_dictionary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(
+                args,
+                Some(b"abc"),
+            )
+        };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let mut wrong = TypvalT::default();
+        let mut accepted = TypvalT::default();
+
+        unsafe {
+            f_call(
+                &[
+                    string(b"len"),
+                    TypvalT {
+                        value: TypvalValue::List(args),
+                        ..Default::default()
+                    },
+                    num(5),
+                ],
+                &mut wrong,
+            );
+            f_call(
+                &[
+                    string(b"len"),
+                    TypvalT {
+                        value: TypvalValue::List(args),
+                        ..Default::default()
+                    },
+                    TypvalT {
+                        value: TypvalValue::Dict(dict),
+                        ..Default::default()
+                    },
+                ],
+                &mut accepted,
+            );
+        }
+
+        assert_eq!(wrong.value, TypvalValue::Unknown);
+        assert_eq!(accepted.value, TypvalValue::Number(3));
+        unsafe {
+            crate::eval::typval::tv_dict_free(dict);
+            crate::eval::typval::tv_list_free(args);
+        }
     }
 
     // --- f_add ---
