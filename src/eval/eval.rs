@@ -381,6 +381,26 @@ pub fn var_flavour(varname: &[u8]) -> VarFlavourT {
     }
 }
 
+/// Set a global variable while hiding the current funccall scope
+/// (`var_set_global`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::save_funccal`] and
+/// [`crate::eval::vars::set_var`]. Callers must serialize funccall and
+/// global-variable state.
+pub unsafe fn var_set_global(name: &[u8], mut value: TypvalT) {
+    let mut entry = crate::eval::userfunc::FuncCalEntryT::default();
+    // SAFETY: `entry` remains live until the restore guard drops.
+    unsafe {
+        crate::eval::userfunc::save_funccal(
+            std::ptr::addr_of_mut!(entry),
+        )
+    };
+    let _funccal = SafeEvalFunccalGuard;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::set_var(name, &mut value, false) };
+}
+
 /// Convert any typval to text without reporting an error
 /// (`typval_tostring`).
 ///
@@ -6986,6 +7006,93 @@ mod tests {
         assert_eq!(var_flavour(b"UPPER_123"), VarFlavourT::Shada);
         assert_eq!(var_flavour(b"U\0lower"), VarFlavourT::Shada);
         assert_eq!(var_flavour(b""), VarFlavourT::Default);
+    }
+
+    #[test]
+    fn var_set_global_bypasses_the_current_local_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            crate::eval::vars::vars_clear(
+                &mut *crate::eval::vars::get_globvar_dict(),
+            )
+        };
+
+        let mut fc =
+            Box::new(crate::eval::typval_defs::FunccallT::default());
+        crate::eval::vars::init_var_dict(
+            &mut fc.fc_l_vars,
+            &mut fc.fc_l_vars_var,
+            crate::eval::typval_defs::ScopeType::DefScope,
+        );
+        let fc_ptr = std::ptr::addr_of_mut!(*fc);
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        unsafe {
+            var_set_global(
+                b"nero_global_answer",
+                TypvalT {
+                    value: TypvalValue::Number(42),
+                    ..TypvalT::default()
+                },
+            )
+        };
+
+        assert!(
+            unsafe {
+                crate::eval::typval::tv_dict_find(
+                    Some(&mut *crate::eval::vars::get_globvar_dict()),
+                    b"nero_global_answer",
+                )
+            }
+            .is_some()
+        );
+        assert!(
+            unsafe {
+                crate::eval::typval::tv_dict_find(
+                    Some(
+                        &mut *std::ptr::addr_of_mut!((*fc_ptr).fc_l_vars),
+                    ),
+                    b"nero_global_answer",
+                )
+            }
+            .is_none()
+        );
+        assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe {
+            crate::eval::vars::vars_clear(
+                &mut *crate::eval::vars::get_globvar_dict(),
+            );
+            crate::eval::vars::vars_clear(
+                &mut *std::ptr::addr_of_mut!((*fc_ptr).fc_l_vars),
+            );
+        }
+        drop(fc);
+    }
+
+    #[test]
+    fn var_set_global_restores_funccal_when_assignment_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc =
+            Box::new(crate::eval::typval_defs::FunccallT::default());
+        let fc_ptr = std::ptr::addr_of_mut!(*fc);
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        let result = std::panic::catch_unwind(|| unsafe {
+            var_set_global(
+                b"nero_bad_func",
+                TypvalT {
+                    value: TypvalValue::Func(Some(b"Missing".to_vec())),
+                    ..TypvalT::default()
+                },
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        drop(fc);
     }
 
     #[test]
