@@ -1418,6 +1418,32 @@ impl Drop for PartialCallArgs {
     }
 }
 
+/// Prepend a method base to a function's arguments (`argv_add_base`).
+///
+/// Returns `None` when no base was supplied. The original writes
+/// shallow `typval_T` values into a caller-provided temporary array;
+/// this returns an owned `Vec` whose pointer-bearing variants retain
+/// the same borrowed-pointer semantics.
+///
+/// # Safety
+/// A non-null `basetv` must point to a live value, and all
+/// pointer-bearing arguments must remain live while the returned
+/// values are used.
+#[must_use]
+unsafe fn argv_add_base(
+    basetv: *mut TypvalT,
+    argvars: &[TypvalT],
+) -> Option<Vec<TypvalT>> {
+    if basetv.is_null() {
+        return None;
+    }
+    let mut values = Vec::with_capacity(argvars.len() + 1);
+    // SAFETY: non-null base is live by contract.
+    values.push(unsafe { (&*basetv).clone() });
+    values.extend_from_slice(argvars);
+    Some(values)
+}
+
 /// Call a function with full [`FuncexeT`] state (`call_func`).
 ///
 /// Partial-bound arguments are copied in front of explicit arguments,
@@ -1532,14 +1558,9 @@ pub unsafe fn call_func_with_state(
                      arguments need the user-function execution path"
                 );
             }
-            let mut based = None;
-            if !funcexe.fe_basetv.is_null() {
-                let mut values = Vec::with_capacity(argvars.len() + 1);
-                // SAFETY: non-null base is live by contract.
-                values.push(unsafe { (&*funcexe.fe_basetv).clone() });
-                values.extend_from_slice(argvars);
-                based = Some(values);
-            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let based =
+                unsafe { argv_add_base(funcexe.fe_basetv, argvars) };
             let user_args = based.as_deref().unwrap_or(argvars);
             // SAFETY: forwarded from this function's own safety doc.
             return unsafe {
@@ -3360,6 +3381,49 @@ mod tests {
         assert!(state.fe_selfdict.is_null());
         assert!(state.fe_basetv.is_null());
         assert!(!state.fe_found_var);
+    }
+
+    #[test]
+    fn argv_add_base_prepends_a_method_base() {
+        let mut base = TypvalT {
+            value: TypvalValue::Number(7),
+            ..Default::default()
+        };
+        let args = [
+            TypvalT {
+                value: TypvalValue::Number(11),
+                ..Default::default()
+            },
+            TypvalT {
+                value: TypvalValue::Number(13),
+                ..Default::default()
+            },
+        ];
+
+        let values = unsafe {
+            argv_add_base(std::ptr::from_mut(&mut base), &args)
+        }
+        .expect("non-null base");
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                TypvalValue::Number(7),
+                TypvalValue::Number(11),
+                TypvalValue::Number(13),
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_add_base_none_leaves_arguments_unallocated() {
+        assert!(unsafe {
+            argv_add_base(std::ptr::null_mut(), &[TypvalT::default()])
+        }
+        .is_none());
     }
 
     #[test]
