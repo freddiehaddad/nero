@@ -4561,23 +4561,82 @@ static EVAL7_RECURSE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCe
 /// smaller-stack concern, so only that branch is modeled).
 const EVAL7_MAX_RECURSE: i32 = 1000;
 
-/// Recursion-depth counter for `callback_call` (not yet translated -
-/// needs the full user-function/callback-invocation machinery) -
-/// `callback_depth` in the original. Always `0` today: nothing in
-/// this crate can currently invoke a real Vimscript callback.
+/// Recursion-depth counter for [`callback_call`] (`callback_depth`).
 static CALLBACK_DEPTH: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 
 /// Return the current recursion depth of nested callback invocations
-/// (`get_callback_depth`). Always `0` today - see `CALLBACK_DEPTH`'s
-/// own doc comment. Translated ahead of `callback_call` itself,
-/// matching this crate's established "small, simple, mechanically
-/// correct piece ahead of its real caller" precedent - its own real
-/// caller, `eval/funcs.c`'s `f_state()`, remains separately blocked
-/// (needs `move.c`'s `op_pending()`, confirmed NOT a legitimate
-/// "always false" shortcut).
+/// (`get_callback_depth`).
 #[must_use]
 pub fn get_callback_depth() -> i32 {
     unsafe { *CALLBACK_DEPTH.get_mut() }
+}
+
+struct CallbackDepthGuard;
+
+impl CallbackDepthGuard {
+    unsafe fn new() -> Self {
+        // SAFETY: callers serialize callback-depth state.
+        unsafe { *CALLBACK_DEPTH.get_mut() += 1 };
+        Self
+    }
+}
+
+impl Drop for CallbackDepthGuard {
+    fn drop(&mut self) {
+        // SAFETY: construction's caller serialized callback-depth
+        // state for this guard's full lifetime.
+        unsafe { *CALLBACK_DEPTH.get_mut() -= 1 };
+    }
+}
+
+/// Invoke a callback and return whether it was called successfully
+/// (`callback_call`).
+///
+/// Funcref callbacks are complete. Partials still need bound
+/// `funcexe_T` state, and Lua callbacks need the Lua host.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::call_func`]. Callers must
+/// serialize callback depth, function-table, and option state.
+#[must_use]
+pub unsafe fn callback_call(
+    callback: &crate::eval::typval_defs::Callback,
+    argvars: &[TypvalT],
+    rettv: &mut TypvalT,
+) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if i64::from(unsafe { *CALLBACK_DEPTH.get_mut() })
+        > unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd }
+    {
+        return false;
+    }
+
+    let name = match callback {
+        crate::eval::typval_defs::Callback::Funcref(name) => {
+            if name.starts_with(b"v:lua.") {
+                unimplemented!(
+                    "callback_call: v:lua Funcrefs need the Lua host"
+                );
+            }
+            name.as_slice()
+        }
+        crate::eval::typval_defs::Callback::Partial(_) => {
+            unimplemented!(
+                "callback_call: Partial callbacks need bound funcexe_T state"
+            )
+        }
+        crate::eval::typval_defs::Callback::Lua(_) => {
+            unimplemented!("callback_call: Lua callbacks need the Lua host")
+        }
+        crate::eval::typval_defs::Callback::None => return false,
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let _depth = unsafe { CallbackDepthGuard::new() };
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe {
+        crate::eval::userfunc::call_func(name, rettv, argvars, true)
+    }) == crate::eval::userfunc::FnameTransError::None
 }
 
 /// Handle sixth level expression: number/blob/single-quoted-string
@@ -7589,15 +7648,107 @@ mod tests {
 
     #[test]
     fn get_callback_depth_reflects_callback_depth() {
-        // Directly manipulate the file-static (something no real,
-        // translated caller can currently do, since nothing can
-        // invoke a real Vimscript callback yet) to prove
-        // get_callback_depth reads the REAL value, not a hardcoded 0.
+        // Direct manipulation proves get_callback_depth reads the real
+        // counter independently of callback_call's own increment path.
         let _lock = crate::globals::global_state_test_lock();
         unsafe { *CALLBACK_DEPTH.get_mut() = 3 };
         assert_eq!(get_callback_depth(), 3);
         unsafe { *CALLBACK_DEPTH.get_mut() = 0 };
         assert_eq!(get_callback_depth(), 0);
+    }
+
+    #[test]
+    fn callback_call_invokes_a_funcref_builtin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_mfd = unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd = 100 };
+        let callback =
+            crate::eval::typval_defs::Callback::Funcref(b"len".to_vec());
+        let args = [TypvalT {
+            value: TypvalValue::String(Some(b"hello".to_vec())),
+            ..TypvalT::default()
+        }];
+        let mut rettv = TypvalT::default();
+
+        assert!(unsafe { callback_call(&callback, &args, &mut rettv) });
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+        assert_eq!(get_callback_depth(), 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd = old_mfd };
+    }
+
+    #[test]
+    fn callback_call_returns_false_for_none_and_unknown_funcref() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let old_mfd = unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd = 100 };
+        let mut rettv = TypvalT::default();
+
+        assert!(!unsafe {
+            callback_call(
+                &crate::eval::typval_defs::Callback::None,
+                &[],
+                &mut rettv,
+            )
+        });
+        assert!(!unsafe {
+            callback_call(
+                &crate::eval::typval_defs::Callback::Funcref(
+                    b"NeroMissingCallback".to_vec(),
+                ),
+                &[],
+                &mut rettv,
+            )
+        });
+        assert_eq!(get_callback_depth(), 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd = old_mfd };
+        crate::eval::userfunc::func_init();
+    }
+
+    #[test]
+    fn callback_call_honors_maxfuncdepth() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_depth = unsafe { *CALLBACK_DEPTH.get_mut() };
+        let old_mfd = unsafe { crate::option_vars::OPTION_VARS.get_mut().p_mfd };
+        unsafe {
+            *CALLBACK_DEPTH.get_mut() = 2;
+            crate::option_vars::OPTION_VARS.get_mut().p_mfd = 1;
+        }
+        let mut rettv = TypvalT::default();
+        assert!(!unsafe {
+            callback_call(
+                &crate::eval::typval_defs::Callback::Funcref(
+                    b"len".to_vec(),
+                ),
+                &[],
+                &mut rettv,
+            )
+        });
+        assert_eq!(get_callback_depth(), 2);
+
+        unsafe {
+            *CALLBACK_DEPTH.get_mut() = old_depth;
+            crate::option_vars::OPTION_VARS.get_mut().p_mfd = old_mfd;
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bound funcexe_T")]
+    fn callback_call_partial_needs_bound_call_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut partial = crate::eval::typval_defs::PartialT::default();
+        let mut rettv = TypvalT::default();
+        let _ = unsafe {
+            callback_call(
+                &crate::eval::typval_defs::Callback::Partial(
+                    std::ptr::addr_of_mut!(partial),
+                ),
+                &[],
+                &mut rettv,
+            )
+        };
     }
 
     #[test]

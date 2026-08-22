@@ -1394,11 +1394,13 @@ mod tests {
 
     #[test]
     fn apply_autocmds_returns_false_when_no_autocmds_registered() {
+        let _lock = crate::globals::global_state_test_lock();
         assert!(!apply_autocmds(EventT::BufEnter, None, None, false, None));
     }
 
     #[test]
     fn apply_autocmds_exarg_returns_false_when_no_autocmds_registered() {
+        let _lock = crate::globals::global_state_test_lock();
         assert!(!apply_autocmds_exarg(
             EventT::BufWritePre,
             None,
@@ -1412,6 +1414,7 @@ mod tests {
     #[test]
     fn apply_autocmds_retval_returns_false_and_leaves_retval_unchanged() {
         use crate::vim_defs::OK;
+        let _lock = crate::globals::global_state_test_lock();
         let mut retval = OK;
         let did_cmd =
             apply_autocmds_retval(EventT::BufEnter, None, None, false, None, &mut retval);
