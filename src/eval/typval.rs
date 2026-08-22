@@ -7382,6 +7382,43 @@ mod tests {
     }
 
     #[test]
+    fn dict_watcher_notify_calls_matching_partial() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        unsafe { (*dict).dv_refcount += 1 };
+        let item = tv_dict_item_alloc(b"watched");
+        let partial = Box::into_raw(Box::new(PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"get".to_vec()),
+            ..Default::default()
+        }));
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Number(7);
+            tv_dict_add(&mut *dict, item);
+            tv_dict_watcher_add(
+                dict,
+                b"watched",
+                Callback::Partial(partial),
+            );
+            tv_dict_watcher_notify(
+                dict,
+                b"watched",
+                Some(&TypvalT {
+                    value: TypvalValue::Number(8),
+                    ..TypvalT::default()
+                }),
+                Some(&TypvalT {
+                    value: TypvalValue::Number(7),
+                    ..TypvalT::default()
+                }),
+            );
+        }
+        assert_eq!(unsafe { (*partial).pt_refcount }, 1);
+        assert!(!unsafe { (&(*dict).watchers)[0].busy });
+        unsafe { tv_dict_unref(dict) };
+    }
+
+    #[test]
     fn dict_watcher_notify_skips_nonmatching_watchers() {
         let _lock = crate::globals::global_state_test_lock();
         let dict = tv_dict_alloc();

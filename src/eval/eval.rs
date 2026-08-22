@@ -4598,12 +4598,13 @@ impl Drop for CallbackDepthGuard {
 /// Invoke a callback and return whether it was called successfully
 /// (`callback_call`).
 ///
-/// Funcref callbacks are complete. Partials still need bound
-/// `funcexe_T` state, and Lua callbacks need the Lua host.
+/// Funcref and Partial callbacks are complete. Lua callbacks need the
+/// Lua host.
 ///
 /// # Safety
-/// Forwarded from [`crate::eval::userfunc::call_func`]. Callers must
-/// serialize callback depth, function-table, and option state.
+/// Forwarded from [`crate::eval::userfunc::call_func_with_state`].
+/// Callers must serialize callback depth, function-table, option, and
+/// current-window state.
 #[must_use]
 pub unsafe fn callback_call(
     callback: &crate::eval::typval_defs::Callback,
@@ -4617,19 +4618,24 @@ pub unsafe fn callback_call(
         return false;
     }
 
-    let name = match callback {
+    let (name, partial) = match callback {
         crate::eval::typval_defs::Callback::Funcref(name) => {
             if name.starts_with(b"v:lua.") {
                 unimplemented!(
                     "callback_call: v:lua Funcrefs need the Lua host"
                 );
             }
-            name.as_slice()
+            (name.clone(), std::ptr::null_mut())
         }
-        crate::eval::typval_defs::Callback::Partial(_) => {
-            unimplemented!(
-                "callback_call: Partial callbacks need bound funcexe_T state"
-            )
+        crate::eval::typval_defs::Callback::Partial(partial) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let Some(name) = (unsafe { partial_name(*partial) }) else {
+                return false;
+            };
+            if name.is_empty() {
+                return false;
+            }
+            (name, *partial)
         }
         crate::eval::typval_defs::Callback::Lua(_) => {
             unimplemented!("callback_call: Lua callbacks need the Lua host")
@@ -4637,11 +4643,31 @@ pub unsafe fn callback_call(
         crate::eval::typval_defs::Callback::None => return false,
     };
 
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+    let line = if curwin.is_null() {
+        0
+    } else {
+        // SAFETY: a non-null current window is live by this function's
+        // global-state contract.
+        unsafe { (*curwin).w_cursor.lnum }
+    };
+    let mut funcexe = crate::eval::userfunc::FuncexeT {
+        fe_firstline: line,
+        fe_lastline: line,
+        fe_evaluate: true,
+        fe_partial: partial,
+        ..Default::default()
+    };
     // SAFETY: forwarded from this function's own safety doc.
     let _depth = unsafe { CallbackDepthGuard::new() };
     // SAFETY: forwarded from this function's own safety doc.
     (unsafe {
-        crate::eval::userfunc::call_func(name, rettv, argvars, true)
+        crate::eval::userfunc::call_func_with_state(
+            &name,
+            rettv,
+            argvars,
+            &mut funcexe,
+        )
     }) == crate::eval::userfunc::FnameTransError::None
 }
 
@@ -5622,15 +5648,53 @@ unsafe fn eval_expr_func(
     i32::from(error == crate::eval::userfunc::FnameTransError::None)
 }
 
+/// Evaluate a bound Partial with `argv` (`eval_expr_partial`).
+///
+/// # Safety
+/// A non-null Partial and every pointer-bearing argument must remain
+/// valid for the call.
+unsafe fn eval_expr_partial(
+    expr: &TypvalT,
+    argv: &[TypvalT],
+    rettv: &mut TypvalT,
+) -> i32 {
+    let TypvalValue::Partial(partial) = expr.value else {
+        unreachable!();
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(name) = (unsafe { partial_name(partial) }) else {
+        return FAIL;
+    };
+    if name.is_empty() {
+        return FAIL;
+    }
+
+    let mut funcexe = crate::eval::userfunc::FuncexeT {
+        fe_evaluate: true,
+        fe_partial: partial,
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let error = unsafe {
+        crate::eval::userfunc::call_func_with_state(
+            &name,
+            rettv,
+            argv,
+            &mut funcexe,
+        )
+    };
+    i32::from(error == crate::eval::userfunc::FnameTransError::None)
+}
+
 /// Evaluate an expression which can be a function, partial, or string.
 /// Pass arguments `argv[..argc]` (`eval_expr_typval`).
 ///
-/// String-expression and named Funcref dispatch are complete. A bound
-/// [`TypvalValue::Partial`] still needs `eval_expr_partial`/
-/// `call_partial`.
+/// String-expression, named Funcref, and bound Partial dispatch are
+/// complete.
 ///
 /// # Safety
-/// Forwarded from `eval_expr_string`'s own safety doc.
+/// Forwarded from `eval_expr_string`, `eval_expr_func`, and
+/// `eval_expr_partial`.
 pub unsafe fn eval_expr_typval(
     expr: &TypvalT,
     want_func: bool,
@@ -5638,10 +5702,8 @@ pub unsafe fn eval_expr_typval(
     rettv: &mut TypvalT,
 ) -> i32 {
     if matches!(expr.value, TypvalValue::Partial(_)) {
-        unimplemented!(
-            "eval_expr_typval: a Partial callback needs eval_expr_partial (call_partial), not yet \
-             translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { eval_expr_partial(expr, argv, rettv) };
     }
     if matches!(expr.value, TypvalValue::Func(_)) || want_func {
         // SAFETY: forwarded from this function's own safety doc.
@@ -7747,12 +7809,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bound funcexe_T")]
-    fn callback_call_partial_needs_bound_call_state() {
+    fn callback_call_invokes_a_partial_builtin() {
         let _lock = crate::globals::global_state_test_lock();
-        let mut partial = crate::eval::typval_defs::PartialT::default();
+        let mut partial = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"len".to_vec()),
+            pt_argv: vec![TypvalT {
+                value: TypvalValue::String(Some(b"hello".to_vec())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         let mut rettv = TypvalT::default();
-        let _ = unsafe {
+        assert!(unsafe {
             callback_call(
                 &crate::eval::typval_defs::Callback::Partial(
                     std::ptr::addr_of_mut!(partial),
@@ -7760,7 +7828,9 @@ mod tests {
                 &[],
                 &mut rettv,
             )
-        };
+        });
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+        assert_eq!(get_callback_depth(), 0);
     }
 
     #[test]
@@ -10982,12 +11052,53 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "eval_expr_partial")]
-    fn eval_expr_typval_panics_on_a_partial() {
-        let pt = crate::eval::typval_defs::PartialT::default();
-        let expr = TypvalT { value: TypvalValue::Partial(&pt as *const _ as *mut _), ..TypvalT::default() };
+    fn eval_expr_typval_calls_a_partial() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut pt = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"pow".to_vec()),
+            pt_argv: vec![TypvalT {
+                value: TypvalValue::Float(2.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let expr = TypvalT {
+            value: TypvalValue::Partial(std::ptr::from_mut(&mut pt)),
+            ..TypvalT::default()
+        };
+        let mut argv = [TypvalT {
+            value: TypvalValue::Float(3.0),
+            ..Default::default()
+        }];
         let mut rettv = TypvalT::default();
-        unsafe { eval_expr_typval(&expr, false, &mut [], &mut rettv) };
+        assert_eq!(
+            unsafe {
+                eval_expr_typval(
+                    &expr,
+                    false,
+                    &mut argv,
+                    &mut rettv,
+                )
+            },
+            OK
+        );
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn eval_expr_typval_rejects_a_null_partial() {
+        let expr = TypvalT {
+            value: TypvalValue::Partial(std::ptr::null_mut()),
+            ..TypvalT::default()
+        };
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe { eval_expr_typval(&expr, false, &mut [], &mut rettv) },
+            FAIL
+        );
     }
 
     #[test]
