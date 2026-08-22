@@ -6610,6 +6610,36 @@ pub unsafe fn prompt_invoke_callback() {
     }
 }
 
+/// Invoke the current prompt buffer's interrupt callback
+/// (`invoke_prompt_interrupt`).
+///
+/// Returns false when no callback is configured. Actual callback
+/// execution still needs `callback_call`/the full `funcexe_T` path.
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a live buffer. Callers must
+/// serialize `GLOBALS.got_int` and callback state.
+#[must_use]
+pub unsafe fn invoke_prompt_interrupt() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+    debug_assert!(!curbuf.is_null());
+    // SAFETY: forwarded from this function's own safety doc.
+    if matches!(
+        unsafe { &(*curbuf).b_prompt_interrupt },
+        crate::eval::typval_defs::Callback::None
+    ) {
+        return false;
+    }
+
+    // Don't skip commands while running the interrupt callback.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut().got_int = false };
+    unimplemented!(
+        "invoke_prompt_interrupt: configured callbacks need callback_call"
+    );
+}
+
 /// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
 /// `"dict['key']"`), list item (`"list[expr]"`), or list slice
 /// (`"list[expr:expr]"`) (`get_lval`).
@@ -14278,6 +14308,56 @@ mod tests {
         drop(tab);
         drop(win);
         close_prompt_input_buffer(buf);
+    }
+
+    #[test]
+    fn invoke_prompt_interrupt_returns_false_without_a_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let old_got_int = unsafe { crate::globals::GLOBALS.get_mut().got_int };
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = buf_ptr;
+            crate::globals::GLOBALS.get_mut().got_int = true;
+        }
+
+        assert!(!unsafe { invoke_prompt_interrupt() });
+        assert!(unsafe { crate::globals::GLOBALS.get_mut().got_int });
+
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
+            crate::globals::GLOBALS.get_mut().got_int = old_got_int;
+        }
+    }
+
+    #[test]
+    fn invoke_prompt_interrupt_clears_interrupt_before_callback_boundary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old_curbuf = unsafe { crate::globals::GLOBALS.get_mut().curbuf };
+        let old_got_int = unsafe { crate::globals::GLOBALS.get_mut().got_int };
+        let mut buf = crate::buffer_defs::BufT {
+            b_prompt_interrupt: crate::eval::typval_defs::Callback::Funcref(
+                b"Interrupt".to_vec(),
+            ),
+            ..Default::default()
+        };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = buf_ptr;
+            crate::globals::GLOBALS.get_mut().got_int = true;
+        }
+
+        let result = std::panic::catch_unwind(|| unsafe {
+            invoke_prompt_interrupt()
+        });
+        assert!(result.is_err());
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut().got_int });
+
+        unsafe {
+            crate::globals::GLOBALS.get_mut().curbuf = old_curbuf;
+            crate::globals::GLOBALS.get_mut().got_int = old_got_int;
+        }
     }
 
     #[test]
