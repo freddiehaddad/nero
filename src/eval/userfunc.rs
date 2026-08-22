@@ -2553,7 +2553,7 @@ pub fn get_current_funccal_dict(ht: *mut HashtabT) -> *mut DictT {
     let fc_l_vars_ht = unsafe { &mut (*current).fc_l_vars.dv_hashtab as *mut HashtabT };
     if ht == fc_l_vars_ht {
         // SAFETY: current just checked non-null above.
-        unsafe { &mut (*current).fc_l_vars as *mut DictT }
+        unsafe { std::ptr::addr_of_mut!((*current).fc_l_vars) }
     } else {
         std::ptr::null_mut()
     }
@@ -2793,7 +2793,7 @@ pub fn get_funccal_local_dict() -> *mut DictT {
     }
     // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
     // get_funccal's own safety precondition.
-    unsafe { &mut (*get_funccal()).fc_l_vars as *mut DictT }
+    unsafe { std::ptr::addr_of_mut!((*get_funccal()).fc_l_vars) }
 }
 
 /// @return the `l:` scope variable, or null if there is no current
@@ -2820,7 +2820,9 @@ pub fn get_funccal_local_var() -> *mut ScopeDictDictItem {
     }
     // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
     // get_funccal's own safety precondition.
-    unsafe { &mut (*get_funccal()).fc_l_vars_var as *mut ScopeDictDictItem }
+    unsafe {
+        std::ptr::addr_of_mut!((*get_funccal()).fc_l_vars_var)
+    }
 }
 
 /// @return the hashtable used for local variables in the current
@@ -2834,7 +2836,7 @@ pub fn get_funccal_local_ht() -> *mut HashtabT {
     }
     // SAFETY: get_funccal_local_dict only ever returns null or a
     // pointer to a live DictT's own fc_l_vars field.
-    unsafe { &mut (*d).dv_hashtab as *mut HashtabT }
+    unsafe { std::ptr::addr_of_mut!((*d).dv_hashtab) }
 }
 
 /// @return the dict used for arguments in the current funccal, or
@@ -2852,7 +2854,7 @@ pub fn get_funccal_args_dict() -> *mut DictT {
     }
     // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
     // get_funccal's own safety precondition.
-    unsafe { &mut (*get_funccal()).fc_l_avars as *mut DictT }
+    unsafe { std::ptr::addr_of_mut!((*get_funccal()).fc_l_avars) }
 }
 
 /// @return the `a:` scope variable, or null if there is no current
@@ -2874,7 +2876,9 @@ pub fn get_funccal_args_var() -> *mut ScopeDictDictItem {
     }
     // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
     // get_funccal's own safety precondition.
-    unsafe { &mut (*get_funccal()).fc_l_avars_var as *mut ScopeDictDictItem }
+    unsafe {
+        std::ptr::addr_of_mut!((*get_funccal()).fc_l_avars_var)
+    }
 }
 
 /// @return the hashtable used for arguments in the current funccal, or
@@ -2887,7 +2891,7 @@ pub fn get_funccal_args_ht() -> *mut HashtabT {
     }
     // SAFETY: get_funccal_args_dict only ever returns null or a
     // pointer to a live DictT's own fc_l_avars field.
-    unsafe { &mut (*d).dv_hashtab as *mut HashtabT }
+    unsafe { std::ptr::addr_of_mut!((*d).dv_hashtab) }
 }
 
 /// Add a number variable `name` to dict `dp` with value `nr`

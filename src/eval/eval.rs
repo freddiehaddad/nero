@@ -277,12 +277,9 @@
 //! `eval/funcs.rs`'s `f_islocked`, is wired up as a real caller so
 //! far). The parse-only `skip: true` path and magic-brace name
 //! expansion are complete. One substantive `get_lval` branch remains:
-//! assigning through a scope dictionary (`rettv: Some(_)` inside
-//! `get_lval_dict_item`, needs
-//! `var_wrong_func_name`; `function_exists`/`trans_function_name` are
-//! now real) - `islocked()` always calls with `rettv: None`, so this
-//! is provably unreached by today's one real caller.
-//! `get_lval_subscript`'s own `hashtab_T *ht`/
+//! assigning through a scope dictionary now validates variable names
+//! and Funcref conflicts through `valid_varname`/
+//! `var_wrong_func_name`. `get_lval_subscript`'s own `hashtab_T *ht`/
 //! `dictitem_T *v` parameters, and `get_lval_list`'s own `flags`
 //! parameter, are dropped entirely: confirmed via direct inspection of
 //! the current upstream source that none of the three is ever actually
@@ -7426,14 +7423,6 @@ unsafe fn get_lval_subscript(
 /// written back UNCHANGED from that same value, making a true in/out
 /// parameter unnecessary here).
 ///
-/// The `rettv: Some(_)` sub-branch (checking a function/variable name
-/// is valid before assigning through a scope dictionary)
-/// `unimplemented!()`s - needs `var_wrong_func_name`
-/// (`function_exists`/`trans_function_name` are now real); see this
-/// module's own doc comment for why this is provably unreached by
-/// `islocked()`, the only real caller so far (always passes `rettv:
-/// None`).
-///
 /// # Safety
 /// Same as [`get_lval`].
 #[allow(clippy::too_many_arguments)]
@@ -7480,12 +7469,18 @@ unsafe fn get_lval_dict_item(
     // variable name is valid (only variable name unless it is l: or
     // g: dictionary). Disallow overwriting a builtin function.
     // SAFETY: forwarded from this function's own safety doc.
-    if rettv.is_some() && unsafe { (*lp.ll_dict).dv_scope } != crate::eval::typval_defs::ScopeType::NoScope {
-        unimplemented!(
-            "get_lval_dict_item: assigning through a scope dictionary needs \
-             var_wrong_func_name (function_exists/trans_function_name are real), not yet \
-             translated - see this function's own doc comment"
-        );
+    let scope = unsafe { (*lp.ll_dict).dv_scope };
+    if let Some(rettv) = rettv
+        && scope != crate::eval::typval_defs::ScopeType::NoScope
+        && ((scope == crate::eval::typval_defs::ScopeType::DefScope
+            && crate::eval::typval::tv_is_func(rettv)
+            && crate::eval::vars::var_wrong_func_name(
+                key,
+                lp.ll_di.is_null(),
+            ))
+            || !crate::eval::vars::valid_varname(key))
+    {
+        return GlvStatus::Fail;
     }
 
     if !lp.ll_di.is_null()
@@ -7821,7 +7816,7 @@ mod tests {
     }
 
     #[test]
-    fn var_set_global_restores_funccal_when_assignment_panics() {
+    fn var_set_global_restores_funccal_when_assignment_is_rejected() {
         let _lock = crate::globals::global_state_test_lock();
         let mut fc =
             Box::new(crate::eval::typval_defs::FunccallT::default());
@@ -7837,10 +7832,19 @@ mod tests {
                 },
             )
         });
-        assert!(result.is_err());
-        assert_eq!(crate::eval::userfunc::get_current_funccal(), fc_ptr);
-
+        let restored = crate::eval::userfunc::get_current_funccal();
+        let rejected = unsafe {
+            crate::eval::typval::tv_dict_find(
+                crate::eval::vars::get_globvar_dict().as_mut(),
+                b"nero_bad_func",
+            )
+        }
+        .is_none();
         crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+
+        assert!(result.is_ok());
+        assert_eq!(restored, fc_ptr);
+        assert!(rejected);
         drop(fc);
     }
 
@@ -15528,6 +15532,131 @@ mod tests {
         );
 
         clear_lval(&mut lv);
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_validates_scope_dictionary_assignment_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let scope = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*scope).dv_scope =
+                crate::eval::typval_defs::ScopeType::DefScope;
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                b"Scope",
+                scope,
+            );
+        }
+        let function = TypvalT {
+            value: TypvalValue::Func(Some(b"len".to_vec())),
+            ..Default::default()
+        };
+
+        let mut lowercase = LvalT::default();
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    b"g:Scope.lower",
+                    Some(&function),
+                    &mut lowercase,
+                    false,
+                    false,
+                    0,
+                    FNE_CHECK_START,
+                )
+            },
+            None
+        );
+
+        let uppercase_name = b"g:Scope.Upper";
+        let mut uppercase = LvalT::default();
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    uppercase_name,
+                    Some(&function),
+                    &mut uppercase,
+                    false,
+                    false,
+                    0,
+                    FNE_CHECK_START,
+                )
+            },
+            Some(uppercase_name.len())
+        );
+        assert_eq!(uppercase.ll_newkey.as_deref(), Some(&b"Upper"[..]));
+        clear_lval(&mut uppercase);
+
+        let bracket_name = b"g:Scope['Upper2']";
+        let mut bracket = LvalT::default();
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    bracket_name,
+                    Some(&function),
+                    &mut bracket,
+                    false,
+                    false,
+                    0,
+                    FNE_CHECK_START,
+                )
+            },
+            Some(bracket_name.len())
+        );
+        assert_eq!(bracket.ll_newkey.as_deref(), Some(&b"Upper2"[..]));
+        clear_lval(&mut bracket);
+
+        let prefixed_scope = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*prefixed_scope).dv_scope =
+                crate::eval::typval_defs::ScopeType::Scope;
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *crate::eval::vars::get_globvar_dict(),
+                b"PrefixedScope",
+                prefixed_scope,
+            );
+        }
+        let prefixed_name = b"g:PrefixedScope.lower";
+        let mut prefixed = LvalT::default();
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    prefixed_name,
+                    Some(&function),
+                    &mut prefixed,
+                    false,
+                    false,
+                    0,
+                    FNE_CHECK_START,
+                )
+            },
+            Some(prefixed_name.len())
+        );
+        assert_eq!(prefixed.ll_newkey.as_deref(), Some(&b"lower"[..]));
+        clear_lval(&mut prefixed);
+
+        let mut invalid = LvalT::default();
+        assert_eq!(
+            unsafe {
+                get_lval(
+                    b"g:Scope['bad-key']",
+                    Some(&TypvalT {
+                        value: TypvalValue::Number(1),
+                        ..Default::default()
+                    }),
+                    &mut invalid,
+                    false,
+                    false,
+                    0,
+                    FNE_CHECK_START,
+                )
+            },
+            None
+        );
+
         reset_globals_for_test();
     }
 

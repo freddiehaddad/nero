@@ -44,12 +44,9 @@
 //! taking `&[u8]`), `tv_dict_item_free`, `tv_dict_item_copy`,
 //! `tv_dict_item_remove`, `tv_dict_alloc`, `tv_dict_free_contents`/
 //! `tv_dict_free_dict`/`tv_dict_free`/`tv_dict_unref`, `tv_dict_find`/
-//! `tv_dict_has_key`/`tv_dict_len`, `tv_dict_add` (omits the original's
-//! `tv_dict_wrong_func_name` g:/l: validation - needs
-//! `get_globvar_dict`/`get_funccal_local_ht`/`var_wrong_func_name`,
-//! none translated, and nothing in this crate can even construct a
-//! real global/local-funccall scope dict yet for that check to apply
-//! to), `tv_dict_add_list`/`_dict`/`_tv`/`_nr`/`_float`/`_bool`/`_str`
+//! `tv_dict_has_key`/`tv_dict_len`, `tv_dict_wrong_func_name`,
+//! `tv_dict_add`, `tv_dict_add_list`/`_dict`/`_tv`/`_nr`/`_float`/
+//! `_bool`/`_str`
 //! (`_str_len`/`_allocated_str` collapsed into `tv_dict_add_str`,
 //! since Rust's `&[u8]` already carries its own length - see
 //! `tv_dict_add_str`'s own doc comment), `tv_dict_add_func` (needs
@@ -2072,9 +2069,9 @@ pub unsafe fn tv_dict_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// (not simply omitted) for signature fidelity with this genuinely
 /// reusable original function.
 ///
-/// Omits the original's own `tv_dict_wrong_func_name` check (see
-/// [`tv_dict_add`]'s own doc comment for why this can never trigger
-/// yet). Watcher notifications are complete.
+/// Scope-name and Funcref-conflict validation through
+/// [`tv_dict_wrong_func_name`] is complete. Watcher notifications are
+/// complete.
 ///
 /// # Safety
 /// `d1`/`d2` must be valid, non-null pointers to live `DictT`s, with
@@ -2098,6 +2095,12 @@ pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
         };
         // SAFETY: forwarded from this function's own safety doc.
         let di1 = unsafe { tv_dict_find(Some(&mut *d1), &key) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*d1).dv_scope } != ScopeType::NoScope
+            && !crate::eval::vars::valid_varname(&key)
+        {
+            break;
+        }
 
         match di1 {
             None => {
@@ -2111,7 +2114,7 @@ pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
                 // SAFETY: forwarded from this function's own safety doc.
                 let new_di = unsafe { tv_dict_item_copy(di2) };
                 // SAFETY: forwarded from this function's own safety doc.
-                if unsafe { tv_dict_add(&mut *d1, new_di) } == FAIL {
+                if unsafe { tv_dict_add(d1, new_di) } == FAIL {
                     // SAFETY: forwarded from this function's own safety doc.
                     unsafe { tv_dict_item_free(new_di) };
                 } else if watched {
@@ -2133,6 +2136,17 @@ pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
                 // SAFETY: forwarded from this function's own safety doc.
                 let (locked, flags) = unsafe { ((*di1).di_tv.v_lock, (*di1).di_flags) };
                 if value_check_lock(locked, None) || crate::eval::vars::var_check_ro(flags) {
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety
+                // doc.
+                if unsafe {
+                    tv_dict_wrong_func_name(
+                        d1,
+                        &(*di2).di_tv,
+                        &key,
+                    )
+                } {
                     break;
                 }
                 let mut oldtv = TypvalT::default();
@@ -2491,27 +2505,66 @@ pub unsafe fn tv_dict_get_bool(
     tv_get_bool(unsafe { &(*di).di_tv })
 }
 
+/// Check whether adding function value `tv` under `name` to `d` would
+/// violate global/local Funcref naming rules
+/// (`tv_dict_wrong_func_name`).
+///
+/// # Safety
+/// `d` must be a valid pointer to a live Dictionary. Function-call and
+/// scope-dictionary global state must be serialized.
+#[must_use]
+pub unsafe fn tv_dict_wrong_func_name(
+    d: *mut DictT,
+    tv: &TypvalT,
+    name: &[u8],
+) -> bool {
+    if d.is_null() || !tv_is_func(tv) {
+        return false;
+    }
+    let global = std::ptr::eq(d, crate::eval::vars::get_globvar_dict());
+    // SAFETY: non-null `d` is live by contract.
+    let local_ht = unsafe { std::ptr::addr_of_mut!((*d).dv_hashtab) };
+    let local = std::ptr::eq(
+        local_ht,
+        crate::eval::userfunc::get_funccal_local_ht(),
+    );
+    (global || local)
+        && crate::eval::vars::var_wrong_func_name(name, true)
+}
+
 /// Add item to dictionary (`tv_dict_add`).
 ///
 /// @return `FAIL` if key already exists.
 ///
-/// Omits the original's `tv_dict_wrong_func_name` check (rejecting a
-/// function-typed value added to the real `g:`/`l:` scope dict) - see
-/// this module's own doc comment for why.
-///
 /// # Safety
-/// `item` must be a valid, non-null pointer previously returned by
+/// `d` must be a valid, non-null pointer to a live Dictionary. `item`
+/// must be a valid, non-null pointer previously returned by
 /// [`tv_dict_item_alloc`] (or equivalent), not already present in any
 /// dictionary's hashtable.
-pub unsafe fn tv_dict_add(d: &mut DictT, item: *mut DictitemT) -> i32 {
+///
+/// The raw Dictionary pointer is required because Funcref-name
+/// validation may re-enter variable lookup and read this same global
+/// or local scope Dictionary before the insertion writes it.
+pub unsafe fn tv_dict_add(d: *mut DictT, item: *mut DictitemT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe {
+        tv_dict_wrong_func_name(
+            d,
+            &(*item).di_tv,
+            &(*item).di_key,
+        )
+    } {
+        return FAIL;
+    }
     // SAFETY: `di_key` is owned by `*item`, which the caller
     // guarantees outlives this hashtable entry (forwarded from this
     // function's own safety doc).
     let key_ptr = unsafe { (*item).di_key.as_mut_ptr() as *mut std::os::raw::c_char };
     // SAFETY: forwarded from this function's own safety doc.
-    let rc = unsafe { d.dv_hashtab.hash_add(key_ptr) };
+    let rc = unsafe { (*d).dv_hashtab.hash_add(key_ptr) };
     if rc == OK {
-        d.dv_index.insert(key_ptr as usize, item);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*d).dv_index.insert(key_ptr as usize, item) };
     }
     rc
 }
@@ -2669,7 +2722,7 @@ pub unsafe fn tv_dict_add_dict(d: &mut DictT, key: &[u8], dict: *mut DictT) -> i
 ///
 /// # Safety
 /// Forwards [`tv_copy`]'s own safety requirements for `tv`.
-pub unsafe fn tv_dict_add_tv(d: &mut DictT, key: &[u8], tv: &TypvalT) -> i32 {
+pub unsafe fn tv_dict_add_tv(d: *mut DictT, key: &[u8], tv: &TypvalT) -> i32 {
     let item = tv_dict_item_alloc(key);
     // SAFETY: `item` was just allocated above, not yet in any dict;
     // forwarded from this function's own safety doc for `tv`.
@@ -2765,7 +2818,7 @@ pub fn tv_dict_add_str(d: &mut DictT, key: &[u8], val: Option<&[u8]>) -> i32 {
 ///
 /// # Safety
 /// `fp` must be a valid, non-null pointer to a live `UfuncT`.
-pub unsafe fn tv_dict_add_func(d: &mut DictT, key: &[u8], fp: *mut crate::eval::typval_defs::UfuncT) -> i32 {
+pub unsafe fn tv_dict_add_func(d: *mut DictT, key: &[u8], fp: *mut crate::eval::typval_defs::UfuncT) -> i32 {
     // SAFETY: forwarded from this function's own safety doc.
     let raw_name: &[u8] = unsafe { &(*fp).uf_name };
     let name = &raw_name[..raw_name.len().saturating_sub(1)];
@@ -5880,6 +5933,102 @@ mod tests {
     }
 
     #[test]
+    fn tv_dict_add_enforces_global_funcref_variable_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+
+        let lowercase = tv_dict_item_alloc(b"lower");
+        unsafe {
+            (*lowercase).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            assert_eq!(tv_dict_add(global, lowercase), FAIL);
+            tv_dict_item_free(lowercase);
+        }
+
+        let uppercase = tv_dict_item_alloc(b"Upper");
+        unsafe {
+            (*uppercase).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            assert_eq!(tv_dict_add(global, uppercase), OK);
+            assert_eq!(
+                tv_dict_find(Some(&mut *global), b"Upper"),
+                Some(uppercase)
+            );
+            crate::eval::vars::vars_clear(&mut *global);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_allows_lowercase_funcrefs_in_plain_dicts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        let item = tv_dict_item_alloc(b"lower");
+        unsafe {
+            (*item).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            assert_eq!(tv_dict_add(&mut *dict, item), OK);
+            tv_dict_free(dict);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_enforces_local_partial_variable_names() {
+        struct FunccalGuard;
+
+        impl Drop for FunccalGuard {
+            fn drop(&mut self) {
+                crate::eval::userfunc::set_current_funccal(
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        let mut function =
+            Box::new(crate::eval::typval_defs::UfuncT::default());
+        let function_ptr = std::ptr::addr_of_mut!(*function);
+        let mut call =
+            Box::new(crate::eval::typval_defs::FunccallT {
+                fc_func: function_ptr,
+                ..Default::default()
+            });
+        crate::eval::vars::init_var_dict(
+            &mut call.fc_l_vars,
+            &mut call.fc_l_vars_var,
+            ScopeType::DefScope,
+        );
+        let call_ptr = std::ptr::addr_of_mut!(*call);
+        crate::eval::userfunc::set_current_funccal(call_ptr);
+        let _guard = FunccalGuard;
+        let local = unsafe {
+            std::ptr::addr_of_mut!((*call_ptr).fc_l_vars)
+        };
+
+        let lowercase = tv_dict_item_alloc(b"lower");
+        unsafe {
+            (*lowercase).di_tv.value =
+                TypvalValue::Partial(std::ptr::null_mut());
+            assert_eq!(tv_dict_add(local, lowercase), FAIL);
+            tv_dict_item_free(lowercase);
+        }
+
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"len".to_vec()),
+                ..Default::default()
+            },
+        ));
+        let uppercase = tv_dict_item_alloc(b"Upper");
+        unsafe {
+            (*uppercase).di_tv.value = TypvalValue::Partial(partial);
+            assert_eq!(tv_dict_add(local, uppercase), OK);
+            crate::eval::vars::vars_clear(&mut *local);
+        }
+    }
+
+    #[test]
     fn tv_dict_add_list_increments_refcount_and_stores_pointer() {
         let _lock = crate::globals::global_state_test_lock();
         let d = tv_dict_alloc();
@@ -7653,6 +7802,48 @@ mod tests {
         unsafe {
             tv_dict_unref(d1);
             tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn dict_extend_rejects_invalid_keys_for_scope_dicts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let scope = tv_dict_alloc();
+        let source = tv_dict_alloc();
+        unsafe {
+            (*scope).dv_refcount = 1;
+            (*scope).dv_scope = ScopeType::Scope;
+            (*source).dv_refcount = 1;
+            tv_dict_add_nr(&mut *source, b"bad-key", 7);
+            tv_dict_extend(scope, source, b"keep");
+            assert!(!tv_dict_has_key(Some(&mut *scope), b"bad-key"));
+            tv_dict_unref(scope);
+            tv_dict_unref(source);
+        }
+    }
+
+    #[test]
+    fn dict_extend_does_not_replace_a_global_with_invalid_funcref() {
+        let _lock = crate::globals::global_state_test_lock();
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+        let source = tv_dict_alloc();
+        unsafe {
+            (*source).dv_refcount = 1;
+            tv_dict_add_nr(&mut *global, b"lower", 7);
+            let item = tv_dict_item_alloc(b"lower");
+            (*item).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            assert_eq!(tv_dict_add(source, item), OK);
+
+            tv_dict_extend(global, source, b"force");
+
+            assert_eq!(
+                tv_dict_get_number(Some(&mut *global), b"lower"),
+                7
+            );
+            crate::eval::vars::vars_clear(&mut *global);
+            tv_dict_unref(source);
         }
     }
 

@@ -305,7 +305,17 @@ pub unsafe fn dict_set_var(
             Object::Nil
         };
         if dict == crate::eval::vars::get_vimvar_dict() {
-            match unsafe { crate::eval::vars::before_set_vvar(key, item, &converted) } {
+            let watched =
+                unsafe { crate::eval::typval::tv_dict_is_watched(dict) };
+            match unsafe {
+                crate::eval::vars::before_set_vvar(
+                    key,
+                    item,
+                    &mut converted,
+                    true,
+                    watched,
+                )
+            } {
                 crate::eval::vars::BeforeSetVvar::Handled => {
                     unsafe { crate::eval::typval::tv_clear_simple(&converted) };
                     return old;
@@ -329,7 +339,7 @@ pub unsafe fn dict_set_var(
     } else {
         let item = crate::eval::typval::tv_dict_item_alloc(key);
         unsafe { (*item).di_tv = std::mem::take(&mut converted) };
-        let _ = unsafe { crate::eval::typval::tv_dict_add(&mut *dict, item) };
+        let _ = unsafe { crate::eval::typval::tv_dict_add(dict, item) };
         Object::Nil
     }
 }

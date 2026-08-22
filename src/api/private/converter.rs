@@ -121,7 +121,7 @@ pub unsafe fn object_to_vim(
             for item in items {
                 let dict_item = tv_dict_item_alloc(&item.key);
                 unsafe { (*dict_item).di_tv = object_to_vim(&item.value, _err) };
-                let _ = unsafe { tv_dict_add(&mut *dict, dict_item) };
+                let _ = unsafe { tv_dict_add(dict, dict_item) };
             }
             unsafe { (*dict).dv_refcount += 1 };
             TypvalValue::Dict(dict)

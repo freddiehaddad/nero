@@ -210,25 +210,73 @@ pub(crate) enum BeforeSetVvar {
 /// Additional handling before assigning a `v:` variable
 /// (`before_set_vvar`).
 ///
-/// Dictionary watchers are omitted because `DictT` has no watcher
-/// registry yet and therefore no current dictionary can be watched.
+/// The original's String branch leaves a reentrantly-written
+/// `v:errmsg` untouched if `tv_get_string()` itself emits an error.
+/// Message emission cannot currently re-enter variable assignment in
+/// this crate, so the same final value is stored directly; restore that
+/// guard with the message pipeline.
 ///
 /// # Safety
 /// `item` must point to a live `DictitemT`; may mutate shared search
-/// and redraw state for `v:searchforward`/`v:hlsearch`.
+/// and redraw state for `v:searchforward`/`v:hlsearch`. Pointer-bearing
+/// `value` and watcher state must remain valid for the call.
 pub(crate) unsafe fn before_set_vvar(
     name: &[u8],
     item: *mut crate::eval::typval_defs::DictitemT,
-    value: &TypvalT,
+    value: &mut TypvalT,
+    copy: bool,
+    watched: bool,
 ) -> BeforeSetVvar {
     use crate::eval::typval_defs::TypvalValue;
-    match unsafe { &(*item).di_tv.value } {
-        TypvalValue::String(_) => {
-            let string = crate::eval::typval::tv_get_string(value);
-            unsafe { (*item).di_tv.value = TypvalValue::String(Some(string)) };
+    match unsafe { (*item).di_tv.var_type() } {
+        VarType::String => {
+            let mut oldtv = TypvalT::default();
+            if watched {
+                // SAFETY: item points to the live existing v: value.
+                unsafe {
+                    crate::eval::typval::tv_copy(
+                        &(*item).di_tv,
+                        &mut oldtv,
+                    )
+                };
+            }
+            let string = if !copy {
+                match &mut value.value {
+                    TypvalValue::String(string) => string.take(),
+                    _ => Some(crate::eval::typval::tv_get_string(value)),
+                }
+            } else {
+                Some(crate::eval::typval::tv_get_string(value))
+            };
+            unsafe {
+                (*item).di_tv.value = TypvalValue::String(string)
+            };
+            if watched {
+                let dict = get_vimvar_dict();
+                // SAFETY: the v: Dictionary and item remain live.
+                unsafe {
+                    crate::eval::typval::tv_dict_watcher_notify(
+                        dict,
+                        name,
+                        Some(&(*item).di_tv),
+                        Some(&oldtv),
+                    );
+                    crate::eval::typval::tv_clear_simple(&oldtv);
+                }
+            }
             BeforeSetVvar::Handled
         }
-        TypvalValue::Number(_) => {
+        VarType::Number => {
+            let mut oldtv = TypvalT::default();
+            if watched {
+                // SAFETY: item points to the live existing v: value.
+                unsafe {
+                    crate::eval::typval::tv_copy(
+                        &(*item).di_tv,
+                        &mut oldtv,
+                    )
+                };
+            }
             let number = crate::eval::typval::tv_get_number(value);
             unsafe { (*item).di_tv.value = TypvalValue::Number(number) };
             if name == b"searchforward" {
@@ -237,9 +285,22 @@ pub(crate) unsafe fn before_set_vvar(
                 unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = number == 0;
                 unsafe { crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_SOME_VALID) };
             }
+            if watched {
+                let dict = get_vimvar_dict();
+                // SAFETY: the v: Dictionary and item remain live.
+                unsafe {
+                    crate::eval::typval::tv_dict_watcher_notify(
+                        dict,
+                        name,
+                        Some(&(*item).di_tv),
+                        Some(&oldtv),
+                    );
+                    crate::eval::typval::tv_clear_simple(&oldtv);
+                }
+            }
             BeforeSetVvar::Handled
         }
-        _ if unsafe { (*item).di_tv.var_type() } != value.var_type() => {
+        current if current != value.var_type() => {
             BeforeSetVvar::TypeError
         }
         _ => BeforeSetVvar::SetNormally,
@@ -904,7 +965,9 @@ pub fn get_globvar_dict() -> *mut DictT {
 pub fn get_globvar_ht() -> *mut HashtabT {
     // SAFETY: forwarded from get_globvar_dict's own established
     // convention.
-    unsafe { &mut (*get_globvar_dict()).dv_hashtab as *mut HashtabT }
+    unsafe {
+        std::ptr::addr_of_mut!((*get_globvar_dict()).dv_hashtab)
+    }
 }
 
 
@@ -1641,7 +1704,7 @@ pub fn find_var_ht_dict(name: &[u8]) -> (*mut HashtabT, &[u8], *mut DictT) {
         std::ptr::null_mut()
     } else {
         // SAFETY: d just checked non-null above.
-        unsafe { &mut (*d).dv_hashtab as *mut HashtabT }
+        unsafe { std::ptr::addr_of_mut!((*d).dv_hashtab) }
     };
     (ht, varname, d)
 }
@@ -2622,6 +2685,35 @@ pub fn valid_varname(varname: &[u8]) -> bool {
     true
 }
 
+/// Check whether `name` is valid for storing a Funcref/Partial
+/// (`var_wrong_func_name`).
+///
+/// Window/buffer/script/tab scope names and autoload names are
+/// accepted without an uppercase first identifier byte. A newly
+/// created variable may not hide an existing function. Diagnostics
+/// are omitted while preserving the original boolean result.
+#[must_use]
+pub fn var_wrong_func_name(name: &[u8], new_var: bool) -> bool {
+    let name = &name[..name
+        .iter()
+        .position(|&byte| byte == crate::ascii_defs::NUL)
+        .unwrap_or(name.len())];
+    let scoped = matches!(name.first(), Some(b'w' | b'b' | b's' | b't'))
+        && name.get(1) == Some(&b':');
+    let identifier_start = if !name.is_empty() && name.get(1) == Some(&b':') {
+        name.get(2).copied().unwrap_or(crate::ascii_defs::NUL)
+    } else {
+        name.first().copied().unwrap_or(crate::ascii_defs::NUL)
+    };
+    if !scoped
+        && !crate::macros_defs::ascii_isupper(i32::from(identifier_start))
+        && !name.contains(&b'#')
+    {
+        return true;
+    }
+    new_var && crate::eval::userfunc::function_exists(name, false)
+}
+
 /// Whether it's NOT OK to change a variable with the given
 /// `DictitemT.di_flags`: `true` when read-only, or
 /// read-only-in-the-sandbox while currently inside the sandbox
@@ -2810,6 +2902,43 @@ mod set_vcount_and_valid_varname_tests {
     fn valid_varname_rejects_other_punctuation() {
         assert!(!valid_varname(b"foo-bar"));
         assert!(!valid_varname(b"foo bar"));
+    }
+
+    #[test]
+    fn var_wrong_func_name_enforces_scope_and_autoload_rules() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(var_wrong_func_name(b"g:lower", false));
+        assert!(var_wrong_func_name(b"a:lower", false));
+        assert!(!var_wrong_func_name(b"g:Upper", false));
+        assert!(!var_wrong_func_name(b"w:lower", false));
+        assert!(!var_wrong_func_name(b"b:lower", false));
+        assert!(!var_wrong_func_name(b"s:lower", false));
+        assert!(!var_wrong_func_name(b"t:lower", false));
+        assert!(!var_wrong_func_name(b"autoload#lower", false));
+    }
+
+    #[test]
+    fn var_wrong_func_name_rejects_hiding_an_existing_function() {
+        struct FuncRegistryGuard;
+
+        impl Drop for FuncRegistryGuard {
+            fn drop(&mut self) {
+                crate::eval::userfunc::func_init();
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_name: b"ExistingFunction\0".to_vec(),
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::from_mut(&mut function);
+        unsafe { crate::eval::userfunc::func_hashtab_add(function_ptr) };
+        let _registry = FuncRegistryGuard;
+
+        assert!(var_wrong_func_name(b"ExistingFunction", true));
+        assert!(!var_wrong_func_name(b"ExistingFunction", false));
     }
 
     #[test]
@@ -3087,12 +3216,20 @@ mod tests {
             (*string_item).di_tv.value =
                 crate::eval::typval_defs::TypvalValue::String(None);
         }
-        let number = TypvalT {
+        let mut number = TypvalT {
             value: crate::eval::typval_defs::TypvalValue::Number(42),
             ..Default::default()
         };
         assert_eq!(
-            unsafe { before_set_vvar(b"errmsg", string_item, &number) },
+            unsafe {
+                before_set_vvar(
+                    b"errmsg",
+                    string_item,
+                    &mut number,
+                    true,
+                    false,
+                )
+            },
             BeforeSetVvar::Handled
         );
         assert!(matches!(
@@ -3105,12 +3242,20 @@ mod tests {
             (*number_item).di_tv.value =
                 crate::eval::typval_defs::TypvalValue::Number(0);
         }
-        let string = TypvalT {
+        let mut string = TypvalT {
             value: crate::eval::typval_defs::TypvalValue::String(Some(b"7".to_vec())),
             ..Default::default()
         };
         assert_eq!(
-            unsafe { before_set_vvar(b"count", number_item, &string) },
+            unsafe {
+                before_set_vvar(
+                    b"count",
+                    number_item,
+                    &mut string,
+                    true,
+                    false,
+                )
+            },
             BeforeSetVvar::Handled
         );
         assert!(matches!(
@@ -3130,13 +3275,62 @@ mod tests {
             (*item).di_tv.value =
                 crate::eval::typval_defs::TypvalValue::Dict(std::ptr::null_mut());
         }
-        let number = TypvalT {
+        let mut number = TypvalT {
             value: crate::eval::typval_defs::TypvalValue::Number(1),
             ..Default::default()
         };
         assert_eq!(
-            unsafe { before_set_vvar(b"event", item, &number) },
+            unsafe {
+                before_set_vvar(
+                    b"event",
+                    item,
+                    &mut number,
+                    true,
+                    false,
+                )
+            },
             BeforeSetVvar::TypeError
+        );
+        unsafe { crate::eval::typval::tv_dict_item_free(item) };
+    }
+
+    #[test]
+    fn before_set_vvar_moves_a_string_when_copy_is_false() {
+        let item = crate::eval::typval::tv_dict_item_alloc(b"errmsg");
+        unsafe {
+            (*item).di_tv.value =
+                crate::eval::typval_defs::TypvalValue::String(Some(
+                    b"old".to_vec(),
+                ));
+        }
+        let mut value = TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::String(
+                Some(b"new".to_vec()),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                before_set_vvar(
+                    b"errmsg",
+                    item,
+                    &mut value,
+                    false,
+                    false,
+                )
+            },
+            BeforeSetVvar::Handled
+        );
+        assert_eq!(
+            unsafe { &(*item).di_tv.value },
+            &crate::eval::typval_defs::TypvalValue::String(Some(
+                b"new".to_vec(),
+            ))
+        );
+        assert_eq!(
+            value.value,
+            crate::eval::typval_defs::TypvalValue::String(None)
         );
         unsafe { crate::eval::typval::tv_dict_item_free(item) };
     }
@@ -5036,15 +5230,8 @@ pub unsafe fn set_var(name: &[u8], tv: &mut TypvalT, copy: bool) {
 /// provide - i.e. the same safety contract [`find_var_ht_dict`]/
 /// [`find_var_in_ht`] themselves already carry.
 ///
-/// # Panics
-/// Panics if `tv` holds a `Func`/`Partial` value - needs
-/// `var_wrong_func_name`; `function_exists`/`trans_function_name` are
-/// now real. Also panics if `name`
-/// resolves into the `v:` scope dict specifically - needs
-/// `before_set_vvar`, not yet translated. Neither is reached by
-/// `settabvar`/`setwinvar`/`setbufvar` (which only ever target
-/// `t:`/`w:`/`b:` names) or by setting an ordinary Number/Float/
-/// String/List/Dict/Blob value.
+/// Existing `v:` values are routed through [`before_set_vvar`] so
+/// String/Number slots preserve their type and special side effects.
 pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const: bool) {
     let (ht, varname, dict) = find_var_ht_dict(name);
     // SAFETY: `tv_dict_is_watched` accepts null and `dict`, when
@@ -5057,14 +5244,6 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
         return;
     }
 
-    if crate::eval::typval::tv_is_func(tv) {
-        unimplemented!(
-            "set_var_const: setting a Func/Partial value needs var_wrong_func_name \
-             (function_exists/trans_function_name are real), not yet translated - see this function's \
-             own doc comment"
-        );
-    }
-
     // SAFETY: forwarded from this function's own safety doc; dict is
     // non-null since ht is non-null (find_var_ht_dict's own contract).
     let mut found = unsafe { find_var_in_ht(dict, 0, varname, true) };
@@ -5074,24 +5253,44 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
         // SAFETY: forwarded from this function's own safety doc.
         found = unsafe { crate::eval::userfunc::find_var_in_scoped_ht(name, true) };
     }
+    if crate::eval::typval::tv_is_func(tv)
+        && var_wrong_func_name(name, found.is_none())
+    {
+        return;
+    }
 
-    let di_tv: *mut TypvalT;
     let mut oldtv = TypvalT::default();
 
-    match found {
+    let di_tv: *mut TypvalT = match found {
         Some(variant) => {
             if is_const {
                 // emsg(_(e_cannot_mod)) omitted (message display).
                 return;
             }
-            let (di_flags, tv_ptr): (*mut u8, *mut TypvalT) = match variant {
+            let (di_flags, tv_ptr, item_ptr): (
+                *mut u8,
+                *mut TypvalT,
+                *mut DictitemT,
+            ) = match variant {
                 DictitemVariant::Dict(p) => {
                     // SAFETY: forwarded from this function's own safety doc.
-                    unsafe { (&mut (*p).di_flags as *mut u8, &mut (*p).di_tv as *mut TypvalT) }
+                    unsafe {
+                        (
+                            std::ptr::addr_of_mut!((*p).di_flags),
+                            std::ptr::addr_of_mut!((*p).di_tv),
+                            p,
+                        )
+                    }
                 }
                 DictitemVariant::Scope(p) => {
                     // SAFETY: forwarded from this function's own safety doc.
-                    unsafe { (&mut (*p).di_flags as *mut u8, &mut (*p).di_tv as *mut TypvalT) }
+                    unsafe {
+                        (
+                            std::ptr::addr_of_mut!((*p).di_flags),
+                            std::ptr::addr_of_mut!((*p).di_tv),
+                            std::ptr::null_mut(),
+                        )
+                    }
                 }
             };
             // Check in this order for backwards compatibility: whether
@@ -5104,6 +5303,26 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
             if var_check_ro(flags) || value_check_lock(lock, None) || var_check_lock(flags) {
                 return;
             }
+            if std::ptr::eq(dict, get_vimvar_dict()) {
+                if item_ptr.is_null() {
+                    return;
+                }
+                // SAFETY: v: entries are full Dictitems and remain
+                // live in the v: Dictionary for this assignment.
+                match unsafe {
+                    before_set_vvar(
+                        varname,
+                        item_ptr,
+                        tv,
+                        copy,
+                        watched,
+                    )
+                } {
+                    BeforeSetVvar::Handled
+                    | BeforeSetVvar::TypeError => return,
+                    BeforeSetVvar::SetNormally => {}
+                }
+            }
             if watched {
                 // SAFETY: `tv_ptr` points to the live existing item.
                 unsafe { crate::eval::typval::tv_copy(&*tv_ptr, &mut oldtv) };
@@ -5111,7 +5330,7 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
             // existing variable, need to clear the value.
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { crate::eval::typval::tv_clear_simple(&*tv_ptr) };
-            di_tv = tv_ptr;
+            tv_ptr
         }
         None => {
             // Can't add "v:" or "a:" variable.
@@ -5129,7 +5348,7 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
             let item = crate::eval::typval::tv_dict_item_alloc(varname);
             // SAFETY: dict is non-null, forwarded from this function's
             // own safety doc.
-            if unsafe { crate::eval::typval::tv_dict_add(&mut *dict, item) } == crate::vim_defs::FAIL
+            if unsafe { crate::eval::typval::tv_dict_add(dict, item) } == crate::vim_defs::FAIL
             {
                 // SAFETY: item was just allocated via
                 // tv_dict_item_alloc's own Box::into_raw, never added
@@ -5144,9 +5363,9 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
                 unsafe { (*item).di_flags |= dict_item_flags::LOCK };
             }
             // SAFETY: forwarded from this function's own safety doc.
-            di_tv = unsafe { &mut (*item).di_tv };
+            unsafe { &mut (*item).di_tv }
         }
-    }
+    };
 
     if copy || matches!(tv.value, TypvalValue::Number(_) | TypvalValue::Float(_)) {
         // SAFETY: forwarded from this function's own safety doc.
@@ -6105,6 +6324,36 @@ mod set_var_tests {
         }
     }
 
+    struct VimvarValueCleanup {
+        item: *mut DictitemT,
+        saved: TypvalT,
+    }
+
+    impl VimvarValueCleanup {
+        unsafe fn install(item: *mut DictitemT) -> Self {
+            let mut saved = TypvalT::default();
+            unsafe {
+                crate::eval::typval::tv_copy(
+                    &(*item).di_tv,
+                    &mut saved,
+                )
+            };
+            Self { item, saved }
+        }
+    }
+
+    impl Drop for VimvarValueCleanup {
+        fn drop(&mut self) {
+            unsafe {
+                crate::eval::typval::tv_clear_simple(
+                    &(*self.item).di_tv,
+                );
+                (*self.item).di_tv =
+                    std::mem::take(&mut self.saved);
+            }
+        }
+    }
+
     fn reset_shared_state() {
         crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
         unsafe { vars_clear(GLOBVARDICT.get_mut()) };
@@ -6311,8 +6560,7 @@ mod set_var_tests {
     }
 
     #[test]
-    #[should_panic(expected = "var_wrong_func_name")]
-    fn set_var_with_a_funcref_value_panics() {
+    fn set_var_rejects_a_lowercase_global_funcref_name() {
         let _lock = crate::globals::global_state_test_lock();
         reset_shared_state();
 
@@ -6321,6 +6569,120 @@ mod set_var_tests {
             ..TypvalT::default()
         };
         unsafe { set_var(b"g:myvar", &mut tv, true) };
+
+        assert_eq!(
+            unsafe { eval_variable(b"g:myvar", None, false, false) },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(
+            tv.value,
+            TypvalValue::Func(Some(b"SomeFunc".to_vec()))
+        );
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_var_accepts_an_uppercase_global_funcref_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let mut tv = TypvalT {
+            value: TypvalValue::Func(Some(b"len".to_vec())),
+            ..TypvalT::default()
+        };
+        unsafe { set_var(b"g:MyRef", &mut tv, true) };
+
+        let mut rettv = TypvalT::default();
+        assert_eq!(
+            unsafe {
+                eval_variable(
+                    b"g:MyRef",
+                    Some(&mut rettv),
+                    true,
+                    false,
+                )
+            },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            rettv.value,
+            TypvalValue::Func(Some(b"len".to_vec()))
+        );
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_var_preserves_an_existing_vimvar_string_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = get_vimvar_dict();
+        let item = crate::eval::typval::tv_dict_find(
+            unsafe { dict.as_mut() },
+            b"errmsg",
+        )
+        .expect("v:errmsg must exist");
+        let _value = unsafe {
+            VimvarValueCleanup::install(item)
+        };
+        let _watcher = unsafe {
+            WatcherCleanup::install(dict, b"errmsg")
+        };
+        let mut number = TypvalT {
+            value: TypvalValue::Number(42),
+            ..Default::default()
+        };
+
+        unsafe { set_var(b"v:errmsg", &mut number, true) };
+
+        assert_eq!(
+            unsafe { &(*item).di_tv.value },
+            &TypvalValue::String(Some(b"42".to_vec()))
+        );
+        assert_eq!(number.value, TypvalValue::Number(42));
+        assert!(!unsafe {
+            crate::eval::typval::tv_dict_is_watched(dict)
+        });
+    }
+
+    #[test]
+    fn before_set_vvar_notifies_number_watchers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = get_vimvar_dict();
+        let item = crate::eval::typval::tv_dict_find(
+            unsafe { dict.as_mut() },
+            b"count",
+        )
+        .expect("v:count must exist");
+        let _value = unsafe {
+            VimvarValueCleanup::install(item)
+        };
+        let _watcher = unsafe {
+            WatcherCleanup::install(dict, b"count")
+        };
+        let mut number = TypvalT {
+            value: TypvalValue::Number(17),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe {
+                before_set_vvar(
+                    b"count",
+                    item,
+                    &mut number,
+                    true,
+                    true,
+                )
+            },
+            BeforeSetVvar::Handled
+        );
+        assert_eq!(
+            unsafe { &(*item).di_tv.value },
+            &TypvalValue::Number(17)
+        );
+        assert!(!unsafe {
+            crate::eval::typval::tv_dict_is_watched(dict)
+        });
     }
 
     // ---- set_internal_string_var ----
