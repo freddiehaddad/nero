@@ -6322,6 +6322,43 @@ pub fn check_luafunc_name(str: &[u8], paren: bool) -> usize {
     p
 }
 
+/// Set the fixed `v:argv` List (`set_argv_var`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_list_alloc`],
+/// [`crate::eval::typval::tv_list_append_string`], and
+/// [`crate::eval::vars::set_vim_var_list`]. Callers must serialize
+/// `VIMVARS` and the GC List registry.
+pub unsafe fn set_argv_var(argv: &[Vec<u8>]) {
+    let list = crate::eval::typval::tv_list_alloc(
+        isize::try_from(argv.len()).expect("argv length must fit isize"),
+    );
+    // SAFETY: `list` was allocated immediately above.
+    unsafe {
+        crate::eval::typval::tv_list_set_lock(
+            list,
+            crate::eval::typval_defs::VarLockStatus::Fixed,
+        );
+    }
+
+    for arg in argv {
+        // SAFETY: `list` remains live throughout this loop.
+        unsafe {
+            crate::eval::typval::tv_list_append_string(list, Some(arg));
+            (*(*list).lv_last).li_tv.v_lock =
+                crate::eval::typval_defs::VarLockStatus::Fixed;
+        }
+    }
+
+    // SAFETY: `list` is live and ownership is transferred to v:argv.
+    unsafe {
+        crate::eval::vars::set_vim_var_list(
+            crate::eval::vars::VimVarIndex::Argv,
+            list,
+        )
+    };
+}
+
 /// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
 /// `"dict['key']"`), list item (`"list[expr]"`), or list slice
 /// (`"list[expr:expr]"`) (`get_lval`).
@@ -13560,7 +13597,8 @@ mod tests {
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
     }
 
-    // --- is_luafunc / tv_is_luafunc / get_lval / clear_lval ---
+    // --- is_luafunc / tv_is_luafunc / set_argv_var / get_lval /
+    //     clear_lval ---
 
     #[test]
     fn is_luafunc_matches_only_the_real_v_lua_partial() {
@@ -13615,6 +13653,84 @@ mod tests {
         };
         clear_lval(&mut lv);
         assert_eq!(lv.ll_name.as_deref(), Some(&b"name"[..]));
+    }
+
+    #[test]
+    fn set_argv_var_builds_a_fixed_list_of_fixed_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe {
+            crate::eval::vars::get_vim_var_list(
+                crate::eval::vars::VimVarIndex::Argv,
+            )
+        }
+        .is_null());
+
+        unsafe {
+            set_argv_var(&[
+                b"nero".to_vec(),
+                b"--headless".to_vec(),
+                b"file.txt".to_vec(),
+            ])
+        };
+        let list = unsafe {
+            crate::eval::vars::get_vim_var_list(
+                crate::eval::vars::VimVarIndex::Argv,
+            )
+        };
+        assert!(!list.is_null());
+        assert_eq!(
+            unsafe { (*list).lv_lock },
+            crate::eval::typval_defs::VarLockStatus::Fixed
+        );
+        assert_eq!(unsafe { (*list).lv_len }, 3);
+
+        let first = unsafe { crate::eval::typval::tv_list_find(list, 0) };
+        let second = unsafe { crate::eval::typval::tv_list_find(list, 1) };
+        assert_eq!(
+            unsafe { (*first).li_tv.value.clone() },
+            TypvalValue::String(Some(b"nero".to_vec()))
+        );
+        assert_eq!(
+            unsafe { (*second).li_tv.value.clone() },
+            TypvalValue::String(Some(b"--headless".to_vec()))
+        );
+        assert_eq!(
+            unsafe { (*first).li_tv.v_lock },
+            crate::eval::typval_defs::VarLockStatus::Fixed
+        );
+
+        unsafe {
+            crate::eval::vars::set_vim_var_list(
+                crate::eval::vars::VimVarIndex::Argv,
+                std::ptr::null_mut(),
+            );
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn set_argv_var_supports_an_empty_argument_vector() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { set_argv_var(&[]) };
+        let list = unsafe {
+            crate::eval::vars::get_vim_var_list(
+                crate::eval::vars::VimVarIndex::Argv,
+            )
+        };
+        assert!(!list.is_null());
+        assert_eq!(unsafe { (*list).lv_len }, 0);
+        assert_eq!(
+            unsafe { (*list).lv_lock },
+            crate::eval::typval_defs::VarLockStatus::Fixed
+        );
+
+        unsafe {
+            crate::eval::vars::set_vim_var_list(
+                crate::eval::vars::VimVarIndex::Argv,
+                std::ptr::null_mut(),
+            );
+            crate::eval::typval::tv_list_unref(list);
+        }
     }
 
     // --- skip_luafunc_name / check_luafunc_name ---
