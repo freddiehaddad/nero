@@ -213,10 +213,10 @@
 //! behavior for such input, not a deferred gap.
 //! `handle_subscript` mirrors this same minimality: only the real
 //! "nothing follows" fast path (no `[`/`.`/`(`/`->` continuation)
-//! returns successfully; anything that would actually need
-//! `eval_index`/`call_func_rettv`/`eval_method`/`eval_lambda`
-//! (all substantial, separate undertakings) panics via
-//! `unimplemented!()` instead. Its own `preceded_by_whitespace`
+//! returns successfully. Indexing and direct named builtin methods are
+//! real; callable-value `(`, lambda methods, `v:lua` methods, and
+//! dynamically-resolved method names remain at their separate
+//! subsystem boundaries. Its own `preceded_by_whitespace`
 //! parameter replaces the original's `!ascii_iswhite(*(*arg - 1))`
 //! check (looking at the byte immediately BEFORE `arg`, which this
 //! module's own "remaining slice, indexed from 0" idiom can't express
@@ -3639,10 +3639,10 @@ pub unsafe fn set_selfdict(rettv: &mut TypvalT, selfdict: *mut crate::eval::typv
 /// The `[`/`.` forms are now real, including the original's own
 /// LOOP (so `a[0][1].foo` chains correctly) and `selfdict` tracking
 /// (the dict a `.name`/`[key]` lookup was just read FROM, kept alive
-/// across the loop in case the NEXT step needs it). `(` (function
-/// call, `call_func_rettv`) and `->` (method call, `eval_method`/
-/// `eval_lambda`) still panic via `unimplemented!()` - substantial,
-/// separate undertakings, not attempted here.
+/// across the loop in case the NEXT step needs it). Direct named
+/// builtin `->` methods are real through `eval_method`; `(` callable-
+/// value calls, lambda methods, `v:lua` methods, and dynamically-
+/// resolved method names remain deferred.
 ///
 /// The original's own final "turn `dict.Func` into a partial bound to
 /// `dict`" step (`set_selfdict`/`make_partial`, reached only when the
@@ -3710,10 +3710,22 @@ pub fn handle_subscript(
                  translated"
             );
         } else if starts_method_call {
-            unimplemented!(
-                "handle_subscript: method-call handling (eval_method/eval_lambda) is not yet \
-                 translated"
-            );
+            if rest.get(2) == Some(&b'{') {
+                unimplemented!(
+                    "handle_subscript: lambda methods need eval_lambda/get_lambda_tv"
+                );
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let (r, consumed) = unsafe {
+                eval_method(
+                    rest,
+                    rettv,
+                    evalarg.as_deref_mut(),
+                    true,
+                )
+            };
+            ret = r;
+            pos += consumed;
         } else {
             // '[' or '.'
             // SAFETY: forwarded from this function's own safety doc.
@@ -3753,6 +3765,120 @@ pub fn handle_subscript(
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { tv_dict_unref(selfdict) };
     (ret, pos)
+}
+
+/// Evaluate a direct named builtin method call, `->name(args)`
+/// (`eval_method`).
+///
+/// Lambda methods, `v:lua` methods, and the original's fallback that
+/// evaluates an arbitrary expression before the `(` remain separate
+/// untranslated branches.
+///
+/// Returns `(status, bytes_consumed)`.
+///
+/// # Safety
+/// Pointer-bearing values in `rettv`, parsed arguments, and global
+/// current-window state must remain valid through the call.
+unsafe fn eval_method(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    evalarg: Option<&mut EvalargT>,
+    evaluate: bool,
+) -> (i32, usize) {
+    use crate::eval::typval::tv_clear_simple;
+
+    debug_assert!(arg.starts_with(b"->"));
+    if arg.get(2..).is_some_and(|rest| rest.starts_with(b"v:lua.")) {
+        unimplemented!("eval_method: v:lua methods need the Lua host");
+    }
+
+    let mut base = std::mem::take(rettv);
+    let mut pos = 2;
+    let (name_len, name_consumed, alias) =
+        get_name_len(&arg[pos..], evaluate);
+    if name_len == 0 {
+        if evaluate {
+            // SAFETY: `base` owns the former rettv value.
+            unsafe { tv_clear_simple(&base) };
+        }
+        return (FAIL, pos);
+    }
+    let name = alias
+        .as_deref()
+        .unwrap_or(&arg[pos..pos + name_len]);
+    let had_whitespace = name_consumed > 0
+        && crate::ascii_defs::ascii_iswhite(i32::from(
+            arg[pos + name_consumed - 1],
+        ));
+    pos += name_consumed;
+
+    if arg.get(pos) != Some(&b'(') {
+        if arg[pos..].contains(&b'(') {
+            unimplemented!(
+                "eval_method: dynamically-resolved method names need eval7"
+            );
+        }
+        if evaluate {
+            // SAFETY: `base` owns the former rettv value.
+            unsafe { tv_clear_simple(&base) };
+        }
+        return (FAIL, pos);
+    }
+    if had_whitespace {
+        if evaluate {
+            // SAFETY: `base` owns the former rettv value.
+            unsafe { tv_clear_simple(&base) };
+        }
+        return (FAIL, pos);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (parsed, consumed, argvars) = unsafe {
+        crate::eval::userfunc::get_func_arguments(
+            &arg[pos..],
+            evalarg,
+            0,
+        )
+    };
+    pos += consumed;
+    let mut status = parsed;
+    if status == OK {
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+        let line = if curwin.is_null() {
+            0
+        } else {
+            unsafe { (*curwin).w_cursor.lnum }
+        };
+        let mut funcexe = crate::eval::userfunc::FuncexeT {
+            fe_firstline: line,
+            fe_lastline: line,
+            fe_evaluate: evaluate,
+            fe_basetv: std::ptr::from_mut(&mut base),
+            ..Default::default()
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let error = unsafe {
+            crate::eval::userfunc::call_func_with_state(
+                name,
+                rettv,
+                &argvars,
+                &mut funcexe,
+            )
+        };
+        status = i32::from(
+            error == crate::eval::userfunc::FnameTransError::None,
+        );
+    }
+
+    for value in argvars.iter().rev() {
+        // SAFETY: parsed arguments are locally owned.
+        unsafe { tv_clear_simple(value) };
+    }
+    if evaluate {
+        // SAFETY: `base` owns the former rettv value.
+        unsafe { tv_clear_simple(&base) };
+    }
+    (status, pos)
 }
 
 /// `eval.c`'s own file-static `namespace_char` - the single-character
@@ -10358,17 +10484,88 @@ mod tests {
     }
 
     #[test]
-    fn handle_subscript_arrow_method_call_panics_even_with_preceding_whitespace() {
+    fn handle_subscript_arrow_method_call_ignores_preceding_whitespace() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
         let mut evalarg = evaluate_evalarg();
         // "->" continues regardless of preceding whitespace (matches
         // the original's own `|| (**arg == '-' && (*arg)[1] == '>')`
         // being a separate OR-branch, not gated by the whitespace
         // check at all).
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_subscript(b"->len()", &mut rettv, Some(&mut evalarg), true)
-        }));
-        assert!(result.is_err());
+        let (ret, consumed) =
+            handle_subscript(b"->len()", &mut rettv, Some(&mut evalarg), true);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 7);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn eval_method_rejects_whitespace_before_the_parenthesis() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT {
+            value: TypvalValue::Number(2),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) =
+            unsafe { eval_method(b"->pow (3)", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, 6);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn eval_method_rejects_a_missing_or_unknown_method() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut missing_name = TypvalT {
+            value: TypvalValue::Number(2),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+        assert_eq!(
+            unsafe {
+                eval_method(
+                    b"->",
+                    &mut missing_name,
+                    Some(&mut evalarg),
+                    true,
+                )
+            },
+            (FAIL, 2)
+        );
+
+        let mut unknown = TypvalT {
+            value: TypvalValue::Number(2),
+            ..Default::default()
+        };
+        let (ret, consumed) = unsafe {
+            eval_method(
+                b"->NeroMissingMethod()",
+                &mut unknown,
+                Some(&mut evalarg),
+                true,
+            )
+        };
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, b"->NeroMissingMethod()".len());
+    }
+
+    #[test]
+    fn eval_method_parse_only_consumes_without_calling() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = EvalargT::default();
+        let (ret, consumed) = unsafe {
+            eval_method(
+                b"->pow(3)",
+                &mut rettv,
+                Some(&mut evalarg),
+                false,
+            )
+        };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
     }
 
     // --- clear_evalarg ---
@@ -13359,6 +13556,31 @@ mod tests {
         let (ret, tv) = eval_str(b"\"hello\"[1]");
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"e".to_vec())));
+    }
+
+    #[test]
+    fn e2e_builtin_method_calls_and_chaining() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"2->pow(3)");
+        assert_eq!(ret, OK);
+        let TypvalValue::Float(value) = tv.value else {
+            panic!("expected a Float");
+        };
+        assert!((value - 8.0).abs() < 1.0e-12);
+
+        let (ret, tv) = eval_str(b"8->fmod(3)->float2nr()");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn e2e_list_method_releases_the_base_after_the_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let (ret, tv) = eval_str(b"[1, 2]->len()");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(2));
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 
     #[test]
