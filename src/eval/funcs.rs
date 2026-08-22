@@ -137,10 +137,9 @@
 //! function and stores its real `UfuncT` pointer. Invalid-input
 //! diagnostics remain at the untranslated message-display boundary;
 //! the same failure control flow and return values are preserved.
-//! The original's `save_function_name` may also dereference a
-//! Dictionary member while resolving a String name such as
-//! `"dict.Func"`; that form remains deferred with the broader lvalue
-//! name-resolution machinery.
+//! Name validation uses the real `save_function_name`/
+//! `trans_function_name` path, including Dictionary members and
+//! `<lambda>{digits}` names.
 //!
 //! Also translated: `call()` plus `eval/userfunc.c`'s `func_call` -
 //! invoke a String name, Funcref, or Partial with arguments copied
@@ -2758,36 +2757,47 @@ unsafe fn common_function(
             .position(|&byte| byte == crate::ascii_defs::NUL)
             .unwrap_or(name.len()),
     );
-    if name.is_empty()
+    let mut translated_name = None;
+    let should_translate = (use_string
+        && !name.contains(&crate::eval::eval::AUTOLOAD_CHAR))
+        || is_funcref;
+    let mut has_trailing = false;
+    if should_translate {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (translated, consumed) = unsafe {
+            crate::eval::userfunc::save_function_name(
+                &name,
+                false,
+                crate::eval::userfunc::TFN_INT
+                    | crate::eval::userfunc::TFN_QUIET
+                    | crate::eval::userfunc::TFN_NO_AUTOLOAD
+                    | crate::eval::userfunc::TFN_NO_DEREF,
+                None,
+            )
+        };
+        has_trailing = consumed < name.len();
+        translated_name = translated;
+    }
+    if has_trailing
+        || name.is_empty()
         || (use_string
             && name.first().is_some_and(u8::is_ascii_digit))
+        || (is_funcref && translated_name.is_none())
     {
         // semsg(e_invarg2) omitted - message display is not translated.
         return;
     }
 
-    let lookup_name = if let Some(global) = name.strip_prefix(b"g:") {
-        global.to_vec()
-    } else {
-        crate::eval::userfunc::fname_trans_sid(&name)
-            .unwrap_or_else(|_| name.clone())
-    };
-    if is_funcref {
-        if crate::eval::userfunc::find_func(&lookup_name).is_null() {
-            // semsg(E700) omitted - message display is not translated.
-            return;
+    if let Some(translated) = translated_name.as_deref()
+        && if is_funcref {
+            crate::eval::userfunc::find_func(translated).is_null()
+        } else {
+            !crate::eval::userfunc::translated_function_exists(
+                translated,
+            )
         }
-    } else if use_string
-        && !name.contains(&crate::eval::eval::AUTOLOAD_CHAR)
-        && (name.iter().any(|&byte| {
-            crate::ascii_defs::ascii_iswhite(i32::from(byte))
-                || byte == b'('
-        }) || !crate::eval::userfunc::translated_function_exists(
-            &lookup_name,
-        ))
     {
-        // semsg(e_invarg2/E700) omitted - message display is not
-        // translated.
+        // semsg(E700) omitted - message display is not translated.
         return;
     }
 
@@ -2902,7 +2912,11 @@ unsafe fn common_function(
         partial.pt_func = unsafe { (*source_partial).pt_func };
         unsafe { crate::eval::userfunc::func_ptr_ref(partial.pt_func) };
     } else if is_funcref {
-        partial.pt_func = crate::eval::userfunc::find_func(&lookup_name);
+        partial.pt_func = crate::eval::userfunc::find_func(
+            translated_name
+                .as_deref()
+                .expect("funcref requires a translated name"),
+        );
         unsafe { crate::eval::userfunc::func_ptr_ref(partial.pt_func) };
     } else {
         crate::eval::userfunc::func_ref(actual_name.as_deref());
@@ -13128,6 +13142,107 @@ mod tests {
             TypvalValue::Func(Some(b"<SNR>123_Foo".to_vec()))
         );
         unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn function_accepts_a_dictionary_member_funcref_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let member = crate::eval::typval::tv_dict_item_alloc(b"F");
+        unsafe {
+            (*member).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            crate::eval::typval::tv_dict_add(dict, member);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *global,
+                b"d",
+                dict,
+            );
+        }
+        let mut rettv = TypvalT::default();
+        let mut strict = TypvalT::default();
+
+        unsafe {
+            f_function(&[string(b"d.F")], &mut rettv);
+            f_funcref(&[string(b"d.F")], &mut strict);
+        }
+
+        assert_eq!(
+            rettv.value,
+            TypvalValue::Func(Some(b"d.F".to_vec()))
+        );
+        assert_eq!(strict.value, TypvalValue::Unknown);
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&rettv);
+            crate::eval::vars::vars_clear(&mut *global);
+        }
+    }
+
+    #[test]
+    fn function_accepts_a_noncallable_dictionary_member_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_nr(
+                &mut *dict,
+                b"F",
+                42,
+            );
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *global,
+                b"d",
+                dict,
+            );
+        }
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_function(&[string(b"d.F")], &mut rettv) };
+
+        assert_eq!(
+            rettv.value,
+            TypvalValue::Func(Some(b"d.F".to_vec()))
+        );
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&rettv);
+            crate::eval::vars::vars_clear(&mut *global);
+        }
+    }
+
+    #[test]
+    fn function_preserves_a_registered_lambda_name() {
+        struct FuncRegistryGuard;
+
+        impl Drop for FuncRegistryGuard {
+            fn drop(&mut self) {
+                crate::eval::userfunc::func_init();
+            }
+        }
+
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_name: b"<lambda>1\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::from_mut(&mut function);
+        unsafe { crate::eval::userfunc::func_hashtab_add(function_ptr) };
+        let _registry = FuncRegistryGuard;
+        let mut rettv = TypvalT::default();
+
+        unsafe { f_function(&[string(b"<lambda>1")], &mut rettv) };
+
+        assert_eq!(
+            rettv.value,
+            TypvalValue::Func(Some(b"<lambda>1".to_vec()))
+        );
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 2);
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+        assert_eq!(unsafe { (*function_ptr).uf_refcount }, 1);
     }
 
     #[test]

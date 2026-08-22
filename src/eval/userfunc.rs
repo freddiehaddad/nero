@@ -1268,6 +1268,37 @@ pub unsafe fn trans_function_name(
     (Some(result), consumed)
 }
 
+/// Save a function name, preserving `<lambda>{digits}` verbatim and
+/// otherwise delegating to [`trans_function_name`]
+/// (`save_function_name`).
+///
+/// Returns `(name, consumed)`, replacing the original's allocated
+/// string plus advanced `char **name`.
+///
+/// # Safety
+/// Forwarded from [`trans_function_name`].
+#[must_use]
+pub unsafe fn save_function_name(
+    input: &[u8],
+    skip: bool,
+    flags: i32,
+    mut fudi: Option<&mut FuncdictT>,
+) -> (Option<Vec<u8>>, usize) {
+    if input.starts_with(b"<lambda>") {
+        let prefix = b"<lambda>".len();
+        let consumed =
+            prefix + crate::charset::getdigits(&input[prefix..], false, 0).1;
+        if let Some(fudi) = fudi.as_deref_mut() {
+            *fudi = FuncdictT::default();
+        }
+        return (Some(input[..consumed].to_vec()), consumed);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        trans_function_name(input, skip, flags, fudi, None)
+    }
+}
+
 /// Parse a function-call's argument list: `(arg1, arg2, ...)`
 /// (`get_func_arguments`).
 ///
@@ -5142,6 +5173,57 @@ mod tests {
         );
 
         unsafe { crate::eval::vars::vars_clear(&mut *glob) };
+    }
+
+    #[test]
+    fn save_function_name_preserves_lambda_names() {
+        let mut fudi = FuncdictT {
+            fd_dict: std::ptr::dangling_mut(),
+            fd_newkey: Some(b"stale".to_vec()),
+            fd_di: std::ptr::dangling_mut(),
+        };
+
+        assert_eq!(
+            unsafe {
+                save_function_name(
+                    b"<lambda>123tail",
+                    false,
+                    TFN_INT,
+                    Some(&mut fudi),
+                )
+            },
+            (Some(b"<lambda>123".to_vec()), 11)
+        );
+        assert!(fudi.fd_dict.is_null());
+        assert!(fudi.fd_newkey.is_none());
+        assert!(fudi.fd_di.is_null());
+        assert_eq!(
+            unsafe {
+                save_function_name(
+                    b"<lambda>-1tail",
+                    false,
+                    TFN_INT,
+                    None,
+                )
+            },
+            (Some(b"<lambda>-1".to_vec()), 10)
+        );
+    }
+
+    #[test]
+    fn save_function_name_delegates_ordinary_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe {
+                save_function_name(
+                    b"g:len",
+                    false,
+                    TFN_INT | TFN_QUIET,
+                    None,
+                )
+            },
+            (Some(b"len".to_vec()), 5)
+        );
     }
 
     #[test]
