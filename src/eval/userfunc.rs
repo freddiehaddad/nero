@@ -853,6 +853,109 @@ pub unsafe fn get_user_func_name(
     Some(result)
 }
 
+/// Delete a user function (`:delfunction`, `ex_delfunction`).
+///
+/// Direct, script-local, and Dictionary-member names are resolved
+/// through [`trans_function_name`]. In-use or internally referenced
+/// functions are left unchanged; still-referenced functions are
+/// removed from the registry and marked deleted, while unreferenced
+/// functions are cleared and freed. Diagnostics are omitted.
+/// The source argument is not truncated before a following command
+/// separator because upstream uses that mutation only in omitted
+/// diagnostics. A null `fd_di` with a non-null Dictionary is treated
+/// as a no-op rather than dereferenced; current `get_lval` resolution
+/// cannot produce that state.
+///
+/// # Safety
+/// Forwarded from [`trans_function_name`]. Registered functions and
+/// any Dictionary item resolved from `eap.arg` must remain live. A
+/// function that is actually freed must have been allocated via
+/// `Box::into_raw`.
+pub unsafe fn ex_delfunction(
+    eap: &mut crate::ex_cmds_defs::ExargT,
+) {
+    let arg = eap.arg.clone().unwrap_or_default();
+    let mut fudi = FuncdictT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (name, consumed) = unsafe {
+        trans_function_name(
+            &arg,
+            eap.skip,
+            0,
+            Some(&mut fudi),
+            None,
+        )
+    };
+    let Some(name) = name else {
+        return;
+    };
+
+    let tail = &arg[consumed.min(arg.len())..];
+    let white = crate::charset::skipwhite(tail);
+    let end = tail
+        .get(white)
+        .copied()
+        .unwrap_or(crate::ascii_defs::NUL);
+    if !crate::ex_docmd::ends_excmd(end) {
+        return;
+    }
+    eap.nextcmd = crate::ex_docmd::check_nextcmd(tail)
+        .map(|next| tail[next..].to_vec());
+
+    if name.first().is_some_and(u8::is_ascii_digit)
+        && fudi.fd_dict.is_null()
+    {
+        return;
+    }
+    if eap.skip {
+        return;
+    }
+
+    let fp = find_func(&name);
+    if fp.is_null() {
+        return;
+    }
+    // SAFETY: non-null function was resolved from the live registry.
+    if unsafe { (*fp).uf_calls } > 0
+        || unsafe { (*fp).uf_refcount } > 2
+    {
+        return;
+    }
+
+    if !fudi.fd_dict.is_null() {
+        if fudi.fd_di.is_null() {
+            return;
+        }
+        // SAFETY: pointers were resolved together by get_lval.
+        unsafe {
+            crate::eval::typval::tv_dict_item_remove(
+                &mut *fudi.fd_dict,
+                fudi.fd_di,
+            )
+        };
+        return;
+    }
+
+    // SAFETY: non-null function remains live.
+    let keep_threshold = if func_name_refcount(
+        unsafe { &(*fp).uf_name },
+    ) {
+        0
+    } else {
+        1
+    };
+    if unsafe { (*fp).uf_refcount } > keep_threshold {
+        // SAFETY: function is live and registered.
+        if unsafe { func_remove(fp) } {
+            unsafe { (*fp).uf_refcount -= 1 };
+        }
+        unsafe { (*fp).uf_flags |= fc_flags::DELETED };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { func_clear_free(fp, false) };
+    }
+}
+
 /// Whether `name` could be a builtin function name: starts with a
 /// lower-case letter and doesn't contain `':'` at index 1 or the
 /// autoload separator (`'#'`, `AUTOLOAD_CHAR`) anywhere
@@ -5807,6 +5910,188 @@ mod tests {
             unsafe { get_user_func_name(&xp, 0) },
             Some(expected)
         );
+    }
+
+    #[test]
+    fn ex_delfunction_frees_an_unreferenced_ordinary_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let function = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"DeleteMe\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        }));
+        unsafe { func_hashtab_add(function) };
+        let _registry = FuncRegistryReset;
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"DeleteMe".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { ex_delfunction(&mut eap) };
+
+        assert!(find_func(b"DeleteMe").is_null());
+    }
+
+    #[test]
+    fn ex_delfunction_marks_a_still_referenced_function_deleted() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let function = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"KeepDeleted\0".to_vec(),
+            uf_refcount: 2,
+            ..Default::default()
+        }));
+        unsafe { func_hashtab_add(function) };
+        let _registry = FuncRegistryReset;
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"KeepDeleted".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { ex_delfunction(&mut eap) };
+
+        let removed = find_func(b"KeepDeleted").is_null();
+        let refcount = unsafe { (*function).uf_refcount };
+        let deleted =
+            unsafe { (*function).uf_flags } & fc_flags::DELETED != 0;
+        unsafe { func_ptr_unref(function) };
+
+        assert!(removed);
+        assert_eq!(refcount, 1);
+        assert!(deleted);
+    }
+
+    #[test]
+    fn ex_delfunction_keeps_in_use_or_internally_referenced_functions() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let in_use = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"InUse\0".to_vec(),
+            uf_refcount: 1,
+            uf_calls: 1,
+            ..Default::default()
+        }));
+        let internal = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"InternalUse\0".to_vec(),
+            uf_refcount: 3,
+            ..Default::default()
+        }));
+        unsafe {
+            func_hashtab_add(in_use);
+            func_hashtab_add(internal);
+        }
+        let _registry = FuncRegistryReset;
+        for name in [b"InUse".as_slice(), b"InternalUse".as_slice()] {
+            let mut eap = crate::ex_cmds_defs::ExargT {
+                arg: Some(name.to_vec()),
+                ..Default::default()
+            };
+            unsafe { ex_delfunction(&mut eap) };
+        }
+
+        let in_use_retained = find_func(b"InUse") == in_use;
+        let internal_retained = find_func(b"InternalUse") == internal;
+        unsafe {
+            (*in_use).uf_calls = 0;
+            func_clear_free(in_use, false);
+            func_clear_free(internal, false);
+        }
+
+        assert!(in_use_retained);
+        assert!(internal_retained);
+    }
+
+    #[test]
+    fn ex_delfunction_removes_a_dictionary_funcref_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+        let function = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"123\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        }));
+        unsafe { func_hashtab_add(function) };
+        let _registry = FuncRegistryReset;
+        func_ref(Some(b"123"));
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"F");
+        unsafe {
+            (*item).di_tv.value =
+                TypvalValue::Func(Some(b"123".to_vec()));
+            crate::eval::typval::tv_dict_add(dict, item);
+            crate::eval::typval::tv_dict_add_dict(
+                &mut *global,
+                b"d",
+                dict,
+            );
+        }
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"g:d.F".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { ex_delfunction(&mut eap) };
+
+        let removed = unsafe {
+            crate::eval::typval::tv_dict_find(
+                dict.as_mut(),
+                b"F",
+            )
+        }
+        .is_none();
+        let refcount = unsafe { (*function).uf_refcount };
+        unsafe {
+            crate::eval::vars::vars_clear(&mut *global);
+            func_clear_free(function, false);
+        }
+
+        assert!(removed);
+        assert_eq!(refcount, 1);
+    }
+
+    #[test]
+    fn ex_delfunction_parses_next_commands_and_rejects_direct_numbers() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let function = Box::into_raw(Box::new(UfuncT {
+            uf_name: b"123\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        }));
+        unsafe { func_hashtab_add(function) };
+        let _registry = FuncRegistryReset;
+        let global = crate::eval::vars::get_globvar_dict();
+        unsafe { crate::eval::vars::vars_clear(&mut *global) };
+        func_ref(Some(b"123"));
+        let reference = crate::eval::typval::tv_dict_item_alloc(b"F");
+        unsafe {
+            (*reference).di_tv.value =
+                TypvalValue::Func(Some(b"123".to_vec()));
+            crate::eval::typval::tv_dict_add(global, reference);
+        }
+        let mut skipped = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"AnyName | echo next".to_vec()),
+            skip: true,
+            ..Default::default()
+        };
+        unsafe { ex_delfunction(&mut skipped) };
+        assert_eq!(skipped.nextcmd, Some(b" echo next".to_vec()));
+
+        let mut direct = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"g:F".to_vec()),
+            ..Default::default()
+        };
+        unsafe { ex_delfunction(&mut direct) };
+        let retained = find_func(b"123") == function;
+        unsafe {
+            crate::eval::vars::vars_clear(&mut *global);
+            func_clear_free(function, false);
+        }
+
+        assert!(retained);
     }
 
     #[test]
