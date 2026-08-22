@@ -6080,7 +6080,8 @@ mod set_var_tests {
                     key,
                     crate::eval::typval_defs::Callback::None,
                 );
-                (&mut (*dict).watchers)
+                (*dict)
+                    .watchers
                     .last_mut()
                     .expect("watcher was just added")
                     .needs_free = true;
