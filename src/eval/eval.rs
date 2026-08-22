@@ -213,10 +213,10 @@
 //! behavior for such input, not a deferred gap.
 //! `handle_subscript` mirrors this same minimality: only the real
 //! "nothing follows" fast path (no `[`/`.`/`(`/`->` continuation)
-//! returns successfully. Indexing and direct named builtin methods are
-//! real; callable-value `(`, lambda methods, `v:lua` methods, and
-//! dynamically-resolved method names remain at their separate
-//! subsystem boundaries. Its own `preceded_by_whitespace`
+//! returns successfully. Indexing, callable `Func`/`Partial` values,
+//! and direct named builtin methods are real; lambda methods, `v:lua`
+//! methods, and dynamically-resolved method names remain at their
+//! separate subsystem boundaries. Its own `preceded_by_whitespace`
 //! parameter replaces the original's `!ascii_iswhite(*(*arg - 1))`
 //! check (looking at the byte immediately BEFORE `arg`, which this
 //! module's own "remaining slice, indexed from 0" idiom can't express
@@ -3639,10 +3639,10 @@ pub unsafe fn set_selfdict(rettv: &mut TypvalT, selfdict: *mut crate::eval::typv
 /// The `[`/`.` forms are now real, including the original's own
 /// LOOP (so `a[0][1].foo` chains correctly) and `selfdict` tracking
 /// (the dict a `.name`/`[key]` lookup was just read FROM, kept alive
-/// across the loop in case the NEXT step needs it). Direct named
-/// builtin `->` methods are real through `eval_method`; `(` callable-
-/// value calls, lambda methods, `v:lua` methods, and dynamically-
-/// resolved method names remain deferred.
+/// across the loop in case the NEXT step needs it). Callable-value `(`
+/// calls and direct named builtin `->` methods are real through
+/// `call_func_rettv`/`eval_method`; lambda methods, `v:lua` methods,
+/// and dynamically-resolved method names remain deferred.
 ///
 /// The original's own final "turn `dict.Func` into a partial bound to
 /// `dict`" step (`set_selfdict`/`make_partial`, reached only when the
@@ -3705,10 +3705,23 @@ pub fn handle_subscript(
         }
 
         if rest.first() == Some(&b'(') {
-            unimplemented!(
-                "handle_subscript: function-call handling (call_func_rettv) is not yet \
-                 translated"
-            );
+            // SAFETY: forwarded from this function's own safety doc.
+            let (r, consumed) = unsafe {
+                call_func_rettv(
+                    rest,
+                    evalarg.as_deref_mut(),
+                    rettv,
+                    evaluate,
+                    selfdict,
+                    std::ptr::null_mut(),
+                )
+            };
+            ret = r;
+            pos += consumed;
+            // SAFETY: release the call's held self Dictionary exactly
+            // where the original does.
+            unsafe { tv_dict_unref(selfdict) };
+            selfdict = std::ptr::null_mut();
         } else if starts_method_call {
             if rest.get(2) == Some(&b'{') {
                 unimplemented!(
@@ -3765,6 +3778,104 @@ pub fn handle_subscript(
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { tv_dict_unref(selfdict) };
     (ret, pos)
+}
+
+/// Call the `Func`/`Partial` value held in `rettv`
+/// (`call_func_rettv`).
+///
+/// Returns `(status, bytes_consumed)` for the argument list beginning
+/// at `arg[0] == '('`. Lua function values remain at the Lua boundary.
+///
+/// # Safety
+/// Pointer-bearing `rettv`, `selfdict`, `basetv`, parsed arguments, and
+/// global current-window state must remain valid through the call.
+unsafe fn call_func_rettv(
+    arg: &[u8],
+    evalarg: Option<&mut EvalargT>,
+    rettv: &mut TypvalT,
+    evaluate: bool,
+    selfdict: *mut crate::eval::typval_defs::DictT,
+    basetv: *mut TypvalT,
+) -> (i32, usize) {
+    use crate::eval::typval::tv_clear_simple;
+
+    debug_assert_eq!(arg.first(), Some(&b'('));
+    let mut functv = TypvalT::default();
+    let mut partial = std::ptr::null_mut();
+    let name = if evaluate {
+        functv = std::mem::take(rettv);
+        match functv.value {
+            TypvalValue::Partial(value) => {
+                partial = value;
+                // SAFETY: non-null Partial is live by contract.
+                unsafe { partial_name(value) }.unwrap_or_default()
+            }
+            TypvalValue::Func(ref value) => value.clone().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    if evaluate && name.is_empty() {
+        // SAFETY: functv owns the former rettv value.
+        unsafe { tv_clear_simple(&functv) };
+        return (FAIL, 0);
+    }
+
+    let partial_argc = if partial.is_null() {
+        0
+    } else {
+        unsafe { (*partial).pt_argv.len() }
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (parsed, mut consumed, argvars) = unsafe {
+        crate::eval::userfunc::get_func_arguments(
+            arg,
+            evalarg,
+            partial_argc,
+        )
+    };
+    let mut status = parsed;
+    if status == OK {
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
+        let line = if curwin.is_null() {
+            0
+        } else {
+            unsafe { (*curwin).w_cursor.lnum }
+        };
+        let mut funcexe = crate::eval::userfunc::FuncexeT {
+            fe_firstline: line,
+            fe_lastline: line,
+            fe_evaluate: evaluate,
+            fe_partial: partial,
+            fe_selfdict: selfdict,
+            fe_basetv: basetv,
+            ..Default::default()
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let error = unsafe {
+            crate::eval::userfunc::call_func_with_state(
+                &name,
+                rettv,
+                &argvars,
+                &mut funcexe,
+            )
+        };
+        status = i32::from(
+            error == crate::eval::userfunc::FnameTransError::None,
+        );
+    }
+
+    for value in argvars.iter().rev() {
+        // SAFETY: parsed arguments are locally owned.
+        unsafe { tv_clear_simple(value) };
+    }
+    if evaluate {
+        // SAFETY: functv owns the former rettv value.
+        unsafe { tv_clear_simple(&functv) };
+    }
+    consumed += skipwhite(&arg[consumed..]);
+    (status, consumed)
 }
 
 /// Evaluate a direct named builtin method call, `->name(args)`
@@ -3841,6 +3952,7 @@ unsafe fn eval_method(
         )
     };
     pos += consumed;
+    pos += skipwhite(&arg[pos..]);
     let mut status = parsed;
     if status == OK {
         let curwin = unsafe { crate::globals::GLOBALS.get_mut().curwin };
@@ -10481,6 +10593,122 @@ mod tests {
         assert_eq!(list_item(result, 0), TypvalValue::Number(1));
         assert_eq!(list_item(result, 1), TypvalValue::Number(2));
         unsafe { crate::eval::typval::tv_list_unref(result) };
+    }
+
+    #[test]
+    fn handle_subscript_calls_a_funcref_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT {
+            value: TypvalValue::Func(Some(b"len".to_vec())),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+
+        let (ret, consumed) =
+            handle_subscript(b"(\"abc\")", &mut rettv, Some(&mut evalarg), false);
+
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 7);
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn callable_value_consumes_trailing_whitespace_and_stops_chaining() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT {
+            value: TypvalValue::Func(Some(b"len".to_vec())),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+
+        let (ret, consumed) = handle_subscript(
+            b"(\"abc\") [0]",
+            &mut rettv,
+            Some(&mut evalarg),
+            false,
+        );
+
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn handle_subscript_calls_a_partial_with_bound_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let partial = Box::into_raw(Box::new(
+            crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_name: Some(b"pow".to_vec()),
+                pt_argv: vec![TypvalT {
+                    value: TypvalValue::Float(2.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ));
+        let mut rettv = TypvalT {
+            value: TypvalValue::Partial(partial),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+
+        let (ret, consumed) =
+            handle_subscript(b"(3.0)", &mut rettv, Some(&mut evalarg), false);
+
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 5);
+        let TypvalValue::Float(result) = rettv.value else {
+            panic!("expected a Float");
+        };
+        assert!((result - 8.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn handle_subscript_calls_a_funcref_read_from_a_dict_without_leaking() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        let dict = test_dict_for_rettv();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"f");
+        unsafe {
+            (*item).di_tv.value =
+                TypvalValue::Func(Some(b"len".to_vec()));
+            crate::eval::typval::tv_dict_add(&mut *dict, item);
+        }
+        let mut rettv = TypvalT {
+            value: TypvalValue::Dict(dict),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+
+        let (ret, consumed) = handle_subscript(
+            b".f(\"abcd\")",
+            &mut rettv,
+            Some(&mut evalarg),
+            false,
+        );
+
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 10);
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_empty_funcref_fails_without_consuming_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT {
+            value: TypvalValue::Func(Some(Vec::new())),
+            ..Default::default()
+        };
+        let mut evalarg = evaluate_evalarg();
+
+        let (ret, consumed) =
+            handle_subscript(b"()", &mut rettv, Some(&mut evalarg), false);
+
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, 0);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
     }
 
     #[test]
