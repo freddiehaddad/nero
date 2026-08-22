@@ -956,6 +956,43 @@ pub unsafe fn ex_delfunction(
     }
 }
 
+/// Format a pending return value as an Ex command
+/// (`get_return_cmd`).
+///
+/// `None` replaces the original's null `void *rettv`. Returns
+/// `":return "` for no value. Long commands are truncated to
+/// `IOSIZE - 1` bytes with a trailing ellipsis. The original builds in
+/// shared `IObuff`, but its sole caller consumes only the returned
+/// allocation, so a local owned buffer has the same observable result.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::encode::encode_tv2echo`].
+#[must_use]
+pub unsafe fn get_return_cmd(rettv: Option<&TypvalT>) -> Vec<u8> {
+    let mut value = match rettv {
+        Some(value) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::encode::encode_tv2echo(value) }
+        }
+        None => Vec::new(),
+    };
+    // Reproduce strlen()/xstrlcpy(): embedded NUL ends the encoded
+    // value before the IOSIZE truncation decision.
+    value.truncate(
+        value
+            .iter()
+            .position(|&byte| byte == crate::ascii_defs::NUL)
+            .unwrap_or(value.len()),
+    );
+    let mut command = b":return ".to_vec();
+    command.extend_from_slice(&value);
+    if command.len() >= crate::globals::IOSIZE {
+        command.truncate(crate::globals::IOSIZE - 4);
+        command.extend_from_slice(b"...");
+    }
+    command
+}
+
 /// Whether `name` could be a builtin function name: starts with a
 /// lower-case letter and doesn't contain `':'` at index 1 or the
 /// autoload separator (`'#'`, `AUTOLOAD_CHAR`) anywhere
@@ -6092,6 +6129,90 @@ mod tests {
         }
 
         assert!(retained);
+    }
+
+    #[test]
+    fn get_return_cmd_formats_values_and_missing_values() {
+        assert_eq!(unsafe { get_return_cmd(None) }, b":return ");
+        assert_eq!(
+            unsafe {
+                get_return_cmd(Some(&TypvalT {
+                    value: TypvalValue::Number(42),
+                    ..Default::default()
+                }))
+            },
+            b":return 42"
+        );
+        assert_eq!(
+            unsafe {
+                get_return_cmd(Some(&TypvalT {
+                    value: TypvalValue::String(Some(b"done".to_vec())),
+                    ..Default::default()
+                }))
+            },
+            b":return done"
+        );
+    }
+
+    #[test]
+    fn get_return_cmd_stops_at_an_embedded_nul_before_truncating() {
+        let short = TypvalT {
+            value: TypvalValue::String(Some(b"a\0bbb".to_vec())),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { get_return_cmd(Some(&short)) },
+            b":return a"
+        );
+
+        let mut bytes = vec![b'x'; 500];
+        bytes.push(crate::ascii_defs::NUL);
+        bytes.extend(std::iter::repeat_n(b'y', 2_000));
+        let long = TypvalT {
+            value: TypvalValue::String(Some(bytes)),
+            ..Default::default()
+        };
+        let command = unsafe { get_return_cmd(Some(&long)) };
+        let mut expected = b":return ".to_vec();
+        expected.extend(std::iter::repeat_n(b'x', 500));
+        assert_eq!(command, expected);
+        assert!(!command.ends_with(b"..."));
+    }
+
+    #[test]
+    fn get_return_cmd_obeys_the_exact_iosize_boundary() {
+        let fitting = TypvalT {
+            value: TypvalValue::String(Some(vec![
+                b'x';
+                crate::globals::IOSIZE - 9
+            ])),
+            ..Default::default()
+        };
+        let fitting_command = unsafe { get_return_cmd(Some(&fitting)) };
+        let mut expected_fitting = b":return ".to_vec();
+        expected_fitting.extend(std::iter::repeat_n(
+            b'x',
+            crate::globals::IOSIZE - 9,
+        ));
+        assert_eq!(fitting_command, expected_fitting);
+        assert!(!fitting_command.ends_with(b"..."));
+
+        let truncated = TypvalT {
+            value: TypvalValue::String(Some(vec![
+                b'x';
+                crate::globals::IOSIZE - 8
+            ])),
+            ..Default::default()
+        };
+        let truncated_command =
+            unsafe { get_return_cmd(Some(&truncated)) };
+        let mut expected_truncated = b":return ".to_vec();
+        expected_truncated.extend(std::iter::repeat_n(
+            b'x',
+            crate::globals::IOSIZE - 12,
+        ));
+        expected_truncated.extend_from_slice(b"...");
+        assert_eq!(truncated_command, expected_truncated);
     }
 
     #[test]
