@@ -2019,14 +2019,6 @@ pub unsafe fn tv_dict_item_remove(dict: &mut DictT, item: *mut DictitemT) {
 /// "`call_internal_func` enforces `min_argc`/`max_argc` before
 /// dispatch" convention.
 ///
-/// The original's own `tv_dict_watcher_notify` call (only reachable
-/// if `tv_dict_is_watched(d)`) is omitted - nothing in this crate ever
-/// sets up a dict watcher (`dictwatcheradd()`/the whole watcher
-/// feature aren't translated, and `DictT` has no watcher-list field
-/// at all), so `tv_dict_is_watched` would always be false; matches
-/// this crate's established "omit a provably-unreachable branch"
-/// policy.
-///
 /// # Safety
 /// `argvars[0].value` must be `Dict`-typed; if its pointer is
 /// non-null, it must be valid, with every item genuinely allocated
@@ -2059,6 +2051,9 @@ pub unsafe fn tv_dict_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe {
         *rettv = std::mem::take(&mut (*di).di_tv);
         tv_dict_item_remove(&mut *d, di);
+        if tv_dict_is_watched(d) {
+            tv_dict_watcher_notify(d, &key, None, Some(rettv));
+        }
     }
 }
 
@@ -2087,10 +2082,7 @@ pub unsafe fn tv_dict_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
 ///
 /// Omits the original's own `tv_dict_wrong_func_name` check (see
 /// [`tv_dict_add`]'s own doc comment for why this can never trigger
-/// yet) and its whole watcher-notification path
-/// (`tv_dict_is_watched`/`tv_dict_watcher_notify`) - analogously
-/// unreachable, since nothing in this crate ever sets up a dict
-/// watcher either (`DictT` has no watcher-list field at all).
+/// yet). Watcher notifications are complete.
 ///
 /// # Safety
 /// `d1`/`d2` must be valid, non-null pointers to live `DictT`s, with
@@ -2098,6 +2090,8 @@ pub unsafe fn tv_dict_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// `Box::into_raw`.
 pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
     let action0 = action.first().copied().unwrap_or(b'f');
+    // SAFETY: forwarded from this function's own safety doc.
+    let watched = unsafe { tv_dict_is_watched(d1) };
 
     // SAFETY: forwarded from this function's own safety doc.
     let items: Vec<*mut DictitemT> = unsafe { &*d2 }.dv_index.values().copied().collect();
@@ -2128,6 +2122,16 @@ pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
                 if unsafe { tv_dict_add(&mut *d1, new_di) } == FAIL {
                     // SAFETY: forwarded from this function's own safety doc.
                     unsafe { tv_dict_item_free(new_di) };
+                } else if watched {
+                    // SAFETY: new_di is now owned by d1 and live.
+                    unsafe {
+                        tv_dict_watcher_notify(
+                            d1,
+                            &key,
+                            Some(&(*new_di).di_tv),
+                            None,
+                        )
+                    };
                 }
             }
             Some(_) if action0 == b'e' => {
@@ -2139,10 +2143,27 @@ pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
                 if value_check_lock(locked, None) || crate::eval::vars::var_check_ro(flags) {
                     break;
                 }
+                let mut oldtv = TypvalT::default();
+                if watched {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { tv_copy(&(*di1).di_tv, &mut oldtv) };
+                }
                 // SAFETY: forwarded from this function's own safety doc.
                 unsafe {
                     tv_clear_simple(&(*di1).di_tv);
                     tv_copy(&(*di2).di_tv, &mut (*di1).di_tv);
+                }
+                if watched {
+                    // SAFETY: di1 remains live in d1.
+                    unsafe {
+                        tv_dict_watcher_notify(
+                            d1,
+                            &key,
+                            Some(&(*di1).di_tv),
+                            Some(&oldtv),
+                        );
+                        tv_clear_simple(&oldtv);
+                    }
                 }
             }
             _ => {} // action == "keep" ('k'), or di2 == di1: do nothing.
@@ -7402,6 +7423,91 @@ mod tests {
         }
         assert!(!unsafe { tv_dict_is_watched(dict) });
         unsafe { tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn dict_remove_notifies_watchers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        unsafe { (*dict).dv_refcount += 1 };
+        let item = tv_dict_item_alloc(b"key");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Number(7);
+            tv_dict_add(&mut *dict, item);
+            tv_dict_watcher_add(
+                dict,
+                b"key",
+                Callback::Funcref(b"get".to_vec()),
+            );
+            (&mut (*dict).watchers)[0].needs_free = true;
+        }
+        let args = [
+            TypvalT {
+                value: TypvalValue::Dict(dict),
+                ..TypvalT::default()
+            },
+            TypvalT {
+                value: TypvalValue::String(Some(b"key".to_vec())),
+                ..TypvalT::default()
+            },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { tv_dict_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+        assert!(!unsafe { tv_dict_is_watched(dict) });
+        unsafe { tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn dict_extend_notifies_for_new_and_replaced_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = tv_dict_alloc();
+        let d2 = tv_dict_alloc();
+        unsafe {
+            (*d1).dv_refcount += 1;
+            (*d2).dv_refcount += 1;
+            let first = tv_dict_item_alloc(b"key");
+            (*first).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *d1, first);
+            let second = tv_dict_item_alloc(b"key");
+            (*second).di_tv.value = TypvalValue::Number(2);
+            tv_dict_add(&mut *d2, second);
+            tv_dict_watcher_add(
+                d1,
+                b"*",
+                Callback::Funcref(b"get".to_vec()),
+            );
+            (&mut (*d1).watchers)[0].needs_free = true;
+            tv_dict_extend(d1, d2, b"force");
+        }
+        assert_eq!(
+            unsafe { tv_dict_get_number(Some(&mut *d1), b"key") },
+            2
+        );
+        assert!(!unsafe { tv_dict_is_watched(d1) });
+
+        unsafe {
+            tv_dict_watcher_add(
+                d1,
+                b"*",
+                Callback::Funcref(b"get".to_vec()),
+            );
+            (&mut (*d1).watchers)[0].needs_free = true;
+            let new_item = tv_dict_item_alloc(b"new");
+            (*new_item).di_tv.value = TypvalValue::Number(3);
+            tv_dict_add(&mut *d2, new_item);
+            tv_dict_extend(d1, d2, b"keep");
+        }
+        assert_eq!(
+            unsafe { tv_dict_get_number(Some(&mut *d1), b"new") },
+            3
+        );
+        assert!(!unsafe { tv_dict_is_watched(d1) });
+
+        unsafe {
+            tv_dict_unref(d1);
+            tv_dict_unref(d2);
+        }
     }
 
     #[test]
