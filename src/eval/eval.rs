@@ -401,6 +401,28 @@ pub unsafe fn var_set_global(name: &[u8], mut value: TypvalT) {
     unsafe { crate::eval::vars::set_var(name, &mut value, false) };
 }
 
+/// Format the current source name and line (`eval_fmt_source_name_line`).
+///
+/// Rust returns a growable byte vector instead of writing through the
+/// original's caller-provided bounded buffer.
+///
+/// # Safety
+/// Forwarded from [`crate::runtime::sourcing_name`]. Callers must
+/// serialize execution-stack access.
+#[must_use]
+pub unsafe fn eval_fmt_source_name_line() -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(mut name) = (unsafe { crate::runtime::sourcing_name() })
+    else {
+        return b"?".to_vec();
+    };
+    name.push(b':');
+    name.extend_from_slice(
+        crate::runtime::sourcing_lnum().to_string().as_bytes(),
+    );
+    name
+}
+
 /// Convert any typval to text without reporting an error
 /// (`typval_tostring`).
 ///
@@ -7332,6 +7354,37 @@ mod tests {
 
         crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
         drop(fc);
+    }
+
+    #[test]
+    fn eval_fmt_source_name_line_is_question_mark_without_a_source() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::estack_clear_for_test();
+        assert_eq!(unsafe { eval_fmt_source_name_line() }, b"?");
+        crate::runtime::estack_clear_for_test();
+    }
+
+    #[test]
+    fn eval_fmt_source_name_line_formats_the_top_script_frame() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::estack_clear_for_test();
+        let mut name = b"plugin/nero.vim\0".to_vec();
+        let name_ptr = name.as_mut_ptr();
+        unsafe {
+            crate::runtime::estack_push(
+                crate::runtime_defs::EtypeT::Script,
+                name_ptr,
+                42,
+            );
+        }
+
+        assert_eq!(
+            unsafe { eval_fmt_source_name_line() },
+            b"plugin/nero.vim:42"
+        );
+
+        crate::runtime::estack_clear_for_test();
+        drop(name);
     }
 
     #[test]

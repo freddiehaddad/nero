@@ -215,6 +215,17 @@ pub unsafe fn estack_pop() {
     }
 }
 
+/// Clear all execution-stack entries for cross-module tests.
+///
+/// Real code never removes the base Top frame; tests that begin from
+/// the pre-initialization empty static need to restore that exact
+/// state after exercising a sourced frame.
+#[cfg(test)]
+pub(crate) fn estack_clear_for_test() {
+    // SAFETY: callers hold the crate-wide global-state test lock.
+    unsafe { EXESTACK.get_mut().clear() };
+}
+
 unsafe fn estack_entry_name(
     entry: &crate::runtime_defs::EstackT,
 ) -> Option<Vec<u8>> {
