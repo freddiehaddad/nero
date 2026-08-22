@@ -294,6 +294,8 @@ static FUNC_HASHTAB: LazyLock<GlobalCell<FuncHashtab>> =
 /// (Re-)initialize the function hash table (`func_init`).
 pub fn func_init() {
     *unsafe { FUNC_HASHTAB.get_mut() } = FuncHashtab::default();
+    *unsafe { USER_FUNC_EXPAND_STATE.get_mut() } =
+        UserFuncExpandState::default();
 }
 
 /// Return the function hash table (`func_tbl_get`).
@@ -767,6 +769,85 @@ pub unsafe fn make_partial(selfdict: *mut DictT, rettv: &mut TypvalT) {
 pub fn function_list_modified(prev_ht_changed: i32) -> bool {
     let table = unsafe { FUNC_HASHTAB.get_mut() };
     prev_ht_changed != table.ht.ht_changed
+}
+
+#[derive(Default)]
+struct UserFuncExpandState {
+    done: usize,
+    changed: i32,
+    slot: usize,
+}
+
+static USER_FUNC_EXPAND_STATE: LazyLock<GlobalCell<UserFuncExpandState>> =
+    LazyLock::new(|| GlobalCell::new(UserFuncExpandState::default()));
+
+/// Return the `idx`th user-defined function completion candidate
+/// (`get_user_func_name`).
+///
+/// Dictionary and lambda functions return an empty candidate (not
+/// `None`) so enumeration continues. In non-`UserFunc` contexts an
+/// opening parenthesis is appended, plus `)` for a non-varargs
+/// zero-argument function. Enumeration stops if the function table
+/// changes after `idx == 0`, matching the original static iterator.
+///
+/// # Safety
+/// Function-table and expansion state must not be mutated concurrently;
+/// every registered function pointer must remain live.
+#[must_use]
+pub unsafe fn get_user_func_name(
+    xp: &crate::cmdexpand_defs::ExpandT,
+    idx: i32,
+) -> Option<Vec<u8>> {
+    if idx < 0 {
+        return None;
+    }
+    let table = unsafe { FUNC_HASHTAB.get_mut() };
+    let state = unsafe { USER_FUNC_EXPAND_STATE.get_mut() };
+    if idx == 0 {
+        state.done = 0;
+        state.slot = 0;
+        state.changed = table.ht.ht_changed;
+    }
+    if state.changed != table.ht.ht_changed
+        || state.done >= table.ht.ht_used
+    {
+        return None;
+    }
+    if state.done > 0 {
+        state.slot += 1;
+    }
+    let slots = table.ht.ht_array.as_slice();
+    while state.slot < slots.len()
+        && hashitem_empty(&slots[state.slot])
+    {
+        state.slot += 1;
+    }
+    let hi = slots.get(state.slot)?;
+    state.done += 1;
+    let fp = table.index.get(&(hi.hi_key as usize)).copied()?;
+    // SAFETY: pointer came from the unchanged live function table.
+    let function = unsafe { &*fp };
+    let raw_name = function.uf_name.as_slice();
+    let name = raw_name
+        .strip_suffix(&[crate::ascii_defs::NUL])
+        .unwrap_or(raw_name);
+    if function.uf_flags & fc_flags::DICT != 0
+        || name.starts_with(b"<lambda>")
+    {
+        return Some(Vec::new());
+    }
+    if name.len() + 4 >= crate::globals::IOSIZE {
+        return Some(name.to_vec());
+    }
+
+    let mut result = cat_func_name(function);
+    if xp.xp_context != crate::cmdexpand_defs::ExpandContext::UserFunc {
+        result.push(b'(');
+        if function.uf_varargs == 0 && function.uf_args.is_empty() {
+            result.push(b')');
+        }
+    }
+    Some(result)
 }
 
 /// Whether `name` could be a builtin function name: starts with a
@@ -5421,7 +5502,228 @@ mod tests {
         let prev = unsafe { (*func_tbl_get()).ht_changed };
         let mut fp = Box::new(UfuncT { uf_name: b"Changed\0".to_vec(), ..Default::default() });
         unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+        let _registry = FuncRegistryReset;
         assert!(function_list_modified(prev));
+    }
+
+    #[test]
+    fn get_user_func_name_formats_and_filters_registered_functions() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut functions = vec![
+            Box::new(UfuncT {
+                uf_name: b"Alpha\0".to_vec(),
+                ..Default::default()
+            }),
+            Box::new(UfuncT {
+                uf_name: b"Beta\0".to_vec(),
+                uf_args: crate::garray_defs::GarrayT {
+                    ga_len: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            Box::new(UfuncT {
+                uf_name: b"Gamma\0".to_vec(),
+                uf_varargs: 1,
+                ..Default::default()
+            }),
+            Box::new(UfuncT {
+                uf_name: b"DictFunction\0".to_vec(),
+                uf_flags: fc_flags::DICT,
+                ..Default::default()
+            }),
+            Box::new(UfuncT {
+                uf_name: b"<lambda>7\0".to_vec(),
+                ..Default::default()
+            }),
+        ];
+        for function in &mut functions {
+            unsafe { func_hashtab_add(std::ptr::from_mut(&mut **function)) };
+        }
+        let _registry = FuncRegistryReset;
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Functions,
+            ..Default::default()
+        };
+        let mut candidates = Vec::new();
+        for idx in 0..functions.len() as i32 {
+            candidates.push(
+                unsafe { get_user_func_name(&xp, idx) }
+                    .expect("one result per registered function"),
+            );
+        }
+        assert_eq!(
+            unsafe { get_user_func_name(&xp, functions.len() as i32) },
+            None
+        );
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![
+                Vec::new(),
+                Vec::new(),
+                b"Alpha()".to_vec(),
+                b"Beta(".to_vec(),
+                b"Gamma(".to_vec(),
+            ]
+        );
+
+        let bare = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::UserFunc,
+            ..Default::default()
+        };
+        let mut bare_candidates = Vec::new();
+        for idx in 0..functions.len() as i32 {
+            bare_candidates.push(
+                unsafe { get_user_func_name(&bare, idx) }
+                    .expect("one result per registered function"),
+            );
+        }
+        bare_candidates.sort();
+        assert_eq!(
+            bare_candidates,
+            vec![
+                Vec::new(),
+                Vec::new(),
+                b"Alpha".to_vec(),
+                b"Beta".to_vec(),
+                b"Gamma".to_vec(),
+            ]
+        );
+
+        let expression = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Expression,
+            ..Default::default()
+        };
+        let mut expression_candidates = Vec::new();
+        for idx in 0..functions.len() as i32 {
+            expression_candidates.push(
+                unsafe { get_user_func_name(&expression, idx) }
+                    .expect("one result per registered function"),
+            );
+        }
+        expression_candidates.sort();
+        assert_eq!(expression_candidates, candidates);
+    }
+
+    #[test]
+    fn get_user_func_name_stops_when_the_table_changes() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut first = Box::new(UfuncT {
+            uf_name: b"First\0".to_vec(),
+            ..Default::default()
+        });
+        let mut second = Box::new(UfuncT {
+            uf_name: b"Second\0".to_vec(),
+            ..Default::default()
+        });
+        unsafe { func_hashtab_add(std::ptr::from_mut(&mut *first)) };
+        let _registry = FuncRegistryReset;
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::UserFunc,
+            ..Default::default()
+        };
+        assert!(unsafe { get_user_func_name(&xp, 0) }.is_some());
+
+        unsafe { func_hashtab_add(std::ptr::from_mut(&mut *second)) };
+
+        assert_eq!(unsafe { get_user_func_name(&xp, 1) }, None);
+    }
+
+    #[test]
+    fn get_user_func_name_skips_removed_hash_slots() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut functions = [
+            Box::new(UfuncT {
+                uf_name: b"First\0".to_vec(),
+                ..Default::default()
+            }),
+            Box::new(UfuncT {
+                uf_name: b"Removed\0".to_vec(),
+                ..Default::default()
+            }),
+            Box::new(UfuncT {
+                uf_name: b"Third\0".to_vec(),
+                ..Default::default()
+            }),
+        ];
+        let pointers: Vec<*mut UfuncT> = functions
+            .iter_mut()
+            .map(|function| std::ptr::from_mut(&mut **function))
+            .collect();
+        unsafe {
+            for &pointer in &pointers {
+                func_hashtab_add(pointer);
+            }
+            assert!(func_remove(pointers[1]));
+        }
+        let _registry = FuncRegistryReset;
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::UserFunc,
+            ..Default::default()
+        };
+        let mut candidates = vec![
+            unsafe { get_user_func_name(&xp, 0) }
+                .expect("first survivor"),
+            unsafe { get_user_func_name(&xp, 1) }
+                .expect("second survivor"),
+        ];
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![b"First".to_vec(), b"Third".to_vec()]
+        );
+        assert_eq!(unsafe { get_user_func_name(&xp, 2) }, None);
+    }
+
+    #[test]
+    fn get_user_func_name_does_not_suffix_oversized_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let name = vec![b'X'; crate::globals::IOSIZE - 4];
+        let mut stored = name.clone();
+        stored.push(crate::ascii_defs::NUL);
+        let mut function = Box::new(UfuncT {
+            uf_name: stored,
+            ..Default::default()
+        });
+        unsafe { func_hashtab_add(std::ptr::from_mut(&mut *function)) };
+        let _registry = FuncRegistryReset;
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Functions,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { get_user_func_name(&xp, 0) }, Some(name));
+    }
+
+    #[test]
+    fn get_user_func_name_suffixes_the_last_name_that_fits() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let name = vec![b'X'; crate::globals::IOSIZE - 5];
+        let mut stored = name.clone();
+        stored.push(crate::ascii_defs::NUL);
+        let mut function = Box::new(UfuncT {
+            uf_name: stored,
+            ..Default::default()
+        });
+        unsafe { func_hashtab_add(std::ptr::from_mut(&mut *function)) };
+        let _registry = FuncRegistryReset;
+        let xp = crate::cmdexpand_defs::ExpandT {
+            xp_context: crate::cmdexpand_defs::ExpandContext::Functions,
+            ..Default::default()
+        };
+        let mut expected = name;
+        expected.extend_from_slice(b"()");
+
+        assert_eq!(
+            unsafe { get_user_func_name(&xp, 0) },
+            Some(expected)
+        );
     }
 
     #[test]
