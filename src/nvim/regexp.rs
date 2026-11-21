@@ -731,6 +731,9 @@ impl Default for Regitem {
 pub(super) struct Regbehind {
     pub save_after: Regsave,
     pub save_behind: Regsave,
+    /// How many characters the start of the look-behind lies before its end, or before the end
+    /// of the previous line once it crossed there.
+    pub chars_back: i32,
     pub save_need_clear_subexpr: bool,
     pub save_start: [SaveSe; NSUBEXP],
     pub save_end: [SaveSe; NSUBEXP],
@@ -1263,6 +1266,23 @@ impl<'a> Regexec<'a> {
             return prev.min(line.len()) as Colnr;
         }
         (prev - crate::mbyte::utf_head_off_slice(line, prev) as usize) as Colnr
+    }
+
+    /// The column up to `n` characters before column `col` of the current line, stopping at its
+    /// start, and how many characters that is.
+    pub(super) fn chars_before(&self, mut col: Colnr, n: i32) -> (Colnr, i32) {
+        let start = (col - n).max(0);
+        // Each ASCII byte is a character.
+        let window = self.line().get(start as usize..col as usize);
+        if window.is_some_and(<[u8]>::is_ascii) {
+            return (start, col - start);
+        }
+        let mut back = 0;
+        while back < n && col > 0 {
+            col = self.prev_char_col(col);
+            back += 1;
+        }
+        (col, back)
     }
 
     /// The class of the character before the current position, -1 at the start of the line.

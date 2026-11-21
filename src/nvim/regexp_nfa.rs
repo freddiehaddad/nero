@@ -3291,8 +3291,8 @@ fn recursive_regmatch(
         }
         endposp = Some(endpos);
 
-        // Go back the specified number of bytes, or as far as the start of the previous line,
-        // to try matching "\@<=" or not matching "\@<!".
+        // Go back the specified number of characters, or as far as the start of the previous
+        // line, to try matching "\@<=" or not matching "\@<!".
         if st.val <= 0 {
             if rex.reg_multi() {
                 rex.lnum -= 1;
@@ -3304,26 +3304,20 @@ fn recursive_regmatch(
             }
             rex.input = 0;
         } else {
-            if rex.reg_multi() && rex.input_col() < st.val {
-                // Not enough bytes in this line: go to the end of the previous line.
+            let (col, back) = rex.chars_before(rex.input_col(), st.val);
+            rex.input = col as usize;
+            if back < st.val && rex.reg_multi() {
+                // Not enough characters in this line: go back from the end of the previous line.
                 rex.lnum -= 1;
                 match rex.getline(rex.lnum) {
                     Some(line) => {
                         rex.line = line;
-                        rex.input = rex.getline_len(rex.lnum) as usize;
+                        let end = rex.line().len() as Colnr;
+                        rex.input = rex.chars_before(end, st.val).0 as usize;
                     }
                     // Can't go before the first line.
-                    None => {
-                        rex.lnum += 1;
-                        rex.input = 0;
-                    }
+                    None => rex.lnum += 1,
                 }
-            }
-            if rex.input_col() >= st.val {
-                let off = rex.input - st.val as usize;
-                rex.input = off - crate::mbyte::utf_head_off_slice(rex.line(), off) as usize;
-            } else {
-                rex.input = 0;
             }
         }
     }

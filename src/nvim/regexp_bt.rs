@@ -2726,6 +2726,54 @@ fn restore_subexpr(rex: &mut Regexec<'_>, bp: &Regbehind) {
     }
 }
 
+/// Moves the start of a look-behind one character back, to try again to match it so that it ends
+/// where what follows starts. When matching buffer lines it may go to the end of the previous
+/// line once, and the limit then counts from there. Returns false when it cannot go back.
+///
+/// Not inlined: it would add register pressure to the loop in [`regmatch_inner`] that every
+/// pattern runs.
+#[inline(never)]
+fn behind_step_back(
+    rex: &mut Regexec<'_>,
+    backpos: &mut Vec<Backpos>,
+    rp: &mut Regitem,
+    bp: &mut Regbehind,
+    limit: i64,
+) -> bool {
+    if limit > 0 && i64::from(bp.chars_back) >= limit {
+        return false;
+    }
+    if rex.has_match {
+        let col = rp.rs_un.regsave().rs_u.ptr.unwrap_or(0);
+        if col == 0 {
+            return false;
+        }
+        rp.rs_un.regsave_mut().rs_u.ptr = Some(rex.prev_char_col(col as Colnr) as usize);
+    } else {
+        let pos = rp.rs_un.regsave().rs_u.pos();
+        if pos.col == 0 {
+            let lnum = pos.lnum - 1;
+            if pos.lnum < rex.behind_pos.rs_u.pos().lnum || rex.reg_firstlnum + lnum < 1 {
+                return false;
+            }
+            rp.rs_un.regsave_mut().rs_u.pos_mut().lnum = lnum;
+            reg_restore(rex, backpos, rp.rs_un.regsave());
+            rp.rs_un.regsave_mut().rs_u.pos_mut().col = rex.getline_len(rex.lnum);
+            bp.chars_back = 0;
+            return true;
+        }
+        let col = if pos.lnum == rex.lnum {
+            rex.prev_char_col(pos.col)
+        } else {
+            let line = rex.getline(pos.lnum).unwrap_or_default();
+            pos.col - 1 - crate::mbyte::utf_head_off_slice(line.bytes(), pos.col as usize - 1)
+        };
+        rp.rs_un.regsave_mut().rs_u.pos_mut().col = col;
+    }
+    bp.chars_back += 1;
+    true
+}
+
 fn regmatch_inner(
     rex: &mut Regexec<'_>,
     prog: &[u8],
@@ -3654,6 +3702,7 @@ fn regmatch_inner(
                             let rp = regstack.items.last_mut().unwrap();
                             reg_save(rex, bp_len, &mut bp.save_after);
                             bp.save_behind = rex.behind_pos;
+                            bp.chars_back = 0;
 
                             rex.behind_pos = *rp.rs_un.regsave();
                             rp.rs_state = RS_BEHIND2;
@@ -3677,58 +3726,9 @@ fn regmatch_inner(
                             regstack.pop(&mut scan);
                             regstack.pop_behind();
                         } else {
-                            let mut no = true;
+                            // No match or a match that doesn't end where we want it.
                             let limit = operand_min(prog, rp.rs_scan.unwrap());
-                            if !rex.has_match {
-                                let rp_pos = rp.rs_un.regsave().rs_u.pos();
-                                let bpos = rex.behind_pos.rs_u.pos();
-                                if limit > 0
-                                    && i64::from(
-                                        (if rp_pos.lnum < bpos.lnum {
-                                            rex.getline_len(rex.lnum)
-                                        } else {
-                                            bpos.col
-                                        }) - rp_pos.col,
-                                    ) >= limit
-                                {
-                                    no = false;
-                                } else if rp_pos.col == 0 {
-                                    rp.rs_un.regsave_mut().rs_u.pos_mut().lnum -= 1;
-
-                                    let new_lnum = rp.rs_un.regsave().rs_u.pos().lnum;
-                                    if new_lnum + 1 < bpos.lnum || rex.reg_firstlnum + new_lnum < 1
-                                    {
-                                        no = false;
-                                    } else {
-                                        reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
-                                        rp.rs_un.regsave_mut().rs_u.pos_mut().col =
-                                            rex.getline_len(rex.lnum);
-                                    }
-                                } else if rp_pos.lnum == rex.lnum {
-                                    rp.rs_un.regsave_mut().rs_u.pos_mut().col =
-                                        rex.prev_char_col(rp_pos.col);
-                                } else {
-                                    let line = rex.getline(rp_pos.lnum).unwrap_or_default();
-                                    let head_off = crate::mbyte::utf_head_off_slice(
-                                        line.bytes(),
-                                        rp_pos.col as usize - 1,
-                                    );
-                                    rp.rs_un.regsave_mut().rs_u.pos_mut().col -= head_off + 1;
-                                }
-                            } else {
-                                let cur = rp.rs_un.regsave().rs_u.ptr.unwrap_or(0);
-                                if cur == 0 {
-                                    no = false;
-                                } else {
-                                    let prev = rex.prev_char_col(cur as Colnr) as usize;
-                                    rp.rs_un.regsave_mut().rs_u.ptr = Some(prev);
-                                    let behind = rex.behind_pos.rs_u.ptr.unwrap_or(0);
-                                    if limit > 0 && behind.saturating_sub(prev) > limit as usize {
-                                        no = false;
-                                    }
-                                }
-                            }
-                            if no {
+                            if behind_step_back(rex, &mut regstack.backpos, rp, bp, limit) {
                                 reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
                                 scan = rp.rs_scan.map(|idx| operand_idx(idx) + 4);
 

@@ -339,14 +339,40 @@ describe('regexp engine', function()
     end
   end)
 
-  it('limits a look-behind to its byte count in both engines', function()
+  it('limits a look-behind to its character count in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(
-        { too_long = { '', -1, -1 }, fits = { 'b', 3, 4 } },
+        {
+          fits = { 'b', 3, 4 },
+          too_long = { '', -1, -1 },
+          cluster = { 'x', 3, 4 },
+          negative = { '', -1, -1 },
+          buf_fits = { 1, 4 },
+          buf_too_long = { 0, 0 },
+          prev_line = { 2, 2 },
+          prev_line_too_long = { 0, 0 },
+        },
         n.exec_lua(function(p)
+          local function matchpos(s, pat)
+            return vim.fn.matchstrpos(s, p .. pat)
+          end
+          local function searchpos(lines, pat)
+            vim.api.nvim_buf_set_lines(0, 0, -1, true, lines)
+            vim.api.nvim_win_set_cursor(0, { 1, 0 })
+            return vim.fn.searchpos(p .. pat, 'cW')
+          end
+          -- "e" with a combining acute accent is one character.
+          local e_acute = 'e\204\129'
           return {
-            too_long = vim.fn.matchstrpos('aéb', p .. [[\(aé\)\@2<=b]]),
-            fits = vim.fn.matchstrpos('aéb', p .. [[\(é\)\@2<=b]]),
+            fits = matchpos('aéb', [[\(aé\)\@2<=b]]),
+            too_long = matchpos('xaéb', [[\(xaé\)\@2<=b]]),
+            cluster = matchpos(e_acute .. 'x', [[\(]] .. e_acute .. [[\)\@1<=x]]),
+            negative = matchpos('ééb', [[\(éé\)\@2<!b]]),
+            buf_fits = searchpos({ 'aéb' }, [[\(aé\)\@2<=b]]),
+            buf_too_long = searchpos({ 'xaéb' }, [[\(xaé\)\@2<=b]]),
+            -- After crossing a line boundary, the limit counts from the end of the line.
+            prev_line = searchpos({ 'éé', 'xb' }, [[\(éé\nx\)\@2<=b]]),
+            prev_line_too_long = searchpos({ 'xéé', 'b' }, [[\(xéé\n\)\@2<=b]]),
           }
         end, [[\%#=]] .. engine)
       )

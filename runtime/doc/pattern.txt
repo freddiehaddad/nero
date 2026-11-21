@@ -760,12 +760,12 @@ overview.
 	\([a-z]\+\)\zs,\1		",abc" in "abc,abc"
 
 \@123<=
-	Like "\@<=" but only look back 123 bytes.  This avoids trying lots
-	of matches that are known to fail and make executing the pattern very
-	slow.  Example, check if there is a "<" just before "span":
+	Like "\@<=" but only look back 123 characters.  This avoids trying
+	lots of matches that are known to fail and make executing the pattern
+	very slow.  Example, check if there is a "<" just before "span":
 		/<\@1<=span
-	This will try matching "<" only one byte before "span", which is the
-	only place that works anyway.
+	This will try matching "<" only one character before "span", which is
+	the only place that works anyway.
 	After crossing a line boundary, the limit is relative to the end of
 	the line.  Thus the characters at the start of the line with the match
 	are not counted (this is just to keep it simple).
@@ -786,9 +786,9 @@ overview.
 	\(\/\/.*\)\@<!in	"in" which is not after "//"
 <
 \@123<!
-	Like "\@<!" but only look back 123 bytes.  This avoids trying lots of
-	matches that are known to fail and make executing the pattern very
-	slow.
+	Like "\@<!" but only look back 123 characters.  This avoids trying
+	lots of matches that are known to fail and make executing the pattern
+	very slow.
 
 \@>							*/\@>*
 	Matches the preceding atom like matching a whole pattern.

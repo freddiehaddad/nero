@@ -680,6 +680,8 @@ These existing features changed their behavior.
   autocommand.
 • |sockconnect()| channels are closed when the peer closes the connection
   (EOF), like RPC channels.
+• A look-behind limit, such as 123 in "\@123<=", counts characters instead
+  of bytes. |/\@<=| |/\@<!|
 
 ==============================================================================
 REMOVED FEATURES                                                 *news-removed*
