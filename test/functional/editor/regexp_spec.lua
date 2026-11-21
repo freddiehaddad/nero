@@ -141,4 +141,26 @@ describe('regexp engine', function()
       end)
     )
   end)
+
+  it('finds matches after \\@> in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          one_char_atom = { 'x-0', '' },
+          group_before_atom = { 'x-0', 'x' },
+          submatch_before_atom = { '', 'b' },
+        },
+        n.exec_lua(function(p)
+          local function ml(str, pat)
+            return vim.list_slice(vim.fn.matchlist(str, p .. pat), 1, 2)
+          end
+          local r = {}
+          r.one_char_atom = ml('ax-0', [[.b\=.\@>0]])
+          r.group_before_atom = ml('abx-0', [[\(.b\=\).\@>0]])
+          r.submatch_before_atom = ml('Ab-', [[\a\=\(\a\)\=.\@>\zs]])
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

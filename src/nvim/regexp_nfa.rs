@@ -2556,20 +2556,6 @@ fn match_follows(states: &[NfaState], startstate: Option<usize>, depth: i32) -> 
     false
 }
 
-fn state_in_list(
-    re_s: &RegexpState,
-    lastlist: &[[i32; 2]],
-    l: &NfaList,
-    state: Option<usize>,
-    subs: &Regsubs,
-) -> bool {
-    let Some(state_idx) = state else {
-        return false;
-    };
-    lastlist[state_idx][re_s.nfa_ll_index.get()] == l.id
-        && !(re_s.rex.nfa_has_backref.get() || has_state_with_pos(re_s, l, state_idx, subs, None))
-}
-
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn addstate(
@@ -3907,68 +3893,41 @@ fn nfa_regmatch_ctx(
                 NFA_START_PATTERN => {
                     let out1_out = t_st.out1.and_then(|o1| (&prog.state)[o1].out);
                     let out1_out_out = out1_out.and_then(|oo| (&prog.state)[oo].out);
-                    let skip = if state_in_list(
+                    copy_sub_off(re_s, &mut m.norm, &mut thislist.t[t_idx].subs.norm);
+                    if re_s.rex.nfa_has_zsubexpr.get() {
+                        copy_sub_off(re_s, &mut m.synt, &mut thislist.t[t_idx].subs.synt);
+                    }
+                    let res = recursive_regmatch(
                         re_s,
+                        nfa_s,
+                        t_state_idx,
+                        None,
+                        prog,
                         lastlist,
-                        nextlist,
-                        out1_out,
-                        &thislist.t[t_idx].subs,
-                    ) {
-                        out1_out
-                    } else if state_in_list(
-                        re_s,
-                        lastlist,
-                        nextlist,
-                        out1_out_out,
-                        &thislist.t[t_idx].subs,
-                    ) || state_in_list(
-                        re_s,
-                        lastlist,
-                        thislist,
-                        out1_out_out,
-                        &thislist.t[t_idx].subs,
-                    ) {
-                        out1_out_out
-                    } else {
-                        None
-                    };
-                    if skip.is_none() {
-                        copy_sub_off(re_s, &mut m.norm, &mut thislist.t[t_idx].subs.norm);
+                        &mut *submatch,
+                        m,
+                        &mut listids,
+                    );
+                    if res == NFA_TOO_EXPENSIVE {
+                        nfa_s.nfa_match.set(res);
+                        return finish_nfa_regmatch(nfa_s, &mut list);
+                    }
+                    if res != 0 {
+                        copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut m.norm);
                         if re_s.rex.nfa_has_zsubexpr.get() {
-                            copy_sub_off(re_s, &mut m.synt, &mut thislist.t[t_idx].subs.synt);
+                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.synt, &mut m.synt);
                         }
-                        let res = recursive_regmatch(
-                            re_s,
-                            nfa_s,
-                            t_state_idx,
-                            None,
-                            prog,
-                            lastlist,
-                            &mut *submatch,
-                            m,
-                            &mut listids,
-                        );
-                        if res == NFA_TOO_EXPENSIVE {
-                            nfa_s.nfa_match.set(res);
-                            return finish_nfa_regmatch(nfa_s, &mut list);
-                        }
-                        if res != 0 {
-                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut m.norm);
-                            if re_s.rex.nfa_has_zsubexpr.get() {
-                                copy_sub_off(re_s, &mut thislist.t[t_idx].subs.synt, &mut m.synt);
-                            }
-                            let bytelen = m.norm.list[0].end_col - re_s.rex.input_col();
-                            if bytelen == 0 {
-                                add_here = true;
-                                add_state = out1_out_out;
-                            } else if bytelen <= clen {
-                                add_state = out1_out_out;
-                                add_off = clen;
-                            } else {
-                                add_state = out1_out;
-                                add_off = bytelen;
-                                add_count = bytelen - clen;
-                            }
+                        let bytelen = m.norm.list[0].end_col - re_s.rex.input_col();
+                        if bytelen == 0 {
+                            add_here = true;
+                            add_state = out1_out_out;
+                        } else if bytelen <= clen {
+                            add_state = out1_out_out;
+                            add_off = clen;
+                        } else {
+                            add_state = out1_out;
+                            add_off = bytelen;
+                            add_count = bytelen - clen;
                         }
                     }
                 }
