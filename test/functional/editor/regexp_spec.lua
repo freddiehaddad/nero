@@ -1,5 +1,6 @@
 local t = require('test.testutil')
 local n = require('test.functional.testnvim')()
+local Screen = require('test.functional.ui.screen')
 
 local describe, it, before_each = t.describe, t.it, t.before_each
 local eq = t.eq
@@ -257,6 +258,30 @@ describe('regexp engine', function()
     end
   end)
 
+  it('highlights matches that \\zs or \\ze in a look-behind puts before the search', function()
+    local screen = Screen.new(20, 4)
+    n.exec_lua(function()
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'abc', 'abc', 'abc' })
+      vim.fn.setreg('/', [[\(\zs.\ze.\)\@<=]])
+      vim.v.hlsearch = 1
+    end)
+    screen:expect([[
+      {10:^ab}c                 |
+      {10:ab}c                 |*2
+                          |
+    ]])
+    n.exec_lua(function()
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'abcd', 'abcd', 'abcd' })
+      vim.o.cpoptions = vim.o.cpoptions:gsub('c', '')
+      vim.fn.setreg('/', [[\(\zs.\)\@<=.]])
+      vim.v.hlsearch = 1
+    end)
+    screen:expect([[
+      {10:^abcd}                |
+      {10:abcd}                |*2
+                          |
+    ]])
+  end)
   it('reports NFA submatches only from the path that matched', function()
     eq(
       {

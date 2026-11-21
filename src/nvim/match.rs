@@ -514,6 +514,7 @@ fn next_search_hl(
         return;
     }
 
+    let mut searched_from: Option<Colnr> = None;
     loop {
         let Some((shl_tm, shl_lnum, start_col, end_lnum, end_col, shl_buf)) =
             with_shl(win, search_hl, match_key, |shl| {
@@ -548,6 +549,19 @@ fn next_search_hl(
         } else {
             matchcol = end_col;
         }
+        // A "\zs" or "\ze" in a look-behind can put a match before the column the search
+        // began at, so searching from it again could find the same match forever: move on.
+        if let Some(prev) = searched_from
+            && matchcol <= prev
+        {
+            let line_slice = crate::memline::ml_get_buf_slice(shl_buf.borrow(), lnum);
+            if (prev as usize) >= line_slice.len() {
+                with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
+                break;
+            }
+            matchcol = prev + crate::mbyte::utfc_slice2len(&line_slice[prev as usize..]) as Colnr;
+        }
+        searched_from = Some(matchcol);
 
         if with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = lnum).is_none() {
             break;
