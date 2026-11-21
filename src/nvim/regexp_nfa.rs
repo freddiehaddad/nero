@@ -2651,22 +2651,28 @@ fn addstate_idx(
 
             let ll_idx = re_s.nfa_ll_index.get();
             if lastlist[state_idx][ll_idx] == l.id && st_c != NFA_SKIP {
+                // This state is already in the list, don't add it again, unless it is
+                // an MOPEN that is used for a backreference or when there is a PIM.
+                // For NFA_MATCH check the position, lower position is preferred.
                 if !re_s.rex.nfa_has_backref.get()
                     && pim.is_none()
                     && !l.has_pim
                     && st_c != NFA_MATCH
                 {
-                    if off_arg <= -ADDSTATE_HERE_OFFSET {
+                    // When called from addstate_here() do insert before existing states.
+                    let add_here = off_arg <= -ADDSTATE_HERE_OFFSET;
+                    let found = add_here && {
                         let listindex = -(off_arg + ADDSTATE_HERE_OFFSET);
                         let limit = l.n.min(listindex) as usize;
-                        let found = l.t[..limit].iter().any(|t| t.state == Some(state_idx));
-                        if found {
-                            return true;
-                        }
-                    } else {
+                        l.t[..limit].iter().any(|t| t.state == Some(state_idx))
+                    };
+                    if !add_here || found {
                         return true;
                     }
-                } else if has_state_with_pos(re_s, l, state_idx, subs, pim.as_deref()) {
+                }
+
+                // Do not add the state again when it exists with the same positions.
+                if has_state_with_pos(re_s, l, state_idx, subs, pim.as_deref()) {
                     return true;
                 }
             }

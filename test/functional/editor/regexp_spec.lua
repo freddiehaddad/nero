@@ -124,4 +124,21 @@ describe('regexp engine', function()
       end)
     )
   end)
+
+  it('ends empty loops after zero-width NFA states', function()
+    eq(
+      {
+        eol_star_search = 1,
+        bol_group_repeat = { '', '' },
+      },
+      n.exec_lua(function()
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'x' })
+        local r = {}
+        -- The timeout turns a hang into a failure.
+        r.eol_star_search = vim.fn.search([[\%#=2x\_$*]], 'nw', 0, 10000)
+        r.bol_group_repeat = vim.list_slice(vim.fn.matchlist('x', [[\%#=2^\(\s*\)\+]]), 1, 2)
+        return r
+      end)
+    )
+  end)
 end)
