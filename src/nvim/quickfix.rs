@@ -1632,12 +1632,18 @@ fn qf_new_list(qi: &QfInfo, qf_title: Option<&CStr>) {
     qfl.qf_has_user_data = false;
 }
 
-fn qf_parse_fmt_f(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields, prefix: i32) -> QfStatus {
-    if rmp.startp[midx].is_null() || rmp.endp[midx].is_null() {
+fn qf_parse_fmt_f(
+    rmp: &Regmatch,
+    midx: usize,
+    subject: &[u8],
+    fields: &mut Qffields,
+    prefix: i32,
+) -> QfStatus {
+    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
         return QfStatus::Fail;
     }
 
-    let match_cstr = std::ffi::CString::new(rmp.span_bytes(midx)).unwrap_or_default();
+    let match_cstr = std::ffi::CString::new(rmp.group(midx, subject)).unwrap_or_default();
     expand_env(match_cstr.as_c_str(), &mut fields.namebuf[..CMDBUFFSIZE]);
 
     if crate::strings::vim_haschr(c"OPQ", prefix)
@@ -1649,11 +1655,11 @@ fn qf_parse_fmt_f(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields, prefix
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_b(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_b(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    let bnr = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as i32;
+    };
+    let bnr = crate::charset::parse_i64_prefix(text) as i32;
     if buflist_findnr(bnr).is_none() {
         return QfStatus::Fail;
     }
@@ -1661,51 +1667,51 @@ fn qf_parse_fmt_b(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfS
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_n(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_n(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.enr = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as i32;
+    };
+    fields.enr = crate::charset::parse_i64_prefix(text) as i32;
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_l(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_l(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.lnum = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as Linenr;
+    };
+    fields.lnum = crate::charset::parse_i64_prefix(text) as Linenr;
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_e(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_e(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.end_lnum = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as Linenr;
+    };
+    fields.end_lnum = crate::charset::parse_i64_prefix(text) as Linenr;
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_c(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_c(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.col = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as i32;
+    };
+    fields.col = crate::charset::parse_i64_prefix(text) as i32;
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_k(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_k(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.end_col = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as i32;
+    };
+    fields.end_col = crate::charset::parse_i64_prefix(text) as i32;
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_t(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_t(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.type_ = rmp.startp[midx].first_byte();
+    };
+    fields.type_ = text.first().copied().unwrap_or(0);
     QfStatus::Ok
 }
 
@@ -1718,38 +1724,33 @@ fn copy_nonerror_line(line: &[u8], fields: &mut Qffields) -> QfStatus {
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_m(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() || rmp.endp[midx].is_null() {
+fn qf_parse_fmt_m(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
         return QfStatus::Fail;
     }
-    let span = rmp.span_bytes(midx);
+    let span = rmp.group(midx, subject);
     let len = span.len();
     if len >= fields.errmsg.len() {
         fields.errmsg.resize(len + 1, 0);
     }
-    crate::memory::copy_bytes_to_c_buf(&mut fields.errmsg[..len + 1], &span);
+    crate::memory::copy_bytes_to_c_buf(&mut fields.errmsg[..len + 1], span);
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_r(
-    rmp: &mut Regmatch,
-    midx: usize,
-    line_base: usize,
-    tail_off: &mut Option<usize>,
-) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_r(rmp: &Regmatch, midx: usize, tail_off: &mut Option<usize>) -> QfStatus {
+    let Some(start) = rmp.startp[midx] else {
         return QfStatus::Fail;
-    }
-    *tail_off = Some(rmp.startp[midx].addr().saturating_sub(line_base));
+    };
+    *tail_off = Some(start);
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_p(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() || rmp.endp[midx].is_null() {
+fn qf_parse_fmt_p(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
         return QfStatus::Fail;
     }
     fields.col = 0;
-    for &b in &rmp.span_bytes(midx) {
+    for &b in rmp.group(midx, subject) {
         fields.col += 1;
         if b == TAB {
             fields.col += 7;
@@ -1761,20 +1762,20 @@ fn qf_parse_fmt_p(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfS
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_v(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() {
+fn qf_parse_fmt_v(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    let Some(text) = rmp.text_from(midx, subject) else {
         return QfStatus::Fail;
-    }
-    fields.col = rmp.startp[midx].with_bytes(crate::charset::parse_i64_prefix) as i32;
+    };
+    fields.col = crate::charset::parse_i64_prefix(text) as i32;
     fields.use_viscol = true;
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_s(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() || rmp.endp[midx].is_null() {
+fn qf_parse_fmt_s(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
         return QfStatus::Fail;
     }
-    let span = rmp.span_bytes(midx);
+    let span = rmp.group(midx, subject);
     let len = span.len().min(CMDBUFFSIZE - 5);
     fields.pattern[..3].copy_from_slice(b"^\\V");
     fields.pattern[3..3 + len].copy_from_slice(&span[..len]);
@@ -1782,20 +1783,19 @@ fn qf_parse_fmt_s(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfS
     QfStatus::Ok
 }
 
-fn qf_parse_fmt_o(rmp: &mut Regmatch, midx: usize, fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_null() || rmp.endp[midx].is_null() {
+fn qf_parse_fmt_o(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
+    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
         return QfStatus::Fail;
     }
-    let span = rmp.span_bytes(midx);
+    let span = rmp.group(midx, subject);
     let len = span.len();
     let dsize = (crate::memory::bytes_until_nul(&fields.module).len() + len + 1).min(CMDBUFFSIZE);
-    crate::memory::append_bytes_to_c_buf(&mut fields.module[..dsize], &span);
+    crate::memory::append_bytes_to_c_buf(&mut fields.module[..dsize], span);
     QfStatus::Ok
 }
-
 fn qf_parse_match(
     line: &[u8],
-    line_base: usize,
+    subject: &[u8],
     fmt_ptr: &Efm,
     regmatch: &mut Regmatch,
     fields: &mut Qffields,
@@ -1818,30 +1818,30 @@ fn qf_parse_match(
         let mut status = QfStatus::Ok;
         let midx = fmt_ptr.addr[i] as isize;
         if i == 0 && midx > 0 {
-            status = qf_parse_fmt_f(regmatch, midx as usize, fields, i32::from(idx));
+            status = qf_parse_fmt_f(regmatch, midx as usize, subject, fields, i32::from(idx));
         } else if i == FMT_PATTERN_M {
             if fmt_ptr.flags == b'+' && qf_multiscan == 0 {
                 status = copy_nonerror_line(line, fields);
             } else if midx > 0 {
-                status = qf_parse_fmt_m(regmatch, midx as usize, fields);
+                status = qf_parse_fmt_m(regmatch, midx as usize, subject, fields);
             }
         } else if i == FMT_PATTERN_R && midx > 0 {
-            status = qf_parse_fmt_r(regmatch, midx as usize, line_base, tail_off);
+            status = qf_parse_fmt_r(regmatch, midx as usize, tail_off);
         } else if midx > 0 {
             let m = midx as usize;
             status = match i {
-                1 => qf_parse_fmt_b(regmatch, m, fields),
-                2 => qf_parse_fmt_n(regmatch, m, fields),
-                3 => qf_parse_fmt_l(regmatch, m, fields),
-                4 => qf_parse_fmt_e(regmatch, m, fields),
-                5 => qf_parse_fmt_c(regmatch, m, fields),
-                6 => qf_parse_fmt_k(regmatch, m, fields),
-                7 => qf_parse_fmt_t(regmatch, m, fields),
-                8 => qf_parse_fmt_m(regmatch, m, fields),
-                10 => qf_parse_fmt_p(regmatch, m, fields),
-                11 => qf_parse_fmt_v(regmatch, m, fields),
-                12 => qf_parse_fmt_s(regmatch, m, fields),
-                13 => qf_parse_fmt_o(regmatch, m, fields),
+                1 => qf_parse_fmt_b(regmatch, m, subject, fields),
+                2 => qf_parse_fmt_n(regmatch, m, subject, fields),
+                3 => qf_parse_fmt_l(regmatch, m, subject, fields),
+                4 => qf_parse_fmt_e(regmatch, m, subject, fields),
+                5 => qf_parse_fmt_c(regmatch, m, subject, fields),
+                6 => qf_parse_fmt_k(regmatch, m, subject, fields),
+                7 => qf_parse_fmt_t(regmatch, m, subject, fields),
+                8 => qf_parse_fmt_m(regmatch, m, subject, fields),
+                10 => qf_parse_fmt_p(regmatch, m, subject, fields),
+                11 => qf_parse_fmt_v(regmatch, m, subject, fields),
+                12 => qf_parse_fmt_s(regmatch, m, subject, fields),
+                13 => qf_parse_fmt_o(regmatch, m, subject, fields),
                 _ => QfStatus::Ok,
             };
         }
@@ -1886,13 +1886,12 @@ fn qf_parse_get_fields(
     regmatch.rm_ic = true;
     regmatch.borrow_prog(fmt_ptr.prog.as_deref());
     let line_bytes = crate::memory::bytes_until_nul(line);
-    let line_base = line_bytes.as_ptr() as usize;
     let r = vim_regexec(&mut regmatch, line_bytes, 0);
     let mut status = QfStatus::Fail;
     if r {
         status = qf_parse_match(
             line,
-            line_base,
+            line_bytes,
             fmt_ptr,
             &mut regmatch,
             fields,
@@ -7232,8 +7231,8 @@ fn hgr_search_file(qfl_rc: &QfListRc, fname: &CStr, p_regmatch: &mut Regmatch) {
     while !vim_fgets(&mut iobuff, &fd) && !input_state().got_int.get() {
         let orig_bytes = crate::memory::bytes_until_nul(&iobuff);
         if vim_regexec(p_regmatch, orig_bytes, 0) {
-            let start_off = p_regmatch.start_offset(0, orig_bytes);
-            let end_off = p_regmatch.end_offset(0, orig_bytes);
+            let start_off = p_regmatch.start(0);
+            let end_off = p_regmatch.end(0);
             let mut l = orig_bytes.len();
             while l > 0 && iobuff[l - 1] <= b' ' {
                 l -= 1;

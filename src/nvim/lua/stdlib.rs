@@ -83,8 +83,8 @@ fn regex_match_slice(lstate: *mut lua_State, regex: &mut LuaRegex, str_bytes: &[
     let matched = vim_regexec(&mut rm, str_bytes, 0);
 
     if matched {
-        lua_pushinteger_safe(lstate, rm.start_offset(0, str_bytes) as lua_Integer);
-        lua_pushinteger_safe(lstate, rm.end_offset(0, str_bytes) as lua_Integer);
+        lua_pushinteger_safe(lstate, rm.start(0) as lua_Integer);
+        lua_pushinteger_safe(lstate, rm.end(0) as lua_Integer);
         return 2;
     }
     0

@@ -3464,22 +3464,22 @@ pub fn find_pattern_in_path(
 
                 let mut new_fname_cstr = if find_substr(inc_opt_cstr, b"\\zs") {
                     find_file_name_in_path(
-                        &incl_regmatch.span_bytes(0),
+                        incl_regmatch.group(0, line_bytes),
                         FNAME_EXP | FNAME_INCL | FNAME_REL,
                         1,
                         p_fname_opt,
                     )
                 } else {
-                    incl_regmatch.endp[0].with_bytes(|endp_bytes| {
-                        file_name_in_line(
-                            endp_bytes,
-                            0,
-                            FNAME_EXP | FNAME_INCL | FNAME_REL,
-                            1,
-                            p_fname_opt,
-                            None,
-                        )
-                    })
+                    let endp_bytes = incl_regmatch.endp[0]
+                        .map_or(&[][..], |end| &line_bytes[end.min(line_bytes.len())..]);
+                    file_name_in_line(
+                        endp_bytes,
+                        0,
+                        FNAME_EXP | FNAME_INCL | FNAME_REL,
+                        1,
+                        p_fname_opt,
+                        None,
+                    )
                 }
                 .map(|cstr| {
                     let mut v: Vec<u8> = cstr.into_bytes_with_nul();
@@ -3552,10 +3552,10 @@ pub fn find_pattern_in_path(
                         } else {
                             let line_bytes = crate::memory::bytes_until_nul(&file_line_vec);
                             if find_substr(inc_opt_cstr, b"\\zs") {
-                                p_idx = incl_regmatch.start_offset(0, line_bytes);
+                                p_idx = incl_regmatch.start(0);
                                 i = incl_regmatch.span_len(0) as i32;
                             } else {
-                                p_idx = incl_regmatch.end_offset(0, line_bytes);
+                                p_idx = incl_regmatch.end(0);
                                 let p_bytes = &line_bytes[p_idx.min(line_bytes.len())..];
                                 let skip_n = p_bytes
                                     .iter()
@@ -3569,7 +3569,7 @@ pub fn find_pattern_in_path(
                             }
 
                             if i == 0 {
-                                let end_off = incl_regmatch.end_offset(0, line_bytes);
+                                let end_off = incl_regmatch.end(0);
                                 p_idx = end_off;
                                 i = (line_bytes.len() - end_off) as i32;
                             } else if p_idx > 0 {
@@ -3662,7 +3662,7 @@ pub fn find_pattern_in_path(
                     if !def_regmatch.regprog.is_null()
                         && vim_regexec(&mut def_regmatch, line_bytes, 0)
                     {
-                        p_idx = def_regmatch.end_offset(0, line_bytes);
+                        p_idx = def_regmatch.end(0);
                         let p_bytes = &line_bytes[p_idx.min(line_bytes.len())..];
                         let skip_n = p_bytes
                             .iter()
@@ -3696,7 +3696,7 @@ pub fn find_pattern_in_path(
                             && vim_regexec(&mut regmatch, line_bytes, p_idx as Colnr)
                         {
                             matched = true;
-                            let sp_idx = regmatch.start_offset(0, line_bytes);
+                            let sp_idx = regmatch.start(0);
                             startp_idx = Some(sp_idx);
                             if skip_comments {
                                 if (line_bytes.first() != Some(&b'#')

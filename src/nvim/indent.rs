@@ -741,7 +741,8 @@ pub fn get_number_indent(lnum: Linenr) -> i32 {
             0,
         ) {
             pos.lnum = lnum;
-            pos.col = regmatch.end_offset(0, &line) as Colnr;
+            // The match ran on the line after its leader.
+            pos.col = (lead_len as usize + regmatch.end(0)) as Colnr;
             pos.coladd = 0;
         }
         regmatch.free_prog();
@@ -884,8 +885,7 @@ pub fn get_breakindent_win(wp: &WinInfoInfo, line: &[u8]) -> i32 {
                     if wp.w_briopt_list.get() > 0 {
                         INDENT_STATE.with_borrow_mut(|st| st.prev_list += wp.w_briopt_list.get());
                     } else {
-                        let span_vec = regmatch.span_bytes(0);
-                        let mut span = span_vec.as_slice();
+                        let mut span = regmatch.group(0, new_line.to_bytes());
                         let mut indent: i32 = 0;
                         while !span.is_empty() {
                             indent += win_chartabsize(wp, span, indent);

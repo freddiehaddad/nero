@@ -6414,8 +6414,8 @@ pub fn do_string_sub(
         let sub_bytes = sub_cstr.to_bytes();
 
         while vim_regexec_nl(&mut regmatch, str_opt, tail_off as Colnr) {
-            let start_off = regmatch.start_offset(0, str_bytes);
-            let end_off = regmatch.end_offset(0, str_bytes);
+            let start_off = regmatch.start(0);
+            let end_off = regmatch.end(0);
             // An empty match counts only once, and a `\zs` or `\ze` in a look-behind can end a
             // match where this search started or before it: skip a character instead.
             let passed = end_off < tail_off || (end_off == tail_off && start_off != tail_off);
@@ -6434,7 +6434,14 @@ pub fn do_string_sub(
                 zero_width = Some(start_off);
             }
 
-            let sublen = vim_regsub(&mut regmatch, sub_bytes, expr, &mut [], REGSUB_MAGIC);
+            let sublen = vim_regsub(
+                &mut regmatch,
+                str_bytes,
+                sub_bytes,
+                expr,
+                &mut [],
+                REGSUB_MAGIC,
+            );
             if sublen <= 0 {
                 out = None;
                 break;
@@ -6449,6 +6456,7 @@ pub fn do_string_sub(
             buf.resize(cur_len + (sublen as usize), 0);
             vim_regsub(
                 &mut regmatch,
+                str_bytes,
                 sub_bytes,
                 expr,
                 &mut buf[cur_len..cur_len + (sublen as usize)],

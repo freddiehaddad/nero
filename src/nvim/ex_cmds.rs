@@ -751,10 +751,10 @@ pub fn ex_sort(eap: &mut Exarg) {
             let mut end_col: Colnr = len;
             if !regmatch.regprog.is_null() && vim_regexec(&mut regmatch, s_bytes, 0) {
                 if EXCMDS_STATE.with(|s| s.sort_rx.get()) {
-                    start_col = regmatch.start_offset(0, s_bytes) as Colnr;
-                    end_col = regmatch.end_offset(0, s_bytes) as Colnr;
+                    start_col = regmatch.start(0) as Colnr;
+                    end_col = regmatch.end(0) as Colnr;
                 } else {
-                    start_col = regmatch.end_offset(0, s_bytes) as Colnr;
+                    start_col = regmatch.end(0) as Colnr;
                 }
             } else if !regmatch.regprog.is_null() {
                 end_col = 0;
@@ -1069,10 +1069,10 @@ pub fn ex_uniq(eap: &mut Exarg) {
             let mut end_col: Colnr = len;
             if !regmatch.regprog.is_null() && vim_regexec(&mut regmatch, s_bytes, 0) {
                 if EXCMDS_STATE.with(|s| s.sort_rx.get()) {
-                    start_col = regmatch.start_offset(0, s_bytes) as Colnr;
-                    end_col = regmatch.end_offset(0, s_bytes) as Colnr;
+                    start_col = regmatch.start(0) as Colnr;
+                    end_col = regmatch.end(0) as Colnr;
                 } else {
-                    start_col = regmatch.end_offset(0, s_bytes) as Colnr;
+                    start_col = regmatch.end(0) as Colnr;
                 }
             } else if !regmatch.regprog.is_null() {
                 end_col = 0;

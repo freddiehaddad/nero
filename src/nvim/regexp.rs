@@ -378,7 +378,7 @@ impl Default for Regmmatch {
 const REG_LINE_SLOTS: usize = 64;
 
 #[derive(Clone, Copy, Default, Debug)]
-pub struct RegLineSlice {
+pub(crate) struct RegLineSlice {
     slot: u8,
     valid: u8,
     off: u32,
@@ -404,7 +404,7 @@ impl PartialEq for RegLineSlice {
 
 impl Eq for RegLineSlice {}
 
-pub const REG_LINE_NULL: RegLineSlice = RegLineSlice {
+pub(crate) const REG_LINE_NULL: RegLineSlice = RegLineSlice {
     slot: 0,
     valid: 0,
     off: 0,
@@ -686,28 +686,30 @@ pub(super) fn reg_line_from_clean_bytes_with_nul(
 }
 
 #[inline(always)]
-pub fn reg_line_from_bytes_with_nul(bytes: &[u8]) -> RegLineSlice {
+pub(crate) fn reg_line_from_bytes_with_nul(bytes: &[u8]) -> RegLineSlice {
     reg_line_from_bytes_inner(0, 0, 0, bytes, true)
 }
 
 #[inline(always)]
-pub fn reg_line_from_bytes(bytes: &[u8]) -> RegLineSlice {
+pub(crate) fn reg_line_from_bytes(bytes: &[u8]) -> RegLineSlice {
     reg_line_from_bytes_inner(0, 0, 0, bytes, false)
 }
 
 #[inline(always)]
-pub fn reg_line_from_opt_bytes(s: Option<&[u8]>) -> RegLineSlice {
+pub(crate) fn reg_line_from_opt_bytes(s: Option<&[u8]>) -> RegLineSlice {
     match s {
         Some(s) => reg_line_from_bytes(s),
         None => REG_LINE_NULL,
     }
 }
 
+/// The result of matching one string. `startp[i]` and `endp[i]` are the byte offsets of group
+/// `i` (0 is the whole match) in the matched string, or `None` when the group did not match.
 #[derive(Clone)]
 pub struct Regmatch {
     pub regprog: RegprogPtr,
-    pub startp: [RegLineSlice; NSUBEXP],
-    pub endp: [RegLineSlice; NSUBEXP],
+    pub startp: [Option<usize>; NSUBEXP],
+    pub endp: [Option<usize>; NSUBEXP],
     pub rm_matchcol: Colnr,
     pub rm_ic: bool,
 }
@@ -716,33 +718,50 @@ impl Regmatch {
     pub const fn new() -> Self {
         Self {
             regprog: RegprogPtr::NULL,
-            startp: [REG_LINE_NULL; NSUBEXP],
-            endp: [REG_LINE_NULL; NSUBEXP],
+            startp: [None; NSUBEXP],
+            endp: [None; NSUBEXP],
             rm_matchcol: 0,
             rm_ic: false,
         }
     }
 
+    /// Byte offset of the start of group `idx` in the matched string, or 0 when it did not match.
+    #[inline(always)]
+    pub fn start(&self, idx: usize) -> usize {
+        self.startp[idx].unwrap_or(0)
+    }
+
+    /// Byte offset of the end of group `idx` in the matched string, or 0 when it did not match.
+    #[inline(always)]
+    pub fn end(&self, idx: usize) -> usize {
+        self.endp[idx].unwrap_or(0)
+    }
+
+    /// Length in bytes of the text group `idx` matched: 0 when it did not match, or when `\ze`
+    /// put its end before its start.
     #[inline(always)]
     pub fn span_len(&self, idx: usize) -> usize {
-        self.endp[idx].offset_from(self.startp[idx])
+        match (self.startp[idx], self.endp[idx]) {
+            (Some(start), Some(end)) => end.saturating_sub(start),
+            _ => 0,
+        }
     }
 
+    /// The text group `idx` matched in `subject`, the string that was matched.
     #[inline(always)]
-    pub fn span_bytes(&self, idx: usize) -> Vec<u8> {
-        self.startp[idx].with_span(self.endp[idx], <[u8]>::to_vec)
+    pub fn group<'s>(&self, idx: usize, subject: &'s [u8]) -> &'s [u8] {
+        let Some(start) = self.startp[idx] else {
+            return &[];
+        };
+        let start = start.min(subject.len());
+        &subject[start..(start + self.span_len(idx)).min(subject.len())]
     }
 
+    /// `subject`, the string that was matched, from where group `idx` starts; `None` when the
+    /// group did not match.
     #[inline(always)]
-    pub fn start_offset(&self, idx: usize, base: &[u8]) -> usize {
-        self.startp[idx]
-            .addr()
-            .saturating_sub(base.as_ptr() as usize)
-    }
-
-    #[inline(always)]
-    pub fn end_offset(&self, idx: usize, base: &[u8]) -> usize {
-        self.endp[idx].addr().saturating_sub(base.as_ptr() as usize)
+    pub fn text_from<'s>(&self, idx: usize, subject: &'s [u8]) -> Option<&'s [u8]> {
+        Some(&subject[self.startp[idx]?.min(subject.len())..])
     }
 
     #[inline(always)]
@@ -1797,12 +1816,14 @@ impl RegexecState {
     }
 
     #[inline(always)]
-    pub fn load_match(&self, rmp: &Regmatch) {
+    pub fn load_match(&self, rmp: &Regmatch, subject: &[u8]) {
         self.has_match.set(true);
         self.has_mmatch.set(false);
+        let line = reg_line_from_bytes(subject);
+        let at = |off: Option<usize>| off.map_or(REG_LINE_NULL, |off| line.wrapping_add(off));
         for i in 0..NSUBEXP {
-            self.rm_startp[i].set(rmp.startp[i]);
-            self.rm_endp[i].set(rmp.endp[i]);
+            self.rm_startp[i].set(at(rmp.startp[i]));
+            self.rm_endp[i].set(at(rmp.endp[i]));
         }
         self.rm_matchcol.set(rmp.rm_matchcol);
         self.cached_lines.set([(Linenr::MIN, REG_LINE_NULL); 2]);
@@ -1810,9 +1831,10 @@ impl RegexecState {
 
     #[inline(always)]
     pub fn save_match(&self, rmp: &mut Regmatch) {
+        let off = |pos: RegLineSlice| (!pos.is_null()).then(|| pos.off());
         for i in 0..NSUBEXP {
-            rmp.startp[i] = self.rm_startp[i].get();
-            rmp.endp[i] = self.rm_endp[i].get();
+            rmp.startp[i] = off(self.rm_startp[i].get());
+            rmp.endp[i] = off(self.rm_endp[i].get());
         }
         rmp.rm_matchcol = self.rm_matchcol.get();
     }
@@ -3708,8 +3730,10 @@ pub(crate) fn fill_submatch_list(
     argskip + 1
 }
 
+/// Substitutes `source` for the match `rmp` found in `subject`, the string that was matched.
 pub fn vim_regsub(
     rmp: &mut Regmatch,
+    subject: &[u8],
     source: &[u8],
     expr: Option<&TypVal>,
     dest: &mut [u8],
@@ -3724,7 +3748,7 @@ pub fn vim_regsub(
     RE_STATE.with(|s| s.rex_in_use.set(true));
 
     RE_STATE.with(|s| {
-        s.rex.load_match(rmp);
+        s.rex.load_match(rmp, subject);
         s.rex.bt_magic_wrong.set(rmp.regprog.bt_magic_wrong());
     });
     RE_STATE.with(|s| s.rex.reg_maxline.set(0));
@@ -5095,8 +5119,8 @@ mod tests {
         rm.set_prog(vim_regcomp(&pat_buf[..6], RE_MAGIC + RE_STRING));
         assert!(!rm.regprog.is_null());
         assert!(vim_regexec(&mut rm, &line_buf[..5], 0));
-        assert_eq!(rm.start_offset(0, &line_buf[..5]), 2);
-        assert_eq!(rm.end_offset(0, &line_buf[..5]), 5);
+        assert_eq!(rm.start(0), 2);
+        assert_eq!(rm.end(0), 5);
         assert!(!vim_regexec(&mut rm, &line_buf[..4], 0));
         rm.free_prog();
     }

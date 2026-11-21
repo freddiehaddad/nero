@@ -4986,9 +4986,9 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
 
                     idx += 1;
                 } else {
-                    let str_cstr = str_cstr_opt.unwrap_or(c"");
-                    let match_start = regmatch.start_offset(0, str_cstr.to_bytes());
-                    let adv = utfc_ptr2len(regmatch.startp[0]) as usize;
+                    let str_bytes = str_cstr_opt.unwrap_or(c"").to_bytes();
+                    let match_start = regmatch.start(0);
+                    let adv = utfc_ptr2len(&str_bytes[match_start.min(str_bytes.len())..]) as usize;
                     startcol = (match_start + adv) as Colnr;
                     if i64::from(startcol) > len || (startcol as usize) <= match_start {
                         match_found = false;
@@ -5000,6 +5000,8 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
             if match_found {
                 let expr_bytes = expr_cstr_opt.map_or(&b""[..], CStr::to_bytes);
                 let str_bytes = str_cstr_opt.map_or(&b""[..], CStr::to_bytes);
+                // The match ran on `str`, which is `expr` without its first `str_off` bytes.
+                let str_off = expr_bytes.len() - str_bytes.len();
                 match type_ {
                     SomeMatchType::SomeMatchStrPos => {
                         let ret_l = rettv.value.list();
@@ -5011,15 +5013,15 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
 
                         crate::eval::typval::tv_set_string_len(
                             &mut li1.tv_mut(),
-                            Some(&regmatch.span_bytes(0)),
+                            Some(regmatch.group(0, str_bytes)),
                         );
 
                         li3.tv_mut().value = crate::eval::typval::TvValue::Number(
-                            regmatch.start_offset(0, expr_bytes) as Varnumber,
+                            (str_off + regmatch.start(0)) as Varnumber,
                         );
 
                         li4.tv_mut().value = crate::eval::typval::TvValue::Number(
-                            regmatch.end_offset(0, expr_bytes) as Varnumber,
+                            (str_off + regmatch.end(0)) as Varnumber,
                         );
 
                         if !l.is_null() {
@@ -5029,15 +5031,13 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
                     }
                     SomeMatchType::SomeMatchList => {
                         for i in 0..NSUBEXP {
-                            if regmatch.endp[i].is_null() {
+                            if regmatch.endp[i].is_none() {
                                 tv_list_append_string(rettv.value.list_ref(), None, 0);
                             } else {
-                                regmatch.startp[i].with_span(regmatch.endp[i], |bytes| {
-                                    crate::eval::typval::tv_list_append_bytes(
-                                        rettv.value.list_ref(),
-                                        bytes,
-                                    );
-                                });
+                                crate::eval::typval::tv_list_append_bytes(
+                                    rettv.value.list_ref(),
+                                    regmatch.group(i, str_bytes),
+                                );
                             }
                         }
                     }
@@ -5047,7 +5047,7 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
                         } else {
                             crate::eval::typval::tv_set_string_len(
                                 &mut *rettv,
-                                Some(&regmatch.span_bytes(0)),
+                                Some(regmatch.group(0, str_bytes)),
                             );
                         }
                     }
@@ -5056,18 +5056,13 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
                             rettv.value =
                                 crate::eval::typval::TvValue::Number(Varnumber::from(idx));
                         } else {
-                            if type_ == SomeMatchType::SomeMatch {
-                                rettv.value = crate::eval::typval::TvValue::Number(
-                                    regmatch.start_offset(0, str_bytes) as Varnumber,
-                                );
+                            let off = if type_ == SomeMatchType::SomeMatch {
+                                regmatch.start(0)
                             } else {
-                                rettv.value = crate::eval::typval::TvValue::Number(
-                                    regmatch.end_offset(0, str_bytes) as Varnumber,
-                                );
-                            }
-                            *rettv.value.number_mut() += ((str_bytes.as_ptr() as isize)
-                                - (expr_bytes.as_ptr() as isize))
-                                as Varnumber;
+                                regmatch.end(0)
+                            };
+                            rettv.value =
+                                crate::eval::typval::TvValue::Number((str_off + off) as Varnumber);
                         }
                     }
                 }
@@ -5114,21 +5109,19 @@ fn get_matches_in_str(
             tv_dict_add_nr(&d, c"idx", Varnumber::from(idx));
         }
 
-        let match_start = rmp.start_offset(0, str_bytes);
-        let match_end = rmp.end_offset(0, str_bytes);
+        let match_start = rmp.start(0);
+        let match_end = rmp.end(0);
         tv_dict_add_nr(&d, c"byteidx", match_start as Varnumber);
 
-        tv_dict_add_str_len(&d, c"text", Some(&rmp.span_bytes(0)));
+        tv_dict_add_str_len(&d, c"text", Some(rmp.group(0, str_bytes)));
         if submatches {
             let sml = tv_list_alloc((NSUBEXP - 1) as isize);
             tv_dict_add_list(&d, c"submatches", Some(&sml));
             for i in 1..NSUBEXP {
-                if rmp.endp[i].is_null() {
+                if rmp.endp[i].is_none() {
                     tv_list_append_string(&sml, Some(c""), 0);
                 } else {
-                    rmp.startp[i].with_span(rmp.endp[i], |bytes| {
-                        crate::eval::typval::tv_list_append_bytes(&sml, bytes);
-                    });
+                    crate::eval::typval::tv_list_append_bytes(&sml, rmp.group(i, str_bytes));
                 }
             }
         }
@@ -7608,7 +7601,7 @@ pub fn f_split(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFuncData) 
                     vim_regexec_nl(&mut regmatch, Some(str_bytes), col)
                 };
                 let end_off = if match_found {
-                    regmatch.start_offset(0, str_bytes)
+                    regmatch.start(0)
                 } else {
                     str_bytes.len()
                 };
@@ -7617,20 +7610,20 @@ pub fn f_split(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFuncData) 
                     || (tv_list_len(rettv.value.list_opt()) > 0
                         && !str_bytes.is_empty()
                         && match_found
-                        && end_off < regmatch.end_offset(0, str_bytes))
+                        && end_off < regmatch.end(0))
                 {
                     tv_list_append_string(rettv.value.list_ref(), Some(str_cstr), end_off as isize);
                 }
                 if !match_found {
                     break;
                 }
-                let match_end_off = regmatch.end_offset(0, str_bytes);
+                let match_end_off = regmatch.end(0).min(str_bytes.len());
                 if match_end_off > 0 {
                     col = 0;
                 } else {
-                    col = utfc_ptr2len(regmatch.endp[0]);
+                    col = utfc_ptr2len(str_bytes);
                 }
-                str_cstr = &str_cstr[match_end_off.min(str_bytes.len())..];
+                str_cstr = &str_cstr[match_end_off..];
             }
             regmatch.free_prog();
         }
