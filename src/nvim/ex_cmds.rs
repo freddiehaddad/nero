@@ -4105,9 +4105,11 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                 do_again = false;
 
                 'skip: {
-                    if matchcol == prev_matchcol
-                        && regmatch.endpos[0].lnum == 0
-                        && matchcol == regmatch.endpos[0].col
+                    // An empty match counts only once, and a `\ze` in a look-behind can end a
+                    // match before the column the search started at: skip a character.
+                    if regmatch.endpos[0].lnum == 0
+                        && (regmatch.endpos[0].col < matchcol
+                            || (matchcol == prev_matchcol && matchcol == regmatch.endpos[0].col))
                     {
                         if sub_firstline.as_slice()[matchcol as usize] == 0 {
                             skip_match = true;
@@ -4382,7 +4384,13 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                             nmatch_tl += nmatch - 1;
                             crate::memline::ml_get_len(lastlnum) as usize
                         };
-                        let copy_len = (regmatch.startpos[0].col - copycol) as usize;
+                        // A `\zs` in a look-behind can start the match inside text that was
+                        // already replaced: replace only the text after it.
+                        let start = Lpos {
+                            col: regmatch.startpos[0].col.max(copycol),
+                            ..regmatch.startpos[0]
+                        };
+                        let copy_len = (start.col - copycol) as usize;
                         sub_grow_buf(
                             &mut new_start,
                             &mut new_start_size,
@@ -4453,7 +4461,6 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         }
 
                         let mut replaced_bytes: Bcount = 0;
-                        let start = regmatch.startpos[0];
                         let end = regmatch.endpos[0];
                         for j in 0..(nmatch - 1) {
                             replaced_bytes +=

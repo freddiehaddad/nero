@@ -213,6 +213,50 @@ describe('regexp engine', function()
     end
   end)
 
+  it('substitutes matches that \\zs or \\ze puts before the search column', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          string_ends_at_column = 'Xb',
+          string_starts_before = 'XXX',
+          buffer_starts_before = 'XXX',
+          buffer_ends_before = 'Xbc',
+          -- The second match starts inside the first replacement: it replaces only "c".
+          buffer_changes = { '--dXYZ', 3, { { 0, 2, 1 }, { 1, 1, 1 } } },
+        },
+        n.exec_lua(function(p)
+          local api = vim.api
+          local function sub_line(line, pat)
+            api.nvim_buf_set_lines(0, 0, -1, false, { line })
+            vim.cmd('silent s/' .. p .. pat .. '/X/g')
+            return api.nvim_get_current_line()
+          end
+          local r = {}
+          r.string_ends_at_column = vim.fn.substitute('ab', p .. [[\(\zsa\)\@<=]], 'X', 'g')
+          r.string_starts_before = vim.fn.substitute('abcd', p .. [[\(\zs.\)\@<=.]], 'X', 'g')
+          r.buffer_starts_before = sub_line('abcd', [[\(\zs.\)\@<=.]])
+          r.buffer_ends_before = sub_line('abc', [[\(\zs.\ze.\)\@<=]])
+          api.nvim_buf_set_lines(0, 0, -1, false, { 'abcdXYZ' })
+          local ns = api.nvim_create_namespace('')
+          local mark = api.nvim_buf_set_extmark(0, ns, 0, 4, {})
+          local changes = {}
+          api.nvim_buf_attach(0, false, {
+            on_bytes = function(_, _, _, _, col, _, _, old_col, _, _, new_col)
+              table.insert(changes, { col, old_col, new_col })
+            end,
+          })
+          vim.cmd('silent s/' .. p .. [[\(\zs.\)\@<=[bc]/-/g]])
+          r.buffer_changes = {
+            api.nvim_get_current_line(),
+            api.nvim_buf_get_extmark_by_id(0, ns, mark, {})[2],
+            changes,
+          }
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
+
   it('reports NFA submatches only from the path that matched', function()
     eq(
       {

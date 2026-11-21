@@ -6416,15 +6416,21 @@ pub fn do_string_sub(
         while vim_regexec_nl(&mut regmatch, str_opt, tail_off as Colnr) {
             let start_off = regmatch.start_offset(0, str_bytes);
             let end_off = regmatch.end_offset(0, str_bytes);
-            if start_off == end_off {
-                if zero_width == Some(start_off) {
-                    let i = crate::mbyte::utfc_slice2len(&str_bytes[tail_off..]);
-                    if let Some(buf) = &mut out {
-                        buf.extend_from_slice(&str_bytes[tail_off..(tail_off + i).min(len)]);
-                    }
-                    tail_off = (tail_off + i).min(len);
-                    continue;
+            // An empty match counts only once, and a `\zs` or `\ze` in a look-behind can end a
+            // match where this search started or before it: skip a character instead.
+            let passed = end_off < tail_off || (end_off == tail_off && start_off != tail_off);
+            if passed || (start_off == end_off && zero_width == Some(start_off)) {
+                if tail_off >= len {
+                    break;
                 }
+                let i = crate::mbyte::utfc_slice2len(&str_bytes[tail_off..]);
+                if let Some(buf) = &mut out {
+                    buf.extend_from_slice(&str_bytes[tail_off..(tail_off + i).min(len)]);
+                }
+                tail_off = (tail_off + i).min(len);
+                continue;
+            }
+            if start_off == end_off {
                 zero_width = Some(start_off);
             }
 
