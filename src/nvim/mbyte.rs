@@ -1029,35 +1029,6 @@ impl AsMbyteSlice for &crate::option_vars::RcCStr {
     }
 }
 
-impl AsMbyteSlice for crate::regexp::RegLineSlice {
-    #[inline(always)]
-    fn with_char_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        let b0 = self.first_byte();
-        if b0 == 0 {
-            f(&[])
-        } else if b0 < 0x80 {
-            f(&[b0])
-        } else if self.valid_len() >= 4 {
-            let lb = self.lookahead_bytes();
-            let valid = &lb[..self.valid_len() as usize];
-            f(crate::memory::bytes_until_nul(valid))
-        } else {
-            self.with_bytes(|b| f(&b[..b.len().min(MB_MAXCHAR as usize)]))
-        }
-    }
-    #[inline(always)]
-    fn with_cluster_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        let b0 = self.first_byte();
-        if b0 == 0 {
-            f(&[])
-        } else if b0 < 0x80 && self.second_byte() < 0x80 {
-            f(&[b0])
-        } else {
-            self.with_bytes(f)
-        }
-    }
-}
-
 #[inline]
 pub fn utf_ptr2_char_info(bytes: impl AsMbyteSlice) -> CharInfo {
     bytes.with_char_bytes(|bytes| {

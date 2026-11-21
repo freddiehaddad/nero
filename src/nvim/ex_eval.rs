@@ -1377,7 +1377,7 @@ pub fn ex_catch(eap: &mut Exarg) {
                     input_state().got_int.set(false);
                     let cur_excp = exc_state().current_exception.get().unwrap();
                     let val_cstr = cur_excp.value.as_c_str();
-                    caught = vim_regexec_nl(&mut regmatch, Some(val_cstr.to_bytes()), 0);
+                    caught = vim_regexec_nl(&mut regmatch, val_cstr.to_bytes(), 0);
                     input_state()
                         .got_int
                         .set(input_state().got_int.get() | (prev_got_int));

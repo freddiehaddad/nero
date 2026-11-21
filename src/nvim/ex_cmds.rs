@@ -4354,7 +4354,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                             let _textlock = input_state().lock_text();
                             let rel_lnum = sub_firstlnum - regmatch.startpos[0].lnum;
                             vim_regsub_multi(
-                                &mut regmatch,
+                                &regmatch,
                                 rel_lnum,
                                 sub_bytes,
                                 &mut [],
@@ -4416,7 +4416,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                             let _textlock = input_state().lock_text();
                             let rel_lnum = sub_firstlnum - regmatch.startpos[0].lnum;
                             vim_regsub_multi(
-                                &mut regmatch,
+                                &regmatch,
                                 rel_lnum,
                                 sub_bytes,
                                 &mut new_start.as_mut_slice()[new_end_idx..new_end_idx + sublen],

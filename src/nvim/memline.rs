@@ -3292,7 +3292,7 @@ pub fn ml_try_mark_global_lines(
     if line1 > line2 || line1 < 1 || input_state().got_int.get() {
         return Some(0);
     }
-    if regmatch.regprog.re_in_use() || crate::regexp::rex_in_use() {
+    if regmatch.regprog.re_in_use() {
         return None;
     }
     if (buf.b_ml.ml_flags.get() & ML_LINE_DIRTY) != 0 {
@@ -3303,6 +3303,7 @@ pub fn ml_try_mark_global_lines(
     }
     let rmm_ic = regmatch.rmm_ic;
     let rmm_maxcol = regmatch.rmm_maxcol;
+    let chartab = buf.b_chartab.get();
 
     crate::regexp::with_pure_nfa_prog(&regmatch.regprog, |nfa| {
         let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
@@ -3315,15 +3316,7 @@ pub fn ml_try_mark_global_lines(
         let active_chunks = &mut chunks[start_c..=end_c];
         let total_lines = (line2 - line1 + 1) as usize;
 
-        fn scan_slice(
-            slice: &mut [LineChunk],
-            nfa: &crate::regexp::NfaRegprog,
-            line1: Linenr,
-            line2: Linenr,
-            rmm_ic: bool,
-            rmm_maxcol: Colnr,
-            invert: bool,
-        ) -> Result<(i32, Linenr), ()> {
+        let scan_slice = |slice: &mut [LineChunk]| -> Result<(i32, Linenr), ()> {
             let mut ndone: i32 = 0;
             let mut lowest: Linenr = 0;
             if rmm_maxcol == 0
@@ -3368,10 +3361,11 @@ pub fn ml_try_mark_global_lines(
                     }
                     let matched = crate::regexp::nfa_match_line_slice(
                         nfa,
-                        entry.text.to_bytes_with_nul(),
+                        entry.text.to_bytes(),
                         0,
                         rmm_ic,
                         rmm_maxcol,
+                        chartab,
                     )?
                     .is_some();
                     if matched != invert {
@@ -3384,7 +3378,7 @@ pub fn ml_try_mark_global_lines(
                 }
             }
             Ok((ndone, lowest))
-        }
+        };
 
         let use_parallel = active_chunks.len() >= 4
             && if rmm_maxcol == 0 && nfa.fast_literal_params(rmm_ic).is_some() {
@@ -3394,7 +3388,6 @@ pub fn ml_try_mark_global_lines(
             };
 
         let res = if use_parallel {
-            let b_chartab = buf.b_chartab.get();
             let (isf_chartab, isi_chartab) = crate::charset::get_global_chartabs();
             let p_mmp = opt_vars().p_mmp.get();
             let nthreads = std::thread::available_parallelism()
@@ -3405,13 +3398,8 @@ pub fn ml_try_mark_global_lines(
                 let mut handles = Vec::with_capacity(nthreads);
                 for worker_slice in active_chunks.chunks_mut(group_len) {
                     handles.push(s.spawn(move || {
-                        crate::regexp::init_worker_regex_env(
-                            b_chartab,
-                            isf_chartab,
-                            isi_chartab,
-                            p_mmp,
-                        );
-                        scan_slice(worker_slice, nfa, line1, line2, rmm_ic, rmm_maxcol, invert)
+                        crate::regexp::init_worker_regex_env(isf_chartab, isi_chartab, p_mmp);
+                        scan_slice(worker_slice)
                     }));
                 }
                 let mut total_ndone = 0i32;
@@ -3435,8 +3423,7 @@ pub fn ml_try_mark_global_lines(
                 }
             })
         } else {
-            crate::regexp::init_main_regex_buf(buf);
-            scan_slice(active_chunks, nfa, line1, line2, rmm_ic, rmm_maxcol, invert)
+            scan_slice(active_chunks)
         };
 
         match res {
@@ -3483,7 +3470,7 @@ pub fn ml_try_vimgrep_lines(
     if tomatch == 0 || input_state().got_int.get() {
         return Some(Vec::new());
     }
-    if !is_fuzzy && (regmatch.regprog.re_in_use() || crate::regexp::rex_in_use()) {
+    if !is_fuzzy && regmatch.regprog.re_in_use() {
         return None;
     }
     if (buf.b_ml.ml_flags.get() & ML_LINE_DIRTY) != 0 {
@@ -3637,15 +3624,11 @@ pub fn ml_try_vimgrep_lines(
                 let ch_start = ch.start_lnum;
                 for (idx, entry) in ch.lines.iter().enumerate() {
                     let lnum = ch_start + idx as Linenr;
-                    let str_bytes_with_nul = entry.text.to_bytes_with_nul();
-                    let linelen = str_bytes_with_nul.len().saturating_sub(1) as Colnr;
+                    let str_bytes = entry.text.to_bytes();
+                    let linelen = str_bytes.len() as Colnr;
                     let mut col: Colnr = 0;
                     while let Some((s_col, e_col)) = crate::regexp::nfa_match_line_slice(
-                        nfa,
-                        str_bytes_with_nul,
-                        col,
-                        rmm_ic,
-                        rmm_maxcol,
+                        nfa, str_bytes, col, rmm_ic, rmm_maxcol, b_chartab,
                     )? {
                         out.push(VgrFastMatch {
                             lnum,
@@ -3689,12 +3672,7 @@ pub fn ml_try_vimgrep_lines(
                 let mut handles = Vec::with_capacity(nthreads);
                 for worker_slice in chunks.chunks(group_len) {
                     handles.push(s.spawn(move || {
-                        crate::regexp::init_worker_regex_env(
-                            b_chartab,
-                            isf_chartab,
-                            isi_chartab,
-                            p_mmp,
-                        );
+                        crate::regexp::init_worker_regex_env(isf_chartab, isi_chartab, p_mmp);
                         scan_nfa(worker_slice, tomatch)
                     }));
                 }
@@ -3720,7 +3698,6 @@ pub fn ml_try_vimgrep_lines(
                 }
             })
         } else {
-            crate::regexp::init_main_regex_buf(buf);
             scan_nfa(&chunks, tomatch).ok()
         }
     })

@@ -1934,7 +1934,7 @@ pub fn pattern_match(pat: &[u8], text: Option<&[u8]>, ic: bool) -> bool {
     regmatch.set_prog(vim_regcomp(pat, RE_MAGIC + RE_STRING));
     if !regmatch.regprog.is_null() {
         regmatch.rm_ic = ic;
-        matches = vim_regexec_nl(&mut regmatch, text, 0);
+        matches = text.is_some_and(|text| vim_regexec_nl(&mut regmatch, text, 0));
         regmatch.free_prog();
     }
     opt_vars().p_cpo.set(save_cpo);
@@ -6410,10 +6410,9 @@ pub fn do_string_sub(
         let mut tail_off: usize = 0;
         let do_all = flags.to_bytes().first() == Some(&b'g');
         let mut zero_width: Option<usize> = None;
-        let str_opt = Some(str_bytes);
         let sub_bytes = sub_cstr.to_bytes();
 
-        while vim_regexec_nl(&mut regmatch, str_opt, tail_off as Colnr) {
+        while vim_regexec_nl(&mut regmatch, str_bytes, tail_off as Colnr) {
             let start_off = regmatch.start(0);
             let end_off = regmatch.end(0);
             // An empty match counts only once, and a `\zs` or `\ze` in a look-behind can end a
@@ -6434,14 +6433,7 @@ pub fn do_string_sub(
                 zero_width = Some(start_off);
             }
 
-            let sublen = vim_regsub(
-                &mut regmatch,
-                str_bytes,
-                sub_bytes,
-                expr,
-                &mut [],
-                REGSUB_MAGIC,
-            );
+            let sublen = vim_regsub(&regmatch, str_bytes, sub_bytes, expr, &mut [], REGSUB_MAGIC);
             if sublen <= 0 {
                 out = None;
                 break;
@@ -6455,7 +6447,7 @@ pub fn do_string_sub(
             let cur_len = buf.len();
             buf.resize(cur_len + (sublen as usize), 0);
             vim_regsub(
-                &mut regmatch,
+                &regmatch,
                 str_bytes,
                 sub_bytes,
                 expr,

@@ -6069,7 +6069,7 @@ fn is_regex_match(pat: &CStr, str_arg: &CStr) -> bool {
         msg_state()
             .msg_silent
             .set(msg_state().msg_silent.get() + (1));
-        let res = vim_regexec_nl(&mut regmatch, Some(str_arg.to_bytes()), 0);
+        let res = vim_regexec_nl(&mut regmatch, str_arg.to_bytes(), 0);
         msg_state()
             .msg_silent
             .set(msg_state().msg_silent.get() - (1));

@@ -4968,8 +4968,8 @@ fn find_some_match(argvars: &mut [TypVal], rettv: &mut TypVal, type_: SomeMatchT
                     }
                 }
 
-                match_found =
-                    vim_regexec_nl(&mut regmatch, str_cstr_opt.map(CStr::to_bytes), startcol);
+                match_found = str_cstr_opt
+                    .is_some_and(|s| vim_regexec_nl(&mut regmatch, s.to_bytes(), startcol));
 
                 if match_found {
                     nth -= 1;
@@ -5092,11 +5092,10 @@ fn get_matches_in_str(
 ) {
     let str_bytes = str_cstr.to_bytes();
     let len = str_bytes.len();
-    let str_opt = Some(str_bytes);
     let mut startidx: Colnr = 0;
 
     loop {
-        if !vim_regexec_nl(rmp, str_opt, startidx) {
+        if !vim_regexec_nl(rmp, str_bytes, startidx) {
             break;
         }
 
@@ -7598,7 +7597,7 @@ pub fn f_split(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFuncData) 
                 let match_found = if str_bytes.is_empty() {
                     false
                 } else {
-                    vim_regexec_nl(&mut regmatch, Some(str_bytes), col)
+                    vim_regexec_nl(&mut regmatch, str_bytes, col)
                 };
                 let end_off = if match_found {
                     regmatch.start(0)
