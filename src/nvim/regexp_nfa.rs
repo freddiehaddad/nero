@@ -2200,19 +2200,17 @@ fn post2nfa(states: &mut [NfaState], postfix: &[i32], nfa_calc_size: bool) -> Op
                     n = postfix[idx];
                 }
                 if nfa_calc_size {
-                    re_s.nstate.set(re_s.nstate.get() + (if pattern { 4 } else { 2 }));
+                    re_s.nstate.set(re_s.nstate.get() + (if pattern { 3 } else { 2 }));
                 } else {
                     let e = pop!(p);
                     let s1 = alloc_state(states, end_state, None, None)?;
                     let s = alloc_state(states, start_state, e.start, Some(s1))?;
+                    patch(states, e.out, Some(s1));
                     if pattern {
                         let skip = alloc_state(states, NFA_SKIP, None, None)?;
-                        let zend = alloc_state(states, NFA_ZEND, Some(s1), None)?;
                         states[s1].out = Some(skip);
-                        patch(states, e.out, Some(zend));
                         push!(frag(Some(s), list1(NfaOutSlot::Out(skip))));
                     } else {
-                        patch(states, e.out, Some(s1));
                         push!(frag(Some(s), list1(NfaOutSlot::Out(s1))));
                         if before {
                             if n <= 0 {
@@ -2324,6 +2322,8 @@ fn post2nfa(states: &mut [NfaState], postfix: &[i32], nfa_calc_size: bool) -> Op
 }
 
 fn nfa_postprocess(prog: &mut NfaRegprog) {
+    let mut seen = Vec::new();
+    let mut todo = Vec::new();
     for i in 0..prog.nstate as usize {
         let st = prog.state[i];
         let c = st.c;
@@ -2334,6 +2334,11 @@ fn nfa_postprocess(prog: &mut NfaRegprog) {
         {
             let out1_out = st.out1.and_then(|o1| prog.state[o1].out);
             let directly = if match_follows(&prog.state, out1_out, 0) {
+                true
+            } else if (c == NFA_START_INVISIBLE || c == NFA_START_INVISIBLE_BEFORE)
+                && sets_match_bounds(&prog.state, i, &mut seen, &mut todo)
+            {
+                // A postponed match would apply its \zs or \ze after those that follow it.
                 true
             } else {
                 let ch_invisible = failure_chance(&prog.state, st.out, 0);
@@ -2353,6 +2358,32 @@ fn nfa_postprocess(prog: &mut NfaRegprog) {
             }
         }
     }
+}
+
+/// Whether the body of the look-around at `start` contains `\zs` or `\ze`. A state visited
+/// by this walk is marked `start + 1` in `seen`, so walks need not clear it.
+fn sets_match_bounds(
+    states: &[NfaState],
+    start: usize,
+    seen: &mut Vec<usize>,
+    todo: &mut Vec<usize>,
+) -> bool {
+    seen.resize(states.len(), 0);
+    let end = states[start].out1;
+    todo.clear();
+    todo.extend(states[start].out);
+    while let Some(i) = todo.pop() {
+        if Some(i) == end || std::mem::replace(&mut seen[i], start + 1) == start + 1 {
+            continue;
+        }
+        let st = states[i];
+        if st.c == NFA_ZSTART || st.c == NFA_ZEND {
+            return true;
+        }
+        todo.extend(st.out);
+        todo.extend(st.out1);
+    }
+    false
 }
 
 #[inline(always)]
@@ -2400,17 +2431,6 @@ fn copy_sub_off(_re_s: &RegexpState, to: &mut Regsub, from: &mut Regsub) {
     }
     let n = (from.in_use as usize).min(NSUBEXP);
     to.list[1..n].copy_from_slice(&from.list[1..n]);
-}
-
-fn copy_ze_off(re_s: &RegexpState, to: &mut Regsub, from: &mut Regsub) {
-    if !re_s.rex.nfa_has_zend.get() {
-        return;
-    }
-    let from_m = from.list[0];
-    if from_m.end_lnum >= 0 && from_m.end_col >= 0 {
-        to.list[0].end_lnum = from_m.end_lnum;
-        to.list[0].end_col = from_m.end_col;
-    }
 }
 
 #[inline(always)]
@@ -3254,6 +3274,7 @@ fn recursive_regmatch(
     lastlist: &mut [[i32; 2]],
     submatch: &mut Regsubs,
     m: &mut Regsubs,
+    m_end: Option<&mut Lpos>,
     listids: &mut Vec<i32>,
 ) -> i32 {
     let save_reginput = re_s.rex.input.get();
@@ -3360,7 +3381,16 @@ fn recursive_regmatch(
     }
 
     re_s.nfa_endp.set(endposp);
-    let result = nfa_regmatch_ctx(re_s, nfa_s, prog, lastlist, st.out, &mut *submatch, &mut *m);
+    let result = nfa_regmatch_ctx(
+        re_s,
+        nfa_s,
+        prog,
+        lastlist,
+        st.out,
+        &mut *submatch,
+        &mut *m,
+        m_end,
+    );
 
     if need_restore {
         nfa_restore_listids(&mut lastlist[..prog.nstate as usize], listids);
@@ -3600,10 +3630,15 @@ fn nfa_regmatch(
     m: &mut Regsubs,
 ) -> i32 {
     RE_STATE.with(|re_s| {
-        NFA_STATE.with(|nfa_s| nfa_regmatch_ctx(re_s, nfa_s, prog, lastlist, start, submatch, m))
+        NFA_STATE
+            .with(|nfa_s| nfa_regmatch_ctx(re_s, nfa_s, prog, lastlist, start, submatch, m, None))
     })
 }
 
+/// Runs the NFA from `start` with the submatches in `m`. A match of the whole pattern is stored
+/// in `submatch`. A match of a look-around or `\@>` sub-pattern replaces `m` and stores where
+/// it ended in `m_end`.
+#[allow(clippy::too_many_arguments)]
 fn nfa_regmatch_ctx(
     re_s: &RegexpState,
     nfa_s: &RegexpNfaState,
@@ -3612,6 +3647,7 @@ fn nfa_regmatch_ctx(
     start: Option<usize>,
     submatch: &mut Regsubs,
     m: &mut Regsubs,
+    mut m_end: Option<&mut Lpos>,
 ) -> i32 {
     let Some(start_idx) = start else {
         return 0;
@@ -3815,6 +3851,12 @@ fn nfa_regmatch_ctx(
                         if re_s.rex.nfa_has_zsubexpr.get() {
                             copy_sub(re_s, &mut m.synt, &mut thislist.t[t_idx].subs.synt);
                         }
+                        if let Some(end) = m_end.as_deref_mut() {
+                            *end = Lpos {
+                                lnum: re_s.rex.lnum.get(),
+                                col: re_s.rex.input_col(),
+                            };
+                        }
                     }
                     nfa_s.nfa_match.set(1);
                     if nextlist.n == 0 {
@@ -3851,6 +3893,7 @@ fn nfa_regmatch_ctx(
                             lastlist,
                             &mut *submatch,
                             &mut sub_m,
+                            None,
                             &mut listids,
                         );
                         if res == NFA_TOO_EXPENSIVE {
@@ -3862,15 +3905,10 @@ fn nfa_regmatch_ctx(
                             || st_c == NFA_START_INVISIBLE_BEFORE_NEG
                             || st_c == NFA_START_INVISIBLE_BEFORE_NEG_FIRST;
                         if (res != 0) != is_neg {
-                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut sub_m.norm);
-                            if re_s.rex.nfa_has_zsubexpr.get() {
-                                copy_sub_off(
-                                    re_s,
-                                    &mut thislist.t[t_idx].subs.synt,
-                                    &mut sub_m.synt,
-                                );
+                            if !is_neg {
+                                // Continue with what the look-around matched, \zs and \ze too.
+                                thislist.t[t_idx].subs = sub_m;
                             }
-                            copy_ze_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut sub_m.norm);
                             add_here = true;
                             add_state = out1_out;
                         }
@@ -3909,6 +3947,7 @@ fn nfa_regmatch_ctx(
                     let out1_out_out = out1_out.and_then(|oo| (&prog.state)[oo].out);
                     // As for a look-around, match on a copy of this thread's submatches.
                     let mut sub_m = thislist.t[t_idx].subs;
+                    let mut atom_end = Lpos::default();
                     let res = recursive_regmatch(
                         re_s,
                         nfa_s,
@@ -3918,6 +3957,7 @@ fn nfa_regmatch_ctx(
                         lastlist,
                         &mut *submatch,
                         &mut sub_m,
+                        Some(&mut atom_end),
                         &mut listids,
                     );
                     if res == NFA_TOO_EXPENSIVE {
@@ -3925,11 +3965,9 @@ fn nfa_regmatch_ctx(
                         return finish_nfa_regmatch(nfa_s, &mut list);
                     }
                     if res != 0 {
-                        copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut sub_m.norm);
-                        if re_s.rex.nfa_has_zsubexpr.get() {
-                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.synt, &mut sub_m.synt);
-                        }
-                        let bytelen = sub_m.norm.list[0].end_col - re_s.rex.input_col();
+                        thislist.t[t_idx].subs = sub_m;
+                        // TODO(RE): multi-line match
+                        let bytelen = atom_end.col - re_s.rex.input_col();
                         if bytelen == 0 {
                             add_here = true;
                             add_state = out1_out_out;
@@ -4485,6 +4523,7 @@ fn nfa_regmatch_ctx(
                             lastlist,
                             &mut *submatch,
                             &mut sub_m,
+                            None,
                             &mut listids,
                         );
 
@@ -5171,6 +5210,7 @@ pub(crate) fn nfa_match_line_slice(
                 prog.start,
                 &mut subs,
                 &mut m,
+                None,
             );
             {
                 let mut b = nfa_s.lastlist_buf.borrow_mut();

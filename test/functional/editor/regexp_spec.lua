@@ -181,6 +181,38 @@ describe('regexp engine', function()
     end
   end)
 
+  it('applies \\zs and \\ze inside look-arounds and \\@> in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          atomic_ze = { 'a', 0, 1 },
+          atomic_zs = { ' ', 2, 3 },
+          lookahead_ze = { 'foo', 0, 3 },
+          lookahead_zs = { 'bar', 3, 6 },
+          lookbehind_ze = { '', 1, 1 },
+          lookbehind_zs = { 'ab', 0, 2 },
+          buffer_atomic_ze = { 'a', 0 },
+        },
+        n.exec_lua(function(p)
+          local function pos(str, pat)
+            return vim.fn.matchstrpos(str, p .. pat)
+          end
+          local r = {}
+          r.atomic_ze = pos('abc', [[\(a\zeb\)\@>c]])
+          r.atomic_zs = pos('x0 ', [[\(.\zs\)\@>\s]])
+          r.lookahead_ze = pos('foobar', [[\(foo\zebar\)\@=foobar]])
+          r.lookahead_zs = pos('foobar', [[\(foo\zsbar\)\@=foobar]])
+          r.lookbehind_ze = pos('b ', [[\(b\ze\)\@<= ]])
+          r.lookbehind_zs = pos('ab', [[\(\zsa\)\@<=b]])
+          vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'abc' })
+          local m = vim.fn.matchbufline('', p .. [[\(a\zeb\)\@>c]], 1, 1)[1]
+          r.buffer_atomic_ze = { m.text, m.byteidx }
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
+
   it('reports NFA submatches only from the path that matched', function()
     eq(
       {
