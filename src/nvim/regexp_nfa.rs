@@ -3839,11 +3839,9 @@ fn nfa_regmatch_ctx(
                         || st_c == NFA_START_INVISIBLE_BEFORE_FIRST
                         || st_c == NFA_START_INVISIBLE_BEFORE_NEG_FIRST
                     {
-                        let in_use = m.norm.in_use;
-                        copy_sub_off(re_s, &mut m.norm, &mut thislist.t[t_idx].subs.norm);
-                        if re_s.rex.nfa_has_zsubexpr.get() {
-                            copy_sub_off(re_s, &mut m.synt, &mut thislist.t[t_idx].subs.synt);
-                        }
+                        // Match on a copy of this thread's submatches: a buffer shared between
+                        // threads leaks the groups one look-around sets into the next.
+                        let mut sub_m = thislist.t[t_idx].subs;
                         let res = recursive_regmatch(
                             re_s,
                             nfa_s,
@@ -3852,7 +3850,7 @@ fn nfa_regmatch_ctx(
                             prog,
                             lastlist,
                             &mut *submatch,
-                            m,
+                            &mut sub_m,
                             &mut listids,
                         );
                         if res == NFA_TOO_EXPENSIVE {
@@ -3864,15 +3862,18 @@ fn nfa_regmatch_ctx(
                             || st_c == NFA_START_INVISIBLE_BEFORE_NEG
                             || st_c == NFA_START_INVISIBLE_BEFORE_NEG_FIRST;
                         if (res != 0) != is_neg {
-                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut m.norm);
+                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut sub_m.norm);
                             if re_s.rex.nfa_has_zsubexpr.get() {
-                                copy_sub_off(re_s, &mut thislist.t[t_idx].subs.synt, &mut m.synt);
+                                copy_sub_off(
+                                    re_s,
+                                    &mut thislist.t[t_idx].subs.synt,
+                                    &mut sub_m.synt,
+                                );
                             }
-                            copy_ze_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut m.norm);
+                            copy_ze_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut sub_m.norm);
                             add_here = true;
                             add_state = out1_out;
                         }
-                        m.norm.in_use = in_use;
                     } else {
                         let mut scratch_pim = NfaPim::new();
                         let mut temp_subs = Regsubs::new();
@@ -3906,10 +3907,8 @@ fn nfa_regmatch_ctx(
                 NFA_START_PATTERN => {
                     let out1_out = t_st.out1.and_then(|o1| (&prog.state)[o1].out);
                     let out1_out_out = out1_out.and_then(|oo| (&prog.state)[oo].out);
-                    copy_sub_off(re_s, &mut m.norm, &mut thislist.t[t_idx].subs.norm);
-                    if re_s.rex.nfa_has_zsubexpr.get() {
-                        copy_sub_off(re_s, &mut m.synt, &mut thislist.t[t_idx].subs.synt);
-                    }
+                    // As for a look-around, match on a copy of this thread's submatches.
+                    let mut sub_m = thislist.t[t_idx].subs;
                     let res = recursive_regmatch(
                         re_s,
                         nfa_s,
@@ -3918,7 +3917,7 @@ fn nfa_regmatch_ctx(
                         prog,
                         lastlist,
                         &mut *submatch,
-                        m,
+                        &mut sub_m,
                         &mut listids,
                     );
                     if res == NFA_TOO_EXPENSIVE {
@@ -3926,11 +3925,11 @@ fn nfa_regmatch_ctx(
                         return finish_nfa_regmatch(nfa_s, &mut list);
                     }
                     if res != 0 {
-                        copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut m.norm);
+                        copy_sub_off(re_s, &mut thislist.t[t_idx].subs.norm, &mut sub_m.norm);
                         if re_s.rex.nfa_has_zsubexpr.get() {
-                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.synt, &mut m.synt);
+                            copy_sub_off(re_s, &mut thislist.t[t_idx].subs.synt, &mut sub_m.synt);
                         }
-                        let bytelen = m.norm.list[0].end_col - re_s.rex.input_col();
+                        let bytelen = sub_m.norm.list[0].end_col - re_s.rex.input_col();
                         if bytelen == 0 {
                             add_here = true;
                             add_state = out1_out_out;
@@ -4474,6 +4473,9 @@ fn nfa_regmatch_ctx(
                         || pim_c == NFA_START_INVISIBLE_BEFORE_NEG
                         || pim_c == NFA_START_INVISIBLE_BEFORE_NEG_FIRST;
                     let res = if thislist.t[t_idx].pim.result == NFA_PIM_TODO {
+                        // Start from this thread's submatches, as a direct look-around does, so
+                        // copying the result back cannot clear groups set before it.
+                        let mut sub_m = thislist.t[t_idx].subs;
                         let r = recursive_regmatch(
                             re_s,
                             nfa_s,
@@ -4482,7 +4484,7 @@ fn nfa_regmatch_ctx(
                             prog,
                             lastlist,
                             &mut *submatch,
-                            m,
+                            &mut sub_m,
                             &mut listids,
                         );
 
@@ -4493,13 +4495,17 @@ fn nfa_regmatch_ctx(
                         };
 
                         if (r != 0) != is_neg {
-                            copy_sub_off(re_s, &mut thislist.t[t_idx].pim.subs.norm, &mut m.norm);
+                            copy_sub_off(
+                                re_s,
+                                &mut thislist.t[t_idx].pim.subs.norm,
+                                &mut sub_m.norm,
+                            );
 
                             if re_s.rex.nfa_has_zsubexpr.get() {
                                 copy_sub_off(
                                     re_s,
                                     &mut thislist.t[t_idx].pim.subs.synt,
-                                    &mut m.synt,
+                                    &mut sub_m.synt,
                                 );
                             }
                         }

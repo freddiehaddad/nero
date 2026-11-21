@@ -180,4 +180,29 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('reports NFA submatches only from the path that matched', function()
+    eq(
+      {
+        atomic_alternative = { 'b', '' },
+        postponed_lookbehind = { 'abc', 'a', 'b' },
+        postponed_lookahead = { 'abc', 'a', 'b', 'c' },
+        negative_lookahead = { '', '', '' },
+        failed_branch_ze = { 'b' },
+      },
+      n.exec_lua(function()
+        -- Only the NFA engine: the backtracking engine keeps groups set by failed attempts.
+        local function ml(str, pat, count)
+          return vim.list_slice(vim.fn.matchlist(str, [[\%#=2]] .. pat), 1, count)
+        end
+        local r = {}
+        r.atomic_alternative = ml('ab', [[\(a\)\@>x\|b]], 2)
+        r.postponed_lookbehind = ml('abc', [[\(a\)b\(b\)\@<=c]], 3)
+        r.postponed_lookahead = ml('abc', [[\(a\)\(b\)\(c\)\@=c]], 4)
+        r.negative_lookahead = ml('0', [[\(\(\d\)\@>0\)\@!]], 3)
+        r.failed_branch_ze = ml('xb', [[\(x\@>c\|\ze\&a\)\|b]], 1)
+        return r
+      end)
+    )
+  end)
 end)
