@@ -323,4 +323,18 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('limits a look-behind to its byte count in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        { too_long = { '', -1, -1 }, fits = { 'b', 3, 4 } },
+        n.exec_lua(function(p)
+          return {
+            too_long = vim.fn.matchstrpos('aéb', p .. [[\(aé\)\@2<=b]]),
+            fits = vim.fn.matchstrpos('aéb', p .. [[\(é\)\@2<=b]]),
+          }
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

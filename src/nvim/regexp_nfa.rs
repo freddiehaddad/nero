@@ -3352,8 +3352,8 @@ fn recursive_regmatch(
                     let mut off = re_s.rex.input_off().saturating_sub(st.val as usize);
                     let cand = re_s.rex.line_at(off);
                     if cand.first_byte() >= 0x80 {
-                        off -= cand.with_raw_bytes(|lb| {
-                            crate::mbyte::utf_head_off_slice(lb, off) as usize
+                        off -= re_s.rex.line.get().with_raw_bytes(|line| {
+                            crate::mbyte::utf_head_off_slice(line, off) as usize
                         });
                         re_s.rex.input.set(re_s.rex.line_at(off));
                     } else {
