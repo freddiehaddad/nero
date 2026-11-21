@@ -67,6 +67,21 @@ describe('regexp engine', function()
     end
   end)
 
+  it('reads submatch() from the substituted buffer after a search elsewhere', function()
+    eq(
+      'x1',
+      n.exec_lua(function()
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'x1' })
+        vim.cmd('new')
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'y2' })
+        vim.g.other = vim.fn.win_getid()
+        vim.cmd('wincmd p')
+        vim.cmd([[silent s/x/\=win_execute(g:other, 'call search("y")') .. submatch(0)/]])
+        return vim.api.nvim_get_current_line()
+      end)
+    )
+  end)
+
   it('resolves \\z( \\) captures in syntax regions in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(

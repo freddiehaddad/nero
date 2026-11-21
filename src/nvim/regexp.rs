@@ -1384,13 +1384,15 @@ impl Default for Regexec {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct Regsubmatch {
     pub sm_has_match: bool,
     pub sm_startp: [RegLineSlice; NSUBEXP],
     pub sm_endp: [RegLineSlice; NSUBEXP],
     pub sm_startpos: [Lpos; NSUBEXP],
     pub sm_endpos: [Lpos; NSUBEXP],
+    /// The buffer the lines of a multi-line match are in.
+    pub sm_buf: crate::globals::BufPtr,
     pub sm_firstlnum: Linenr,
     pub sm_maxline: Linenr,
     pub sm_line_lbr: i32,
@@ -1404,6 +1406,7 @@ impl Regsubmatch {
             sm_endp: [REG_LINE_NULL; NSUBEXP],
             sm_startpos: [Lpos::new(); NSUBEXP],
             sm_endpos: [Lpos::new(); NSUBEXP],
+            sm_buf: crate::globals::BufPtr::NULL,
             sm_firstlnum: 0,
             sm_maxline: 0,
             sm_line_lbr: 0,
@@ -2162,7 +2165,7 @@ pub(super) struct RegexpState {
     pub(super) reg_cpo_lit: std::cell::Cell<i32>,
     pub(super) rex_in_use: std::cell::Cell<bool>,
     pub(super) can_f_submatch: std::cell::Cell<bool>,
-    pub(super) rsm: std::cell::Cell<Regsubmatch>,
+    pub(super) rsm: crate::globals::CloneCell<Regsubmatch>,
     pub(super) reg_startzp: [std::cell::Cell<RegLineSlice>; NSUBEXP],
     pub(super) reg_endzp: [std::cell::Cell<RegLineSlice>; NSUBEXP],
     pub(super) reg_startzpos: [std::cell::Cell<Lpos>; NSUBEXP],
@@ -2215,7 +2218,7 @@ impl RegexpState {
             reg_cpo_lit: std::cell::Cell::new(0),
             rex_in_use: std::cell::Cell::new(false),
             can_f_submatch: std::cell::Cell::new(false),
-            rsm: std::cell::Cell::new(Regsubmatch::new()),
+            rsm: crate::globals::CloneCell::new(Regsubmatch::new()),
             reg_startzp: [const { std::cell::Cell::new(REG_LINE_NULL) }; NSUBEXP],
             reg_endzp: [const { std::cell::Cell::new(REG_LINE_NULL) }; NSUBEXP],
             reg_startzpos: [const { std::cell::Cell::new(Lpos { lnum: 0, col: 0 }) }; NSUBEXP],
@@ -3864,6 +3867,7 @@ fn vim_regsub_both(
                     sm_endp: s.rex.endp_arr(),
                     sm_startpos: s.rex.startpos_arr(),
                     sm_endpos: s.rex.endpos_arr(),
+                    sm_buf: s.rex.buf(),
                     sm_firstlnum: s.rex.reg_firstlnum.get(),
                     sm_maxline: s.rex.reg_maxline.get(),
                     sm_line_lbr: i32::from(s.rex.reg_line_lbr.get()),
@@ -4213,7 +4217,7 @@ fn reg_getline_submatch_slice(lnum: Linenr) -> Option<crate::option_vars::RcSlic
     }
     let _ = ml_get_buf_len;
     Some(crate::memline::ml_get_buf_slice(
-        &RE_STATE.with(|s| s.rex.buf()),
+        &RE_STATE.with(|s| s.rsm.with(|rsm| rsm.sm_buf.clone())),
         firstlnum,
     ))
 }
