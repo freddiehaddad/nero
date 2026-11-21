@@ -306,4 +306,21 @@ describe('regexp engine', function()
       end)
     )
   end)
+
+  it('matches a long grapheme cluster as one character in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        { group_lengths = { 82, 1 }, chars = 2 },
+        n.exec_lua(function(p)
+          -- "a" with 40 combining acute accents is one character of 81 bytes.
+          local s = 'a' .. string.rep('\204\129', 40) .. 'b'
+          local m = vim.fn.matchlist(s, p .. [[^.\(.\)]])
+          return {
+            group_lengths = { #m[1], #m[2] },
+            chars = vim.fn.strchars(vim.fn.substitute(s, p .. '.', 'X', 'g')),
+          }
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

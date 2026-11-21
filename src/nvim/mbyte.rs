@@ -1053,7 +1053,7 @@ impl AsMbyteSlice for crate::regexp::RegLineSlice {
         } else if b0 < 0x80 && self.second_byte() < 0x80 {
             f(&[b0])
         } else {
-            self.with_bytes(|b| f(&b[..b.len().min(64)]))
+            self.with_bytes(f)
         }
     }
 }
