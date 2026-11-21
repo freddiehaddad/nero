@@ -15,7 +15,7 @@ General guidelines
 Syncing with Upstream (`neovim/neovim`)
 ---------------------------------------
 
-This repository tracks upstream [`neovim/neovim`](https://github.com/neovim/neovim) to stay 100% feature-, runtime-, and bugfix-compatible.
+This repository tracks upstream [`neovim/neovim`](https://github.com/neovim/neovim) to stay 100% feature-, runtime-, and bugfix-compatible. Compatibility means upstream's intended behavior: the upstream bugs Nero fixes are listed in [Intentional differences from upstream](#4-intentional-differences-from-upstream).
 
 * **Last synced upstream commit**: `f2f87f5fc5` (`master`)
 
@@ -69,15 +69,31 @@ Cross-module state from upstream `src/nvim/globals.h` is partitioned into 9 dece
 
 After porting upstream commits:
 
-1. Run `cargo xtask lintrust` (`cargo clippy --workspace --all-targets -- -D warnings`).
-2. Run `cargo xtask unittest` to verify the Rust library unit tests pass.
-3. Run the affected functional and legacy tests:
+1. Check the ported commits against [Intentional differences from upstream](#4-intentional-differences-from-upstream). Keep Nero's behavior and its regression test unless a commit fixes the same bug; then take the upstream fix and delete the row.
+2. Run `cargo xtask lintrust` (`cargo clippy --workspace --all-targets -- -D warnings`).
+3. Run `cargo xtask unittest` to verify the Rust library unit tests pass.
+4. Run the affected functional and legacy tests:
    ```bash
    cargo xtask functionaltest --release <path/to/spec.lua>
    cargo xtask oldtest --release test_<name>.vim
    ```
-4. If `:help` documentation was modified, run `cargo xtask lintdoc`.
-5. Update the **Last synced upstream commit** SHA in this section of `MAINTAIN.md` and commit.
+5. If `:help` documentation was modified, run `cargo xtask lintdoc`.
+6. Update the **Last synced upstream commit** SHA in this section of `MAINTAIN.md` and commit.
+
+### 4. Intentional differences from upstream
+
+Nero fixes an upstream bug only with the maintainer's approval (see [AGENTS.md](./AGENTS.md#upstream-bugs)). Each row names its regression test; the current ones are in `test/functional/editor/regexp_spec.lua`. Link the upstream report once one is filed.
+
+| Nero | Upstream | Code | Regression test | Upstream report |
+|---|---|---|---|---|
+| The NFA engine always tries a `\@>` atom. | Skips it when an equal state is already queued, so it misses matches. | `regexp_nfa.rs`: `NFA_START_PATTERN` | `finds matches after \@> in both engines` | Not reported |
+| NFA alternatives keep their priority order. | A state queued by a later alternative blocks the same state from an earlier one. | `regexp_nfa.rs`: `addstate_here()` | `prefers the first matching alternative in both engines` | Not reported |
+| NFA submatches come only from the path that matched. | Look-arounds and `\@>` share one submatch buffer, so groups leak or are lost. | `regexp_nfa.rs`: callers of `recursive_regmatch()` | `reports NFA submatches only from the path that matched` | Not reported |
+| The NFA engine honors `\zs` and `\ze` inside look-arounds and `\@>`. | Ignores them. | `regexp_nfa.rs`: `nfa_postprocess()`, `recursive_regmatch()` | `applies \zs and \ze inside look-arounds and \@> in both engines` | Not reported |
+| `:s` and `substitute()` accept a match that `\zs` or `\ze` in a look-behind puts before the search position. | Copies with a negative length (heap corruption) or loops forever. | `ex_cmds.rs`: `do_sub()`; `eval.rs`: `do_string_sub()` | `substitutes matches that \zs or \ze puts before the search column` | Not reported |
+| `'hlsearch'` and `matchadd()` highlighting moves past such matches. | Each redraw spins until `'redrawtime'`. | `match.rs`: `next_search_hl()` | `highlights matches that \zs or \ze in a look-behind puts before the search` | Not reported |
+| A look-behind limit (`\@123<=`, `\@123<!`) counts characters. Design change, documented in `:help /\@<=` and `news.txt`. | Counts bytes, and the engines disagree about a character that crosses the limit. | `regexp_bt.rs`: `behind_step_back()`; `regexp_nfa.rs`: `recursive_regmatch()` | `limits a look-behind to its character count in both engines` | Not reported |
+| `submatch()` in a `\=` expression reads the buffer being substituted. | Reads the buffer of the last pattern compiled or matched, such as after a search in another window. | `regexp.rs`: `Regsubmatch` | `reads submatch() from the substituted buffer after a search elsewhere` | Not reported |
 
 ### Event-boundary changes
 

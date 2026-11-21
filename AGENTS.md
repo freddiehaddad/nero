@@ -6,7 +6,7 @@ Instructions for AI coding agents working in this repository.
 
 This repository (**Nero**) is a pure-Rust port of [Neovim](https://github.com/neovim/neovim) (`edition = "2024"`).
 - **Zero `.c` or `.h` files exist in the repository.** Do not add C source/header files, CMake files, or Zig build files.
-- **100% behavioral, API, and plugin compatibility with upstream Neovim** is the primary invariant. Every change must preserve LuaJIT C API compatibility, Msgpack-RPC wire compatibility, and Vimscript/editor semantics.
+- **100% behavioral, API, and plugin compatibility with upstream Neovim** is the primary invariant. Compatibility means upstream's intended behavior, not its bugs; see [Upstream Bugs](#upstream-bugs). Every change must preserve LuaJIT C API compatibility, Msgpack-RPC wire compatibility, and Vimscript/editor semantics.
 - The workspace builds three application binaries (`nero`, `tee`, `xxd`), the `nero` library crate (`src/nvim/lib.rs`), the `xtask` runner, and the FFI-free `event-lifetimes-tests` package.
 - Rust display and executable names are centralized in `src/branding.rs`, shared by the editor and build tools. Keep Neovim API, protocol, configuration, and file-format identifiers independent of those branding values.
 
@@ -115,6 +115,16 @@ Follow these rules strictly when modifying `src/nvim/`:
 - Upstream C files `src/nvim/<path>.c` and `src/nvim/<path>.h` map 1:1 to `src/nvim/<path>.rs`.
 - Upstream `runtime/` and `test/` changes apply directly.
 - See [MAINTAIN.md](./MAINTAIN.md) for the upstream sync checklist and the last synced commit SHA.
+- Keep the [intentional differences from upstream](./MAINTAIN.md#4-intentional-differences-from-upstream) unless upstream fixes the same bug; then take the upstream fix and delete the row.
+
+## Upstream Bugs
+
+Never reproduce an upstream bug on purpose, and never change upstream behavior without the maintainer's approval.
+
+- **Nero differs from upstream:** this is a porting bug. Fix it to match upstream in its own commit, with a regression test.
+- **Nero matches upstream, but the behavior looks wrong:** stop and report it to the maintainer before changing anything. Include a minimal reproducer with the upstream result and what `:help` documents; whether upstream knows about it (issues, `TODO` comments, Vim's `todo.txt`, skipped tests) and the patch that introduced it; the evidence that it is a bug (a crash, hang, or memory error; a contradiction of `:help`; two implementations of the same behavior, such as the two regex engines, disagreeing; results that depend on earlier commands); who may rely on it (bundled runtime files, plugins); and the cost of the fix.
+- **If a fix is approved:** commit it separately with a regression test, name the upstream bug and its reproducer in the commit message, and add a row to the [intentional differences from upstream](./MAINTAIN.md#4-intentional-differences-from-upstream). Update `:help` and `news.txt` only when documented behavior changes.
+- **If the behavior is kept,** record the reason in a test or code comment so it is not rediscovered. **If the fix is postponed,** track it in a GitHub issue.
 
 ## AI Disclosure
 
