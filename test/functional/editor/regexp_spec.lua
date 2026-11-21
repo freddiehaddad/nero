@@ -163,4 +163,21 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('prefers the first matching alternative in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          negative_lookbehind = { '', 0, 0 },
+          negative_lookahead = { '', 0, 0 },
+        },
+        n.exec_lua(function(p)
+          local r = {}
+          r.negative_lookbehind = vim.fn.matchstrpos('A', p .. [[\%(x\)\@<!\|\i\?]])
+          r.negative_lookahead = vim.fn.matchstrpos('A', p .. [[\%(x\)\@!\|\i\?]])
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

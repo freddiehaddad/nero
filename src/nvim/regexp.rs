@@ -1232,6 +1232,9 @@ pub(super) struct NfaList {
     pub n: i32,
     pub id: i32,
     pub has_pim: bool,
+    /// While addstate_here() inserts at a thread, the end of the threads still queued
+    /// behind it; zero otherwise.
+    pub queued_end: usize,
 }
 
 #[derive(Clone, Copy)]

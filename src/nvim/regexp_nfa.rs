@@ -5,6 +5,7 @@
 use crate::message::{semsg, siemsg};
 use std::ffi::CStr;
 use std::mem::size_of;
+use std::ops::Range;
 
 use super::*;
 
@@ -2474,10 +2475,12 @@ fn has_state_with_pos(
     state: usize,
     subs: &Regsubs,
     pim: Option<&NfaPim>,
+    skip: Range<usize>,
 ) -> bool {
     let has_zsub = re_s.rex.nfa_has_zsubexpr.get();
-    for thread in &l.t[..l.n as usize] {
-        if thread.state == Some(state)
+    for (i, thread) in l.t[..l.n as usize].iter().enumerate() {
+        if !skip.contains(&i)
+            && thread.state == Some(state)
             && sub_equal(re_s, &thread.subs.norm, &subs.norm)
             && (!has_zsub || sub_equal(re_s, &thread.subs.synt, &subs.synt))
             && pim_equal(re_s, Some(&thread.pim), pim)
@@ -2637,6 +2640,9 @@ fn addstate_idx(
 
             let ll_idx = re_s.nfa_ll_index.get();
             if lastlist[state_idx][ll_idx] == l.id && st_c != NFA_SKIP {
+                // The index of the thread that addstate_here() inserts at.
+                let here = (off_arg <= -ADDSTATE_HERE_OFFSET)
+                    .then(|| -(off_arg + ADDSTATE_HERE_OFFSET) as usize);
                 // This state is already in the list, don't add it again, unless it is
                 // an MOPEN that is used for a backreference or when there is a PIM.
                 // For NFA_MATCH check the position, lower position is preferred.
@@ -2646,19 +2652,20 @@ fn addstate_idx(
                     && st_c != NFA_MATCH
                 {
                     // When called from addstate_here() do insert before existing states.
-                    let add_here = off_arg <= -ADDSTATE_HERE_OFFSET;
-                    let found = add_here && {
-                        let listindex = -(off_arg + ADDSTATE_HERE_OFFSET);
-                        let limit = l.n.min(listindex) as usize;
+                    let found = here.is_some_and(|listindex| {
+                        let limit = (l.n as usize).min(listindex);
                         l.t[..limit].iter().any(|t| t.state == Some(state_idx))
-                    };
-                    if !add_here || found {
+                    });
+                    if here.is_none() || found {
                         return true;
                     }
                 }
 
-                // Do not add the state again when it exists with the same positions.
-                if has_state_with_pos(re_s, l, state_idx, subs, pim.as_deref()) {
+                // Do not add the state again when it exists with the same positions. A thread
+                // queued behind an addstate_here() insertion has a lower priority, so a copy of
+                // the state there must not stop the insertion.
+                let queued = here.map_or(0..0, |listindex| listindex + 1..l.queued_end);
+                if has_state_with_pos(re_s, l, state_idx, subs, pim.as_deref(), queued) {
                     return true;
                 }
             }
@@ -2994,7 +3001,9 @@ fn addstate_here(
         );
     }
 
-    if !addstate(
+    // Threads after `listidx` stay queued behind the states inserted here.
+    l.queued_end = tlen as usize;
+    let added = addstate(
         re_s,
         states,
         lastlist,
@@ -3004,7 +3013,9 @@ fn addstate_here(
         pim,
         -listidx - ADDSTATE_HERE_OFFSET,
         0,
-    ) {
+    );
+    l.queued_end = 0;
+    if !added {
         return false;
     }
     if listidx + 1 == tlen {
@@ -3640,12 +3651,14 @@ fn nfa_regmatch_ctx(
             n: 0,
             id: re_s.rex.nfa_listid.get() + 1,
             has_pim: false,
+            queued_end: 0,
         },
         NfaList {
             t: t1,
             n: 0,
             id: 0,
             has_pim: false,
+            queued_end: 0,
         },
     ];
 
