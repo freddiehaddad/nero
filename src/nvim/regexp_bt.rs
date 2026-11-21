@@ -2694,7 +2694,7 @@ fn save_subexpr(rex: &Regexec<'_>, bp: &mut Regbehind) {
     if need_clear {
         return;
     }
-    if !rex.has_match {
+    if rex.reg_multi() {
         for i in 0..NSUBEXP {
             bp.save_start[i].se_u = RegPos::from_pos(rex.rmm_startpos[i]);
             bp.save_end[i].se_u = RegPos::from_pos(rex.rmm_endpos[i]);
@@ -2713,7 +2713,7 @@ fn restore_subexpr(rex: &mut Regexec<'_>, bp: &Regbehind) {
     if bp.save_need_clear_subexpr {
         return;
     }
-    if !rex.has_match {
+    if rex.reg_multi() {
         for i in 0..NSUBEXP {
             rex.rmm_startpos[i] = bp.save_start[i].se_u.pos();
             rex.rmm_endpos[i] = bp.save_end[i].se_u.pos();
@@ -2743,7 +2743,7 @@ fn behind_step_back(
     if limit > 0 && i64::from(bp.chars_back) >= limit {
         return false;
     }
-    if rex.has_match {
+    if !rex.reg_multi() {
         let col = rp.rs_un.regsave().rs_u.ptr.unwrap_or(0);
         if col == 0 {
             return false;
@@ -2827,7 +2827,7 @@ fn regmatch_inner(
 
                 if !rex.reg_line_lbr
                     && with_nl(op)
-                    && !rex.has_match
+                    && rex.reg_multi()
                     && rex.input_byte() == NUL
                     && rex.lnum <= rex.reg_maxline
                 {
@@ -2858,7 +2858,7 @@ fn regmatch_inner(
                         RE_BOF => {
                             if rex.lnum != 0
                                 || rex.input != 0
-                                || (!rex.has_match && rex.reg_firstlnum > 1)
+                                || (rex.reg_multi() && rex.reg_firstlnum > 1)
                             {
                                 status = RegAction::NoMatch;
                             }
@@ -2923,7 +2923,7 @@ fn regmatch_inner(
                             }
                         }
                         RE_LNUM => {
-                            if rex.has_match
+                            if !rex.reg_multi()
                                 || !re_num_cmp(
                                     (rex.lnum + rex.reg_firstlnum) as u32,
                                     prog,
@@ -2944,12 +2944,12 @@ fn regmatch_inner(
                             } else {
                                 rex.reg_win.clone()
                             };
-                            let mut lnum = if !rex.has_match {
+                            let mut lnum = if rex.reg_multi() {
                                 rex.reg_firstlnum + rex.lnum
                             } else {
                                 1
                             };
-                            if !rex.has_match
+                            if rex.reg_multi()
                                 && (lnum <= 0 || lnum > wp.buf().b_ml.ml_line_count.get())
                             {
                                 lnum = 1;
@@ -3349,7 +3349,7 @@ fn regmatch_inner(
                             let no = (op - BACKREF) as usize;
                             let mut len: i32 = 0;
                             rex.cleanup_subexpr();
-                            if rex.has_match {
+                            if !rex.reg_multi() {
                                 if let (Some(start), Some(end)) =
                                     (rex.rm_startp[no], rex.rm_endp[no])
                                 {
@@ -3538,7 +3538,7 @@ fn regmatch_inner(
                             }
                         }
                         BHPOS => {
-                            if !rex.has_match {
+                            if rex.reg_multi() {
                                 let bpos = rex.behind_pos.rs_u.pos();
                                 if bpos.col != rex.input_col() || bpos.lnum != rex.lnum {
                                     status = RegAction::NoMatch;
@@ -3549,7 +3549,7 @@ fn regmatch_inner(
                         }
                         NEWL => {
                             if (c != NUL as i32
-                                || rex.has_match
+                                || !rex.reg_multi()
                                 || rex.lnum > rex.reg_maxline
                                 || rex.reg_line_lbr)
                                 && (c != b'\n' as i32 || !rex.reg_line_lbr)

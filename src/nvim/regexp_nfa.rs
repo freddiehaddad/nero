@@ -2403,7 +2403,7 @@ fn copy_sub(rex: &Regexec<'_>, to: &mut Regsub, from: &mut Regsub) {
     if in_use <= 0 {
         return;
     }
-    if !rex.has_match {
+    if rex.reg_multi() {
         to.orig_start_col = from.orig_start_col;
     }
     if in_use == 1 {
@@ -2517,7 +2517,7 @@ fn pim_equal(rex: &Regexec<'_>, one: Option<&NfaPim>, two: Option<&NfaPim>) -> b
     if one.unwrap().state != two.unwrap().state {
         return false;
     }
-    if !rex.has_match {
+    if rex.reg_multi() {
         let p1 = one.unwrap().end.pos();
         let p2 = two.unwrap().end.pos();
         p1.lnum == p2.lnum && p1.col == p2.col
@@ -2645,7 +2645,7 @@ fn addstate_idx(
                 && rex.input > 0
                 && rex.input_byte() != NUL
                 && (rex.nfa_endp.is_none()
-                    || rex.has_match
+                    || !rex.reg_multi()
                     || rex.lnum == rex.nfa_endp.unwrap().se_u.pos().lnum)
             {
                 return true;
@@ -2833,12 +2833,12 @@ fn addstate_eps(
                     for item in &mut multi[sub.in_use as usize..subidx] {
                         *item = MultiPos::empty();
                     }
-                    if rex.has_match {
+                    if !rex.reg_multi() {
                         multi[subidx] = MultiPos::empty();
                     }
                     sub.in_use = subidx as i32 + 1;
                 }
-                if !rex.has_match {
+                if rex.reg_multi() {
                     if off == -1 {
                         multi[subidx].start_lnum = rex.lnum + 1;
                         multi[subidx].start_col = 0;
@@ -2923,7 +2923,7 @@ fn addstate_eps(
                     }
                     let multi = &mut sub.list;
                     save_multipos = multi[subidx];
-                    if !rex.has_match {
+                    if rex.reg_multi() {
                         if off == -1 {
                             multi[subidx].end_lnum = rex.lnum + 1;
                             multi[subidx].end_col = 0;
@@ -3774,7 +3774,7 @@ fn nfa_regmatch_ctx(
                 }
                 NFA_END_INVISIBLE | NFA_END_INVISIBLE_NEG | NFA_END_PATTERN => {
                     if let Some(endp) = rex.nfa_endp
-                        && if !rex.has_match {
+                        && if rex.reg_multi() {
                             let end_pos = endp.se_u.pos();
 
                             rex.lnum != end_pos.lnum || rex.input_col() != end_pos.col
@@ -3949,7 +3949,9 @@ fn nfa_regmatch_ctx(
                     }
                 }
                 NFA_BOF => {
-                    if rex.lnum == 0 && rex.input == 0 && (rex.has_match || rex.reg_firstlnum == 1)
+                    if rex.lnum == 0
+                        && rex.input == 0
+                        && (!rex.reg_multi() || rex.reg_firstlnum == 1)
                     {
                         add_here = true;
                         add_state = t_st.out;
@@ -3970,7 +3972,7 @@ fn nfa_regmatch_ctx(
                 NFA_NEWL => {
                     if curc == NUL as i32
                         && !rex.reg_line_lbr
-                        && !rex.has_match
+                        && rex.reg_multi()
                         && rex.lnum <= rex.reg_maxline
                     {
                         go_to_nextline = true;
@@ -4281,7 +4283,7 @@ fn nfa_regmatch_ctx(
                     }
                 }
                 NFA_LNUM | NFA_LNUM_GT | NFA_LNUM_LT => {
-                    if !rex.has_match
+                    if rex.reg_multi()
                         && nfa_re_num_cmp(
                             t_st.val as u64,
                             t_st.c - NFA_LNUM,
@@ -4316,12 +4318,12 @@ fn nfa_regmatch_ctx(
                             matched = i64::from(col) > i64::from(t_st.val) * ts;
                         }
                         if !matched {
-                            let mut lnum = if !rex.has_match {
+                            let mut lnum = if rex.reg_multi() {
                                 rex.reg_firstlnum + rex.lnum
                             } else {
                                 1
                             };
-                            if !rex.has_match
+                            if rex.reg_multi()
                                 && (lnum <= 0 || lnum > wp_mut.buf().b_ml.ml_line_count.get())
                             {
                                 lnum = 1;
@@ -4535,7 +4537,7 @@ fn nfa_regmatch_ctx(
                 && clen != 0
                 && (rex.reg_maxcol == 0 || rex.input_col() < rex.reg_maxcol))
                 || rex.nfa_endp.is_some_and(|endp| {
-                    if !rex.has_match {
+                    if rex.reg_multi() {
                         let end_pos = endp.se_u.pos();
                         rex.lnum < end_pos.lnum
                             || (rex.lnum == end_pos.lnum && rex.input_col() < end_pos.col)
@@ -4737,9 +4739,7 @@ fn nfa_regtry(
                 col: item.end_col,
             };
         }
-        if rex.has_mmatch {
-            rex.rmm_matchcol = subs.norm.orig_start_col;
-        }
+        rex.rmm_matchcol = subs.norm.orig_start_col;
         if rex.rmm_startpos[0].lnum < 0 {
             rex.rmm_startpos[0] = Lpos { lnum: 0, col };
         }
@@ -5037,8 +5037,7 @@ pub(crate) fn nfa_match_line_slice(
         return Ok(None);
     }
 
-    let mut rex = Regexec::new(RegLine::Str(line));
-    rex.has_mmatch = true;
+    let mut rex = Regexec::new(Target::Lines, RegLine::Str(line));
     rex.reg_chartab = chartab;
     rex.reg_nobreak = true;
     rex.reg_maxcol = maxcol;

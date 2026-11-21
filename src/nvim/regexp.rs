@@ -1002,12 +1002,19 @@ impl Default for ParseState {
     }
 }
 
+/// What a match reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Target {
+    /// One string (upstream's `rex.reg_match`).
+    Str,
+    /// Lines of a buffer (upstream's `rex.reg_mmatch`).
+    Lines,
+}
+
 /// One match: what it reads, where it is, and the group positions it has found (upstream's
 /// `rex`). A substitution reads a finished match through one as well.
 pub(super) struct Regexec<'a> {
-    /// Matching one string (upstream's `rex.reg_match != NULL`) rather than buffer lines.
-    has_match: bool,
-    has_mmatch: bool,
+    target: Target,
     bt_magic_wrong: bool,
     rm_startp: [Option<usize>; NSUBEXP],
     rm_endp: [Option<usize>; NSUBEXP],
@@ -1057,10 +1064,9 @@ pub(super) struct Regexec<'a> {
 }
 
 impl<'a> Regexec<'a> {
-    pub(super) fn new(line: RegLine<'a>) -> Self {
+    pub(super) fn new(target: Target, line: RegLine<'a>) -> Self {
         Self {
-            has_match: false,
-            has_mmatch: false,
+            target,
             bt_magic_wrong: false,
             rm_startp: [None; NSUBEXP],
             rm_endp: [None; NSUBEXP],
@@ -1112,8 +1118,7 @@ impl<'a> Regexec<'a> {
     /// Prepares matching `line`, a string without NUL; `nl` makes a "\n" in it match a line break.
     pub(super) fn for_string(rmp: &Regmatch, line: &'a [u8], nl: bool) -> Self {
         debug_assert!(!line.contains(&0), "a matched string ends before its NUL");
-        let mut rex = Self::new(RegLine::Str(line));
-        rex.has_match = true;
+        let mut rex = Self::new(Target::Str, RegLine::Str(line));
         rex.rm_matchcol = rmp.rm_matchcol;
         rex.reg_line_lbr = nl;
         rex.set_buf(workspace_state().curbuf.get());
@@ -1129,8 +1134,7 @@ impl<'a> Regexec<'a> {
         buf: &FileBuf,
         lnum: Linenr,
     ) -> Self {
-        let mut rex = Self::new(RegLine::Str(b""));
-        rex.has_mmatch = true;
+        let mut rex = Self::new(Target::Lines, RegLine::default());
         rex.rmm_matchcol = rmp.rmm_matchcol;
         rex.set_buf(crate::globals::BufPtr::from(buf));
         rex.reg_win = win.map_or(crate::globals::WinPtr::NULL, crate::globals::WinPtr::from);
@@ -1154,7 +1158,7 @@ impl<'a> Regexec<'a> {
     /// Matching buffer lines (upstream's `REG_MULTI`).
     #[inline(always)]
     pub(super) fn reg_multi(&self) -> bool {
-        !self.has_match
+        self.target == Target::Lines
     }
 
     /// The current line.
