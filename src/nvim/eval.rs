@@ -6413,8 +6413,8 @@ pub fn do_string_sub(
         let sub_bytes = sub_cstr.to_bytes();
 
         while vim_regexec_nl(&mut regmatch, str_bytes, tail_off as Colnr) {
-            let start_off = regmatch.start(0);
-            let end_off = regmatch.end(0);
+            let start_off = regmatch.match_start();
+            let end_off = regmatch.match_end();
             // An empty match counts only once, and a `\zs` or `\ze` in a look-behind can end a
             // match where this search started or before it: skip a character instead.
             let passed = end_off < tail_off || (end_off == tail_off && start_off != tail_off);

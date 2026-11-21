@@ -1639,11 +1639,11 @@ fn qf_parse_fmt_f(
     fields: &mut Qffields,
     prefix: i32,
 ) -> QfStatus {
-    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
+    let Some(name) = rmp.group(midx, subject) else {
         return QfStatus::Fail;
-    }
+    };
 
-    let match_cstr = std::ffi::CString::new(rmp.group(midx, subject)).unwrap_or_default();
+    let match_cstr = std::ffi::CString::new(name).unwrap_or_default();
     expand_env(match_cstr.as_c_str(), &mut fields.namebuf[..CMDBUFFSIZE]);
 
     if crate::strings::vim_haschr(c"OPQ", prefix)
@@ -1725,10 +1725,9 @@ fn copy_nonerror_line(line: &[u8], fields: &mut Qffields) -> QfStatus {
 }
 
 fn qf_parse_fmt_m(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
+    let Some(span) = rmp.group(midx, subject) else {
         return QfStatus::Fail;
-    }
-    let span = rmp.group(midx, subject);
+    };
     let len = span.len();
     if len >= fields.errmsg.len() {
         fields.errmsg.resize(len + 1, 0);
@@ -1746,11 +1745,11 @@ fn qf_parse_fmt_r(rmp: &Regmatch, midx: usize, tail_off: &mut Option<usize>) -> 
 }
 
 fn qf_parse_fmt_p(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
+    let Some(span) = rmp.group(midx, subject) else {
         return QfStatus::Fail;
-    }
+    };
     fields.col = 0;
-    for &b in rmp.group(midx, subject) {
+    for &b in span {
         fields.col += 1;
         if b == TAB {
             fields.col += 7;
@@ -1772,10 +1771,9 @@ fn qf_parse_fmt_v(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffi
 }
 
 fn qf_parse_fmt_s(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
+    let Some(span) = rmp.group(midx, subject) else {
         return QfStatus::Fail;
-    }
-    let span = rmp.group(midx, subject);
+    };
     let len = span.len().min(CMDBUFFSIZE - 5);
     fields.pattern[..3].copy_from_slice(b"^\\V");
     fields.pattern[3..3 + len].copy_from_slice(&span[..len]);
@@ -1784,10 +1782,9 @@ fn qf_parse_fmt_s(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffi
 }
 
 fn qf_parse_fmt_o(rmp: &Regmatch, midx: usize, subject: &[u8], fields: &mut Qffields) -> QfStatus {
-    if rmp.startp[midx].is_none() || rmp.endp[midx].is_none() {
+    let Some(span) = rmp.group(midx, subject) else {
         return QfStatus::Fail;
-    }
-    let span = rmp.group(midx, subject);
+    };
     let len = span.len();
     let dsize = (crate::memory::bytes_until_nul(&fields.module).len() + len + 1).min(CMDBUFFSIZE);
     crate::memory::append_bytes_to_c_buf(&mut fields.module[..dsize], span);
@@ -7231,8 +7228,8 @@ fn hgr_search_file(qfl_rc: &QfListRc, fname: &CStr, p_regmatch: &mut Regmatch) {
     while !vim_fgets(&mut iobuff, &fd) && !input_state().got_int.get() {
         let orig_bytes = crate::memory::bytes_until_nul(&iobuff);
         if vim_regexec(p_regmatch, orig_bytes, 0) {
-            let start_off = p_regmatch.start(0);
-            let end_off = p_regmatch.end(0);
+            let start_off = p_regmatch.match_start();
+            let end_off = p_regmatch.match_end();
             let mut l = orig_bytes.len();
             while l > 0 && iobuff[l - 1] <= b' ' {
                 l -= 1;

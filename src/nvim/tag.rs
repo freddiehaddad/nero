@@ -1929,7 +1929,7 @@ fn findtags_match_tag(
     if !match_ && !st.orgpat.regmatch.regprog.is_null() {
         match_ = vim_regexec(&mut st.orgpat.regmatch, tagpp.tagname, 0);
         if match_ {
-            margs.matchoff = st.orgpat.regmatch.start(0) as i32;
+            margs.matchoff = st.orgpat.regmatch.match_start() as i32;
             if st.orgpat.regmatch.rm_ic {
                 st.orgpat.regmatch.rm_ic = false;
                 margs.match_no_ic = vim_regexec(&mut st.orgpat.regmatch, tagpp.tagname, 0);

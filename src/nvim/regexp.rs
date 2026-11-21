@@ -421,36 +421,33 @@ impl Regmatch {
         }
     }
 
-    /// Byte offset of the start of group `idx` in the matched string, or 0 when it did not match.
+    /// Byte offset where a successful match starts.
     #[inline(always)]
-    pub fn start(&self, idx: usize) -> usize {
-        self.startp[idx].unwrap_or(0)
+    pub fn match_start(&self) -> usize {
+        self.startp[0].expect("a successful match sets its start")
     }
 
-    /// Byte offset of the end of group `idx` in the matched string, or 0 when it did not match.
+    /// Byte offset where a successful match ends. A `\ze` before `\zs` can put it before the
+    /// start.
     #[inline(always)]
-    pub fn end(&self, idx: usize) -> usize {
-        self.endp[idx].unwrap_or(0)
+    pub fn match_end(&self) -> usize {
+        self.endp[0].expect("a successful match sets its end")
     }
 
-    /// Length in bytes of the text group `idx` matched: 0 when it did not match, or when `\ze`
-    /// put its end before its start.
+    /// The text of a successful match in `subject`, the string that was matched.
     #[inline(always)]
-    pub fn span_len(&self, idx: usize) -> usize {
-        match (self.startp[idx], self.endp[idx]) {
-            (Some(start), Some(end)) => end.saturating_sub(start),
-            _ => 0,
-        }
+    pub fn matched_text<'s>(&self, subject: &'s [u8]) -> &'s [u8] {
+        self.group(0, subject)
+            .expect("a successful match sets its start and end")
     }
 
-    /// The text group `idx` matched in `subject`, the string that was matched.
+    /// The text group `idx` matched in `subject`, the string that was matched; `None` when the
+    /// group did not match. Empty when `\ze` put its end before its start.
     #[inline(always)]
-    pub fn group<'s>(&self, idx: usize, subject: &'s [u8]) -> &'s [u8] {
-        let Some(start) = self.startp[idx] else {
-            return &[];
-        };
-        let start = start.min(subject.len());
-        &subject[start..(start + self.span_len(idx)).min(subject.len())]
+    pub fn group<'s>(&self, idx: usize, subject: &'s [u8]) -> Option<&'s [u8]> {
+        let start = self.startp[idx]?.min(subject.len());
+        let end = self.endp[idx]?.clamp(start, subject.len());
+        Some(&subject[start..end])
     }
 
     /// `subject`, the string that was matched, from where group `idx` starts; `None` when the
@@ -4256,8 +4253,8 @@ mod tests {
         rm.set_prog(vim_regcomp(&pat_buf[..6], RE_MAGIC + RE_STRING));
         assert!(!rm.regprog.is_null());
         assert!(vim_regexec(&mut rm, &line_buf[..5], 0));
-        assert_eq!(rm.start(0), 2);
-        assert_eq!(rm.end(0), 5);
+        assert_eq!(rm.match_start(), 2);
+        assert_eq!(rm.match_end(), 5);
         assert!(!vim_regexec(&mut rm, &line_buf[..4], 0));
         rm.free_prog();
     }

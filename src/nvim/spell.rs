@@ -369,7 +369,7 @@ pub fn spell_check(
                 regmatch.rm_ic = false;
                 let r = vim_regexec(&mut regmatch, ptr_bytes, 0);
                 if r {
-                    *capcol = regmatch.end(0) as i32;
+                    *capcol = regmatch.match_end() as i32;
                 }
             }
             return utfc_ptr2len(ptr_bytes) as usize;
@@ -2216,7 +2216,8 @@ pub fn check_need_cap(wp: &WinInfoInfo, lnum: Linenr, col: Colnr) -> bool {
             if p_idx == 0 || spell_iswordp_nmw(p_bytes, wp) {
                 break;
             }
-            if vim_regexec(&mut regmatch, p_bytes, 0) && p_idx + regmatch.end(0) == endcol as usize
+            if vim_regexec(&mut regmatch, p_bytes, 0)
+                && p_idx + regmatch.match_end() == endcol as usize
             {
                 need_cap = true;
                 break;
