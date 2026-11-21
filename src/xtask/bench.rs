@@ -13,6 +13,7 @@ const BENCH_SPECS: &[&str] = &[
     "test/benchmark/decor_spec.lua",
     "test/benchmark/extmark_spec.lua",
     "test/benchmark/option_spec.lua",
+    "test/benchmark/regexp_spec.lua",
     "test/benchmark/screenpos_spec.lua",
     "test/benchmark/search_spec.lua",
     "test/benchmark/sort_spec.lua",
@@ -231,6 +232,18 @@ pub fn parse_benchmark_text(raw_text: &str) -> BTreeMap<&'static str, f64> {
     }
     if let Some(v) = extract_bench_report_median(&clean, r"sort /\w\+ /") {
         m.insert("sort_pattern_ms", v);
+    }
+    for (label, key) in [
+        ("regexp_subst_count_100k", "regexp_subst_count_100k_ms"),
+        ("regexp_search_loop_100k", "regexp_search_loop_100k_ms"),
+        ("regexp_substitute_20k", "regexp_substitute_20k_ms"),
+        ("regexp_match_str_100k", "regexp_match_str_100k_ms"),
+        ("regexp_syntax_scroll", "regexp_syntax_scroll_ms"),
+        ("regexp_indent", "regexp_indent_ms"),
+    ] {
+        if let Some(v) = extract_bench_report_median(&clean, label) {
+            m.insert(key, v);
+        }
     }
     if let Some(v) = extract_after_prefix_f64(&clean, "treesitter fold:") {
         m.insert("treesitter_fold_ms", v);
@@ -811,6 +824,30 @@ pub fn format_console_summary(
             format!("{v:.2} ms")
         }),
         (
+            "Regex match count (:%s///gn 100k)",
+            "Search",
+            "regexp_subst_count_100k_ms",
+            |v| format!("{v:.1} ms"),
+        ),
+        (
+            "Regex search loop (search() 100k)",
+            "Search",
+            "regexp_search_loop_100k_ms",
+            |v| format!("{v:.1} ms"),
+        ),
+        (
+            "String substitution (20k matches)",
+            "Editing",
+            "regexp_substitute_20k_ms",
+            |v| format!("{v:.2} ms"),
+        ),
+        (
+            "Regex string match (vim.regex 100k)",
+            "Plugins",
+            "regexp_match_str_100k_ms",
+            |v| format!("{v:.1} ms"),
+        ),
+        (
             "Fuzzy file finder (matchfuzzy 50k)",
             "Picker",
             "matchfuzzy_50k_ms",
@@ -857,6 +894,18 @@ pub fn format_console_summary(
             "Syntax",
             "decor_fullscreen_ms",
             |v| format!("{v:.2} ms"),
+        ),
+        (
+            "Legacy syntax scroll (4,000 lines)",
+            "Syntax",
+            "regexp_syntax_scroll_ms",
+            |v| format!("{v:.1} ms"),
+        ),
+        (
+            "Regex-driven indent (gg=G 1,000 lines)",
+            "Editing",
+            "regexp_indent_ms",
+            |v| format!("{v:.1} ms"),
         ),
         (
             "Autocommand event hooks (82.5k ops)",
@@ -1040,7 +1089,13 @@ mod tests {
              \nmatchfuzzy_50k\n  min 9.0000  q25 9.1000  median 9.4000  q75 9.5000  max 9.8000  mean 9.3500  (ms, n=5)\n\
              \ndiff_linematch\n  min 105.0000  q25 108.0000  median 110.5000  q75 112.0000  max 115.0000  mean 110.1000  (ms, n=5)\n\
              \nsort\n  min 220.0000  q25 225.0000  median 230.0000  q75 235.0000  max 240.0000  mean 230.0000  (ms, n=5)\n\
-             \nsort /\\w\\+ /\n  min 310.0000  q25 315.0000  median 320.0000  q75 325.0000  max 330.0000  mean 320.0000  (ms, n=5)\n",
+             \nsort /\\w\\+ /\n  min 310.0000  q25 315.0000  median 320.0000  q75 325.0000  max 330.0000  mean 320.0000  (ms, n=5)\n\
+             \nregexp_subst_count_100k\n  min 50.0000  q25 51.0000  median 52.0000  q75 53.0000  max 54.0000  mean 52.0000  (ms, n=5)\n\
+             \nregexp_search_loop_100k\n  min 90.0000  q25 91.0000  median 92.5000  q75 93.0000  max 94.0000  mean 92.0000  (ms, n=5)\n\
+             \nregexp_substitute_20k\n  min 1.0000  q25 1.1000  median 1.2000  q75 1.3000  max 1.4000  mean 1.2000  (ms, n=5)\n\
+             \nregexp_match_str_100k\n  min 20.0000  q25 21.0000  median 22.0000  q75 23.0000  max 24.0000  mean 22.0000  (ms, n=5)\n\
+             \nregexp_syntax_scroll\n  min 400.0000  q25 410.0000  median 420.0000  q75 430.0000  max 440.0000  mean 420.0000  (ms, n=5)\n\
+             \nregexp_indent\n  min 100.0000  q25 101.0000  median 102.0000  q75 103.0000  max 104.0000  mean 102.0000  (ms, n=5)\n",
         );
 
         log.push_str("-------- Running tests from test/benchmark/treesitter_spec.lua\n");
@@ -1055,7 +1110,7 @@ mod tests {
         );
 
         let parsed = parse_benchmark_text(&log);
-        assert_eq!(parsed.len(), 18);
+        assert_eq!(parsed.len(), 24);
         assert!((parsed["autocmd_suite_ms"] - 30.75).abs() < 1e-6);
         assert!((parsed["autocmd_del_unique_ms"] - 1.25).abs() < 1e-6);
         assert!((parsed["option_suite_ms"] - 140.0).abs() < 1e-6);
@@ -1067,6 +1122,12 @@ mod tests {
         assert!((parsed["diff_linematch_ms"] - 110.50).abs() < 1e-6);
         assert!((parsed["sort_lines_ms"] - 230.0).abs() < 1e-6);
         assert!((parsed["sort_pattern_ms"] - 320.0).abs() < 1e-6);
+        assert!((parsed["regexp_subst_count_100k_ms"] - 52.0).abs() < 1e-6);
+        assert!((parsed["regexp_search_loop_100k_ms"] - 92.5).abs() < 1e-6);
+        assert!((parsed["regexp_substitute_20k_ms"] - 1.2).abs() < 1e-6);
+        assert!((parsed["regexp_match_str_100k_ms"] - 22.0).abs() < 1e-6);
+        assert!((parsed["regexp_syntax_scroll_ms"] - 420.0).abs() < 1e-6);
+        assert!((parsed["regexp_indent_ms"] - 102.0).abs() < 1e-6);
 
         let runs = vec![parsed];
         let svg = generate_svg("d9a842e291", &runs, &runs, &runs, &runs);
