@@ -2701,6 +2701,15 @@ impl BtRegStack {
             + self.trail.len() * size_of::<GroupUndo>()
     }
 
+    /// The bytes allocated for the stack (upstream's `regstack.ga_maxlen`).
+    fn allocated_bytes(&self) -> usize {
+        self.items.capacity() * size_of::<Regitem>()
+            + self.stars.capacity() * size_of::<Regstar>()
+            + self.behinds.capacity() * size_of::<Regbehind>()
+            + self.marks.capacity() * size_of::<usize>()
+            + self.trail.capacity() * size_of::<GroupUndo>()
+    }
+
     #[inline(always)]
     fn clear(&mut self) {
         self.items.clear();
@@ -4151,7 +4160,7 @@ fn finish_bt_regexec(
     regstack: Option<Box<BtRegStack>>,
 ) -> i32 {
     if let Some(mut st) = regstack {
-        if st.byte_len() > REGSTACK_INITIAL as usize {
+        if st.allocated_bytes() > REGSTACK_INITIAL as usize {
             st.items = Vec::new();
             st.stars = Vec::new();
             st.behinds = Vec::new();
@@ -4195,5 +4204,26 @@ fn re_num_cmp(val: u32, prog: &[u8], scan: usize) -> bool {
         val < n
     } else {
         val == n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frees_a_stack_that_a_match_grew() {
+        let _guard = crate::globals::TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _editor = crate::main_init::test_editor();
+
+        let mut rm = Regmatch::new();
+        rm.set_prog(vim_regcomp(br"\%#=1\(a\|b\)*$", RE_MAGIC + RE_STRING));
+        assert!(vim_regexec(&mut rm, &[b'a'; 200], 0));
+        rm.free_prog();
+
+        let allocated = BT_REGSTACK.with(|c| c.borrow().as_ref().map(|st| st.allocated_bytes()));
+        assert!(allocated.is_some_and(|bytes| bytes <= REGSTACK_INITIAL as usize));
     }
 }
