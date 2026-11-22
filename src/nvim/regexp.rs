@@ -1858,6 +1858,10 @@ impl ReSt {
         RE_STATE.with(RegexpState::regparse_prev_char);
     }
     #[inline(always)]
+    pub fn regparse_composing_len(self, char_len: usize) -> usize {
+        RE_STATE.with(|s| s.regparse_composing_len(char_len))
+    }
+    #[inline(always)]
     pub fn regparse_get_char_class(self) -> i32 {
         RE_STATE.with(RegexpState::regparse_get_char_class)
     }
@@ -4166,6 +4170,15 @@ impl RegexpState {
             1 + crate::mbyte::utf_head_off_slice(&base, off - 1) as usize
         });
         self.regparse_off.set(off - step);
+    }
+    /// The length of the composing characters that follow the character of `char_len` bytes just
+    /// read: the rest of the character, as `utfc_ptr2len()` counts it.
+    pub fn regparse_composing_len(&self, char_len: usize) -> usize {
+        REGPARSE_BASE.with(|cell| {
+            let base = cell.borrow();
+            let start = self.regparse_off.get().saturating_sub(char_len);
+            (utfc_ptr2len(base.get(start..).unwrap_or_default()) as usize).saturating_sub(char_len)
+        })
     }
     #[inline(always)]
     pub fn regparse_get_char_class(&self) -> i32 {

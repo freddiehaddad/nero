@@ -193,6 +193,40 @@ fn advance_reginput(rex: &mut Regexec<'_>) {
     rex.advance_input(step);
 }
 
+/// The length of the character at the start of `rest` when its composing characters include each
+/// of `marks`, in any order. At the start of a line the character may lack a base character.
+#[inline(never)]
+fn composing_match_len(rest: &[u8], marks: &[u8]) -> Option<usize> {
+    let start = if rest.is_empty() || utf_iscomposing_legacy(utf_ptr2char(rest)) {
+        0
+    } else {
+        utf_ptr2len(rest) as usize
+    };
+    let mut end = start;
+    while end < rest.len() && utf_iscomposing_legacy(utf_ptr2char(&rest[end..])) {
+        end += utf_ptr2len(&rest[end..]) as usize;
+    }
+    let mut len = 0;
+    let mut m = 0;
+    while m < marks.len() {
+        let mark = utf_ptr2char(&marks[m..]);
+        let mut i = start;
+        loop {
+            if i >= end {
+                return None;
+            }
+            if utf_ptr2char(&rest[i..]) == mark {
+                break;
+            }
+            i += utf_ptr2len(&rest[i..]) as usize;
+        }
+        // Include all following composing characters.
+        len = len.max(i + utfc_ptr2len(&rest[i..]) as usize);
+        m += utf_ptr2len(&marks[m..]) as usize;
+    }
+    Some(len)
+}
+
 fn bt_recognize_char_class(slice: &[u8]) -> i32 {
     let mut newl = false;
     let config = get_char_class_bits(slice, &mut newl);
@@ -256,6 +290,17 @@ fn regmbc(c: i32) {
             let len = crate::mbyte::utf_char2slice(c, &mut st.reg_program.borrow_mut()[idx..]);
             st.regcode_idx.set(idx + len);
         });
+    }
+}
+
+/// Emits the composing characters that follow character `c`, just read, and skips them, so that
+/// the whole character is one operand.
+fn regmbc_composing(c: i32) {
+    let mut len = re_st().regparse_composing_len(utf_char2len(c) as usize);
+    while len > 0 {
+        let cc = getchr();
+        regmbc(cc);
+        len = len.saturating_sub(utf_char2len(cc) as usize);
     }
 }
 
@@ -1668,6 +1713,10 @@ fn regatom(flagp: &mut i32) -> Option<usize> {
     if goto_multibyte || use_multibytecode(c) {
         ret = regnode(MULTIBYTECODE);
         regmbc(c);
+        if utf_iscomposing_legacy(c) {
+            // Composing characters without a base character are one operand.
+            regmbc_composing(c);
+        }
         *flagp |= HASWIDTH | SIMPLE;
         return ret;
     }
@@ -3339,25 +3388,9 @@ fn regmatch_inner(
                             } else {
                                 let opndc = crate::mbyte::utf_slice2char(opnd);
                                 if utf_iscomposing_legacy(opndc) {
-                                    status = RegAction::NoMatch;
-                                    let rest = rex.rest();
-                                    let mut i: usize = 0;
-                                    while i < rest.len() {
-                                        let inpc = utf_ptr2char(&rest[i..]);
-                                        if !utf_iscomposing_legacy(inpc) {
-                                            if i > 0 {
-                                                break;
-                                            }
-                                        } else if opndc == inpc {
-                                            // Include all following composing chars.
-                                            len = (i as i32) + utfc_ptr2len(&rest[i..]);
-                                            status = RegAction::Match;
-                                            break;
-                                        }
-                                        i += utf_ptr2len(&rest[i..]) as usize;
-                                    }
-                                    if status != RegAction::NoMatch {
-                                        rex.advance_input(len as usize);
+                                    match composing_match_len(rex.rest(), &opnd[..len as usize]) {
+                                        Some(n) => rex.advance_input(n),
+                                        None => status = RegAction::NoMatch,
                                     }
                                 } else if rex.cstrncmp(
                                     crate::memory::bytes_until_nul(opnd),

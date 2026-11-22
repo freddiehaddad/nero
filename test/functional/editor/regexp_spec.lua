@@ -438,6 +438,7 @@ describe('regexp engine', function()
   it('matches a decomposed character as one character in both engines', function()
     -- "é" written as "e" and a combining acute accent; a combining tilde.
     local e, tilde = 'e\204\129', '\204\131'
+    local acute = e:sub(2)
     for _, engine in ipairs({ 1, 2 }) do
       eq(
         {
@@ -456,11 +457,22 @@ describe('regexp engine', function()
           precomposed_repeat = '[x]é' .. tilde,
           precomposed_optional = '[x]é' .. tilde,
           repeat_then_skip_accents = '[e' .. e .. '][]x[]',
+          -- A lone accent matches a character that has it, and matching goes on.
+          lone_accent = e .. 'x',
+          lone_accent_then_no_x = '',
+          lone_accent_groups = { e .. 'x', e, 'x' },
+          lone_accents_any_order = 'x' .. acute .. tilde,
+          dot_accent = e .. 'x',
         },
         n.exec_lua(function(p, e_, tilde_)
+          local acute_ = e_:sub(2)
           local function sub(s, pat)
             return vim.fn.substitute(s, p .. pat, '[&]', 'g')
           end
+          local function str(s, pat)
+            return vim.fn.matchstr(s, p .. pat)
+          end
+          local groups = vim.fn.matchlist(e_ .. 'x', p .. '\\(' .. acute_ .. '\\)\\(x\\)')
           return {
             collection = sub(e_ .. 'x', '[e]'),
             negated_collection = sub(e_ .. 'x', '[^x]'),
@@ -475,6 +487,14 @@ describe('regexp engine', function()
             precomposed_repeat = sub('xé' .. tilde_, 'xé*'),
             precomposed_optional = sub('xé' .. tilde_, 'xé\\='),
             repeat_then_skip_accents = sub('e' .. e_ .. 'x', 'e*\\%C'),
+            lone_accent = str(e_ .. 'xy', acute_ .. 'x'),
+            lone_accent_then_no_x = str(e_ .. 'y', acute_ .. 'x'),
+            lone_accent_groups = vim.list_slice(groups, 1, 3),
+            lone_accents_any_order = str(
+              'e' .. tilde_ .. ' x' .. acute_ .. tilde_,
+              tilde_ .. acute_
+            ),
+            dot_accent = str('a' .. e_ .. 'x', '.' .. acute_ .. 'x'),
           }
         end, [[\%#=]] .. engine, e, tilde)
       )
