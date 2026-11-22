@@ -2612,7 +2612,13 @@ fn addstate_idx(
 
     let st_c = states_slice[state_idx].c;
     match st_c {
-        NFA_NCLOSE | NFA_MOPEN | NFA_ZEND | NFA_SPLIT | NFA_EMPTY => addstate_eps(
+        NFA_NCLOSE
+        | NFA_MOPEN
+        | NFA_ZEND
+        | NFA_SPLIT
+        | NFA_EMPTY
+        | NFA_MCLOSE..=NFA_MCLOSE9
+        | NFA_ZCLOSE1..=NFA_ZCLOSE9 => addstate_eps(
             rex,
             states_slice,
             lastlist,
@@ -2624,22 +2630,6 @@ fn addstate_idx(
             off_arg,
             depth,
         ),
-        c if (NFA_MCLOSE..=NFA_MCLOSE9).contains(&c)
-            || (NFA_ZCLOSE1..=NFA_ZCLOSE9).contains(&c) =>
-        {
-            addstate_eps(
-                rex,
-                states_slice,
-                lastlist,
-                l,
-                state_idx,
-                st_c,
-                subs,
-                pim,
-                off_arg,
-                depth,
-            )
-        }
         c => {
             if (c == NFA_BOL || c == NFA_BOF)
                 && rex.input > 0
@@ -2710,12 +2700,14 @@ fn addstate_idx(
                 copy_sub(rex, &mut thread.subs.synt, &mut subs.synt);
             }
 
-            if st_c == NFA_NOPEN
-                || st_c == NFA_ZSTART
-                || st_c == NFA_ZCLOSE
-                || (NFA_MOPEN1..=NFA_MOPEN9).contains(&st_c)
-                || (NFA_ZOPEN..=NFA_ZOPEN9).contains(&st_c)
-            {
+            if matches!(
+                st_c,
+                NFA_NOPEN
+                    | NFA_ZSTART
+                    | NFA_ZCLOSE
+                    | NFA_MOPEN1..=NFA_MOPEN9
+                    | NFA_ZOPEN..=NFA_ZOPEN9
+            ) {
                 return addstate_eps(
                     rex,
                     states_slice,
@@ -2803,10 +2795,7 @@ fn addstate_eps(
                 );
             }
         }
-        c if (NFA_MOPEN..=NFA_MOPEN9).contains(&c)
-            || (NFA_ZOPEN..=NFA_ZOPEN9).contains(&c)
-            || c == NFA_ZSTART =>
-        {
+        c @ (NFA_MOPEN..=NFA_MOPEN9 | NFA_ZOPEN..=NFA_ZOPEN9 | NFA_ZSTART) => {
             let subidx = if c == NFA_ZSTART {
                 0usize
             } else if (NFA_ZOPEN..=NFA_ZOPEN9).contains(&c) {
@@ -2882,10 +2871,7 @@ fn addstate_eps(
             }
             return ok;
         }
-        c if (NFA_MCLOSE..=NFA_MCLOSE9).contains(&c)
-            || (NFA_ZCLOSE..=NFA_ZCLOSE9).contains(&c)
-            || c == NFA_ZEND =>
-        {
+        c @ (NFA_MCLOSE..=NFA_MCLOSE9 | NFA_ZCLOSE..=NFA_ZCLOSE9 | NFA_ZEND) => {
             if c == NFA_MCLOSE && rex.nfa_has_zend && subs.norm.list[0].end_lnum >= 0 {
                 if let Some(o) = st_out {
                     return addstate_idx(
@@ -4270,7 +4256,7 @@ fn nfa_regmatch_ctx(
                         add_off = clen;
                     }
                 }
-                c if (NFA_BACKREF1..=NFA_ZREF9).contains(&c) => {
+                c @ NFA_BACKREF1..=NFA_ZREF9 => {
                     let mut bytelen: i32 = 0;
                     let matched = if (NFA_BACKREF1..=NFA_BACKREF9).contains(&c) {
                         let subidx = c - NFA_BACKREF1 + 1;
@@ -4434,10 +4420,7 @@ fn nfa_regmatch_ctx(
                         add_state = t_st.out;
                     }
                 }
-                c if (NFA_MOPEN1..=NFA_MOPEN9).contains(&c)
-                    || (NFA_ZOPEN..=NFA_ZOPEN9).contains(&c)
-                    || c == NFA_NOPEN
-                    || c == NFA_ZSTART => {}
+                NFA_MOPEN1..=NFA_MOPEN9 | NFA_ZOPEN..=NFA_ZOPEN9 | NFA_NOPEN | NFA_ZSTART => {}
                 c => {
                     let mut matched = c == curc;
                     if !matched && rex.reg_ic {
