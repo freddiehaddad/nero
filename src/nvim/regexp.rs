@@ -3807,17 +3807,16 @@ fn exec_regmmatch_multi(
         match pre_action {
             Some(None) => return 0,
             Some(Some((mcol, end_col))) => {
-                let mut rex = Regexec::for_lines(rmp, win, buf, lnum);
+                // Only the whole match is set: record it without setting up a match.
                 RE_STATE.with(|s| s.re_extmatch_out.set(None));
-                rex.need_clear_subexpr = true;
-                rex.cleanup_subexpr();
-                rex.rmm_startpos[0] = Lpos { lnum: 0, col: mcol };
-                rex.rmm_endpos[0] = Lpos {
+                rmp.startpos = [None; NSUBEXP];
+                rmp.endpos = [None; NSUBEXP];
+                rmp.startpos[0] = Some(Lpos { lnum: 0, col: mcol });
+                rmp.endpos[0] = Some(Lpos {
                     lnum: 0,
                     col: end_col,
-                };
-                rex.rmm_matchcol = mcol;
-                rex.save_mmatch(rmp);
+                });
+                rmp.rmm_matchcol = mcol;
                 return 1;
             }
             None => {}
