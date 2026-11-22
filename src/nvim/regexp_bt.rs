@@ -385,6 +385,22 @@ fn regmbc_composing(c: i32) {
     }
 }
 
+/// Whether a multi follows character `c`, just read, and its composing characters.
+fn multi_follows_char(c: i32) -> bool {
+    let mut len = re_st().regparse_composing_len(utf_char2len(c) as usize);
+    if len == 0 {
+        return re_multi_type(peekchr()) != NOT_MULTI;
+    }
+    let mut ps = ParseState::new();
+    save_parse_state(&mut ps);
+    while len > 0 {
+        len = len.saturating_sub(utf_char2len(getchr()) as usize);
+    }
+    let multi = re_multi_type(peekchr()) != NOT_MULTI;
+    restore_parse_state(&mut ps);
+    multi
+}
+
 #[rustfmt::skip]
 fn reg_equi_class(c: i32) {
     match c {
@@ -1802,32 +1818,32 @@ fn regatom(flagp: &mut i32) -> Option<usize> {
         return ret;
     }
 
+    // A character with composing characters before a multi is the multi's operand as a whole.
+    let base = no_magic(c);
+    if re_st().regparse_composing_len(utf_char2len(base) as usize) > 0 && multi_follows_char(base) {
+        ret = regnode(MULTIBYTECODE);
+        regmbc(base);
+        regmbc_composing(base);
+        *flagp |= HASWIDTH | SIMPLE;
+        return ret;
+    }
+
     ret = regnode(EXACTLY);
     let mut len: i32 = 0;
+    // Append characters, each with its composing characters, as long as:
+    // - no multi follows it; the character is then the multi's operand
+    // - not running into a Magic character
+    // - "one_exactly" is not set
+    // But always emit at least one character. Might be a Multi, e.g., a "[" without matching "]".
     while c != NUL as i32
         && (len == 0
-            || (re_multi_type(peekchr()) == NOT_MULTI
-                && !RE_STATE.with(|s| s.one_exactly.get())
-                && !is_magic_fn(c)))
+            || (!RE_STATE.with(|s| s.one_exactly.get())
+                && !is_magic_fn(c)
+                && !multi_follows_char(c)))
     {
         c = no_magic(c);
         regmbc(c);
-        let mut state: GraphemeState = GRAPHEME_STATE_INIT;
-        loop {
-            let next_ch = re_st().with_regparse_bytes(|p_bytes| {
-                let l = utf_ptr2len(p_bytes) as usize;
-                if !utf_composinglike(p_bytes, p_bytes.get(l..).unwrap_or(&[]), Some(&mut state)) {
-                    None
-                } else {
-                    Some(utf_ptr2char(p_bytes))
-                }
-            });
-            let Some(ch) = next_ch else {
-                break;
-            };
-            regmbc(ch);
-            skipchr();
-        }
+        regmbc_composing(c);
         c = getchr();
         len += 1;
     }

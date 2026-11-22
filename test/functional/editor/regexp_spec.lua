@@ -470,6 +470,14 @@ describe('regexp engine', function()
           not_word_repeat = e .. e .. '[ ]',
           -- With "\Z" the text the pattern needs may lack the accent.
           needed_text_icombine = '[xe]',
+          -- A multi after a decomposed character applies to the whole character.
+          decomposed_plus = '[' .. e .. e .. ']x',
+          decomposed_star = '[' .. e .. '][]x[]',
+          decomposed_count = '[' .. e .. e .. ']' .. e,
+          decomposed_optional = '[' .. e .. 'x]',
+          two_accents_plus = '[' .. e .. tilde .. e .. tilde .. ']x',
+          literal_then_decomposed_star = '[x' .. e .. e .. ']y',
+          accent_after_optional_sequence = 'e' .. tilde,
         },
         n.exec_lua(function(p, e_, tilde_)
           local acute_ = e_:sub(2)
@@ -507,6 +515,13 @@ describe('regexp engine', function()
             word_repeat = sub(e_ .. e_ .. 'x', '\\w\\+'),
             not_word_repeat = sub(e_ .. e_ .. ' ', '\\W\\+'),
             needed_text_icombine = sub('xe', '.*' .. e_ .. '\\Z'),
+            decomposed_plus = sub(e_ .. e_ .. 'x', e_ .. '\\+'),
+            decomposed_star = sub(e_ .. 'x', e_ .. '*'),
+            decomposed_count = sub(e_ .. e_ .. e_, e_ .. '\\{2}'),
+            decomposed_optional = sub(e_ .. 'x', e_ .. '\\=x'),
+            two_accents_plus = sub(e_ .. tilde_ .. e_ .. tilde_ .. 'x', e_ .. tilde_ .. '\\+'),
+            literal_then_decomposed_star = sub('x' .. e_ .. e_ .. 'y', 'x' .. e_ .. '*'),
+            accent_after_optional_sequence = str('xe' .. tilde_, '\\%[ab]' .. tilde_),
           }
         end, [[\%#=]] .. engine, e, tilde)
       )
