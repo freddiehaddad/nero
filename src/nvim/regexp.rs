@@ -2833,23 +2833,20 @@ pub(crate) fn cstrchr_ic(s_bytes: &[u8], c: i32, reg_ic: bool) -> Option<usize> 
 
     let mut idx = 0usize;
     if c < 0x80 {
-        let cu = c as u8;
-        let ccu = cc as u8;
-        while idx < s_bytes.len() {
+        // Skip to either case of the letter, or to a character from 0x80 that may fold to it.
+        let (cu, ccu) = (c as u8, cc as u8);
+        while let Some(off) = crate::strings::find_pair_or_non_ascii(cu, ccu, &s_bytes[idx..]) {
+            idx += off;
             let b0 = s_bytes[idx];
             if b0 < 0x80 {
-                if b0 == cu || b0 == ccu {
-                    return Some(idx);
-                }
-                idx += 1;
-            } else {
-                let rem = &s_bytes[idx..];
-                let uc = crate::mbyte::utf_slice2char(rem);
-                if (uc < 0x80 || uc != i32::from(b0)) && utf_fold(uc) == lc {
-                    return Some(idx);
-                }
-                idx += crate::mbyte::utfc_slice2len(rem);
+                return Some(idx);
             }
+            let rem = &s_bytes[idx..];
+            let uc = crate::mbyte::utf_slice2char(rem);
+            if (uc < 0x80 || uc != i32::from(b0)) && utf_fold(uc) == lc {
+                return Some(idx);
+            }
+            idx += crate::mbyte::utfc_slice2len(rem);
         }
         return None;
     }

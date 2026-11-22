@@ -483,19 +483,70 @@ pub fn vim_haschr<C: crate::charset::AsciiInt>(string: &CStr, c: C) -> bool {
     vim_strchr(string, c.into_ascii_int()).is_some()
 }
 
+const BYTES_LO: u64 = u64::from_ne_bytes([0x01; 8]);
+const BYTES_HI: u64 = u64::from_ne_bytes([0x80; 8]);
+
+/// The high bit of each zero byte of `word`. A byte after a zero byte may also have it, so only
+/// the lowest one reliably marks a zero byte.
+#[inline(always)]
+const fn zero_bytes(word: u64) -> u64 {
+    word.wrapping_sub(BYTES_LO) & !word & BYTES_HI
+}
+
+/// The offset of the first byte of `hay` that `hit` accepts, testing eight bytes at a time:
+/// `mark` gives a word whose lowest set bit is the high bit of the first such byte, or 0.
+#[inline(always)]
+fn find_in_words(hay: &[u8], mark: impl Fn(u64) -> u64, hit: impl Fn(u8) -> bool) -> Option<usize> {
+    let (words, rest) = hay.as_chunks::<8>();
+    for (i, word) in words.iter().enumerate() {
+        let found = mark(u64::from_le_bytes(*word));
+        if found != 0 {
+            return Some(i * 8 + found.trailing_zeros() as usize / 8);
+        }
+    }
+    rest.iter()
+        .position(|&b| hit(b))
+        .map(|i| words.len() * 8 + i)
+}
+
+/// The offset of the first byte `needle` in `hay`.
+#[inline]
+pub fn find_byte(needle: u8, hay: &[u8]) -> Option<usize> {
+    let pattern = BYTES_LO * u64::from(needle);
+    find_in_words(hay, |w| zero_bytes(w ^ pattern), |b| b == needle)
+}
+
+/// The offset of the first byte in `hay` that is `a`, `b` or not ASCII.
+#[inline]
+pub fn find_pair_or_non_ascii(a: u8, b: u8, hay: &[u8]) -> Option<usize> {
+    let (pa, pb) = (BYTES_LO * u64::from(a), BYTES_LO * u64::from(b));
+    find_in_words(
+        hay,
+        |w| zero_bytes(w ^ pa) | zero_bytes(w ^ pb) | (w & BYTES_HI),
+        |x| x == a || x == b || !x.is_ascii(),
+    )
+}
+
 #[inline]
 pub fn vim_strchr_pos(hay: &[u8], c: i32) -> Option<usize> {
     if c <= 0 {
         return None;
     }
     if c < 0x80 {
-        let needle = c as u8;
-        hay.iter().position(|&b| b == needle)
+        find_byte(c as u8, hay)
     } else {
         let mut u8char = [0u8; MB_MAXBYTES + 1];
         let len = utf_char2slice(c, &mut u8char);
-        let needle = &u8char[..len];
-        hay.windows(len).position(|w| w == needle)
+        let (first, rest) = u8char[..len].split_first()?;
+        let mut from = 0;
+        while let Some(off) = find_byte(*first, &hay[from..]) {
+            let at = from + off;
+            if hay[at + 1..].starts_with(rest) {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
     }
 }
 
@@ -3200,6 +3251,35 @@ pub fn f_trim(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFuncData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both searches find what a byte-by-byte search finds, wherever the hit is in a word or in
+    /// the bytes after the last word, among bytes that a word-at-a-time test could mistake.
+    #[test]
+    fn find_byte_and_find_pair_or_non_ascii_match_a_plain_search() {
+        let (a, b) = (b's', b'S');
+        let fillers = [0x00, a - 1, a + 1, a ^ 0x80, a ^ 0x81, b + 1, 0x7f, 0xff];
+        for len in 0usize..=19 {
+            for fill in fillers {
+                for hit in [a, b, 0x80] {
+                    for at in 0..=len {
+                        for last_a in [false, true] {
+                            let mut hay = vec![fill; len];
+                            if at < len {
+                                hay[at] = hit;
+                            }
+                            if last_a && len > 0 {
+                                hay[len - 1] = a;
+                            }
+                            let plain = hay.iter().position(|&x| x == a);
+                            assert_eq!(find_byte(a, &hay), plain, "{hay:?}");
+                            let plain = hay.iter().position(|&x| x == a || x == b || !x.is_ascii());
+                            assert_eq!(find_pair_or_non_ascii(a, b, &hay), plain, "{hay:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn vim_strnsave_unquoted_and_strrep_and_format_typeof_work() {
