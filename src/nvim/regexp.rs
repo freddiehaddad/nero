@@ -3301,7 +3301,7 @@ fn vim_regsub_both(
                         if (flags & REGSUB_BACKSLASH) != 0 {
                             out.push(b'\\');
                         }
-                        i32::from(next)
+                        crate::mbyte::utf_slice2char(&source[idx - 1..])
                     }
                 };
             } else {

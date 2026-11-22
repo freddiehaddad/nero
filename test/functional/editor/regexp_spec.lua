@@ -596,4 +596,19 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('keeps a multibyte character after a backslash in a substitute string', function()
+    eq(
+      { str = 'é-É-é\204\129', buf = { 'é-É-é\204\129' } },
+      n.exec_lua(function()
+        -- Each \é gave "Ã", from the first byte of "é".
+        local sub = '\\é-\\U\\é\\E-\\é\204\129'
+        local r = { str = vim.fn.substitute('x', 'x', sub, '') }
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'x' })
+        vim.cmd('silent s/x/' .. sub .. '/')
+        r.buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+        return r
+      end)
+    )
+  end)
 end)
