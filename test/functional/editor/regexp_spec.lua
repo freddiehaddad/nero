@@ -465,6 +465,9 @@ describe('regexp engine', function()
           dot_accent = e .. 'x',
           lone_accent_repeat = '[' .. e .. e .. ']x',
           lone_accent_star = '[' .. e .. '][]x[]',
+          -- A repeated class decides by the base character.
+          word_repeat = '[' .. e .. e .. 'x]',
+          not_word_repeat = e .. e .. '[ ]',
         },
         n.exec_lua(function(p, e_, tilde_)
           local acute_ = e_:sub(2)
@@ -499,6 +502,8 @@ describe('regexp engine', function()
             dot_accent = str('a' .. e_ .. 'x', '.' .. acute_ .. 'x'),
             lone_accent_repeat = sub(e_ .. e_ .. 'x', acute_ .. '\\+'),
             lone_accent_star = sub(e_ .. 'x', acute_ .. '*'),
+            word_repeat = sub(e_ .. e_ .. 'x', '\\w\\+'),
+            not_word_repeat = sub(e_ .. e_ .. ' ', '\\W\\+'),
           }
         end, [[\%#=]] .. engine, e, tilde)
       )

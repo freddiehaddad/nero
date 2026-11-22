@@ -2500,8 +2500,10 @@ fn regrepeat(
                 count += 1;
                 continue;
             };
+            // The base character decides, as for one character, and the match takes the whole
+            // character. A multibyte base character is in none of these classes.
             let l = utfc_ptr2len(rest) as usize;
-            if l > 1 {
+            if b0 >= 0x80 {
                 if testval != 0 {
                     break;
                 }
@@ -2509,7 +2511,7 @@ fn regrepeat(
             } else if (RI_CLASS_TAB[b0 as usize] & mask) == testval
                 || (rex.reg_line_lbr && b0 == b'\n' && with_nl(op))
             {
-                scan += 1;
+                scan += l;
             } else {
                 break;
             }
