@@ -1522,7 +1522,7 @@ pub fn utf_ptr2char(bytes: impl AsMbyteSlice) -> i32 {
     bytes.with_char_bytes(utf_slice2char)
 }
 
-fn utf_safe_read_char_adv(s: &mut &[u8]) -> i32 {
+pub(crate) fn utf_safe_read_char_adv(s: &mut &[u8]) -> i32 {
     let Some(&b0) = s.first() else {
         return 0;
     };

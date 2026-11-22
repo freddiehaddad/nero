@@ -463,6 +463,8 @@ describe('regexp engine', function()
           lone_accent_groups = { e .. 'x', e, 'x' },
           lone_accents_any_order = 'x' .. acute .. tilde,
           dot_accent = e .. 'x',
+          lone_accent_repeat = '[' .. e .. e .. ']x',
+          lone_accent_star = '[' .. e .. '][]x[]',
         },
         n.exec_lua(function(p, e_, tilde_)
           local acute_ = e_:sub(2)
@@ -495,8 +497,33 @@ describe('regexp engine', function()
               tilde_ .. acute_
             ),
             dot_accent = str('a' .. e_ .. 'x', '.' .. acute_ .. 'x'),
+            lone_accent_repeat = sub(e_ .. e_ .. 'x', acute_ .. '\\+'),
+            lone_accent_star = sub(e_ .. 'x', acute_ .. '*'),
           }
         end, [[\%#=]] .. engine, e, tilde)
+      )
+    end
+  end)
+
+  it('matches case-folded letters in and after repeats in both engines', function()
+    local kelvin = '\226\132\170' -- KELVIN SIGN, which folds to "k"
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          repeat_long_s = 'x[ſſ]x',
+          repeat_s = 'x[ss]x',
+          repeat_kelvin = 'x[' .. kelvin .. kelvin .. ']x',
+        },
+        n.exec_lua(function(p, kelvin_)
+          local function sub(s, pat)
+            return vim.fn.substitute(s, p .. pat, '[&]', 'g')
+          end
+          return {
+            repeat_long_s = sub('xſſx', '\\cs\\+'),
+            repeat_s = sub('xssx', '\\cſ\\+'),
+            repeat_kelvin = sub('x' .. kelvin_ .. kelvin_ .. 'x', '\\ck\\+'),
+          }
+        end, [[\%#=]] .. engine, kelvin)
       )
     end
   end)

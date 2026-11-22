@@ -227,6 +227,39 @@ fn composing_match_len(rest: &[u8], marks: &[u8]) -> Option<usize> {
     Some(len)
 }
 
+/// The character of a MULTIBYTECODE operand, with its composing characters.
+fn multibytecode_char(opnd: &[u8]) -> Option<&[u8]> {
+    // Safety check (just in case 'encoding' was changed since compiling the program).
+    let len = crate::mbyte::utfc_slice2len(opnd);
+    (len >= 2).then(|| &opnd[..len])
+}
+
+/// The length of the text at the start of `rest` that `c`, the character of a MULTIBYTECODE
+/// operand, matches.
+#[inline(never)]
+fn multibytecode_len(rex: &Regexec<'_>, rest: &[u8], c: &[u8]) -> Option<usize> {
+    if utf_iscomposing_legacy(crate::mbyte::utf_slice2char(c)) {
+        return composing_match_len(rest, c);
+    }
+    if rest.starts_with(c) {
+        return Some(c.len());
+    }
+    if !rex.reg_ic && !rex.reg_icombine {
+        return None;
+    }
+    if !rex.reg_icombine && crate::mbyte::utf_slice2len(c) == c.len() {
+        // One character against a valid one: compare the folded characters, as cstrncmp() does.
+        let mut r = rest;
+        let tc = crate::mbyte::utf_safe_read_char_adv(&mut r);
+        if tc > 0 {
+            let same = utf_fold(tc) == utf_fold(crate::mbyte::utf_slice2char(c));
+            return same.then_some(rest.len() - r.len());
+        }
+    }
+    let mut n = c.len() as i32;
+    (rex.cstrncmp(c, rest, &mut n) == 0).then_some(n as usize)
+}
+
 fn bt_recognize_char_class(slice: &[u8]) -> i32 {
     let mut newl = false;
     let config = get_char_class_bits(slice, &mut newl);
@@ -2428,6 +2461,14 @@ fn repeat_crosses_line(rex: &Regexec<'_>, op: i32) -> bool {
     rex.reg_multi() && with_nl(op) && rex.lnum <= rex.reg_maxline && !rex.reg_line_lbr
 }
 
+/// The length of the character at the start of `rest` when it matches the ASCII `letter` by
+/// folding, as EXACTLY does with 'ignorecase'.
+#[inline(never)]
+fn folded_letter_len(rex: &Regexec<'_>, letter: u8, rest: &[u8]) -> Option<usize> {
+    let mut len = 1;
+    (rex.cstrncmp(&[letter], rest, &mut len) == 0).then_some(len as usize)
+}
+
 /// Matches the simple item at `p` at most `maxcount` times from the current position, and
 /// moves the position past what it matched; returns how many times it matched.
 #[inline(always)]
@@ -2561,13 +2602,19 @@ fn regrepeat(
             if rex.reg_ic {
                 let cu = mb_toupper(i32::from(opnd[0]));
                 let cl = mb_tolower(i32::from(opnd[0]));
-                while count < maxcount
-                    && line
-                        .get(scan)
-                        .is_some_and(|&b| i32::from(b) == cu || i32::from(b) == cl)
-                {
+                while count < maxcount {
+                    match line.get(scan) {
+                        Some(&b) if i32::from(b) == cu || i32::from(b) == cl => scan += 1,
+                        // A longer character can fold to the same letter, such as "ſ" to "s".
+                        Some(&b) if b >= 0x80 => {
+                            match folded_letter_len(rex, opnd[0], &line[scan..]) {
+                                Some(len) => scan += len,
+                                None => break,
+                            }
+                        }
+                        _ => break,
+                    }
                     count += 1;
-                    scan += 1;
                 }
             } else {
                 while count < maxcount && line.get(scan) == Some(&opnd[0]) {
@@ -2577,23 +2624,12 @@ fn regrepeat(
             }
         }
         MULTIBYTECODE => {
-            let len = crate::mbyte::utfc_slice2len(opnd);
-            if len > 1 {
-                let cf = if rex.reg_ic {
-                    utf_fold(crate::mbyte::utf_slice2char(opnd))
-                } else {
-                    0
-                };
-                let line = rex.line();
+            if let Some(c) = multibytecode_char(opnd) {
                 while count < maxcount {
-                    let rest = &line[scan.min(line.len())..];
-                    if (utfc_ptr2len(rest) as usize) < len
-                        || (rest[..len] != opnd[..len]
-                            && (!rex.reg_ic || utf_fold(utf_ptr2char(rest)) != cf))
-                    {
-                        break;
+                    match multibytecode_len(rex, rex.line_from(scan), c) {
+                        Some(len) if len > 0 => scan += len,
+                        _ => break,
                     }
-                    scan += len;
                     count += 1;
                 }
             }
@@ -3382,26 +3418,11 @@ fn regmatch_inner(
                         }
                         MULTIBYTECODE => {
                             let opnd = &prog[operand_idx(scan_idx)..];
-                            let mut len = crate::mbyte::utfc_slice2len(opnd) as i32;
-                            if len < 2 {
-                                status = RegAction::NoMatch;
-                            } else {
-                                let opndc = crate::mbyte::utf_slice2char(opnd);
-                                if utf_iscomposing_legacy(opndc) {
-                                    match composing_match_len(rex.rest(), &opnd[..len as usize]) {
-                                        Some(n) => rex.advance_input(n),
-                                        None => status = RegAction::NoMatch,
-                                    }
-                                } else if rex.cstrncmp(
-                                    crate::memory::bytes_until_nul(opnd),
-                                    rex.rest(),
-                                    &mut len,
-                                ) != 0
-                                {
-                                    status = RegAction::NoMatch;
-                                } else {
-                                    rex.advance_input(len as usize);
-                                }
+                            match multibytecode_char(opnd)
+                                .and_then(|c| multibytecode_len(rex, rex.rest(), c))
+                            {
+                                Some(len) => rex.advance_input(len),
+                                None => status = RegAction::NoMatch,
                             }
                         }
                         RE_COMPOSING => {
