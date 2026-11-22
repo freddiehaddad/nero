@@ -571,4 +571,29 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('repeats a group that matches nothing as often as \\{n,m} needs in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          empty_text = { '', '' },
+          after_a_letter = { 'ab', '' },
+          lazy = { 'x', '' },
+          -- Needs the inner loop's count restored, or the outer loop repeats until E363.
+          nested = {},
+        },
+        n.exec_lua(function(p)
+          local function ml(str, pat)
+            return vim.list_slice(vim.fn.matchlist(str, p .. pat), 1, 2)
+          end
+          return {
+            empty_text = ml('', [[\(a\|\)\{2}]]),
+            after_a_letter = ml('ab', [[\(a\|\)\{3}b]]),
+            lazy = ml('x', [[\(a\|\)\{-2,}x]]),
+            nested = ml('', [[\%(\%(a\|\)\{-}\)\+x]]),
+          }
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

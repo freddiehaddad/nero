@@ -3126,6 +3126,18 @@ pub(super) fn free_bt_regstack() {
     BT_REGSTACK.with(|c| *c.borrow_mut() = None);
 }
 
+/// Whether the pass of a `\{n,m}` loop that ends at the BACK at `back` is one of the first n,
+/// which the loop needs even when the pass matches nothing.
+#[inline(never)]
+fn brace_pass_needed(rex: &Regexec<'_>, prog: &[u8], back: usize) -> bool {
+    let op = op_fn(prog, regnext(prog, Some(back)));
+    if !(BRACE_COMPLEX..=BRACE_COMPLEX + 9).contains(&op) {
+        return false;
+    }
+    let no = (op - BRACE_COMPLEX) as usize;
+    i64::from(rex.brace_count[no]) <= rex.brace_min[no].min(rex.brace_max[no])
+}
+
 /// Moves the start of a look-behind one character back, to try again to match it so that it ends
 /// where what follows starts. When matching buffer lines it may go to the end of the previous
 /// line once, and the limit then counts from there. Returns false when it cannot go back.
@@ -3652,8 +3664,11 @@ fn regmatch_inner(
                         NOTHING => {}
                         BACK => {
                             // A pass of a loop ends here. When the input is where it was the last
-                            // time matching got here, the pass matched nothing: stop looping.
-                            if !regstack.loops.pass(rex, scan_idx) {
+                            // time matching got here, the pass matched nothing: stop looping,
+                            // unless `\{n,m}` needs the pass to reach n.
+                            if !regstack.loops.pass(rex, scan_idx)
+                                && !brace_pass_needed(rex, prog, scan_idx)
+                            {
                                 status = RegAction::NoMatch;
                             }
                         }
