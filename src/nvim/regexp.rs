@@ -58,7 +58,6 @@ pub const MAGIC_OFF: RegMagic = 2;
 pub const MAGIC_ON: RegMagic = 3;
 pub const MAGIC_ALL: RegMagic = 4;
 
-pub const REGSUB_COPY: i32 = 1;
 pub const REGSUB_MAGIC: i32 = 2;
 pub const REGSUB_BACKSLASH: i32 = 4;
 
@@ -1030,10 +1029,9 @@ pub(super) enum Target {
 }
 
 /// One match: what it reads, where it is, and the group positions it has found (upstream's
-/// `rex`). A substitution reads a finished match through one as well.
+/// `rex`).
 pub(super) struct Regexec<'a> {
     target: Target,
-    bt_magic_wrong: bool,
     rm_startp: [Option<usize>; NSUBEXP],
     rm_endp: [Option<usize>; NSUBEXP],
     rm_matchcol: Colnr,
@@ -1085,7 +1083,6 @@ impl<'a> Regexec<'a> {
     pub(super) fn new(target: Target, line: RegLine<'a>) -> Self {
         Self {
             target,
-            bt_magic_wrong: false,
             rm_startp: [None; NSUBEXP],
             rm_endp: [None; NSUBEXP],
             rm_matchcol: 0,
@@ -1315,14 +1312,6 @@ impl<'a> Regexec<'a> {
         mb_get_class_tab(&line[head..], &self.reg_chartab)
     }
 
-    pub(super) fn prog_magic_wrong(&self) -> bool {
-        if self.bt_magic_wrong {
-            emsg(tr(E_RE_CORR));
-            return true;
-        }
-        false
-    }
-
     pub(super) fn cleanup_subexpr(&mut self) {
         if !self.need_clear_subexpr {
             return;
@@ -1429,33 +1418,27 @@ pub(super) enum Regsubmatch {
 }
 
 impl Regsubmatch {
-    /// The groups of the match `rex` has found.
-    fn of(rex: &Regexec<'_>) -> Self {
-        if rex.reg_multi() {
-            return Self::Lines(SubmatchLines {
-                buf: rex.reg_buf.clone(),
-                firstlnum: rex.reg_firstlnum,
-                maxline: rex.reg_maxline,
-                startpos: rex.rmm_startpos.map(matched_pos),
-                endpos: rex.rmm_endpos.map(matched_pos),
-            });
-        }
-        let line = rex.line();
+    /// The groups of the match `m`.
+    fn of(m: &SubMatch<'_>) -> Self {
+        let (subject, rmp) = match m {
+            SubMatch::Text { subject, rmp } => (*subject, *rmp),
+            SubMatch::Lines(lines) => return Self::Lines((*lines).clone()),
+        };
         let (lo, hi) = (0..NSUBEXP)
-            .filter_map(|i| Some((rex.rm_startp[i]?, rex.rm_endp[i]?)))
+            .filter_map(|i| Some((rmp.startp[i]?, rmp.endp[i]?)))
             .fold((usize::MAX, 0), |(lo, hi), (s, e)| {
                 (lo.min(s), hi.max(e.max(s)))
             });
         let (text_off, text) = if lo < hi {
-            (lo, &line[lo.min(line.len())..hi.min(line.len())])
+            (lo, &subject[lo.min(subject.len())..hi.min(subject.len())])
         } else {
             (0, &[][..])
         };
         Self::Text(SubmatchText {
             text: std::rc::Rc::from(text),
             text_off,
-            startp: rex.rm_startp,
-            endp: rex.rm_endp,
+            startp: rmp.startp,
+            endp: rmp.endp,
         })
     }
 }
@@ -1835,9 +1818,6 @@ thread_local! {
     };
     pub(super) static REG_PREV_SUB: std::cell::RefCell<Option<std::ffi::CString>> = const {
         std::cell::RefCell::new(None)
-    };
-    pub(super) static EVAL_RESULT: [std::cell::RefCell<Option<std::ffi::CString>>; MAX_REGSUB_NESTING] = const {
-        [const { std::cell::RefCell::new(None) }; MAX_REGSUB_NESTING]
     };
     pub(super) static POST_VEC: std::cell::RefCell<Vec<i32>> = const {
         std::cell::RefCell::new(Vec::new())
@@ -3095,270 +3075,318 @@ pub(crate) fn fill_submatch_list(
     argskip + 1
 }
 
-/// Substitutes `source` for the match `rmp` found in `subject`, the string that was matched,
-/// without its NUL.
+/// A match that a substitution copies groups from.
+enum SubMatch<'a> {
+    /// A match in `subject`, a string without its NUL.
+    Text {
+        subject: &'a [u8],
+        rmp: &'a Regmatch,
+    },
+    /// A match in lines of a buffer.
+    Lines(&'a SubmatchLines),
+}
+
+/// Gives an error and returns true when `prog` is a damaged backtracking program.
+fn prog_magic_wrong(prog: &Regprog) -> bool {
+    if prog.bt_magic_wrong() {
+        emsg(tr(E_RE_CORR));
+        return true;
+    }
+    false
+}
+
+/// Appends character `c` to `out`, encoded in UTF-8.
+fn push_char(out: &mut Vec<u8>, c: i32) {
+    let mut bytes = [0u8; crate::change::MB_MAXCHAR];
+    let len = crate::mbyte::utf_char2slice(c, &mut bytes);
+    out.extend_from_slice(&bytes[..len]);
+}
+
+/// Appends to `out` what `source` substitutes for the match `rmp` found in `subject`, the string
+/// that was matched, without its NUL. With `expr`, or when `source` starts with "\=", that
+/// expression gives the text. Returns false when the substitution fails, after giving an error.
+#[must_use]
 pub fn vim_regsub(
     rmp: &Regmatch,
     subject: &[u8],
     source: &[u8],
     expr: Option<&TypVal>,
-    dest: &mut [u8],
     flags: i32,
-) -> i32 {
-    let mut rex = Regexec::for_string(rmp, subject, true);
-    rex.rm_startp = rmp.startp;
-    rex.rm_endp = rmp.endp;
-    rex.bt_magic_wrong = rmp.regprog.bt_magic_wrong();
-    vim_regsub_both(&rex, Some(source), expr, dest, flags)
+    out: &mut Vec<u8>,
+) -> bool {
+    !prog_magic_wrong(&rmp.regprog)
+        && vim_regsub_both(&SubMatch::Text { subject, rmp }, source, expr, flags, out)
 }
 
-/// Substitutes `source` for the match `rmp` found in the current buffer from line `lnum`.
+/// Like [`vim_regsub`], for the match `rmp` found in the current buffer from line `lnum`.
+#[must_use]
 pub fn vim_regsub_multi(
     rmp: &Regmmatch,
     lnum: Linenr,
     source: &[u8],
-    dest: &mut [u8],
     flags: i32,
-) -> i32 {
+    out: &mut Vec<u8>,
+) -> bool {
+    if prog_magic_wrong(&rmp.regprog) {
+        return false;
+    }
     let buf = curbuf();
-    let mut rex = Regexec::for_lines(rmp, None, &buf, lnum);
-    rex.rmm_startpos = rmp.startpos.map(|pos| pos.unwrap_or(UNSET_LPOS));
-    rex.rmm_endpos = rmp.endpos.map(|pos| pos.unwrap_or(UNSET_LPOS));
-    rex.bt_magic_wrong = rmp.regprog.bt_magic_wrong();
-    vim_regsub_both(&rex, Some(source), None, dest, flags)
+    let maxline = buf.b_ml.ml_line_count.get() - lnum;
+    let lines = SubmatchLines {
+        buf,
+        firstlnum: lnum,
+        maxline,
+        startpos: rmp.startpos,
+        endpos: rmp.endpos,
+    };
+    vim_regsub_both(&SubMatch::Lines(&lines), source, None, flags, out)
 }
-fn vim_regsub_both(
-    rex: &Regexec<'_>,
-    source: Option<&[u8]>,
-    expr: Option<&TypVal>,
-    dest: &mut [u8],
-    flags: i32,
-) -> i32 {
-    let mut no: i32 = -1;
-    let mut func_all: Option<CaseConv> = None;
-    let mut func_one: Option<CaseConv> = None;
-    let mut clnum: Linenr = 0;
-    let mut len: i32 = 0;
-    let copy = (flags & REGSUB_COPY) != 0;
 
-    if source.is_none() && expr.is_none() {
-        emsg(tr(E_NULL));
-        return 0;
-    }
-    if rex.prog_magic_wrong() {
-        return 0;
-    }
+/// Appends to `out` what `source`, or the expression `expr`, substitutes for the match `m`.
+/// Returns false when the substitution fails, after giving an error.
+fn vim_regsub_both(
+    m: &SubMatch<'_>,
+    source: &[u8],
+    expr: Option<&TypVal>,
+    flags: i32,
+    out: &mut Vec<u8>,
+) -> bool {
     if RE_STATE.with(|s| s.regsub_nesting.get()) == MAX_REGSUB_NESTING {
         emsg(tr(E_SUBSTITUTE_NESTING_TOO_DEEP));
-        return 0;
+        return false;
     }
-    let nested = RE_STATE.with(|s| s.regsub_nesting.get());
-    let max_dst = dest.len();
-    let mut dest_slice = copy.then_some(dest);
-    let mut dst_off = 0usize;
+    let source = crate::memory::bytes_until_nul(source);
 
-    let src_opt = source.map(crate::memory::bytes_until_nul);
-    if expr.is_some() || src_opt.is_some_and(|s| s.starts_with(b"\\=")) {
-        if copy {
-            EVAL_RESULT.with(|er| {
-                let mut slot = er[nested].borrow_mut();
-                if let Some(ref eval_cstr) = *slot {
-                    let eval_bytes = eval_cstr.to_bytes_with_nul();
-                    let eval_len = eval_bytes.len() - 1;
-                    if eval_len < max_dst {
-                        if let Some(ref mut out) = dest_slice {
-                            out[..eval_bytes.len()].copy_from_slice(eval_bytes);
-                        }
-                        dst_off += eval_len;
-                        *slot = None;
-                    }
-                }
-            });
+    // When the substitute part starts with "\=" evaluate it as an expression.
+    if expr.is_some() || source.starts_with(b"\\=") {
+        // The expression may contain substitute(), which calls us recursively. Make sure
+        // submatch() gets the text from the first level.
+        let rsm_save = RE_STATE.with(|s| s.rsm.replace(Some(Regsubmatch::of(m))));
+        RE_STATE.with(|s| s.regsub_nesting.set(s.regsub_nesting.get() + 1));
+
+        let result = if let Some(expr) = expr {
+            let mut argv: [TypVal; 2] = [const { TypVal::new() }; 2];
+            let mut rettv: TypVal = TypVal::new();
+            let match_list_id = tv_list_alloc_static();
+
+            rettv.value = crate::eval::typval::TvValue::NULL_STRING;
+
+            argv[0].value = crate::eval::typval::TvValue::List(match_list_id.clone());
+            let mut funcexe = Funcexe {
+                fe_fill_submatch: true,
+                fe_firstline: 0,
+                fe_lastline: 0,
+                fe_doesrange: false,
+                fe_evaluate: true,
+                fe_partial: crate::eval::typval::PartialId::NULL,
+                fe_selfdict: crate::eval::typval::DictId::NULL,
+                fe_basetv: None,
+                fe_found_var: false,
+            };
+            if expr.var_type() == VarType::VarFunc {
+                let s_bytes = expr.value.string_bytes();
+                call_func(s_bytes, -1, &mut rettv, 1, &mut argv, &mut funcexe);
+            } else if expr.var_type() == VarType::VarPartial {
+                let partial = expr.value.partial();
+                let s = partial_name(partial.opt());
+                funcexe.fe_partial = partial.clone();
+                call_func(s.to_bytes(), -1, &mut rettv, 1, &mut argv, &mut funcexe);
+            }
+            // Something failed when the result is unknown; no need to give another error.
+            let result = if rettv.var_type() == VarType::VarUnknown {
+                None
+            } else {
+                let mut buf = [0u8; NUMBUFLEN];
+                tv_get_string_buf_chk(&rettv, &mut buf).map(CStr::to_owned)
+            };
+            tv_clear(&mut rettv);
+            if let Some(match_list) = match_list_id.opt() {
+                tv_list_free_contents(match_list);
+                unref_var_list(match_list);
+            }
+            result
         } else {
-            EVAL_RESULT.with(|er| *er[nested].borrow_mut() = None);
+            eval_to_string(source.get(2..).unwrap_or(&[]), true, false)
+        };
+        RE_STATE.with(|s| s.regsub_nesting.set(s.regsub_nesting.get() - 1));
 
-            let rsm_save = RE_STATE.with(|s| s.rsm.replace(Some(Regsubmatch::of(rex))));
-
-            RE_STATE.with(|s| s.regsub_nesting.set(s.regsub_nesting.get() + (1)));
-
-            if let Some(expr) = expr {
-                let mut argv: [TypVal; 2] = [const { TypVal::new() }; 2];
-                let mut rettv: TypVal = TypVal::new();
-                let match_list_id = tv_list_alloc_static();
-
-                rettv.value = crate::eval::typval::TvValue::NULL_STRING;
-
-                argv[0].value = crate::eval::typval::TvValue::List(match_list_id.clone());
-                let mut funcexe = Funcexe {
-                    fe_fill_submatch: true,
-                    fe_firstline: 0,
-                    fe_lastline: 0,
-                    fe_doesrange: false,
-                    fe_evaluate: true,
-                    fe_partial: crate::eval::typval::PartialId::NULL,
-                    fe_selfdict: crate::eval::typval::DictId::NULL,
-                    fe_basetv: None,
-                    fe_found_var: false,
-                };
-                if expr.var_type() == VarType::VarFunc {
-                    let s_bytes = expr.value.string_bytes();
-                    call_func(s_bytes, -1, &mut rettv, 1, &mut argv, &mut funcexe);
-                } else if expr.var_type() == VarType::VarPartial {
-                    let partial = expr.value.partial();
-                    let s = partial_name(partial.opt());
-                    funcexe.fe_partial = partial.clone();
-                    call_func(s.to_bytes(), -1, &mut rettv, 1, &mut argv, &mut funcexe);
-                }
-                if rettv.var_type() == VarType::VarUnknown {
-                    EVAL_RESULT.with(|er| *er[nested].borrow_mut() = None);
-                } else {
-                    let mut buf = [0u8; NUMBUFLEN];
-                    if let Some(s) = tv_get_string_buf_chk(&rettv, &mut buf) {
-                        let owned = s.to_owned();
-                        EVAL_RESULT.with(|er| *er[nested].borrow_mut() = Some(owned));
+        if let Some(result) = result {
+            // A NL becomes a line break in buffer lines: change it to CR, also after a
+            // backslash, so that this works:
+            //   :s/abc\\\ndef/\="aaa\\\nbbb"/  on text:
+            //   abc\
+            //   def
+            let line_lbr = matches!(m, SubMatch::Text { .. });
+            let mut bytes = result.into_bytes();
+            let mut had_backslash = false;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == NL as u8 && !line_lbr {
+                    bytes[i] = CAR as u8;
+                } else if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    if bytes[i] == NL as u8 && !line_lbr {
+                        bytes[i] = CAR as u8;
                     }
+                    had_backslash = true;
                 }
-                tv_clear(&mut rettv);
-                if let Some(match_list) = match_list_id.opt() {
-                    tv_list_free_contents(match_list);
-                    unref_var_list(match_list);
-                }
-            } else if let Some(src) = src_opt {
-                let val = eval_to_string(src.get(2..).unwrap_or(&[]), true, false);
-                EVAL_RESULT.with(|er| *er[nested].borrow_mut() = val);
+                i += crate::mbyte::utfc_slice2len(&bytes[i..]);
             }
-            RE_STATE.with(|s| s.regsub_nesting.set(s.regsub_nesting.get() - (1)));
-
-            let eval_cstr_opt = EVAL_RESULT.with(|er| er[nested].borrow_mut().take());
-            if let Some(eval_cstr) = eval_cstr_opt {
-                let mut eval_bytes = eval_cstr.into_bytes_with_nul();
-                let mut had_backslash = false;
-                let eval_len = eval_bytes.len().saturating_sub(1);
-                let mut s_idx = 0usize;
-                while s_idx < eval_len {
-                    if eval_bytes[s_idx] == NL as u8 && !rex.reg_line_lbr {
-                        eval_bytes[s_idx] = CAR as u8;
-                    } else if eval_bytes[s_idx] == b'\\' && s_idx + 1 < eval_len {
-                        s_idx += 1;
-                        if eval_bytes[s_idx] == NL as u8 && !rex.reg_line_lbr {
-                            eval_bytes[s_idx] = CAR as u8;
-                        }
-                        had_backslash = true;
-                    }
-                    s_idx += crate::mbyte::utfc_slice2len(&eval_bytes[s_idx..eval_len]);
-                }
-                let final_cstr = if had_backslash && (flags & REGSUB_BACKSLASH) != 0 {
-                    vim_strsave_escaped(&eval_bytes, b"\\")
-                } else {
-                    CStr::from_bytes_with_nul(&eval_bytes)
-                        .unwrap_or_default()
-                        .to_owned()
-                };
-                dst_off += final_cstr.to_bytes().len();
-                EVAL_RESULT.with(|er| *er[nested].borrow_mut() = Some(final_cstr));
+            if had_backslash && (flags & REGSUB_BACKSLASH) != 0 {
+                // Backslashes will be consumed, need to double them.
+                out.extend_from_slice(vim_strsave_escaped(&bytes, b"\\").to_bytes());
+            } else {
+                out.extend_from_slice(&bytes);
             }
-
-            RE_STATE.with(|s| s.rsm.set(rsm_save));
         }
-    } else if let Some(src_bytes) = src_opt {
-        let mut idx = 0usize;
-        while idx < src_bytes.len() {
-            let mut c = src_bytes[idx] as i32;
-            idx += 1;
-            if c == b'&' as i32 && (flags & REGSUB_MAGIC) != 0 {
-                no = 0;
-            } else if c == b'\\' as i32
-                && let Some(&next_b) = src_bytes.get(idx)
-            {
-                if next_b == b'&' && (flags & REGSUB_MAGIC) == 0 {
-                    idx += 1;
-                    no = 0;
-                } else if next_b.is_ascii_digit() {
-                    no = (next_b - b'0') as i32;
-                    idx += 1;
-                } else if matches!(next_b, b'u' | b'U' | b'l' | b'L' | b'e' | b'E') {
-                    idx += 1;
-                    match next_b {
-                        b'u' => {
-                            func_one = Some(CaseConv::Upper);
-                            continue;
-                        }
-                        b'U' => {
-                            func_all = Some(CaseConv::Upper);
-                            continue;
-                        }
-                        b'l' => {
-                            func_one = Some(CaseConv::Lower);
-                            continue;
-                        }
-                        b'L' => {
-                            func_all = Some(CaseConv::Lower);
-                            continue;
-                        }
-                        b'e' | b'E' => {
-                            func_one = None;
-                            func_all = None;
-                            continue;
-                        }
-                        _ => {}
+
+        RE_STATE.with(|s| s.rsm.set(rsm_save));
+        return true;
+    }
+
+    let mut func_all: Option<CaseConv> = None;
+    let mut func_one: Option<CaseConv> = None;
+    let mut idx = 0usize;
+    while idx < source.len() {
+        let mut c = i32::from(source[idx]);
+        idx += 1;
+        let mut no: Option<usize> = None;
+        if c == i32::from(b'&') && (flags & REGSUB_MAGIC) != 0 {
+            no = Some(0);
+        } else if c == i32::from(b'\\')
+            && let Some(&next) = source.get(idx)
+        {
+            if next == b'&' && (flags & REGSUB_MAGIC) == 0 {
+                idx += 1;
+                no = Some(0);
+            } else if next.is_ascii_digit() {
+                no = Some(usize::from(next - b'0'));
+                idx += 1;
+            } else if matches!(next, b'u' | b'U' | b'l' | b'L' | b'e' | b'E') {
+                idx += 1;
+                match next {
+                    b'u' => func_one = Some(CaseConv::Upper),
+                    b'U' => func_all = Some(CaseConv::Upper),
+                    b'l' => func_one = Some(CaseConv::Lower),
+                    b'L' => func_all = Some(CaseConv::Lower),
+                    _ => {
+                        func_one = None;
+                        func_all = None;
                     }
                 }
+                continue;
             }
-            if no < 0 {
-                if c == i32::from(K_SPECIAL) && idx + 2 <= src_bytes.len() {
-                    if let Some(ref mut out) = dest_slice {
-                        if dst_off + 3 > max_dst {
-                            iemsg(c"vim_regsub_both(): not enough space");
-                            return 0;
+        }
+
+        let Some(no) = no else {
+            // An ordinary character.
+            if c == i32::from(K_SPECIAL) && idx + 2 <= source.len() {
+                // Copy a special key as-is.
+                out.extend_from_slice(&source[idx - 1..idx + 2]);
+                idx += 2;
+                continue;
+            }
+            if c == i32::from(b'\\')
+                && let Some(&next) = source.get(idx)
+            {
+                idx += 1;
+                c = match next {
+                    b'r' => CAR,
+                    b'n' => NL,
+                    b't' => TAB,
+                    b'b' => CTRL_H_CONST,
+                    _ => {
+                        // With REGSUB_BACKSLASH the backslash is removed later; it can be used
+                        // to insert a literal CR.
+                        if (flags & REGSUB_BACKSLASH) != 0 {
+                            out.push(b'\\');
                         }
-                        out[dst_off] = c as u8;
-                        out[dst_off + 1] = src_bytes[idx];
-                        out[dst_off + 2] = src_bytes[idx + 1];
+                        i32::from(next)
                     }
-                    dst_off += 3;
-                    idx += 2;
+                };
+            } else {
+                c = crate::mbyte::utf_slice2char(&source[idx - 1..]);
+            }
+
+            let cc = if let Some(f) = func_one.take() {
+                f.apply(c)
+            } else if let Some(f) = func_all {
+                f.apply(c)
+            } else {
+                c
+            };
+            push_char(out, cc);
+
+            // Copy composing characters after it as-is.
+            let cur = &source[idx - 1..];
+            let totlen = crate::mbyte::utfc_slice2len(cur);
+            let clen = crate::mbyte::utf_slice2len(cur);
+            if clen < totlen {
+                out.extend_from_slice(&cur[clen..totlen]);
+            }
+            idx += totlen - 1;
+            continue;
+        };
+
+        // Copy the text group `no` matched: its first line, where it starts in it, and how many
+        // bytes of the line it covers; in buffer lines also where it ends.
+        let (mut line, mut pos, mut len, multi) = match m {
+            SubMatch::Text { subject, rmp } => {
+                let (Some(start), Some(end)) = (rmp.startp[no], rmp.endp[no]) else {
                     continue;
-                }
-
-                if c == b'\\' as i32
-                    && let Some(&next_b) = src_bytes.get(idx)
-                {
-                    match next_b {
-                        b'r' => {
-                            c = CAR;
-                            idx += 1;
-                        }
-                        b'n' => {
-                            c = NL;
-                            idx += 1;
-                        }
-                        b't' => {
-                            c = TAB;
-                            idx += 1;
-                        }
-                        b'b' => {
-                            c = CTRL_H_CONST;
-                            idx += 1;
-                        }
-                        _ => {
-                            if (flags & REGSUB_BACKSLASH) != 0 {
-                                if let Some(ref mut out) = dest_slice {
-                                    if dst_off + 1 > max_dst {
-                                        iemsg(c"vim_regsub_both(): not enough space");
-                                        return 0;
-                                    }
-                                    out[dst_off] = b'\\';
-                                }
-                                dst_off += 1;
-                            }
-                            c = next_b as i32;
-                            idx += 1;
-                        }
-                    }
+                };
+                let len = end.saturating_sub(start) as Colnr;
+                (RegLine::Str(subject), start, len, None)
+            }
+            SubMatch::Lines(lines) => {
+                let (Some(start), Some(end)) = (lines.startpos[no], lines.endpos[no]) else {
+                    continue;
+                };
+                let Some(line) = lines.getline(start.lnum) else {
+                    continue;
+                };
+                let line_end = if end.lnum == start.lnum {
+                    end.col
                 } else {
-                    c = crate::mbyte::utf_slice2char(&src_bytes[idx - 1..]);
+                    line.bytes().len() as Colnr
+                };
+                let multi = Some((lines, start.lnum, end));
+                (line, start.col as usize, line_end - start.col, multi)
+            }
+        };
+        let mut clnum = multi.map_or(0, |(_, lnum, _)| lnum);
+        loop {
+            if len == 0 {
+                // A group in buffer lines continues in the next line, after a line break.
+                let Some((lines, _, end)) = multi else {
+                    break;
+                };
+                if end.lnum == clnum {
+                    break;
                 }
-
+                out.push(CAR as u8);
+                clnum += 1;
+                line = lines.getline(clnum).unwrap_or_default();
+                pos = 0;
+                len = if end.lnum == clnum {
+                    end.col
+                } else {
+                    line.bytes().len() as Colnr
+                };
+                continue;
+            }
+            let s = line.bytes().get(pos..).unwrap_or(&[]);
+            let Some(&b0) = s.first() else {
+                // The text is shorter than the match: keep what has been copied.
+                iemsg(tr(E_RE_DAMG));
+                return true;
+            };
+            if (flags & REGSUB_BACKSLASH) != 0 && (b0 == CAR as u8 || b0 == b'\\') {
+                // Put a backslash before a CR, or it becomes a line break, and double a
+                // backslash, as backslashes are halved later.
+                out.extend_from_slice(&[b'\\', b0]);
+            } else {
+                c = utf_ptr2char(s);
                 let cc = if let Some(f) = func_one.take() {
                     f.apply(c)
                 } else if let Some(f) = func_all {
@@ -3366,140 +3394,17 @@ fn vim_regsub_both(
                 } else {
                     c
                 };
-
-                let cur_slice = &src_bytes[idx - 1..];
-                let totlen = crate::mbyte::utfc_slice2len(cur_slice);
-                let charlen = utf_char2len(cc) as usize;
-
-                if let Some(ref mut out) = dest_slice {
-                    if dst_off + charlen > max_dst {
-                        iemsg(c"vim_regsub_both(): not enough space");
-                        return 0;
-                    }
-                    crate::mbyte::utf_char2slice(cc, &mut out[dst_off..]);
-                }
-                dst_off = (dst_off + charlen).wrapping_sub(1);
-                let clen = crate::mbyte::utf_slice2len(cur_slice);
-
-                if clen < totlen {
-                    let extra_len = totlen - clen;
-                    if let Some(ref mut out) = dest_slice {
-                        if dst_off + extra_len > max_dst {
-                            iemsg(c"vim_regsub_both(): not enough space");
-                            return 0;
-                        }
-                        out[dst_off + 1..dst_off + 1 + extra_len]
-                            .copy_from_slice(&cur_slice[clen..totlen]);
-                    }
-                    dst_off += extra_len;
-                }
-                idx += totlen - 1;
-                dst_off = dst_off.wrapping_add(1);
-            } else {
-                // The line the submatch is copied from, and the offset in it.
-                let mut line: Option<RegLine<'_>> = None;
-                let mut pos = 0usize;
-                if rex.reg_multi() {
-                    let spos = rex.rmm_startpos[no as usize];
-                    let epos = rex.rmm_endpos[no as usize];
-                    clnum = spos.lnum;
-                    if clnum >= 0 && epos.lnum >= 0 {
-                        line = rex.getline(clnum);
-                        pos = spos.col as usize;
-                        len = if epos.lnum == clnum {
-                            epos.col - spos.col
-                        } else {
-                            rex.getline_len(clnum) - spos.col
-                        };
-                    }
-                } else if let (Some(start), Some(end)) =
-                    (rex.rm_startp[no as usize], rex.rm_endp[no as usize])
-                {
-                    line = Some(rex.line.clone());
-                    pos = start;
-                    len = end.saturating_sub(start) as i32;
-                }
-                if let Some(mut line) = line {
-                    loop {
-                        if len == 0 {
-                            if rex.reg_multi() {
-                                let epos = rex.rmm_endpos[no as usize];
-                                if epos.lnum == clnum {
-                                    break;
-                                }
-                                if let Some(ref mut out) = dest_slice {
-                                    if dst_off + 1 > max_dst {
-                                        iemsg(c"vim_regsub_both(): not enough space");
-                                        return 0;
-                                    }
-                                    out[dst_off] = CAR as u8;
-                                }
-                                dst_off += 1;
-                                clnum += 1;
-                                line = rex.getline(clnum).unwrap_or_default();
-                                pos = 0;
-                                len = if epos.lnum == clnum {
-                                    epos.col
-                                } else {
-                                    rex.getline_len(clnum)
-                                };
-                            } else {
-                                break;
-                            }
-                            continue;
-                        }
-                        let s = line.bytes().get(pos..).unwrap_or(&[]);
-                        let Some(&s_b0) = s.first() else {
-                            if copy {
-                                iemsg(tr(E_RE_DAMG));
-                            }
-                            return (dst_off + 1) as i32;
-                        };
-                        if (flags & REGSUB_BACKSLASH) != 0 && (s_b0 == CAR as u8 || s_b0 == b'\\') {
-                            if let Some(ref mut out) = dest_slice {
-                                if dst_off + 2 > max_dst {
-                                    iemsg(c"vim_regsub_both(): not enough space");
-                                    return 0;
-                                }
-                                out[dst_off] = b'\\';
-                                out[dst_off + 1] = s_b0;
-                            }
-                            dst_off += 2;
-                        } else {
-                            c = utf_ptr2char(s);
-                            let cc = if let Some(f) = func_one.take() {
-                                f.apply(c)
-                            } else if let Some(f) = func_all {
-                                f.apply(c)
-                            } else {
-                                c
-                            };
-
-                            let l = utf_ptr2len(s) - 1;
-                            pos += l as usize;
-                            len -= l;
-                            let charlen = utf_char2len(cc) as usize;
-                            if let Some(ref mut out) = dest_slice {
-                                if dst_off + charlen > max_dst {
-                                    iemsg(c"vim_regsub_both(): not enough space");
-                                    return 0;
-                                }
-                                crate::mbyte::utf_char2slice(cc, &mut out[dst_off..]);
-                            }
-                            dst_off += charlen;
-                        }
-                        pos += 1;
-                        len -= 1;
-                    }
-                }
-                no = -1;
+                // Composing characters are copied one at a time, like other characters.
+                let l = utf_ptr2len(s) - 1;
+                pos += l as usize;
+                len -= l;
+                push_char(out, cc);
             }
+            pos += 1;
+            len -= 1;
         }
     }
-    if let Some(ref mut out) = dest_slice {
-        out[dst_off] = NUL;
-    }
-    (dst_off + 1) as i32
+    true
 }
 
 /// The text group `no` of the match being substituted matched, for submatch().

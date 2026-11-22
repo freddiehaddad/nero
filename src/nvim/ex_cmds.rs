@@ -77,9 +77,9 @@ use crate::lua::executor::nlua_call_excmd;
 use crate::main_init::getout;
 use crate::mark::{mark_adjust, mark_adjust_nofold, set_last_cursor, setpcmark};
 use crate::regexp::{
-    MAXCOL, RE_MAGIC, REGSUB_BACKSLASH, REGSUB_COPY, REGSUB_MAGIC, Regmatch, Regmmatch,
-    re_multiline, regtilde, skip_regexp, skip_regexp_err, skip_regexp_ex, vim_regcomp, vim_regexec,
-    vim_regexec_multi, vim_regsub_multi,
+    MAXCOL, RE_MAGIC, REGSUB_BACKSLASH, REGSUB_MAGIC, Regmatch, Regmmatch, re_multiline, regtilde,
+    skip_regexp, skip_regexp_err, skip_regexp_ex, vim_regcomp, vim_regexec, vim_regexec_multi,
+    vim_regsub_multi,
 };
 use crate::runtime::SID_NONE;
 use crate::window::{
@@ -4036,6 +4036,8 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
 
     let mut line2 = eap.line2;
     let mut timed_out: i32 = 0;
+    // What each match is replaced with.
+    let mut sub_text: Vec<u8> = Vec::new();
 
     let mut lnum = eap.line1;
     while lnum <= line2
@@ -4349,25 +4351,26 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         let subflags_save = EXCMDS_STATE.with(|s| s.subflags.get());
 
                         let sub_bytes = sub_owned.as_deref().map_or(&b""[..], CStr::to_bytes);
-                        let mut sublen = {
+                        sub_text.clear();
+                        let substituted = {
                             let _textlock = input_state().lock_text();
                             let rel_lnum = sub_firstlnum - regmatch.match_start().lnum;
                             vim_regsub_multi(
                                 &regmatch,
                                 rel_lnum,
                                 sub_bytes,
-                                &mut [],
                                 REGSUB_BACKSLASH
                                     | if opt_vars().p_magic.get() {
                                         REGSUB_MAGIC
                                     } else {
                                         0
                                     },
-                            ) as usize
+                                &mut sub_text,
+                            )
                         };
 
                         EXCMDS_STATE.with(|s| s.subflags.set(subflags_save));
-                        if sublen == 0
+                        if !substituted
                             || aborting()
                             || EXCMDS_STATE.with(|s| s.subflags.get()).do_count
                         {
@@ -4375,6 +4378,8 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                             input_state().sandbox.set(save_sandbox);
                             break 'skip;
                         }
+                        // The length of the substitute with a NUL, as upstream counts it.
+                        let mut sublen = sub_text.len() + 1;
 
                         let tmp_size = if nmatch == 1 {
                             sub_firstline.size
@@ -4404,33 +4409,13 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
 
                         let new_end_idx = new_start.size;
 
-                        if new_start_size - copy_len < sublen {
-                            sublen = new_start_size - copy_len - 1;
-                        }
-
                         let start_col = new_start.size as i32;
                         current_match.start.col = start_col;
 
-                        let mut n = {
-                            let _textlock = input_state().lock_text();
-                            let rel_lnum = sub_firstlnum - regmatch.match_start().lnum;
-                            vim_regsub_multi(
-                                &regmatch,
-                                rel_lnum,
-                                sub_bytes,
-                                &mut new_start.as_mut_slice()[new_end_idx..new_end_idx + sublen],
-                                REGSUB_COPY
-                                    | REGSUB_BACKSLASH
-                                    | if opt_vars().p_magic.get() {
-                                        REGSUB_MAGIC
-                                    } else {
-                                        0
-                                    },
-                            ) as usize
-                        };
-                        if n > 0 {
-                            new_start.size += n - 1;
-                        }
+                        let new_end = new_end_idx + sub_text.len();
+                        new_start.as_mut_slice()[new_end_idx..new_end].copy_from_slice(&sub_text);
+                        new_start.as_mut_slice()[new_end] = 0;
+                        new_start.size = new_end;
                         search_state()
                             .sub_nsubs
                             .set(search_state().sub_nsubs.get() + (1));
@@ -4475,7 +4460,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                             let p1_b1 = new_start.as_slice()[p1_idx + 1];
                             if p1_b0 == b'\\' && p1_b1 != 0 {
                                 sublen -= 1;
-                                n = new_start.size - p1_idx;
+                                let n = new_start.size - p1_idx;
                                 new_start
                                     .as_mut_slice()
                                     .copy_within(p1_idx + 1..p1_idx + 1 + n + 1, p1_idx);
@@ -4507,7 +4492,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                                     lnum += 1;
                                     line2 += 1;
                                     curwin().w_cursor.add_lnum(1);
-                                    n = new_start.size - plen as usize;
+                                    let n = new_start.size - plen as usize;
 
                                     new_start
                                         .as_mut_slice()

@@ -87,8 +87,7 @@ use crate::option::{
 use crate::option_vars::*;
 use crate::quickfix::set_ref_in_quickfix;
 use crate::regexp::{
-    NUMBUFLEN, RE_MAGIC, RE_STRING, REGSUB_COPY, REGSUB_MAGIC, Regmatch, vim_regcomp,
-    vim_regexec_nl, vim_regsub,
+    NUMBUFLEN, RE_MAGIC, RE_STRING, REGSUB_MAGIC, Regmatch, vim_regcomp, vim_regexec_nl, vim_regsub,
 };
 use crate::register::{K_GREG_EXPR_SRC, get_reg_contents_str};
 use crate::runtime::{
@@ -6433,28 +6432,14 @@ pub fn do_string_sub(
                 zero_width = Some(start_off);
             }
 
-            let sublen = vim_regsub(&regmatch, str_bytes, sub_bytes, expr, &mut [], REGSUB_MAGIC);
-            if sublen <= 0 {
+            // The text up to where the match is, then what replaces the match.
+            let buf = out.get_or_insert_with(|| Vec::with_capacity(200));
+            let i = start_off.saturating_sub(tail_off);
+            buf.extend_from_slice(&str_bytes[tail_off..tail_off + i]);
+            if !vim_regsub(&regmatch, str_bytes, sub_bytes, expr, REGSUB_MAGIC, buf) {
                 out = None;
                 break;
             }
-            let buf = out.get_or_insert_with(|| Vec::with_capacity(200));
-
-            let i = start_off.saturating_sub(tail_off);
-            if i > 0 {
-                buf.extend_from_slice(&str_bytes[tail_off..tail_off + i]);
-            }
-            let cur_len = buf.len();
-            buf.resize(cur_len + (sublen as usize), 0);
-            vim_regsub(
-                &regmatch,
-                str_bytes,
-                sub_bytes,
-                expr,
-                &mut buf[cur_len..cur_len + (sublen as usize)],
-                REGSUB_COPY | REGSUB_MAGIC,
-            );
-            buf.truncate(cur_len + (sublen as usize) - 1);
             tail_off = end_off.min(len);
             if tail_off >= len {
                 break;
