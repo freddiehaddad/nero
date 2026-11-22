@@ -83,14 +83,7 @@ impl SearchGlobalState {
                 no_hlsearch: std::cell::Cell::new(false),
             },
             screen_search_hl: std::cell::RefCell::new(crate::r#match::SynMatch {
-                rm: crate::regexp::Regmmatch {
-                    regprog: crate::regexp::RegprogPtr::NULL,
-                    startpos: [crate::cursor::Lpos { lnum: 0, col: 0 }; crate::regexp::NSUBEXP],
-                    endpos: [crate::cursor::Lpos { lnum: 0, col: 0 }; crate::regexp::NSUBEXP],
-                    rmm_matchcol: 0,
-                    rmm_ic: false,
-                    rmm_maxcol: 0,
-                },
+                rm: crate::regexp::Regmmatch::new(),
                 buf: BufPtr::NULL,
                 lnum: 0,
                 attr: 0,
@@ -993,8 +986,8 @@ pub fn searchit(
                         break;
                     }
                     if nmatched > 0 {
-                        matchpos = regmatch.startpos[0];
-                        endpos = regmatch.endpos[0];
+                        matchpos = regmatch.match_start();
+                        endpos = regmatch.match_end();
                         submatch = first_submatch(&regmatch);
                         if dir == FORWARD && at_first_line {
                             match_ok = true;
@@ -1050,8 +1043,8 @@ pub fn searchit(
                                 if regmatch.regprog.is_null() {
                                     break;
                                 }
-                                matchpos = regmatch.startpos[0];
-                                endpos = regmatch.endpos[0];
+                                matchpos = regmatch.match_start();
+                                endpos = regmatch.match_end();
                                 submatch = first_submatch(&regmatch);
 
                                 if matchpos.lnum != 0 {
@@ -1068,20 +1061,21 @@ pub fn searchit(
                             loop {
                                 if loop_idx != 0
                                     || (if (options & SEARCH_END) != 0 {
-                                        lnum + regmatch.endpos[0].lnum < start_pos.lnum
-                                            || (lnum + regmatch.endpos[0].lnum == start_pos.lnum
-                                                && regmatch.endpos[0].col - 1
+                                        lnum + regmatch.match_end().lnum < start_pos.lnum
+                                            || (lnum + regmatch.match_end().lnum == start_pos.lnum
+                                                && regmatch.match_end().col - 1
                                                     < start_pos.col + extra_col)
                                     } else {
-                                        lnum + regmatch.startpos[0].lnum < start_pos.lnum
-                                            || (lnum + regmatch.startpos[0].lnum == start_pos.lnum
-                                                && regmatch.startpos[0].col
+                                        lnum + regmatch.match_start().lnum < start_pos.lnum
+                                            || (lnum + regmatch.match_start().lnum
+                                                == start_pos.lnum
+                                                && regmatch.match_start().col
                                                     < start_pos.col + extra_col)
                                     })
                                 {
                                     match_ok = true;
-                                    matchpos = regmatch.startpos[0];
-                                    endpos = regmatch.endpos[0];
+                                    matchpos = regmatch.match_start();
+                                    endpos = regmatch.match_end();
                                     submatch = first_submatch(&regmatch);
                                 } else {
                                     break;
@@ -1302,13 +1296,13 @@ fn set_vv_searchforward() {
     );
 }
 
+/// The first group from 1 to 9 that matched, or 0 when none did.
 fn first_submatch(rp: &Regmmatch) -> i32 {
-    for (submatch, pos) in rp.startpos.iter().enumerate().skip(1) {
-        if pos.lnum >= 0 {
-            return submatch as i32;
-        }
-    }
-    0
+    rp.startpos
+        .iter()
+        .skip(1)
+        .position(Option::is_some)
+        .map_or(0, |i| i as i32 + 1)
 }
 
 pub fn parse_search_pattern_offset(
@@ -2917,7 +2911,7 @@ fn is_zero_width(
             return None;
         }
 
-        regmatch.startpos[0].col = -1;
+        let mut start_col: Colnr = -1;
         if move_to_start {
             clearpos(&mut pos);
         } else {
@@ -2941,8 +2935,7 @@ fn is_zero_width(
         {
             let mut nmatched: i32;
             loop {
-                regmatch.startpos[0].col += 1;
-                let start_col = regmatch.startpos[0].col;
+                start_col += 1;
                 nmatched = vim_regexec_multi(
                     &mut regmatch,
                     Some(&curwin()),
@@ -2957,9 +2950,9 @@ fn is_zero_width(
                 }
                 if regmatch.regprog.is_null()
                     || !(if direction == FORWARD {
-                        regmatch.startpos[0].col < pos.col
+                        start_col < pos.col
                     } else {
-                        regmatch.startpos[0].col > pos.col
+                        start_col > pos.col
                     })
                 {
                     break;
@@ -2968,9 +2961,10 @@ fn is_zero_width(
 
             if msg_state().called_emsg.get() == called_emsg_before {
                 result = Some(
-                    nmatched != 0
-                        && regmatch.startpos[0].lnum == regmatch.endpos[0].lnum
-                        && regmatch.startpos[0].col == regmatch.endpos[0].col,
+                    nmatched != 0 && {
+                        let (start, end) = (regmatch.match_start(), regmatch.match_end());
+                        start.lnum == end.lnum && start.col == end.col
+                    },
                 );
             }
         }
@@ -4270,11 +4264,9 @@ mod tests {
     #[test]
     fn first_submatch_and_pos_helpers() {
         let mut rm: Regmmatch = Regmmatch::new();
-        for pos in &mut rm.startpos {
-            pos.lnum = -1;
-        }
+        rm.startpos[0] = Some(Lpos::new());
         assert_eq!(first_submatch(&rm), 0);
-        rm.startpos[3].lnum = 0;
+        rm.startpos[3] = Some(Lpos::new());
         assert_eq!(first_submatch(&rm), 3);
 
         let mut p = CursorPos {

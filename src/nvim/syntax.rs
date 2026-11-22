@@ -1592,7 +1592,6 @@ fn syn_current_attr_ctx(
     can_spell: Option<&mut bool>,
     keep_state: bool,
 ) -> i32 {
-    let mut endpos = Lpos { lnum: 0, col: 0 };
     let mut hl_startpos = Lpos { lnum: 0, col: 0 };
     let mut hl_endpos = Lpos { lnum: 0, col: 0 };
     let mut eos_pos = Lpos { lnum: 0, col: 0 };
@@ -1834,8 +1833,7 @@ fn syn_current_attr_ctx(
                                 continue;
                             }
 
-                            endpos.lnum = regmatch.endpos[0].lnum;
-                            endpos.col = regmatch.endpos[0].col;
+                            let mut endpos = regmatch.match_end();
 
                             syn_add_start_off_ctx(
                                 syn_buf,
@@ -1902,7 +1900,7 @@ fn syn_current_attr_ctx(
                                 if endpos.lnum == cur_lnum_now
                                     && endpos.col + i32::from(syncing) < startcol
                                 {
-                                    if regmatch.startpos[0].col == regmatch.endpos[0].col {
+                                    if regmatch.match_start().col == regmatch.match_end().col {
                                         s.try_next_column.set(true);
                                     }
                                     idx -= 1;
@@ -2594,7 +2592,8 @@ fn find_endpos_ctx(
                 lc_col,
                 &spp.sp_time,
             );
-            if r && (best_idx == -1 || regmatch.startpos[0].col < best_regmatch.startpos[0].col) {
+            if r && (best_idx == -1 || regmatch.match_start().col < best_regmatch.match_start().col)
+            {
                 best_idx = idx;
                 best_regmatch.startpos[0] = regmatch.startpos[0];
                 best_regmatch.endpos[0] = regmatch.endpos[0];
@@ -2624,7 +2623,7 @@ fn find_endpos_ctx(
                 lc_col,
                 &spp_skip.sp_time,
             );
-            if r && regmatch.startpos[0].col <= best_regmatch.startpos[0].col {
+            if r && regmatch.match_start().col <= best_regmatch.match_start().col {
                 syn_add_end_off_ctx(syn_buf, &mut pos, &mut regmatch, spp_skip, SPO_ME_OFF, 1);
 
                 if pos.lnum > startpos.lnum {
@@ -2635,10 +2634,10 @@ fn find_endpos_ctx(
 
                 if pos.col <= matchcol {
                     matchcol += 1;
-                } else if pos.col <= regmatch.endpos[0].col {
+                } else if pos.col <= regmatch.match_end().col {
                     matchcol = pos.col;
                 } else {
-                    matchcol = regmatch.endpos[0].col;
+                    matchcol = regmatch.match_end().col;
                     while matchcol < line_len && matchcol < pos.col {
                         matchcol += 1;
                     }
@@ -2667,11 +2666,9 @@ fn find_endpos_ctx(
         if spp.sp_syn_match_id != spp.sp_syn.id && spp.sp_syn_match_id != 0 {
             *end_idx = best_idx;
             if (spp.sp_off_flags & (1 << (SPO_RE_OFF + SPO_COUNT))) != 0 {
-                hl_endpos.lnum = best_regmatch.endpos[0].lnum;
-                hl_endpos.col = best_regmatch.endpos[0].col;
+                *hl_endpos = best_regmatch.match_end();
             } else {
-                hl_endpos.lnum = best_regmatch.startpos[0].lnum;
-                hl_endpos.col = best_regmatch.startpos[0].col;
+                *hl_endpos = best_regmatch.match_start();
             }
             hl_endpos.col += spp.sp_offsets[SPO_RE_OFF];
 
@@ -2728,12 +2725,12 @@ fn syn_add_end_off_ctx(
     let mut off: i32;
 
     if (spp.sp_off_flags & (1 << idx)) != 0 {
-        result.lnum = regmatch.startpos[0].lnum;
-        col = regmatch.startpos[0].col;
+        result.lnum = regmatch.match_start().lnum;
+        col = regmatch.match_start().col;
         off = spp.sp_offsets[idx] + extra;
     } else {
-        result.lnum = regmatch.endpos[0].lnum;
-        col = regmatch.endpos[0].col;
+        result.lnum = regmatch.match_end().lnum;
+        col = regmatch.match_end().col;
         off = spp.sp_offsets[idx];
     }
 
@@ -2772,12 +2769,12 @@ fn syn_add_start_off_ctx(
     let mut off: i32;
 
     if (spp.sp_off_flags & (1 << (idx + SPO_COUNT))) != 0 {
-        result.lnum = regmatch.endpos[0].lnum;
-        col = regmatch.endpos[0].col;
+        result.lnum = regmatch.match_end().lnum;
+        col = regmatch.match_end().col;
         off = spp.sp_offsets[idx] + extra;
     } else {
-        result.lnum = regmatch.startpos[0].lnum;
-        col = regmatch.startpos[0].col;
+        result.lnum = regmatch.match_start().lnum;
+        col = regmatch.match_start().col;
         off = spp.sp_offsets[idx];
     }
     let line_count = syn_buf.b_ml.ml_line_count.get();
@@ -2862,8 +2859,12 @@ fn syn_regexec(
     }
 
     if r > 0 {
-        rmp.startpos[0].lnum += lnum;
-        rmp.endpos[0].lnum += lnum;
+        // Count the lines of the match from the first line of the buffer.
+        let (Some(start), Some(end)) = (&mut rmp.startpos[0], &mut rmp.endpos[0]) else {
+            unreachable!("a successful match sets its start and end");
+        };
+        start.lnum += lnum;
+        end.lnum += lnum;
         return true;
     }
     false

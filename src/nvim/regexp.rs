@@ -330,11 +330,14 @@ impl PartialEq for RegprogPtr {
 
 impl Eq for RegprogPtr {}
 
+/// The result of matching lines of a buffer. `startpos[i]` and `endpos[i]` are where group `i`
+/// (0 is the whole match) starts and ends, with line numbers counted from the line where matching
+/// started, or `None` when the group did not match.
 #[derive(Clone)]
 pub struct Regmmatch {
     pub regprog: RegprogPtr,
-    pub startpos: [Lpos; NSUBEXP],
-    pub endpos: [Lpos; NSUBEXP],
+    pub startpos: [Option<Lpos>; NSUBEXP],
+    pub endpos: [Option<Lpos>; NSUBEXP],
     pub rmm_matchcol: Colnr,
     pub rmm_ic: bool,
     pub rmm_maxcol: Colnr,
@@ -344,12 +347,24 @@ impl Regmmatch {
     pub const fn new() -> Self {
         Self {
             regprog: RegprogPtr::NULL,
-            startpos: [Lpos::new(); NSUBEXP],
-            endpos: [Lpos::new(); NSUBEXP],
+            startpos: [None; NSUBEXP],
+            endpos: [None; NSUBEXP],
             rmm_matchcol: 0,
             rmm_ic: false,
             rmm_maxcol: 0,
         }
+    }
+
+    /// Where a successful match starts.
+    #[inline(always)]
+    pub fn match_start(&self) -> Lpos {
+        self.startpos[0].expect("a successful match sets its start")
+    }
+
+    /// Where a successful match ends. A `\ze` before `\zs` can put it before the start.
+    #[inline(always)]
+    pub fn match_end(&self) -> Lpos {
+        self.endpos[0].expect("a successful match sets its end")
     }
 
     #[inline(always)]
@@ -1313,8 +1328,8 @@ impl<'a> Regexec<'a> {
             return;
         }
         if self.reg_multi() {
-            self.rmm_startpos = [Lpos { lnum: -1, col: -1 }; NSUBEXP];
-            self.rmm_endpos = [Lpos { lnum: -1, col: -1 }; NSUBEXP];
+            self.rmm_startpos = [UNSET_LPOS; NSUBEXP];
+            self.rmm_endpos = [UNSET_LPOS; NSUBEXP];
         } else {
             self.rm_startp = [None; NSUBEXP];
             self.rm_endp = [None; NSUBEXP];
@@ -1327,8 +1342,8 @@ impl<'a> Regexec<'a> {
             return;
         }
         if self.reg_multi() {
-            self.reg_startzpos = [Lpos { lnum: -1, col: -1 }; NSUBEXP];
-            self.reg_endzpos = [Lpos { lnum: -1, col: -1 }; NSUBEXP];
+            self.reg_startzpos = [UNSET_LPOS; NSUBEXP];
+            self.reg_endzpos = [UNSET_LPOS; NSUBEXP];
         } else {
             self.reg_startzp = [None; NSUBEXP];
             self.reg_endzp = [None; NSUBEXP];
@@ -1345,10 +1360,20 @@ impl<'a> Regexec<'a> {
 
     #[inline(always)]
     pub(super) fn save_mmatch(&self, rmp: &mut Regmmatch) {
-        rmp.startpos = self.rmm_startpos;
-        rmp.endpos = self.rmm_endpos;
+        rmp.startpos = self.rmm_startpos.map(matched_pos);
+        rmp.endpos = self.rmm_endpos.map(matched_pos);
         rmp.rmm_matchcol = self.rmm_matchcol;
     }
+}
+
+/// How the engines mark the position of a group in buffer lines that is not set: line -1, as
+/// upstream does. Matches leave the engines with such positions as `None`.
+pub(super) const UNSET_LPOS: Lpos = Lpos { lnum: -1, col: -1 };
+
+/// A group position from the engines, or `None` when it is not set.
+#[inline(always)]
+fn matched_pos(pos: Lpos) -> Option<Lpos> {
+    (pos.lnum >= 0).then_some(pos)
 }
 
 /// The groups of a match in a string, kept while a substitution evaluates an expression: the
@@ -1376,8 +1401,8 @@ pub(super) struct SubmatchLines {
     buf: crate::globals::BufPtr,
     firstlnum: Linenr,
     maxline: Linenr,
-    startpos: [Lpos; NSUBEXP],
-    endpos: [Lpos; NSUBEXP],
+    startpos: [Option<Lpos>; NSUBEXP],
+    endpos: [Option<Lpos>; NSUBEXP],
 }
 
 impl SubmatchLines {
@@ -1411,8 +1436,8 @@ impl Regsubmatch {
                 buf: rex.reg_buf.clone(),
                 firstlnum: rex.reg_firstlnum,
                 maxline: rex.reg_maxline,
-                startpos: rex.rmm_startpos,
-                endpos: rex.rmm_endpos,
+                startpos: rex.rmm_startpos.map(matched_pos),
+                endpos: rex.rmm_endpos.map(matched_pos),
             });
         }
         let line = rex.line();
@@ -3097,8 +3122,8 @@ pub fn vim_regsub_multi(
 ) -> i32 {
     let buf = curbuf();
     let mut rex = Regexec::for_lines(rmp, None, &buf, lnum);
-    rex.rmm_startpos = rmp.startpos;
-    rex.rmm_endpos = rmp.endpos;
+    rex.rmm_startpos = rmp.startpos.map(|pos| pos.unwrap_or(UNSET_LPOS));
+    rex.rmm_endpos = rmp.endpos.map(|pos| pos.unwrap_or(UNSET_LPOS));
     rex.bt_magic_wrong = rmp.regprog.bt_magic_wrong();
     vim_regsub_both(&rex, Some(source), None, dest, flags)
 }
@@ -3483,15 +3508,15 @@ pub fn reg_submatch(no: i32) -> Option<std::ffi::CString> {
     match RE_STATE.with(|s| s.rsm.get())? {
         Regsubmatch::Text(m) => m.group(no).and_then(cstring_from_bytes),
         Regsubmatch::Lines(m) => {
-            let mut lnum = m.startpos[no].lnum;
-            let end_lnum = m.endpos[no].lnum;
-            if lnum < 0 || end_lnum < 0 {
+            let (Some(start), Some(end)) = (m.startpos[no], m.endpos[no]) else {
                 return None;
-            }
+            };
+            let mut lnum = start.lnum;
+            let end_lnum = end.lnum;
             let first_line = m.getline(lnum)?;
             let first_line = first_line.bytes();
-            let scol = (m.startpos[no].col as usize).min(first_line.len());
-            let ecol = m.endpos[no].col as usize;
+            let scol = (start.col as usize).min(first_line.len());
+            let ecol = end.col as usize;
             let mut buf: Vec<u8> = Vec::new();
             if end_lnum == lnum {
                 let end_idx = ecol.min(first_line.len());
@@ -3525,14 +3550,11 @@ pub fn reg_submatch_list(no: i32) -> Option<crate::eval::typval::ListId> {
             list
         }
         Regsubmatch::Lines(m) => {
-            let slnum = m.startpos[no].lnum;
-            let elnum = m.endpos[no].lnum;
-            if slnum < 0 || elnum < 0 {
+            let (Some(start), Some(end)) = (m.startpos[no], m.endpos[no]) else {
                 return None;
-            }
-
-            let scol = m.startpos[no].col;
-            let ecol = m.endpos[no].col;
+            };
+            let (slnum, elnum) = (start.lnum, end.lnum);
+            let (scol, ecol) = (start.col, end.col);
 
             let list = tv_list_alloc((elnum - slnum + 1) as isize);
 

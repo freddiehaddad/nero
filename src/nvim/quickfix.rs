@@ -5344,7 +5344,7 @@ fn vgr_match_buflines(
                 } else {
                     buf.b_fnum.get()
                 };
-                let mesg_cstr = ml_get_buf(buf, regmatch.startpos[0].lnum + lnum);
+                let mesg_cstr = ml_get_buf(buf, regmatch.match_start().lnum + lnum);
                 if qf_add_entry(
                     qfl_rc,
                     None,
@@ -5352,10 +5352,10 @@ fn vgr_match_buflines(
                     None,
                     entry_fnum,
                     &mesg_cstr,
-                    regmatch.startpos[0].lnum + lnum,
-                    regmatch.endpos[0].lnum + lnum,
-                    regmatch.startpos[0].col + 1,
-                    regmatch.endpos[0].col + 1,
+                    regmatch.match_start().lnum + lnum,
+                    regmatch.match_end().lnum + lnum,
+                    regmatch.match_start().col + 1,
+                    regmatch.match_end().col + 1,
                     false,
                     None,
                     0,
@@ -5372,10 +5372,10 @@ fn vgr_match_buflines(
                 if *tomatch == 0 {
                     break;
                 }
-                if (flags & VGR_GLOBAL) == 0 || regmatch.endpos[0].lnum > 0 {
+                if (flags & VGR_GLOBAL) == 0 || regmatch.match_end().lnum > 0 {
                     break;
                 }
-                col = regmatch.endpos[0].col + Colnr::from(col == regmatch.endpos[0].col);
+                col = regmatch.match_end().col + Colnr::from(col == regmatch.match_end().col);
                 if col > ml_get_buf_len(buf, lnum) {
                     break;
                 }

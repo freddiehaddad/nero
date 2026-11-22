@@ -33,7 +33,7 @@ use crate::strings::{format_to_buf, gettext};
 use crate::window::WinInfoInfo;
 
 use crate::change::MB_MAXCHAR;
-use crate::cursor::{Colnr, Linenr};
+use crate::cursor::{Colnr, Linenr, Lpos};
 use crate::eval::K_LIST_LEN_MAY_KNOW_CONST;
 
 const SEARCH_HL_PRIORITY: i32 = 0;
@@ -44,8 +44,10 @@ pub(crate) const K_CPO_SEARCH: i32 = b'c' as i32;
 
 #[derive(Clone)]
 pub struct SynMatch {
+    /// The last match found, which may continue in the lines after `lnum`.
     pub rm: Regmmatch,
     pub buf: crate::globals::BufPtr,
+    /// The line where the match in `rm` starts, or 0 when there is none.
     pub lnum: Linenr,
     pub attr: i32,
     pub attr_cur: i32,
@@ -180,11 +182,7 @@ fn match_add(
         mit_pattern: pat.map(std::ffi::CStr::to_owned),
         mit_match: Regmmatch {
             regprog,
-            startpos: [crate::cursor::Lpos { lnum: 0, col: 0 }; 10],
-            endpos: [crate::cursor::Lpos { lnum: 0, col: 0 }; 10],
-            rmm_matchcol: 0,
-            rmm_ic: false,
-            rmm_maxcol: 0,
+            ..Regmmatch::new()
         },
         mit_pos: if pos_len > 0 {
             vec![Llpos::default(); pos_len as usize]
@@ -414,10 +412,11 @@ fn next_search_hl_pos(
         };
 
         shl.lnum = lnum;
-        shl.rm.startpos[0].lnum = 0;
-        shl.rm.startpos[0].col = start;
-        shl.rm.endpos[0].lnum = 0;
-        shl.rm.endpos[0].col = end;
+        shl.rm.startpos[0] = Some(Lpos {
+            lnum: 0,
+            col: start,
+        });
+        shl.rm.endpos[0] = Some(Lpos { lnum: 0, col: end });
         shl.is_addpos = true;
         shl.has_cursor = false;
         *mit_pos_cur = (found as i32) + 1;
@@ -499,10 +498,11 @@ fn next_search_hl(
 
     let Some(early_return) = with_shl_mut(win, search_hl, match_key, |shl| {
         if shl.lnum != 0 {
-            let l = shl.lnum + shl.rm.endpos[0].lnum - shl.rm.startpos[0].lnum;
+            let (start, end) = (shl.rm.match_start(), shl.rm.match_end());
+            let l = shl.lnum + end.lnum - start.lnum;
             if lnum > l {
                 shl.lnum = 0;
-            } else if lnum < l || shl.rm.endpos[0].col > mincol {
+            } else if lnum < l || end.col > mincol {
                 return true;
             }
         }
@@ -516,38 +516,31 @@ fn next_search_hl(
 
     let mut searched_from: Option<Colnr> = None;
     loop {
-        let Some((shl_tm, shl_lnum, start_col, end_lnum, end_col, shl_buf)) =
-            with_shl(win, search_hl, match_key, |shl| {
-                (
-                    shl.tm,
-                    shl.lnum,
-                    shl.rm.startpos[0].col,
-                    shl.rm.endpos[0].lnum,
-                    shl.rm.endpos[0].col,
-                    shl.buf.clone(),
-                )
-            })
-        else {
+        let Some((shl_tm, held, shl_buf)) = with_shl(win, search_hl, match_key, |shl| {
+            let held = (shl.lnum != 0).then(|| (shl.rm.match_start(), shl.rm.match_end()));
+            (shl.tm, held, shl.buf.clone())
+        }) else {
             break;
         };
         if profile_passed_limit(shl_tm) {
             with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
             break;
         }
-        if shl_lnum == 0 {
-            matchcol = 0;
-        } else if !crate::strings::vim_haschr(&opt_vars().p_cpo.as_cstr(), K_CPO_SEARCH)
-            || (end_lnum == 0 && end_col <= start_col)
-        {
-            matchcol = start_col;
-            let line_slice = crate::memline::ml_get_buf_slice(shl_buf.borrow(), lnum);
-            if (matchcol as usize) >= line_slice.len() {
-                with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
-                break;
+        match held {
+            None => matchcol = 0,
+            Some((start, end))
+                if !crate::strings::vim_haschr(&opt_vars().p_cpo.as_cstr(), K_CPO_SEARCH)
+                    || (end.lnum == 0 && end.col <= start.col) =>
+            {
+                matchcol = start.col;
+                let line_slice = crate::memline::ml_get_buf_slice(shl_buf.borrow(), lnum);
+                if (matchcol as usize) >= line_slice.len() {
+                    with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
+                    break;
+                }
+                matchcol += crate::mbyte::utfc_slice2len(&line_slice[matchcol as usize..]) as Colnr;
             }
-            matchcol += crate::mbyte::utfc_slice2len(&line_slice[matchcol as usize..]) as Colnr;
-        } else {
-            matchcol = end_col;
+            Some((_, end)) => matchcol = end.col,
         }
         // A "\zs" or "\ze" in a look-behind can put a match before the column the search
         // began at, so searching from it again could find the same match forever: move on.
@@ -630,13 +623,11 @@ fn next_search_hl(
         let done = with_shl_mut(win, search_hl, match_key, |shl| {
             if nmatched == 0 {
                 shl.lnum = 0;
-                true
-            } else if shl.rm.startpos[0].lnum > 0
-                || shl.rm.startpos[0].col >= mincol
-                || nmatched > 1
-                || shl.rm.endpos[0].col > mincol
-            {
-                shl.lnum += shl.rm.startpos[0].lnum;
+                return true;
+            }
+            let (start, end) = (shl.rm.match_start(), shl.rm.match_end());
+            if start.lnum > 0 || start.col >= mincol || nmatched > 1 || end.col > mincol {
+                shl.lnum += start.lnum;
                 true
             } else {
                 false
@@ -711,8 +702,9 @@ pub fn prepare_search_hl(wp: &WinInfoInfo, search_hl: &mut SynMatch, lnum: Linen
 
                 if with_shl_mut(wp, search_hl, match_key, |shl| {
                     if shl.lnum != 0 {
-                        shl.first_lnum = shl.lnum + shl.rm.endpos[0].lnum - shl.rm.startpos[0].lnum;
-                        n = shl.rm.endpos[0].col;
+                        let (start, end) = (shl.rm.match_start(), shl.rm.match_end());
+                        shl.first_lnum = shl.lnum + end.lnum - start.lnum;
+                        n = end.col;
                     } else {
                         shl.first_lnum += 1;
                         n = 0;
@@ -732,12 +724,12 @@ pub fn prepare_search_hl(wp: &WinInfoInfo, search_hl: &mut SynMatch, lnum: Linen
 
 /// Update `shl->has_cursor` based on the match in `shl` and the cursor position (`check_cur_search_hl`).
 fn check_cur_search_hl(wp: &WinInfoInfo, shl: &mut SynMatch) {
-    let linecount = shl.rm.endpos[0].lnum - shl.rm.startpos[0].lnum;
+    let (start, end) = (shl.rm.match_start(), shl.rm.match_end());
+    let linecount = end.lnum - start.lnum;
     shl.has_cursor = wp.w_cursor.get().lnum >= shl.lnum
         && wp.w_cursor.get().lnum <= shl.lnum + linecount
-        && (wp.w_cursor.get().lnum > shl.lnum || wp.w_cursor.get().col >= shl.rm.startpos[0].col)
-        && (wp.w_cursor.get().lnum < shl.lnum + linecount
-            || wp.w_cursor.get().col < shl.rm.endpos[0].col);
+        && (wp.w_cursor.get().lnum > shl.lnum || wp.w_cursor.get().col >= start.col)
+        && (wp.w_cursor.get().lnum < shl.lnum + linecount || wp.w_cursor.get().col < end.col);
 }
 
 /// Prepare for `'hlsearch'` and match highlighting in one window line (`prepare_search_hl_line`).
@@ -793,13 +785,10 @@ pub fn prepare_search_hl_line(
         let shl_lnum = with_shl(wp, search_hl, match_key, |shl| shl.lnum).unwrap_or(0);
         if shl_lnum != 0 && shl_lnum <= lnum {
             with_shl_mut(wp, search_hl, match_key, |shl| {
-                shl.startcol = if shl.lnum == lnum {
-                    shl.rm.startpos[0].col
-                } else {
-                    0
-                };
-                shl.endcol = if lnum == shl.lnum + shl.rm.endpos[0].lnum - shl.rm.startpos[0].lnum {
-                    shl.rm.endpos[0].col
+                let (start, end) = (shl.rm.match_start(), shl.rm.match_end());
+                shl.startcol = if shl.lnum == lnum { start.col } else { 0 };
+                shl.endcol = if lnum == shl.lnum + end.lnum - start.lnum {
+                    end.col
                 } else {
                     MAXCOL
                 };
@@ -944,12 +933,9 @@ pub fn update_search_hl(
 
                 if with_shl(wp, search_hl, match_key, |shl| shl.lnum).unwrap_or(0) == lnum {
                     with_shl_mut(wp, search_hl, match_key, |shl| {
-                        shl.startcol = shl.rm.startpos[0].col;
-                        shl.endcol = if shl.rm.endpos[0].lnum == 0 {
-                            shl.rm.endpos[0].col
-                        } else {
-                            MAXCOL
-                        };
+                        let (start, end) = (shl.rm.match_start(), shl.rm.match_end());
+                        shl.startcol = start.col;
+                        shl.endcol = if end.lnum == 0 { end.col } else { MAXCOL };
                     });
 
                     if is_search_hl {

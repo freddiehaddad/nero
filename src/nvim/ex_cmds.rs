@@ -4082,11 +4082,11 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                     pre_match: 0,
                 };
 
-                if regmatch.startpos[0].lnum > 0 {
+                if regmatch.match_start().lnum > 0 {
                     current_match.pre_match = lnum;
-                    lnum += regmatch.startpos[0].lnum;
-                    sub_firstlnum += regmatch.startpos[0].lnum;
-                    nmatch -= regmatch.startpos[0].lnum;
+                    lnum += regmatch.match_start().lnum;
+                    sub_firstlnum += regmatch.match_start().lnum;
+                    nmatch -= regmatch.match_start().lnum;
                     sub_firstline.clear();
                 }
 
@@ -4107,9 +4107,9 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                 'skip: {
                     // An empty match counts only once, and a `\ze` in a look-behind can end a
                     // match before the column the search started at: skip a character.
-                    if regmatch.endpos[0].lnum == 0
-                        && (regmatch.endpos[0].col < matchcol
-                            || (matchcol == prev_matchcol && matchcol == regmatch.endpos[0].col))
+                    if regmatch.match_end().lnum == 0
+                        && (regmatch.match_end().col < matchcol
+                            || (matchcol == prev_matchcol && matchcol == regmatch.match_end().col))
                     {
                         if sub_firstline.as_slice()[matchcol as usize] == 0 {
                             skip_match = true;
@@ -4123,7 +4123,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         break 'skip;
                     }
 
-                    matchcol = regmatch.endpos[0].col;
+                    matchcol = regmatch.match_end().col;
                     prev_matchcol = matchcol;
 
                     if EXCMDS_STATE.with(|s| s.subflags.get()).do_count {
@@ -4149,7 +4149,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                     if EXCMDS_STATE.with(|s| s.subflags.get()).do_ask && cmdpreview_ns <= 0 {
                         let mut typed: i32 = 0;
                         let save_state = edit_state().state_global.get();
-                        curwin().w_cursor.set_col(regmatch.startpos[0].col);
+                        curwin().w_cursor.set_col(regmatch.match_start().col);
 
                         if curwin().w_onebuf_opt.wo_crb.get() {
                             do_check_cursorbind();
@@ -4196,14 +4196,13 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                                         );
                                     }
 
-                                    search_state()
-                                        .search_global
-                                        .match_lines
-                                        .set(regmatch.endpos[0].lnum - regmatch.startpos[0].lnum);
+                                    search_state().search_global.match_lines.set(
+                                        regmatch.match_end().lnum - regmatch.match_start().lnum,
+                                    );
                                     search_state()
                                         .search_global
                                         .match_endcol
-                                        .set(regmatch.endpos[0].col + len_change);
+                                        .set(regmatch.match_end().col + len_change);
                                     if search_state().search_global.match_lines.get() == 0
                                         && search_state().search_global.match_endcol.get() == 0
                                     {
@@ -4298,7 +4297,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         }
                     }
 
-                    curwin().w_cursor.set_col(regmatch.startpos[0].col);
+                    curwin().w_cursor.set_col(regmatch.match_start().col);
 
                     if nmatch > curbuf().b_ml.ml_line_count.get() - sub_firstlnum + 1 {
                         nmatch = curbuf().b_ml.ml_line_count.get() - sub_firstlnum + 1;
@@ -4310,11 +4309,11 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                     }
 
                     if cmdpreview_ns > 0 && !has_second_delim {
-                        current_match.start.col = regmatch.startpos[0].col;
+                        current_match.start.col = regmatch.match_start().col;
                         if current_match.end.lnum == 0 {
                             current_match.end.lnum = sub_firstlnum + nmatch - 1;
                         }
-                        current_match.end.col = regmatch.endpos[0].col;
+                        current_match.end.col = regmatch.match_end().col;
 
                         if nmatch > 1 {
                             sub_firstlnum += nmatch - 1;
@@ -4352,7 +4351,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         let sub_bytes = sub_owned.as_deref().map_or(&b""[..], CStr::to_bytes);
                         let mut sublen = {
                             let _textlock = input_state().lock_text();
-                            let rel_lnum = sub_firstlnum - regmatch.startpos[0].lnum;
+                            let rel_lnum = sub_firstlnum - regmatch.match_start().lnum;
                             vim_regsub_multi(
                                 &regmatch,
                                 rel_lnum,
@@ -4387,14 +4386,14 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         // A `\zs` in a look-behind can start the match inside text that was
                         // already replaced: replace only the text after it.
                         let start = Lpos {
-                            col: regmatch.startpos[0].col.max(copycol),
-                            ..regmatch.startpos[0]
+                            col: regmatch.match_start().col.max(copycol),
+                            ..regmatch.match_start()
                         };
                         let copy_len = (start.col - copycol) as usize;
                         sub_grow_buf(
                             &mut new_start,
                             &mut new_start_size,
-                            copy_len + (tmp_size - regmatch.endpos[0].col as usize) + sublen + 1,
+                            copy_len + (tmp_size - regmatch.match_end().col as usize) + sublen + 1,
                         );
 
                         let cc = copycol as usize;
@@ -4414,7 +4413,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
 
                         let mut n = {
                             let _textlock = input_state().lock_text();
-                            let rel_lnum = sub_firstlnum - regmatch.startpos[0].lnum;
+                            let rel_lnum = sub_firstlnum - regmatch.match_start().lnum;
                             vim_regsub_multi(
                                 &regmatch,
                                 rel_lnum,
@@ -4439,7 +4438,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
 
                         curwin().w_cursor.set_col(0);
 
-                        copycol = regmatch.endpos[0].col;
+                        copycol = regmatch.match_end().col;
 
                         if nmatch > 1 {
                             sub_firstlnum += nmatch - 1;
@@ -4461,7 +4460,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         }
 
                         let mut replaced_bytes: Bcount = 0;
-                        let end = regmatch.endpos[0];
+                        let end = regmatch.match_end();
                         for j in 0..(nmatch - 1) {
                             replaced_bytes +=
                                 crate::memline::ml_get_slice(lnum_start + j).len() as Bcount + 1;
@@ -4575,7 +4574,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
                         );
                         nmatch == 0
                     }
-                    || regmatch.startpos[0].lnum > 0
+                    || regmatch.match_start().lnum > 0
                 {
                     if !new_start.is_null() {
                         let cc = (copycol as usize).min(sub_firstline.size);
@@ -4666,7 +4665,7 @@ fn do_sub(eap: &mut Exarg, tm: Proftime, cmdpreview_ns: i32, cmdpreview_bufnr: O
 
                     if nmatch <= 0 {
                         if nmatch == -1 {
-                            lnum -= regmatch.startpos[0].lnum;
+                            lnum -= regmatch.match_start().lnum;
                         }
                         push_preview_lines(cmdpreview_ns, &mut preview_lines, current_match);
                         break;
