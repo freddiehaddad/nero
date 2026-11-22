@@ -434,4 +434,34 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('matches a decomposed character as one character in both engines', function()
+    -- "é" written as "e" and a combining acute accent; a combining tilde.
+    local e, tilde = 'e\204\129', '\204\131'
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          collection = '[' .. e .. ']x',
+          negated_collection = '[' .. e .. ']x',
+          collection_ic = '[' .. e .. ']x',
+          class_collection = '[' .. e .. '][x]',
+          collection_then_x = '[' .. e .. 'x]',
+          collection_extra_accent = '[' .. e .. tilde .. ']x',
+        },
+        n.exec_lua(function(p, e_, tilde_)
+          local function sub(s, pat)
+            return vim.fn.substitute(s, p .. pat, '[&]', 'g')
+          end
+          return {
+            collection = sub(e_ .. 'x', '[e]'),
+            negated_collection = sub(e_ .. 'x', '[^x]'),
+            collection_ic = sub(e_ .. 'x', '\\c[E]'),
+            class_collection = sub(e_ .. 'x', '[[:alpha:]]'),
+            collection_then_x = sub(e_ .. 'x', '[^y]x'),
+            collection_extra_accent = sub(e_ .. tilde_ .. 'x', '[' .. e_ .. ']'),
+          }
+        end, [[\%#=]] .. engine, e, tilde)
+      )
+    end
+  end)
 end)

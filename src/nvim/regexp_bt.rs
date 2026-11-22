@@ -3300,18 +3300,23 @@ fn regmatch_inner(
                             if c == NUL as i32 || (matched.is_none() == (op == ANYOF)) {
                                 status = RegAction::NoMatch;
                             } else {
-                                let q_utfc = crate::mbyte::utfc_slice2len(q_slice);
+                                // The composing characters of the first item must follow the
+                                // base character, whichever item matched (as upstream does).
                                 let q_utf = crate::mbyte::utf_slice2len(q_slice);
-                                let len = q_utfc - q_utf;
-                                let step = utf_ptr2len(rex.rest()) as usize;
-                                rex.advance_input(step);
-                                if len != 0 {
-                                    let q_comp = &q_slice[q_utf..q_utf + len];
+                                let q_utfc = crate::mbyte::utfc_slice2len(q_slice);
+                                if q_utfc == q_utf {
+                                    advance_reginput(rex);
+                                } else {
+                                    let marks = &q_slice[q_utf..q_utfc];
                                     let rest = rex.rest();
-                                    if q_comp != &rest[..len.min(rest.len())] {
+                                    let base = utf_ptr2len(rest) as usize;
+                                    if rest.get(base..).unwrap_or_default().starts_with(marks) {
+                                        // The match includes the rest of the character.
+                                        let len = utfc_ptr2len(rest) as usize;
+                                        rex.advance_input(len.max(base + marks.len()));
+                                    } else {
                                         status = RegAction::NoMatch;
                                     }
-                                    rex.advance_input(len);
                                 }
                             }
                         }
