@@ -112,10 +112,145 @@ struct Regstar {
 
 const JUST_CALC_SIZE: usize = usize::MAX;
 
+/// A loop's BACK and where the input was when matching last reached it.
 #[derive(Clone, Copy)]
-pub(super) struct Backpos {
+struct Backpos {
     bp_scan: usize,
-    bp_pos: Regsave,
+    bp_pos: RegPos,
+}
+
+/// A change to what loops keep track of, with what it replaced.
+#[derive(Clone, Copy)]
+enum LoopChange {
+    /// Matching reached a BACK for the first time, which added entry `idx` to `backpos`.
+    Added { idx: u32 },
+    /// The pass count of `\{n,m}` loop `no` was `old`.
+    Count { no: u32, old: i32 },
+}
+
+impl LoopChange {
+    /// What the change is to: a `backpos` entry or a pass count.
+    #[inline(always)]
+    fn key(self) -> (bool, u32) {
+        match self {
+            Self::Added { idx } => (false, idx),
+            Self::Count { no, .. } => (true, no),
+        }
+    }
+}
+
+/// What loops keep track of while matching: where matching last reached each loop's BACK
+/// (upstream's `backpos`; a pass that ends where the previous one ended matched nothing), and the
+/// pass count of each `\{n,m}` loop (`brace_count` in [`Regexec`]). Added entries and count
+/// changes go on `log`. A saved position records how long the log was, and restoring it undoes
+/// the changes made since, so that matching that backs up continues with the counts it had there.
+struct LoopState {
+    backpos: Vec<Backpos>,
+    log: Vec<LoopChange>,
+}
+
+impl LoopState {
+    const fn new() -> Self {
+        Self {
+            backpos: Vec::new(),
+            log: Vec::new(),
+        }
+    }
+
+    /// How many changes are on the log, for [`reg_save`].
+    #[inline(always)]
+    fn changes(&self) -> usize {
+        self.log.len()
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.backpos.clear();
+        self.log.clear();
+    }
+
+    /// Records that matching reached the BACK at `scan`. Returns false when the input is where
+    /// it was the last time matching got there: the pass matched nothing.
+    ///
+    /// Like upstream, backing up does not move an entry back. When an abandoned attempt moved
+    /// it, a pass that matches nothing after backing up goes unnoticed, and a loop can repeat
+    /// until E363: `\(x\=\)\+y` on "x" (#163). Moving entries back fixes that, but nested loops
+    /// then try every way to split the text: `\%(\%(\a\)*\)*c$` on "c" and 24 letters takes
+    /// seconds instead of failing with E363 at once.
+    #[inline(always)]
+    fn pass(&mut self, rex: &Regexec<'_>, scan: usize) -> bool {
+        if let Some(idx) = self.backpos.iter().position(|bp| bp.bp_scan == scan) {
+            if reg_pos_equal(rex, &self.backpos[idx].bp_pos) {
+                return false;
+            }
+            self.backpos[idx].bp_pos = reg_pos(rex);
+        } else {
+            self.log.push(LoopChange::Added {
+                idx: self.backpos.len() as u32,
+            });
+            self.backpos.push(Backpos {
+                bp_scan: scan,
+                bp_pos: reg_pos(rex),
+            });
+        }
+        true
+    }
+
+    /// Sets the pass count of `\{n,m}` loop `no`.
+    #[inline(always)]
+    fn set_count(&mut self, rex: &mut Regexec<'_>, no: usize, count: i32) {
+        self.log.push(LoopChange::Count {
+            no: no as u32,
+            old: rex.brace_count[no],
+        });
+        rex.brace_count[no] = count;
+    }
+
+    /// Undoes the changes after the first `len`, newest first.
+    #[inline(always)]
+    fn undo_to(&mut self, rex: &mut Regexec<'_>, len: usize) {
+        if self.log.len() > len {
+            self.undo_after(rex, len);
+        }
+    }
+
+    /// Not inlined, like [`undo_groups_after`]: only loops that repeat a sub-pattern need it.
+    #[inline(never)]
+    fn undo_after(&mut self, rex: &mut Regexec<'_>, len: usize) {
+        for change in self.log.drain(len..).rev() {
+            match change {
+                LoopChange::Added { idx } => {
+                    let added = self.backpos.pop();
+                    debug_assert!(added.is_some() && idx as usize == self.backpos.len());
+                }
+                LoopChange::Count { no, old } => rex.brace_count[no as usize] = old,
+            }
+        }
+    }
+
+    /// Keeps only the first change to each thing after the first `len`. Once the operand of a
+    /// `\@>` matched, matching can back up only to before it, and undoing the first change puts
+    /// back what was there. Without this a `\@>` in a loop would keep every change its operand
+    /// made.
+    #[inline(always)]
+    fn keep_first_changes(&mut self, len: usize) {
+        if self.log.len() > len + 1 {
+            self.keep_first_changes_after(len);
+        }
+    }
+
+    #[inline(never)]
+    fn keep_first_changes_after(&mut self, len: usize) {
+        let mut kept = len;
+        for i in len..self.log.len() {
+            let change = self.log[i];
+            if !self.log[len..kept].iter().any(|k| k.key() == change.key()) {
+                self.log[kept] = change;
+                kept += 1;
+            }
+        }
+        self.log.truncate(kept);
+    }
 }
 
 struct RegexpBtState {
@@ -2364,19 +2499,29 @@ pub(super) fn bt_regcomp(expr: &[u8], re_flags: i32) -> Option<BtRegprog> {
     Some(r)
 }
 
+/// The current position, as [`reg_save`] records it.
 #[inline(always)]
-fn reg_save(rex: &Regexec<'_>, backpos_len: usize, save: &mut Regsave) {
+fn reg_pos(rex: &Regexec<'_>) -> RegPos {
     if rex.reg_multi() {
-        save.rs_u = RegPos::from_pos(rex.cur_pos());
+        RegPos::from_pos(rex.cur_pos())
     } else {
-        save.rs_u.ptr = Some(rex.input);
+        RegPos {
+            ptr: Some(rex.input),
+            pos: Lpos::new(),
+        }
     }
-    save.rs_len = backpos_len as i32;
 }
 
-/// Restores the position `save` holds.
+/// Saves the current position, and how many changes `loops` has (see [`LoopState`]).
 #[inline(always)]
-fn reg_restore(rex: &mut Regexec<'_>, backpos: &mut Vec<Backpos>, save: &Regsave) {
+fn reg_save(rex: &Regexec<'_>, loop_changes: usize, save: &mut Regsave) {
+    save.rs_u = reg_pos(rex);
+    save.rs_len = loop_changes as i32;
+}
+
+/// Restores the position `save` holds, and undoes the changes to `loops` made since.
+#[inline(always)]
+fn reg_restore(rex: &mut Regexec<'_>, loops: &mut LoopState, save: &Regsave) {
     if rex.reg_multi() {
         let pos = save.rs_u.pos();
         if rex.lnum != pos.lnum {
@@ -2387,18 +2532,24 @@ fn reg_restore(rex: &mut Regexec<'_>, backpos: &mut Vec<Backpos>, save: &Regsave
     } else if let Some(ptr) = save.rs_u.ptr {
         rex.input = ptr;
     }
-    backpos.truncate(save.rs_len as usize);
+    loops.undo_to(rex, save.rs_len as usize);
+}
+
+/// Whether the current position is `pos`.
+#[inline(always)]
+fn reg_pos_equal(rex: &Regexec<'_>, pos: &RegPos) -> bool {
+    if rex.reg_multi() {
+        let pos = pos.pos();
+        rex.lnum == pos.lnum && rex.input_col() == pos.col
+    } else {
+        pos.ptr == Some(rex.input)
+    }
 }
 
 /// Whether the current position is the one `save` holds.
 #[inline(always)]
 fn reg_save_equal(rex: &Regexec<'_>, save: &Regsave) -> bool {
-    if rex.reg_multi() {
-        let pos = save.rs_u.pos();
-        rex.lnum == pos.lnum && rex.input_col() == pos.col
-    } else {
-        save.rs_u.ptr == Some(rex.input)
-    }
+    reg_pos_equal(rex, &save.rs_u)
 }
 
 /// Saves `*posp` in `savep` and sets it to the current position `cur`.
@@ -2827,7 +2978,10 @@ struct BtRegStack {
     stars: Vec<Regstar>,
     behinds: Vec<Regbehind>,
     behinds_len: usize,
-    backpos: Vec<Backpos>,
+    /// Not counted for 'maxmempattern', like upstream's `backpos`: its log grows with the passes
+    /// of loops, whose items are on the stack, and keeps only the first change to each thing in
+    /// the operand of a `\@>` that matched.
+    loops: LoopState,
     max_bytes: usize,
     /// How long `trail` was when each [`RS_NOMATCH`] item (`\@=`, `\@!` or `\@>`) was pushed.
     marks: Vec<usize>,
@@ -2846,7 +3000,7 @@ impl BtRegStack {
             stars: Vec::new(),
             behinds: Vec::new(),
             behinds_len: 0,
-            backpos: Vec::new(),
+            loops: LoopState::new(),
             max_bytes: (1000usize) << 10,
             marks: Vec::new(),
             trail: Vec::new(),
@@ -2880,9 +3034,7 @@ impl BtRegStack {
         self.marks.clear();
         self.trail.clear();
         self.open = 0;
-        if !self.backpos.is_empty() {
-            self.backpos.clear();
-        }
+        self.loops.clear();
     }
 
     #[inline(always)]
@@ -2983,7 +3135,7 @@ pub(super) fn free_bt_regstack() {
 #[inline(never)]
 fn behind_step_back(
     rex: &mut Regexec<'_>,
-    backpos: &mut Vec<Backpos>,
+    loops: &mut LoopState,
     rp: &mut Regitem,
     bp: &mut Regbehind,
     limit: i64,
@@ -3005,7 +3157,7 @@ fn behind_step_back(
                 return false;
             }
             rp.rs_un.regsave_mut().rs_u.pos_mut().lnum = lnum;
-            reg_restore(rex, backpos, rp.rs_un.regsave());
+            reg_restore(rex, loops, rp.rs_un.regsave());
             rp.rs_un.regsave_mut().rs_u.pos_mut().col = rex.getline_len(rex.lnum);
             bp.chars_back = 0;
             return true;
@@ -3499,27 +3651,10 @@ fn regmatch_inner(
                         }
                         NOTHING => {}
                         BACK => {
-                            let idx = if let Some(pos) = regstack
-                                .backpos
-                                .iter()
-                                .position(|item| item.bp_scan == scan_idx)
-                            {
-                                if reg_save_equal(rex, &regstack.backpos[pos].bp_pos) {
-                                    status = RegAction::NoMatch;
-                                }
-                                pos
-                            } else {
-                                let pos = regstack.backpos.len();
-                                regstack.backpos.push(Backpos {
-                                    bp_scan: scan_idx,
-                                    bp_pos: Regsave::new(),
-                                });
-                                pos
-                            };
-                            if status != RegAction::NoMatch {
-                                let mut pos_val = Regsave::new();
-                                reg_save(rex, regstack.backpos.len(), &mut pos_val);
-                                regstack.backpos[idx].bp_pos = pos_val;
+                            // A pass of a loop ends here. When the input is where it was the last
+                            // time matching got here, the pass matched nothing: stop looping.
+                            if !regstack.loops.pass(rex, scan_idx) {
+                                status = RegAction::NoMatch;
                             }
                         }
                         x if (MOPEN..=MOPEN + 9).contains(&x) => {
@@ -3641,7 +3776,7 @@ fn regmatch_inner(
                                 let no = (op_fn(prog, next) - BRACE_COMPLEX) as usize;
                                 rex.brace_min[no] = operand_min(prog, scan_idx);
                                 rex.brace_max[no] = operand_max(prog, scan_idx);
-                                rex.brace_count[no] = 0;
+                                regstack.loops.set_count(rex, no, 0);
                             } else {
                                 internal_error(c"BRACE_LIMITS");
                                 status = RegAction::Fail;
@@ -3649,17 +3784,15 @@ fn regmatch_inner(
                         }
                         x if (BRACE_COMPLEX..=BRACE_COMPLEX + 9).contains(&x) => {
                             let no = (op - BRACE_COMPLEX) as usize;
-                            let (bmin, bmax, bcount) = {
-                                let c = rex.brace_count[no] + 1;
-                                rex.brace_count[no] = c;
-                                (rex.brace_min[no], rex.brace_max[no], c)
-                            };
+                            let bcount = rex.brace_count[no] + 1;
+                            regstack.loops.set_count(rex, no, bcount);
+                            let (bmin, bmax) = (rex.brace_min[no], rex.brace_max[no]);
 
-                            let bp_len = regstack.backpos.len();
+                            let loop_changes = regstack.loops.changes();
                             if i64::from(bcount) <= bmin.min(bmax) {
                                 if let Some(rp) = regstack.push(RS_BRCPLX_MORE, scan) {
                                     rp.rs_no = no as i16;
-                                    reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                    reg_save(rex, loop_changes, rp.rs_un.regsave_mut());
                                     next = Some(operand_idx(scan_idx));
                                 } else {
                                     status = RegAction::Fail;
@@ -3668,7 +3801,7 @@ fn regmatch_inner(
                                 if i64::from(bcount) <= bmax {
                                     if let Some(rp) = regstack.push(RS_BRCPLX_LONG, scan) {
                                         rp.rs_no = no as i16;
-                                        reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                        reg_save(rex, loop_changes, rp.rs_un.regsave_mut());
                                         next = Some(operand_idx(scan_idx));
                                     } else {
                                         status = RegAction::Fail;
@@ -3676,7 +3809,7 @@ fn regmatch_inner(
                                 }
                             } else if i64::from(bcount) <= bmin {
                                 if let Some(rp) = regstack.push(RS_BRCPLX_SHORT, scan) {
-                                    reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                    reg_save(rex, loop_changes, rp.rs_un.regsave_mut());
                                 } else {
                                     status = RegAction::Fail;
                                 }
@@ -3730,10 +3863,10 @@ fn regmatch_inner(
                             }
                         }
                         NOMATCH | MATCH | SUBPAT => {
-                            let bp_len = regstack.backpos.len();
+                            let loop_changes = regstack.loops.changes();
                             if let Some(rp) = regstack.push(RS_NOMATCH, scan) {
                                 rp.rs_no = op as i16;
-                                reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                reg_save(rex, loop_changes, rp.rs_un.regsave_mut());
                                 regstack.marks.push(regstack.trail.len());
                                 regstack.open += 1;
                                 next = Some(operand_idx(scan_idx));
@@ -3742,10 +3875,10 @@ fn regmatch_inner(
                             }
                         }
                         BEHIND | NOBEHIND => {
-                            let bp_len = regstack.backpos.len();
+                            let loop_changes = regstack.loops.changes();
                             if let Some(rp) = regstack.push(RS_BEHIND1, scan) {
                                 rp.rs_no = op as i16;
-                                reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                reg_save(rex, loop_changes, rp.rs_un.regsave_mut());
                                 regstack.push_behind();
                             } else {
                                 status = RegAction::Fail;
@@ -3820,17 +3953,17 @@ fn regmatch_inner(
                         } else {
                             if status != RegAction::Break {
                                 let rp = regstack.items.last_mut().unwrap();
-                                reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                                reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
                                 scan = rp.rs_scan;
                             }
                             if scan.is_none() || op_fn(prog, scan) != BRANCH {
                                 status = RegAction::NoMatch;
                                 regstack.pop(&mut scan);
                             } else {
-                                let bp_len = regstack.backpos.len();
+                                let loop_changes = regstack.loops.changes();
                                 let rp = regstack.items.last_mut().unwrap();
                                 rp.rs_scan = regnext(prog, scan);
-                                reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                reg_save(rex, loop_changes, rp.rs_un.regsave_mut());
                                 scan = scan.map(operand_idx);
                             }
                         }
@@ -3839,7 +3972,8 @@ fn regmatch_inner(
                         if status == RegAction::NoMatch {
                             let rp = regstack.items.last_mut().unwrap();
                             let rs_no = rp.rs_no as usize;
-                            reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                            reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
+                            // Saved after its pass was counted: uncount it.
                             rex.brace_count[rs_no] -= 1;
                         }
                         regstack.pop(&mut scan);
@@ -3848,7 +3982,8 @@ fn regmatch_inner(
                         if status == RegAction::NoMatch {
                             let rp = regstack.items.last_mut().unwrap();
                             let rs_no = rp.rs_no as usize;
-                            reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                            reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
+                            // Saved after its pass was counted: uncount it.
                             rex.brace_count[rs_no] -= 1;
                             status = RegAction::Cont;
                         }
@@ -3860,7 +3995,7 @@ fn regmatch_inner(
                     RS_BRCPLX_SHORT => {
                         if status == RegAction::NoMatch {
                             let rp = regstack.items.last_mut().unwrap();
-                            reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                            reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
                         }
                         regstack.pop(&mut scan);
                         if status == RegAction::NoMatch {
@@ -3885,7 +4020,10 @@ fn regmatch_inner(
                         } else {
                             status = RegAction::Cont;
                             if rp.rs_no != SUBPAT as i16 {
-                                reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                                reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
+                            } else {
+                                let len = rp.rs_un.regsave().rs_len as usize;
+                                regstack.loops.keep_first_changes(len);
                             }
                         }
                         if status == RegAction::Cont && regstack.trail.len() > mark {
@@ -3913,17 +4051,17 @@ fn regmatch_inner(
                             regstack.pop(&mut scan);
                             regstack.pop_behind();
                         } else {
-                            let bp_len = regstack.backpos.len();
+                            let loop_changes = regstack.loops.changes();
                             let behind_idx = regstack.behinds_len - 1;
                             let bp = &mut regstack.behinds[behind_idx];
                             let rp = regstack.items.last_mut().unwrap();
-                            reg_save(rex, bp_len, &mut bp.save_after);
+                            reg_save(rex, loop_changes, &mut bp.save_after);
                             bp.save_behind = rex.behind_pos;
                             bp.chars_back = 0;
 
                             rex.behind_pos = *rp.rs_un.regsave();
                             rp.rs_state = RS_BEHIND2;
-                            reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                            reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
 
                             scan = rp.rs_scan.map(|idx| operand_idx(idx) + 4);
                         }
@@ -3935,7 +4073,7 @@ fn regmatch_inner(
                         if status == RegAction::Match && reg_save_equal(rex, &rex.behind_pos) {
                             rex.behind_pos = bp.save_behind;
                             if rp.rs_no == BEHIND as i16 {
-                                reg_restore(rex, &mut regstack.backpos, &bp.save_after);
+                                reg_restore(rex, &mut regstack.loops, &bp.save_after);
                             } else {
                                 status = RegAction::NoMatch;
                                 undo_groups(rex, &mut regstack.trail, bp.trail_len);
@@ -3945,8 +4083,8 @@ fn regmatch_inner(
                         } else {
                             // No match or a match that doesn't end where we want it.
                             let limit = operand_min(prog, rp.rs_scan.unwrap());
-                            if behind_step_back(rex, &mut regstack.backpos, rp, bp, limit) {
-                                reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                            if behind_step_back(rex, &mut regstack.loops, rp, bp, limit) {
+                                reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
                                 scan = rp.rs_scan.map(|idx| operand_idx(idx) + 4);
 
                                 if status == RegAction::Match {
@@ -3956,7 +4094,7 @@ fn regmatch_inner(
                             } else {
                                 rex.behind_pos = bp.save_behind;
                                 if rp.rs_no == NOBEHIND as i16 {
-                                    reg_restore(rex, &mut regstack.backpos, &bp.save_after);
+                                    reg_restore(rex, &mut regstack.loops, &bp.save_after);
                                     status = RegAction::Match;
                                 } else {
                                     // What follows matched, so it may have set groups.
@@ -3976,7 +4114,7 @@ fn regmatch_inner(
                             regstack.stars.pop();
                         } else {
                             if status != RegAction::Break {
-                                reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
+                                reg_restore(rex, &mut regstack.loops, rp.rs_un.regsave());
                             }
                             loop {
                                 if status != RegAction::Break {
@@ -4032,7 +4170,7 @@ fn regmatch_inner(
                                         && rst.next_fold != 0
                                         && folds_to(rex, rst.next_fold))
                                 {
-                                    reg_save(rex, regstack.backpos.len(), rp.rs_un.regsave_mut());
+                                    reg_save(rex, regstack.loops.changes(), rp.rs_un.regsave_mut());
                                     scan = regnext(prog, rp.rs_scan);
                                     status = RegAction::Cont;
                                     break;
@@ -4309,8 +4447,10 @@ fn finish_bt_regexec(
             st.marks = Vec::new();
             st.trail = Vec::new();
         }
-        if st.backpos.capacity() > BACKPOS_INITIAL as usize {
-            st.backpos = Vec::new();
+        if st.loops.backpos.capacity() > BACKPOS_INITIAL as usize
+            || st.loops.log.capacity() > BACKPOS_INITIAL as usize
+        {
+            st.loops = LoopState::new();
         }
         BT_REGSTACK.with(|c| *c.borrow_mut() = Some(st));
     }
@@ -4367,5 +4507,30 @@ mod tests {
 
         let allocated = BT_REGSTACK.with(|c| c.borrow().as_ref().map(|st| st.allocated_bytes()));
         assert!(allocated.is_some_and(|bytes| bytes <= REGSTACK_INITIAL as usize));
+    }
+
+    /// Undoing to where a `\@>` started puts back what the loops had there, after keeping only
+    /// the first change to each thing that its operand made.
+    #[test]
+    fn keeps_the_first_loop_changes_of_a_matched_atomic_group() {
+        let mut rex = Regexec::new(Target::Str, RegLine::Str(b"abcd"));
+        let mut loops = LoopState::new();
+        assert!(loops.pass(&rex, 10));
+        loops.set_count(&mut rex, 0, 3);
+        let mark = loops.changes();
+        // What the operand changes: a second loop is added and ends a pass, and the count of a
+        // loop entered again goes from 0 to 2.
+        for (input, scan) in [(2, 20), (3, 20)] {
+            rex.input = input;
+            assert!(loops.pass(&rex, scan));
+        }
+        for count in 0..=2 {
+            loops.set_count(&mut rex, 0, count);
+        }
+        loops.keep_first_changes(mark);
+        assert_eq!(loops.changes(), mark + 2);
+        loops.undo_to(&mut rex, mark);
+        assert_eq!(rex.brace_count[0], 3);
+        assert_eq!(loops.backpos.len(), 1);
     }
 }

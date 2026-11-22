@@ -557,4 +557,18 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('counts the passes of a repeated group after backing up in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        -- "ab" and then "x" is one pass, and "\{2}" needs two.
+        { last_pass_backed_up = {} },
+        n.exec_lua(function(p)
+          return {
+            last_pass_backed_up = vim.fn.matchlist('abx', p .. [[\(a\|ab\|bx\)\{2}x]]),
+          }
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)
