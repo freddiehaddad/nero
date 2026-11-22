@@ -3051,6 +3051,51 @@ fn addstate_here(
     true
 }
 
+/// Returns whether character `curc` is in the class that state `c` tests: `\i` to `\U`, and the
+/// `[a-z]`-like collections compiled to a class.
+// Not inlined, nor is check_char_class(): when they are, LLVM moves every class test out of the
+// loop over the states, so each character pays for every test, used by the pattern or not.
+#[inline(never)]
+fn class_matches(rex: &Regexec<'_>, c: i32, curc: i32) -> bool {
+    let nul = NUL as i32;
+    match c {
+        NFA_IDENT => vim_is_idc(curc),
+        NFA_SIDENT => !ascii_isdigit(curc) && vim_is_idc(curc),
+        NFA_KWORD => crate::charset::vim_iswordc_tab(curc, &rex.reg_chartab),
+        NFA_SKWORD => {
+            !ascii_isdigit(curc) && crate::charset::vim_iswordc_tab(curc, &rex.reg_chartab)
+        }
+        NFA_FNAME => vim_isfilec(curc),
+        NFA_SFNAME => !ascii_isdigit(curc) && vim_isfilec(curc),
+        NFA_PRINT => vim_isprintc(curc),
+        NFA_SPRINT => !ascii_isdigit(curc) && vim_isprintc(curc),
+        NFA_WHITE => ascii_iswhite(curc),
+        NFA_NWHITE => curc != nul && !ascii_iswhite(curc),
+        NFA_DIGIT => ri_digit(curc),
+        NFA_NDIGIT => curc != nul && !ri_digit(curc),
+        NFA_HEX => ri_hex(curc),
+        NFA_NHEX => curc != nul && !ri_hex(curc),
+        NFA_OCTAL => ri_octal(curc),
+        NFA_NOCTAL => curc != nul && !ri_octal(curc),
+        NFA_WORD => ri_word(curc),
+        NFA_NWORD => curc != nul && !ri_word(curc),
+        NFA_HEAD => ri_head(curc),
+        NFA_NHEAD => curc != nul && !ri_head(curc),
+        NFA_ALPHA => ri_alpha(curc),
+        NFA_NALPHA => curc != nul && !ri_alpha(curc),
+        NFA_LOWER => ri_lower(curc),
+        NFA_NLOWER => curc != nul && !ri_lower(curc),
+        NFA_UPPER => ri_upper(curc),
+        NFA_NUPPER => curc != nul && !ri_upper(curc),
+        NFA_LOWER_IC => ri_lower(curc) || (rex.reg_ic && ri_upper(curc)),
+        NFA_NLOWER_IC => curc != nul && !(ri_lower(curc) || (rex.reg_ic && ri_upper(curc))),
+        NFA_UPPER_IC => ri_upper(curc) || (rex.reg_ic && ri_lower(curc)),
+        NFA_NUPPER_IC => curc != nul && !(ri_upper(curc) || (rex.reg_ic && ri_lower(curc))),
+        _ => unreachable!("state {c} is not a character class"),
+    }
+}
+
+#[inline(never)]
 fn check_char_class(rex: &Regexec<'_>, cls: i32, c: i32) -> bool {
     match cls {
         NFA_CLASS_ALNUM => {
@@ -4074,184 +4119,8 @@ fn nfa_regmatch_ctx(
                     }
                     add_state = t_st.out;
                 }
-                NFA_IDENT => {
-                    if vim_is_idc(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_SIDENT => {
-                    if !ascii_isdigit(curc) && vim_is_idc(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_KWORD => {
-                    if crate::charset::vim_iswordc_tab(curc, &rex.reg_chartab) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_SKWORD => {
-                    if !ascii_isdigit(curc)
-                        && crate::charset::vim_iswordc_tab(curc, &rex.reg_chartab)
-                    {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_FNAME => {
-                    if vim_isfilec(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_SFNAME => {
-                    if !ascii_isdigit(curc) && vim_isfilec(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_PRINT => {
-                    if vim_isprintc(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_SPRINT => {
-                    if !ascii_isdigit(curc) && vim_isprintc(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_WHITE => {
-                    if ascii_iswhite(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NWHITE => {
-                    if curc != NUL as i32 && !ascii_iswhite(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_DIGIT => {
-                    if ri_digit(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NDIGIT => {
-                    if curc != NUL as i32 && !ri_digit(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_HEX => {
-                    if ri_hex(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NHEX => {
-                    if curc != NUL as i32 && !ri_hex(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_OCTAL => {
-                    if ri_octal(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NOCTAL => {
-                    if curc != NUL as i32 && !ri_octal(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_WORD => {
-                    if ri_word(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NWORD => {
-                    if curc != NUL as i32 && !ri_word(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_HEAD => {
-                    if ri_head(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NHEAD => {
-                    if curc != NUL as i32 && !ri_head(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_ALPHA => {
-                    if ri_alpha(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NALPHA => {
-                    if curc != NUL as i32 && !ri_alpha(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_LOWER => {
-                    if ri_lower(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NLOWER => {
-                    if curc != NUL as i32 && !ri_lower(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_UPPER => {
-                    if ri_upper(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NUPPER => {
-                    if curc != NUL as i32 && !ri_upper(curc) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_LOWER_IC => {
-                    if ri_lower(curc) || (rex.reg_ic && ri_upper(curc)) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NLOWER_IC => {
-                    if curc != NUL as i32 && !(ri_lower(curc) || (rex.reg_ic && ri_upper(curc))) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_UPPER_IC => {
-                    if ri_upper(curc) || (rex.reg_ic && ri_lower(curc)) {
-                        add_state = t_st.out;
-                        add_off = clen;
-                    }
-                }
-                NFA_NUPPER_IC => {
-                    if curc != NUL as i32 && !(ri_upper(curc) || (rex.reg_ic && ri_lower(curc))) {
+                c @ NFA_IDENT..=NFA_NUPPER_IC => {
+                    if class_matches(rex, c, curc) {
                         add_state = t_st.out;
                         add_off = clen;
                     }
