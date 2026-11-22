@@ -102,6 +102,8 @@ static CLASSCODES: [i32; 27] = [
 struct Regstar {
     nextb: i32,
     nextb_ic: i32,
+    /// With 'ignorecase', the folded first character of the literal after the repeat.
+    next_fold: i32,
     count: i64,
     minval: i64,
     #[expect(dead_code)]
@@ -258,6 +260,52 @@ fn multibytecode_len(rex: &Regexec<'_>, rest: &[u8], c: &[u8]) -> Option<usize> 
     }
     let mut n = c.len() as i32;
     (rex.cstrncmp(c, rest, &mut n) == 0).then_some(n as usize)
+}
+
+/// What the literal after a repeat starts with, to skip positions where it cannot match: its first
+/// byte, that byte in the other case, and with 'ignorecase' its first character folded, else 0
+/// (upstream's nextb and nextb_ic).
+#[inline(always)]
+fn star_next_literal(rex: &Regexec<'_>, prog: &[u8], next: Option<usize>) -> (i32, i32, i32) {
+    let Some(next_idx) = next.filter(|_| op_fn(prog, next) == EXACTLY) else {
+        return (NUL as i32, NUL as i32, 0);
+    };
+    let nb = i32::from(prog[operand_idx(next_idx)]);
+    if !rex.reg_ic {
+        (nb, nb, 0)
+    } else if nb < 0x80 {
+        let other = if mb_isupper(nb) {
+            mb_tolower(nb)
+        } else {
+            mb_toupper(nb)
+        };
+        (nb, other, utf_fold(nb))
+    } else {
+        star_next_multibyte(&prog[operand_idx(next_idx)..])
+    }
+}
+
+/// [`star_next_literal`] for a literal that starts with a multibyte character, with 'ignorecase'.
+#[inline(never)]
+fn star_next_multibyte(opnd: &[u8]) -> (i32, i32, i32) {
+    let fold = utf_fold(crate::mbyte::utf_slice2char(opnd));
+    // The character matches an ASCII one only by folding to it; -1 matches no byte.
+    if fold < 0x80 {
+        let other = if mb_isupper(fold) {
+            mb_tolower(fold)
+        } else {
+            mb_toupper(fold)
+        };
+        (fold, other, fold)
+    } else {
+        (-1, -1, fold)
+    }
+}
+
+/// Whether the character at the current position folds to `fold`.
+#[inline(never)]
+fn folds_to(rex: &Regexec<'_>, fold: i32) -> bool {
+    utf_fold(utf_ptr2char(rex.rest())) == fold
 }
 
 fn bt_recognize_char_class(slice: &[u8]) -> i32 {
@@ -3636,23 +3684,8 @@ fn regmatch_inner(
                             } else {
                                 count >= maxval
                             } {
-                                let (nextb, nextb_ic) = if let Some(next_idx) = next
-                                    && op_fn(prog, next) == EXACTLY
-                                {
-                                    let nb = i32::from(prog[operand_idx(next_idx)]);
-                                    let nb_ic = if rex.reg_ic {
-                                        if mb_isupper(nb) {
-                                            mb_tolower(nb)
-                                        } else {
-                                            mb_toupper(nb)
-                                        }
-                                    } else {
-                                        nb
-                                    };
-                                    (nb, nb_ic)
-                                } else {
-                                    (NUL as i32, NUL as i32)
-                                };
+                                let (nextb, nextb_ic, next_fold) =
+                                    star_next_literal(rex, prog, next);
                                 if regstack
                                     .push(
                                         if minval <= maxval {
@@ -3667,6 +3700,7 @@ fn regmatch_inner(
                                     regstack.stars.push(Regstar {
                                         nextb,
                                         nextb_ic,
+                                        next_fold,
                                         count,
                                         minval,
                                         maxval,
@@ -3973,7 +4007,14 @@ fn regmatch_inner(
                                 }
 
                                 let ib = rex.input_byte() as i32;
-                                if rst.nextb == NUL as i32 || ib == rst.nextb || ib == rst.nextb_ic
+                                // With 'ignorecase' a multibyte character can fold to the next
+                                // letter though its first byte differs, such as "ſ" to "s".
+                                if rst.nextb == NUL as i32
+                                    || ib == rst.nextb
+                                    || ib == rst.nextb_ic
+                                    || (ib >= 0x80
+                                        && rst.next_fold != 0
+                                        && folds_to(rex, rst.next_fold))
                                 {
                                     reg_save(rex, regstack.backpos.len(), rp.rs_un.regsave_mut());
                                     scan = regnext(prog, rp.rs_scan);
@@ -4139,8 +4180,9 @@ pub(super) fn bt_regexec_both(
                 break false;
             };
             s += found_off;
+            // Compare as EXACTLY does: the text may differ in length, such as "ſ" for "s".
             let mut len = prog.regmlen;
-            if rex.cstrncmp(&line[s..], regmust, &mut len) == 0 {
+            if rex.cstrncmp(regmust, &line[s..], &mut len) == 0 {
                 break true;
             }
             s += utfc_ptr2len(&line[s..]) as usize;

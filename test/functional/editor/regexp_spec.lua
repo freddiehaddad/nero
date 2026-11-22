@@ -468,6 +468,8 @@ describe('regexp engine', function()
           -- A repeated class decides by the base character.
           word_repeat = '[' .. e .. e .. 'x]',
           not_word_repeat = e .. e .. '[ ]',
+          -- With "\Z" the text the pattern needs may lack the accent.
+          needed_text_icombine = '[xe]',
         },
         n.exec_lua(function(p, e_, tilde_)
           local acute_ = e_:sub(2)
@@ -504,6 +506,7 @@ describe('regexp engine', function()
             lone_accent_star = sub(e_ .. 'x', acute_ .. '*'),
             word_repeat = sub(e_ .. e_ .. 'x', '\\w\\+'),
             not_word_repeat = sub(e_ .. e_ .. ' ', '\\W\\+'),
+            needed_text_icombine = sub('xe', '.*' .. e_ .. '\\Z'),
           }
         end, [[\%#=]] .. engine, e, tilde)
       )
@@ -518,6 +521,10 @@ describe('regexp engine', function()
           repeat_long_s = 'x[ſſ]x',
           repeat_s = 'x[ss]x',
           repeat_kelvin = 'x[' .. kelvin .. kelvin .. ']x',
+          -- The letter after a repeat.
+          after_repeat_long_s = '[aſ]',
+          after_repeat_s = '[as]',
+          after_repeat_omega = '[xω]',
         },
         n.exec_lua(function(p, kelvin_)
           local function sub(s, pat)
@@ -527,6 +534,9 @@ describe('regexp engine', function()
             repeat_long_s = sub('xſſx', '\\cs\\+'),
             repeat_s = sub('xssx', '\\cſ\\+'),
             repeat_kelvin = sub('x' .. kelvin_ .. kelvin_ .. 'x', '\\ck\\+'),
+            after_repeat_long_s = sub('aſ', '\\ca*s'),
+            after_repeat_s = sub('as', '\\ca*ſ'),
+            after_repeat_omega = sub('xω', '\\cx*Ω'),
           }
         end, [[\%#=]] .. engine, kelvin)
       )

@@ -2877,7 +2877,8 @@ impl Regexec<'_> {
             let mut junk: i32 = 0;
             let mut junk2: i32 = 0;
 
-            while ((s1_b.len() - rem1.len()) as i32) < *n {
+            // Both strings can end before "*n" bytes, and neither advances past its end.
+            while ((s1_b.len() - rem1.len()) as i32) < *n && !(rem1.is_empty() && rem2.is_empty()) {
                 c1 = mb_ptr2char_adv(&mut rem1);
                 c2 = mb_ptr2char_adv(&mut rem2);
 
