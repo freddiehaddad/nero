@@ -2601,7 +2601,7 @@ fn regrepeat(
     rex.input = scan;
     count as i32
 }
-#[derive(Default)]
+
 struct BtRegStack {
     items: Vec<Regitem>,
     stars: Vec<Regstar>,
@@ -2678,13 +2678,15 @@ impl BtRegStack {
 }
 
 std::thread_local! {
-    static BT_REGSTACK: std::cell::RefCell<BtRegStack> = const {
-        std::cell::RefCell::new(BtRegStack::new())
+    /// The stack of the last match, for the next to reuse. Boxed: a match takes it out, and
+    /// moving a pointer costs less than moving the stack.
+    static BT_REGSTACK: std::cell::RefCell<Option<Box<BtRegStack>>> = const {
+        std::cell::RefCell::new(None)
     };
 }
 
 pub(super) fn free_bt_regstack() {
-    BT_REGSTACK.with(|c| *c.borrow_mut() = BtRegStack::new());
+    BT_REGSTACK.with(|c| *c.borrow_mut() = None);
 }
 
 #[inline(always)]
@@ -3985,7 +3987,9 @@ pub(super) fn bt_regexec_both(
     rex.lnum = 0;
     let line = rex.line.clone();
 
-    let mut regstack = BT_REGSTACK.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut regstack = BT_REGSTACK
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_else(|| Box::new(BtRegStack::new()));
     regstack.max_bytes = (opt_vars().p_mmp.get().max(1) as usize) << 10;
 
     if prog.reganch != 0 {
@@ -4071,7 +4075,7 @@ fn finish_bt_regexec(
     rex: &mut Regexec<'_>,
     retval: i32,
     col: Colnr,
-    regstack: Option<BtRegStack>,
+    regstack: Option<Box<BtRegStack>>,
 ) -> i32 {
     if let Some(mut st) = regstack {
         if st.byte_len() > REGSTACK_INITIAL as usize {
@@ -4082,7 +4086,7 @@ fn finish_bt_regexec(
         if st.backpos.capacity() > BACKPOS_INITIAL as usize {
             st.backpos = Vec::new();
         }
-        BT_REGSTACK.with(|c| *c.borrow_mut() = st);
+        BT_REGSTACK.with(|c| *c.borrow_mut() = Some(st));
     }
 
     if retval > 0 {
