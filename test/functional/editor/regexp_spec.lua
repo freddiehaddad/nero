@@ -193,6 +193,42 @@ describe('regexp engine', function()
     end
   end)
 
+  it('finds matches after a \\@> that spans lines in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          blocks = { 6, 1, 9, 3 },
+          two_lines = { 1, 2, 2, 2 },
+          from_line_end = { 1, 1, 2, 2 },
+          to_line_start = { 1, 2, 2, 1 },
+          empty_line = { 1, 2, 3, 2 },
+        },
+        n.exec_lua(function(p)
+          -- Where the first match starts and ends.
+          local function pos(lines, pat)
+            vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+            vim.api.nvim_win_set_cursor(0, { 1, 0 })
+            local s = vim.fn.searchpos(p .. pat, 'cW')
+            vim.api.nvim_win_set_cursor(0, { 1, 0 })
+            local e = vim.fn.searchpos(p .. pat, 'ceW')
+            return { s[1], s[2], e[1], e[2] }
+          end
+          return {
+            -- vim/vim#3651: the block without MIDDLE.
+            blocks = pos(
+              { 'BEGIN', 'some', 'MIDDLE', 'stuff', 'END', 'BEGIN', 'other', 'stuff', 'END' },
+              [[\%(BEGIN\_.\{-}\%(MIDDLE\|END\)\)\@>\%(END\)\@<=]]
+            ),
+            two_lines = pos({ 'xa', 'by' }, [[\(a\nb\)\@>y]]),
+            from_line_end = pos({ 'x', 'by' }, [[x\(\nb\)\@>y]]),
+            to_line_start = pos({ 'xa', 'b' }, [[\(a\n\)\@>b]]),
+            empty_line = pos({ 'xa', '', 'by' }, [[\(a\n\nb\)\@>y]]),
+          }
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
+
   it('prefers the first matching alternative in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(

@@ -87,6 +87,7 @@ Nero fixes an upstream bug only with the maintainer's approval (see [AGENTS.md](
 | Nero | Upstream | Code | Regression test | Upstream report |
 |---|---|---|---|---|
 | The NFA engine always tries a `\@>` atom. | Skips it when an equal state is already queued, so it misses matches. | `regexp_nfa.rs`: `NFA_START_PATTERN` | `finds matches after \@> in both engines` | Not reported |
+| The NFA engine continues after a `\@>` atom whose match spans lines. | Continues at the atom's end column on the wrong line, so a buffer search misses the match. | `regexp_nfa.rs`: `NFA_START_PATTERN`, `NFA_SKIP`, `skip_len()` | `finds matches after a \@> that spans lines in both engines` | vim/vim#3651 |
 | NFA alternatives keep their priority order. | A state queued by a later alternative blocks the same state from an earlier one. | `regexp_nfa.rs`: `addstate_here()` | `prefers the first matching alternative in both engines` | Not reported |
 | NFA submatches come only from the path that matched. | Look-arounds and `\@>` share one submatch buffer, so groups leak or are lost. | `regexp_nfa.rs`: callers of `recursive_regmatch()` | `reports submatches only from the path that matched in both engines` | Not reported |
 | The NFA engine honors `\zs` and `\ze` inside look-arounds and `\@>`. | Ignores them. | `regexp_nfa.rs`: `nfa_postprocess()`, `recursive_regmatch()` | `applies \zs and \ze inside look-arounds and \@> in both engines` | Not reported |

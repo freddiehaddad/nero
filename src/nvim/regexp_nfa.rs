@@ -3201,6 +3201,20 @@ fn match_backref(rex: &mut Regexec<'_>, sub: &Regsub, subidx: i32, bytelen: &mut
     false
 }
 
+/// How many steps `NFA_SKIP` takes from the current position to `end`: one per byte and one per
+/// line break.
+fn skip_len(rex: &Regexec<'_>, end: Lpos) -> i32 {
+    if end.lnum <= rex.lnum {
+        return end.col - rex.input_col();
+    }
+    // The rest of this line and its line break, then each line up to `end`.
+    let mut len = rex.line().len() as i32 - rex.input_col() + 1;
+    for lnum in rex.lnum + 1..end.lnum {
+        len += rex.getline_len(lnum) + 1;
+    }
+    len + end.col
+}
+
 fn match_zref(rex: &mut Regexec<'_>, subidx: i32, bytelen: &mut i32) -> bool {
     rex.cleanup_zsubexpr();
     let Some(ref em) = RE_STATE.with(|s| s.re_extmatch_in.get()) else {
@@ -3902,11 +3916,20 @@ fn nfa_regmatch_ctx(
                     }
                     if res != 0 {
                         thislist.t[t_idx].subs = sub_m;
-                        // TODO(RE): multi-line match
-                        let bytelen = atom_end.col - rex.input_col();
+                        let bytelen = skip_len(rex, atom_end);
                         if bytelen == 0 {
                             add_here = true;
                             add_state = out1_out_out;
+                        } else if curc == NUL as i32 && rex.reg_multi() {
+                            // The atom's match goes on in the next line.
+                            go_to_nextline = true;
+                            add_off = -1;
+                            if bytelen == 1 {
+                                add_state = out1_out_out;
+                            } else {
+                                add_state = out1_out;
+                                add_count = bytelen - 1;
+                            }
                         } else if bytelen <= clen {
                             add_state = out1_out_out;
                             add_off = clen;
@@ -4273,7 +4296,22 @@ fn nfa_regmatch_ctx(
                 }
                 NFA_SKIP => {
                     let t_count = thislist.t[t_idx].count;
-                    if t_count - clen <= 0 {
+                    if curc == NUL as i32
+                        && !rex.reg_line_lbr
+                        && rex.reg_multi()
+                        && rex.lnum <= rex.reg_maxline
+                    {
+                        // Skipping the match of a "\@>" that spans lines: the line break counts
+                        // as one.
+                        go_to_nextline = true;
+                        add_off = -1;
+                        if t_count <= 1 {
+                            add_state = t_st.out;
+                        } else {
+                            add_state = Some(t_state_idx);
+                            add_count = t_count - 1;
+                        }
+                    } else if t_count - clen <= 0 {
                         add_state = t_st.out;
                         add_off = clen;
                     } else {
