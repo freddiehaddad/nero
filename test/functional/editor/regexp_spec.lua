@@ -85,17 +85,30 @@ describe('regexp engine', function()
   it('resolves \\z( \\) captures in syntax regions in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(
-        { 'Z', 'Z', 'Z', 'Z', 'Z', '' },
+        {
+          nested = { 'Z', 'Z', 'Z', 'Z', 'Z', '' },
+          failed_atomic = { 'Z', '', 'Z', '' },
+        },
         n.exec_lua(function(re)
           vim.o.regexpengine = re
-          vim.cmd('syntax on | syntax clear')
-          vim.api.nvim_buf_set_lines(0, 0, -1, false, { '<a>', 'x', '</b>', 'y', '</a>', 'z' })
-          vim.cmd([[syntax region Z start="<\z(\w\+\)>" end="</\z1>"]])
-          local names = {}
-          for lnum = 1, 6 do
-            names[lnum] = vim.fn.synIDattr(vim.fn.synID(lnum, 1, 0), 'name')
+          local function names(lines, region)
+            vim.cmd('syntax on | syntax clear')
+            vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+            vim.cmd('syntax region Z ' .. region)
+            local r = {}
+            for lnum = 1, #lines do
+              r[lnum] = vim.fn.synIDattr(vim.fn.synID(lnum, 1, 0), 'name')
+            end
+            return r
           end
-          return names
+          return {
+            nested = names(
+              { '<a>', 'x', '</b>', 'y', '</a>', 'z' },
+              [[start="<\z(\w\+\)>" end="</\z1>"]]
+            ),
+            -- The first branch captures "a" and fails, so the region has no \z1 and ends at once.
+            failed_atomic = names({ 'a', 'b', 'a', 'c' }, [[start="\z(a\)\@>x\|a" end="\z1"]]),
+          }
         end, engine)
       )
     end
@@ -297,29 +310,36 @@ describe('regexp engine', function()
                           |
     ]])
   end)
-  it('reports NFA submatches only from the path that matched', function()
-    eq(
-      {
-        atomic_alternative = { 'b', '' },
-        postponed_lookbehind = { 'abc', 'a', 'b' },
-        postponed_lookahead = { 'abc', 'a', 'b', 'c' },
-        negative_lookahead = { '', '', '' },
-        failed_branch_ze = { 'b' },
-      },
-      n.exec_lua(function()
-        -- Only the NFA engine: the backtracking engine keeps groups set by failed attempts.
-        local function ml(str, pat, count)
-          return vim.list_slice(vim.fn.matchlist(str, [[\%#=2]] .. pat), 1, count)
-        end
-        local r = {}
-        r.atomic_alternative = ml('ab', [[\(a\)\@>x\|b]], 2)
-        r.postponed_lookbehind = ml('abc', [[\(a\)b\(b\)\@<=c]], 3)
-        r.postponed_lookahead = ml('abc', [[\(a\)\(b\)\(c\)\@=c]], 4)
-        r.negative_lookahead = ml('0', [[\(\(\d\)\@>0\)\@!]], 3)
-        r.failed_branch_ze = ml('xb', [[\(x\@>c\|\ze\&a\)\|b]], 1)
-        return r
-      end)
-    )
+  it('reports submatches only from the path that matched in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          atomic_alternative = { 'b', '' },
+          atomic_then_alternative = { 'aaaa', '' },
+          postponed_lookbehind = { 'abc', 'a', 'b' },
+          postponed_lookahead = { 'abc', 'a', 'b', 'c' },
+          negative_lookahead = { '', '', '' },
+          failed_negative_lookahead = { 'ab', 'a', '' },
+          failed_lookbehind = { 'b', '', '', 'b' },
+          failed_branch_ze = { 'b' },
+        },
+        n.exec_lua(function(p)
+          local function ml(str, pat, count)
+            return vim.list_slice(vim.fn.matchlist(str, p .. pat), 1, count)
+          end
+          local r = {}
+          r.atomic_alternative = ml('ab', [[\(a\)\@>x\|b]], 2)
+          r.atomic_then_alternative = ml('aaaa', [[\(a*\)\@>a\|a\+]], 2)
+          r.postponed_lookbehind = ml('abc', [[\(a\)b\(b\)\@<=c]], 3)
+          r.postponed_lookahead = ml('abc', [[\(a\)\(b\)\(c\)\@=c]], 4)
+          r.negative_lookahead = ml('0', [[\(\(\d\)\@>0\)\@!]], 3)
+          r.failed_negative_lookahead = ml('ab', [[\(\(a\)\@!\|a\)b]], 3)
+          r.failed_lookbehind = ml('ab', [[\(x\)\@<=\(b\)\|\(b\)]], 4)
+          r.failed_branch_ze = ml('xb', [[\(x\@>c\|\ze\&a\)\|b]], 1)
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
   end)
 
   it('matches a long grapheme cluster as one character in both engines', function()

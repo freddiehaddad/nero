@@ -642,6 +642,9 @@ pub(super) const RS_BEHIND1: Regstate = 10;
 pub(super) const RS_BEHIND2: Regstate = 11;
 pub(super) const RS_STAR_LONG: Regstate = 12;
 pub(super) const RS_STAR_SHORT: Regstate = 13;
+/// Left by a `\@=` or `\@>` whose operand changed groups: undoes those changes when matching backs
+/// out past it.
+pub(super) const RS_RESTORE: Regstate = 14;
 
 #[derive(Clone, Copy)]
 pub(super) enum RegItemSave {
@@ -731,9 +734,9 @@ pub(super) struct Regbehind {
     /// How many characters the start of the look-behind lies before its end, or before the end
     /// of the previous line once it crossed there.
     pub chars_back: i32,
-    pub save_need_clear_subexpr: bool,
-    pub save_start: [SaveSe; NSUBEXP],
-    pub save_end: [SaveSe; NSUBEXP],
+    /// How long the group trail was when the look-behind started: undoing it back to there puts
+    /// back the groups that the look-behind and what follows it set.
+    pub trail_len: usize,
 }
 
 pub(super) struct FragOut {

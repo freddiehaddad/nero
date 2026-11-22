@@ -2602,6 +2602,64 @@ fn regrepeat(
     count as i32
 }
 
+/// Which position of a group a `\(`, `\)`, `\z(` or `\z)` sets (`\zs` and `\ze` set those of
+/// group 0).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupEdge {
+    Start,
+    End,
+    ZStart,
+    ZEnd,
+}
+
+/// Puts back a group position that matching replaced.
+#[derive(Clone, Copy)]
+struct GroupUndo {
+    edge: GroupEdge,
+    no: u8,
+    old: SaveSe,
+}
+
+impl GroupUndo {
+    /// How to undo the change that the item of a `\(`, `\)`, `\z(` or `\z)` made to the `edge`
+    /// of its group.
+    #[inline(always)]
+    fn of(edge: GroupEdge, rp: &Regitem) -> Self {
+        Self {
+            edge,
+            no: rp.rs_no as u8,
+            old: *rp.rs_un.sesave(),
+        }
+    }
+
+    #[inline(always)]
+    fn apply(&self, rex: &mut Regexec<'_>) {
+        let no = usize::from(self.no);
+        match self.edge {
+            GroupEdge::Start => restore_se_m(rex, &self.old, no, false),
+            GroupEdge::End => restore_se_m(rex, &self.old, no, true),
+            GroupEdge::ZStart => restore_se_z(rex, &self.old, no, false),
+            GroupEdge::ZEnd => restore_se_z(rex, &self.old, no, true),
+        }
+    }
+}
+
+/// Undoes the group changes on `trail` after its first `len`, newest first.
+#[inline(always)]
+fn undo_groups(rex: &mut Regexec<'_>, trail: &mut Vec<GroupUndo>, len: usize) {
+    if trail.len() > len {
+        undo_groups_after(rex, trail, len);
+    }
+}
+
+/// Not inlined, like [`behind_step_back`]: only sub-patterns that set groups need it.
+#[inline(never)]
+fn undo_groups_after(rex: &mut Regexec<'_>, trail: &mut Vec<GroupUndo>, len: usize) {
+    for undo in trail.drain(len..).rev() {
+        undo.apply(rex);
+    }
+}
+
 struct BtRegStack {
     items: Vec<Regitem>,
     stars: Vec<Regstar>,
@@ -2609,6 +2667,14 @@ struct BtRegStack {
     behinds_len: usize,
     backpos: Vec<Backpos>,
     max_bytes: usize,
+    /// How long `trail` was when each [`RS_NOMATCH`] item (`\@=`, `\@!` or `\@>`) was pushed.
+    marks: Vec<usize>,
+    /// How to undo each group change made while a `\@=`, `\@!`, `\@>` or look-behind is open,
+    /// oldest first. An undo stays here after the item of its change is popped because the
+    /// operand matched: the sub-pattern may still fail, or matching may back out past it.
+    trail: Vec<GroupUndo>,
+    /// How many `\@=`, `\@!`, `\@>` and look-behinds are open.
+    open: usize,
 }
 
 impl BtRegStack {
@@ -2620,6 +2686,9 @@ impl BtRegStack {
             behinds_len: 0,
             backpos: Vec::new(),
             max_bytes: (1000usize) << 10,
+            marks: Vec::new(),
+            trail: Vec::new(),
+            open: 0,
         }
     }
 
@@ -2628,6 +2697,8 @@ impl BtRegStack {
         self.items.len() * size_of::<Regitem>()
             + self.stars.len() * size_of::<Regstar>()
             + self.behinds_len * size_of::<Regbehind>()
+            + self.marks.len() * size_of::<usize>()
+            + self.trail.len() * size_of::<GroupUndo>()
     }
 
     #[inline(always)]
@@ -2635,24 +2706,29 @@ impl BtRegStack {
         self.items.clear();
         self.stars.clear();
         self.behinds_len = 0;
+        self.marks.clear();
+        self.trail.clear();
+        self.open = 0;
         if !self.backpos.is_empty() {
             self.backpos.clear();
         }
     }
 
     #[inline(always)]
-    fn push_behind(&mut self, rex: &Regexec<'_>) {
+    fn push_behind(&mut self) {
         let idx = self.behinds_len;
         if idx == self.behinds.len() {
             self.behinds.push(Regbehind::default());
         }
         self.behinds_len = idx + 1;
-        save_subexpr(rex, &mut self.behinds[idx]);
+        self.behinds[idx].trail_len = self.trail.len();
+        self.open += 1;
     }
 
     #[inline(always)]
     fn pop_behind(&mut self) {
         self.behinds_len -= 1;
+        self.open -= 1;
     }
 
     #[inline(always)]
@@ -2675,6 +2751,44 @@ impl BtRegStack {
         let rp = self.items.pop().unwrap();
         *scan = rp.rs_scan;
     }
+
+    /// Records how to undo the change that the group item on top made, while a sub-pattern is
+    /// open.
+    #[inline(always)]
+    fn record_group(&mut self, edge: GroupEdge) {
+        if self.open > 0 {
+            self.push_undo(edge);
+        }
+    }
+
+    /// Not inlined: only groups inside sub-patterns need it.
+    #[inline(never)]
+    fn push_undo(&mut self, edge: GroupEdge) {
+        let undo = GroupUndo::of(edge, self.items.last().unwrap());
+        self.trail.push(undo);
+    }
+
+    /// Pops the item of a `\(`, `\)`, `\z(` or `\z)` that set the `edge` of a group. When
+    /// matching backs out, puts back the position it replaced and drops the undo that
+    /// [`Self::record_group`] recorded, which is the last one on the trail.
+    #[inline(always)]
+    fn pop_group(
+        &mut self,
+        rex: &mut Regexec<'_>,
+        status: RegAction,
+        edge: GroupEdge,
+        scan: &mut Option<usize>,
+    ) {
+        let rp = self.items.pop().unwrap();
+        *scan = rp.rs_scan;
+        if status == RegAction::NoMatch {
+            GroupUndo::of(edge, &rp).apply(rex);
+            if self.open > 0 {
+                let undo = self.trail.pop();
+                debug_assert!(undo.is_some_and(|u| u.edge == edge && i16::from(u.no) == rp.rs_no));
+            }
+        }
+    }
 }
 
 std::thread_local! {
@@ -2687,45 +2801,6 @@ std::thread_local! {
 
 pub(super) fn free_bt_regstack() {
     BT_REGSTACK.with(|c| *c.borrow_mut() = None);
-}
-
-#[inline(always)]
-fn save_subexpr(rex: &Regexec<'_>, bp: &mut Regbehind) {
-    let need_clear = rex.need_clear_subexpr;
-    bp.save_need_clear_subexpr = need_clear;
-    if need_clear {
-        return;
-    }
-    if rex.reg_multi() {
-        for i in 0..NSUBEXP {
-            bp.save_start[i].se_u = RegPos::from_pos(rex.rmm_startpos[i]);
-            bp.save_end[i].se_u = RegPos::from_pos(rex.rmm_endpos[i]);
-        }
-    } else {
-        for i in 0..NSUBEXP {
-            bp.save_start[i].se_u.ptr = rex.rm_startp[i];
-            bp.save_end[i].se_u.ptr = rex.rm_endp[i];
-        }
-    }
-}
-
-#[inline(always)]
-fn restore_subexpr(rex: &mut Regexec<'_>, bp: &Regbehind) {
-    rex.need_clear_subexpr = bp.save_need_clear_subexpr;
-    if bp.save_need_clear_subexpr {
-        return;
-    }
-    if rex.reg_multi() {
-        for i in 0..NSUBEXP {
-            rex.rmm_startpos[i] = bp.save_start[i].se_u.pos();
-            rex.rmm_endpos[i] = bp.save_end[i].se_u.pos();
-        }
-    } else {
-        for i in 0..NSUBEXP {
-            rex.rm_startp[i] = bp.save_start[i].se_u.ptr;
-            rex.rm_endp[i] = bp.save_end[i].se_u.ptr;
-        }
-    }
 }
 
 /// Moves the start of a look-behind one character back, to try again to match it so that it ends
@@ -3308,6 +3383,7 @@ fn regmatch_inner(
                             if let Some(rp) = regstack.push(RS_MOPEN, scan) {
                                 rp.rs_no = no as i16;
                                 save_se_m(rex, rp.rs_un.sesave_mut(), no, false);
+                                regstack.record_group(GroupEdge::Start);
                             } else {
                                 status = RegAction::Fail;
                             }
@@ -3323,6 +3399,7 @@ fn regmatch_inner(
                             if let Some(rp) = regstack.push(RS_ZOPEN, scan) {
                                 rp.rs_no = no as i16;
                                 save_se_z(rex, rp.rs_un.sesave_mut(), no, false);
+                                regstack.record_group(GroupEdge::ZStart);
                             } else {
                                 status = RegAction::Fail;
                             }
@@ -3333,6 +3410,7 @@ fn regmatch_inner(
                             if let Some(rp) = regstack.push(RS_MCLOSE, scan) {
                                 rp.rs_no = no as i16;
                                 save_se_m(rex, rp.rs_un.sesave_mut(), no, true);
+                                regstack.record_group(GroupEdge::End);
                             } else {
                                 status = RegAction::Fail;
                             }
@@ -3343,6 +3421,7 @@ fn regmatch_inner(
                             if let Some(rp) = regstack.push(RS_ZCLOSE, scan) {
                                 rp.rs_no = no as i16;
                                 save_se_z(rex, rp.rs_un.sesave_mut(), no, true);
+                                regstack.record_group(GroupEdge::ZEnd);
                             } else {
                                 status = RegAction::Fail;
                             }
@@ -3524,6 +3603,8 @@ fn regmatch_inner(
                             if let Some(rp) = regstack.push(RS_NOMATCH, scan) {
                                 rp.rs_no = op as i16;
                                 reg_save(rex, bp_len, rp.rs_un.regsave_mut());
+                                regstack.marks.push(regstack.trail.len());
+                                regstack.open += 1;
                                 next = Some(operand_idx(scan_idx));
                             } else {
                                 status = RegAction::Fail;
@@ -3534,7 +3615,7 @@ fn regmatch_inner(
                             if let Some(rp) = regstack.push(RS_BEHIND1, scan) {
                                 rp.rs_no = op as i16;
                                 reg_save(rex, bp_len, rp.rs_un.regsave_mut());
-                                regstack.push_behind(rex);
+                                regstack.push_behind();
                             } else {
                                 status = RegAction::Fail;
                             }
@@ -3586,38 +3667,10 @@ fn regmatch_inner(
                     RS_NOPEN => {
                         regstack.pop(&mut scan);
                     }
-                    RS_MOPEN => {
-                        if status == RegAction::NoMatch {
-                            let rp = regstack.items.last().unwrap();
-                            let no = rp.rs_no as usize;
-                            restore_se_m(rex, rp.rs_un.sesave(), no, false);
-                        }
-                        regstack.pop(&mut scan);
-                    }
-                    RS_ZOPEN => {
-                        if status == RegAction::NoMatch {
-                            let rp = regstack.items.last().unwrap();
-                            let no = rp.rs_no as usize;
-                            restore_se_z(rex, rp.rs_un.sesave(), no, false);
-                        }
-                        regstack.pop(&mut scan);
-                    }
-                    RS_MCLOSE => {
-                        if status == RegAction::NoMatch {
-                            let rp = regstack.items.last().unwrap();
-                            let no = rp.rs_no as usize;
-                            restore_se_m(rex, rp.rs_un.sesave(), no, true);
-                        }
-                        regstack.pop(&mut scan);
-                    }
-                    RS_ZCLOSE => {
-                        if status == RegAction::NoMatch {
-                            let rp = regstack.items.last().unwrap();
-                            let no = rp.rs_no as usize;
-                            restore_se_z(rex, rp.rs_un.sesave(), no, true);
-                        }
-                        regstack.pop(&mut scan);
-                    }
+                    RS_MOPEN => regstack.pop_group(rex, status, GroupEdge::Start, &mut scan),
+                    RS_ZOPEN => regstack.pop_group(rex, status, GroupEdge::ZStart, &mut scan),
+                    RS_MCLOSE => regstack.pop_group(rex, status, GroupEdge::End, &mut scan),
+                    RS_ZCLOSE => regstack.pop_group(rex, status, GroupEdge::ZEnd, &mut scan),
                     RS_BRANCH => {
                         if status == RegAction::Match {
                             regstack.pop(&mut scan);
@@ -3673,6 +3726,8 @@ fn regmatch_inner(
                         }
                     }
                     RS_NOMATCH => {
+                        regstack.open -= 1;
+                        let mark = *regstack.marks.last().unwrap();
                         let rp = regstack.items.last_mut().unwrap();
                         if status
                             == if rp.rs_no == NOMATCH as i16 {
@@ -3681,6 +3736,8 @@ fn regmatch_inner(
                                 RegAction::NoMatch
                             }
                         {
+                            // The sub-pattern fails: undo the groups its operand set.
+                            undo_groups(rex, &mut regstack.trail, mark);
                             status = RegAction::NoMatch;
                         } else {
                             status = RegAction::Cont;
@@ -3688,10 +3745,25 @@ fn regmatch_inner(
                                 reg_restore(rex, &mut regstack.backpos, rp.rs_un.regsave());
                             }
                         }
-                        regstack.pop(&mut scan);
-                        if status == RegAction::Cont {
-                            scan = regnext(prog, scan);
+                        if status == RegAction::Cont && regstack.trail.len() > mark {
+                            // The groups the operand set stand until matching backs out past
+                            // here: keep the item to undo them then.
+                            rp.rs_state = RS_RESTORE;
+                            scan = regnext(prog, rp.rs_scan);
+                        } else {
+                            regstack.marks.pop();
+                            regstack.pop(&mut scan);
+                            if status == RegAction::Cont {
+                                scan = regnext(prog, scan);
+                            }
                         }
+                    }
+                    RS_RESTORE => {
+                        let mark = regstack.marks.pop().unwrap();
+                        if status == RegAction::NoMatch {
+                            undo_groups(rex, &mut regstack.trail, mark);
+                        }
+                        regstack.pop(&mut scan);
                     }
                     RS_BEHIND1 => {
                         if status == RegAction::NoMatch {
@@ -3723,7 +3795,7 @@ fn regmatch_inner(
                                 reg_restore(rex, &mut regstack.backpos, &bp.save_after);
                             } else {
                                 status = RegAction::NoMatch;
-                                restore_subexpr(rex, bp);
+                                undo_groups(rex, &mut regstack.trail, bp.trail_len);
                             }
                             regstack.pop(&mut scan);
                             regstack.pop_behind();
@@ -3736,16 +3808,17 @@ fn regmatch_inner(
 
                                 if status == RegAction::Match {
                                     status = RegAction::NoMatch;
-                                    restore_subexpr(rex, bp);
+                                    undo_groups(rex, &mut regstack.trail, bp.trail_len);
                                 }
                             } else {
                                 rex.behind_pos = bp.save_behind;
                                 if rp.rs_no == NOBEHIND as i16 {
                                     reg_restore(rex, &mut regstack.backpos, &bp.save_after);
                                     status = RegAction::Match;
-                                } else if status == RegAction::Match {
+                                } else {
+                                    // What follows matched, so it may have set groups.
                                     status = RegAction::NoMatch;
-                                    restore_subexpr(rex, bp);
+                                    undo_groups(rex, &mut regstack.trail, bp.trail_len);
                                 }
                                 regstack.pop(&mut scan);
                                 regstack.pop_behind();
@@ -4082,6 +4155,8 @@ fn finish_bt_regexec(
             st.items = Vec::new();
             st.stars = Vec::new();
             st.behinds = Vec::new();
+            st.marks = Vec::new();
+            st.trail = Vec::new();
         }
         if st.backpos.capacity() > BACKPOS_INITIAL as usize {
             st.backpos = Vec::new();
