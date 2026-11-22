@@ -441,12 +441,21 @@ describe('regexp engine', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(
         {
+          -- A collection matches the whole character.
           collection = '[' .. e .. ']x',
           negated_collection = '[' .. e .. ']x',
           collection_ic = '[' .. e .. ']x',
           class_collection = '[' .. e .. '][x]',
           collection_then_x = '[' .. e .. 'x]',
           collection_extra_accent = '[' .. e .. tilde .. ']x',
+          -- A match does not end before an accent.
+          repeat_before_accent = '[]' .. e .. '[]x[]',
+          plus_before_accent = e .. 'x',
+          repeat_after_x = '[x]' .. e,
+          repeat_ic = '[x]' .. e,
+          precomposed_repeat = '[x]é' .. tilde,
+          precomposed_optional = '[x]é' .. tilde,
+          repeat_then_skip_accents = '[e' .. e .. '][]x[]',
         },
         n.exec_lua(function(p, e_, tilde_)
           local function sub(s, pat)
@@ -459,6 +468,13 @@ describe('regexp engine', function()
             class_collection = sub(e_ .. 'x', '[[:alpha:]]'),
             collection_then_x = sub(e_ .. 'x', '[^y]x'),
             collection_extra_accent = sub(e_ .. tilde_ .. 'x', '[' .. e_ .. ']'),
+            repeat_before_accent = sub(e_ .. 'x', 'e*'),
+            plus_before_accent = sub(e_ .. 'x', 'e\\+'),
+            repeat_after_x = sub('x' .. e_, 'xe*'),
+            repeat_ic = sub('x' .. e_, '\\cxE*'),
+            precomposed_repeat = sub('xé' .. tilde_, 'xé*'),
+            precomposed_optional = sub('xé' .. tilde_, 'xé\\='),
+            repeat_then_skip_accents = sub('e' .. e_ .. 'x', 'e*\\%C'),
           }
         end, [[\%#=]] .. engine, e, tilde)
       )

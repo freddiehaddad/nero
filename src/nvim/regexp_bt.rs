@@ -159,6 +159,13 @@ fn operand_idx(idx: usize) -> usize {
     idx + 3
 }
 
+/// Whether node `idx` is the END of the whole pattern: the last node of the program, after which
+/// its operand would start. Look-around operands end in earlier END nodes.
+#[inline(always)]
+fn is_pattern_end(prog: &[u8], idx: usize) -> bool {
+    operand_idx(idx) == prog.len()
+}
+
 #[inline(always)]
 fn operand_min(prog: &[u8], idx: usize) -> i64 {
     i64::from(i32::from_be_bytes([
@@ -2125,6 +2132,10 @@ pub(super) fn bt_regcomp(expr: &[u8], re_flags: i32) -> Option<BtRegprog> {
         reghasz: RE_STATE.with(|s| s.re_has_z.get()) as u8,
         program: bt_st(|st| std::mem::take(&mut *st.reg_program.borrow_mut())),
     };
+    debug_assert!(
+        r.program.len() >= 3 && op_fn(&r.program, Some(r.program.len() - 3)) == END,
+        "the pattern's END is the last node"
+    );
     if (flags & HASNL) != 0 {
         r.regflags |= RF_HASNL;
     }
@@ -3659,7 +3670,19 @@ fn regmatch_inner(
                             }
                         }
                         END => {
-                            status = RegAction::Match;
+                            // As in the NFA engine, the match does not end inside a character,
+                            // before a composing character, unless "\Z" ignores them or the
+                            // match ends at the start of a line.
+                            status = if is_pattern_end(prog, scan_idx)
+                                && !rex.reg_icombine
+                                && rex.input != 0
+                                && rex.input_byte() >= 0x80
+                                && utf_iscomposing_legacy(utf_ptr2char(rex.rest()))
+                            {
+                                RegAction::NoMatch
+                            } else {
+                                RegAction::Match
+                            };
                         }
                         _ => {
                             iemsg(tr(E_RE_CORR));
