@@ -737,6 +737,9 @@ fn tree_count_words(byts: &[u8], idxs: &mut [Idx]) {
         } else {
             let mut n = arridx[d] + curi[d];
             curi[d] += 1;
+            if n >= byts_len {
+                break;
+            }
 
             let c = i32::from(byts[n as usize]);
             if c == 0 {
