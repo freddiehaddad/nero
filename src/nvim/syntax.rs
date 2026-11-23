@@ -3138,7 +3138,7 @@ fn syn_cmd_iskeyword(eap: &mut Exarg, _syncing: i32) {
             return;
         }
         let isk = crate::memory::bytes_to_cstring(arg_bytes);
-        let mut ct = win_s(&curwin()).b_syn_chartab.get();
+        let mut ct = [0; 4];
         parse_isopt(isk.as_bytes(), Some(&mut ct));
         win_s(&curwin()).b_syn_chartab.set(ct);
         win_s(&curwin()).b_syn_isk.set(Some(isk));
