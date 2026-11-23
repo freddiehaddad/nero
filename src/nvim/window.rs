@@ -6161,6 +6161,22 @@ pub fn win_find_tabpage(win: &WinInfoInfo) -> Option<crate::globals::TabpagePtr>
     None
 }
 
+fn win_float_neighbor(tp: &TabPageInfo) -> Option<crate::globals::WinPtr> {
+    let wp = if workspace_state().curtab.get() == tp {
+        workspace_state().prevwin.get()
+    } else {
+        tp.tp_prevwin.get()
+    };
+    let res = if tabpage_win_valid(Some(tp), wp.opt()) && !wp.w_floating.get() {
+        wp
+    } else if workspace_state().curtab.get() == tp {
+        workspace_state().firstwin.get()
+    } else {
+        tp.tp_firstwin.get()
+    };
+    (!res.is_null()).then_some(res)
+}
+
 pub fn win_vert_neighbor(
     tp: &TabPageInfo,
     wp: &WinInfoInfo,
@@ -6168,15 +6184,7 @@ pub fn win_vert_neighbor(
     mut count: i32,
 ) -> Option<crate::globals::WinPtr> {
     if wp.w_floating.get() {
-        let res = if let Some(pw) = prevwin_opt()
-            && win_valid(Some(&pw))
-            && !pw.w_floating.get()
-        {
-            pw
-        } else {
-            workspace_state().firstwin.get()
-        };
-        return (!res.is_null()).then_some(res);
+        return win_float_neighbor(tp);
     }
 
     let mut foundfr = wp.frame();
@@ -6238,15 +6246,7 @@ pub fn win_horz_neighbor(
     mut count: i32,
 ) -> Option<crate::globals::WinPtr> {
     if wp.w_floating.get() {
-        let res = if let Some(pw) = prevwin_opt()
-            && win_valid(Some(&pw))
-            && !pw.w_floating.get()
-        {
-            pw
-        } else {
-            workspace_state().firstwin.get()
-        };
-        return (!res.is_null()).then_some(res);
+        return win_float_neighbor(tp);
     }
 
     let mut foundfr = wp.frame();
