@@ -287,16 +287,14 @@ local function check_performance()
   local buildtype = vim.fn.matchstr(vim.fn.execute('version'), [[\v\cbuild type:?\s*[^\n\r\t]+]])
   if buildtype == '' then
     health.error('failed to get build type from :version')
-  elseif
-    vim.regex([[\v(MinSizeRel|RelWithDebInfo|Release(Fast|Safe|Small)?)]]):match_str(buildtype)
-  then
-    health.ok(buildtype)
-  else
+  elseif vim.regex([[\v(debug|Debug?)]]):match_str(buildtype) then
     health.info(buildtype)
     health.warn('Non-optimized debug build. Nero will be slower.', {
       'Install a Nero release build, or rebuild with `cargo xtask build --release`.',
       suggest_faq,
     })
+  else
+    health.ok(buildtype)
   end
 
   -- check for slow shell invocation
