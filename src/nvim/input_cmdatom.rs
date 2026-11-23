@@ -528,6 +528,9 @@ pub fn atom_origin_pos(buf: &FileBuf) -> CursorPos {
     {
         return o.pos;
     }
+    if curwin().w_buffer.get() != buf {
+        return INIT_POS;
+    }
     curwin().w_cursor.get()
 }
 
