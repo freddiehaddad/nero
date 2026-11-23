@@ -2214,13 +2214,13 @@ fn regbranch(flagp: &mut i32) -> Option<usize> {
     let mut chain: Option<usize> = None;
     let mut flags: i32 = 0;
 
-    *flagp = WORST | HASNL;
+    *flagp = WORST;
 
     let ret = regnode(BRANCH);
     loop {
         let latest = regconcat(&mut flags)?;
-        *flagp |= flags & (HASWIDTH | SPSTART | HASLOOKBH);
-        *flagp &= !HASNL | (flags & HASNL);
+        // Like the NFA engine, a branch can match a line break when any of its concats can.
+        *flagp |= flags & (HASWIDTH | SPSTART | HASNL | HASLOOKBH);
         if chain.is_some() {
             regtail(chain, Some(latest));
         }

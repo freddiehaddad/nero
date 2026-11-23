@@ -784,4 +784,27 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('matches a line break with a \\& branch in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          -- The match starts at the end of the first line.
+          search = { 1, 2 },
+          substitute = { '[ ][b][x][', ']' },
+        },
+        n.exec_lua(function(p)
+          local api = vim.api
+          api.nvim_buf_set_lines(0, 0, -1, false, { 'x', 'foo' })
+          api.nvim_win_set_cursor(0, { 1, 0 })
+          local r = {}
+          r.search = vim.fn.searchpos(p .. [[x*\&\_s*foo]], 'cnW')
+          api.nvim_buf_set_lines(0, 0, -1, false, { ' bx' })
+          vim.cmd('silent s/' .. p .. [[x\{-}\&\_./[&]/g]])
+          r.substitute = api.nvim_buf_get_lines(0, 0, -1, false)
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)
