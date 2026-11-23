@@ -7,8 +7,8 @@ use crate::autocmd::{
     apply_autocmds, has_event,
 };
 use crate::buffer::{
-    Bufref, FileBuf, K_UIMESSAGES, bt_cmdwin, bt_prompt, bt_quickfix, buf_get_changedtick,
-    buf_is_empty, buf_meta_total, bufref_valid, set_bufref,
+    FileBuf, K_UIMESSAGES, bt_cmdwin, bt_prompt, bt_quickfix, buf_get_changedtick, buf_is_empty,
+    buf_meta_total,
 };
 use crate::change::{
     COM_MAX_LEN, K_CPO_LISTWM, K_OPT_VE_FLAG_ONEMORE, MB_MAXCHAR, OPENLINE_DO_COM,
@@ -70,7 +70,9 @@ use crate::input::{
     redo_append_lit, redo_append_str, redo_keys, start_redo_ins, stop_redo_ins, stuff_empty,
     stuff_readbuff_len, stuff_redo_readbuff, stuffchar_readbuff, vgetc, vpeekc, vungetc,
 };
-use crate::input_cmdatom::CmdSpec;
+use crate::input_cmdatom::{
+    CmdOrigin, CmdSpec, atom_ins_opaque_end, atom_origin, atom_origin_changed,
+};
 use crate::insexpand::{
     check_compl_option, compl_status_clear, compl_status_local, ctrl_x_mode_cmdline,
     ctrl_x_mode_dictionary, ctrl_x_mode_files, ctrl_x_mode_function, ctrl_x_mode_line_or_eval,
@@ -1056,13 +1058,7 @@ fn insert_handle_key(s: &mut InsertState) -> i32 {
             ins_mousescroll(MSCR_RIGHT);
         }
         K_PASTE_START | K_EVENT | K_COMMAND | K_LUA => {
-            let mut save_curbuf = Bufref {
-                br_buf: crate::globals::BufPtr::NULL,
-                br_fnum: 0,
-                br_buf_free_count: 0,
-            };
-            let tick = buf_get_changedtick(&curbuf());
-            set_bufref(&mut save_curbuf, workspace_state().curbuf.get().opt());
+            let origin = atom_origin();
 
             if s.c == K_PASTE_START {
                 paste_repeat(1);
@@ -1088,16 +1084,12 @@ fn insert_handle_key(s: &mut InsertState) -> i32 {
                 screen_state().pum_want.active.set(false);
             }
 
-            let changed = bufref_valid(Some(&save_curbuf))
-                && save_curbuf.br_buf == workspace_state().curbuf.get()
-                && tick != buf_get_changedtick(&curbuf());
+            let changed = workspace_state().curbuf.get() == origin.buf.br_buf
+                && atom_origin_changed(origin.clone());
             if curbuf().b_u_synced.get() || changed {
                 edit_state().ins_global.need_undo.set(true);
             }
-            if changed && !ins_compl_active() {
-                mc_ins_cascade();
-                mc_ins_cascade_restart();
-            }
+            atom_ins_opaque_end(origin);
         }
         K_COMPLETE_DELAY => {
             if edit_state().ins_global.dont_sync_undo.get() == K_TRUE {
@@ -1454,7 +1446,7 @@ pub fn ins_redraw(ready: bool) {
         && !pum_visible()
     {
         let mut aco = CtxSwitch::new();
-        let tick = buf_get_changedtick(&curbuf());
+        let origin = atom_origin();
         ctx_switch(&mut aco, None, None, Some(&curbuf()), 0);
         apply_autocmds(
             EVENT_TEXTCHANGEDI,
@@ -1464,15 +1456,10 @@ pub fn ins_redraw(ready: bool) {
             curbuf_opt().as_deref(),
         );
         ctx_restore(&mut aco);
+        ins_autocmd_done(EVENT_TEXTCHANGEDI, origin);
         curbuf()
             .b_last_changedtick_i
             .set(buf_get_changedtick(&curbuf()));
-        if tick != buf_get_changedtick(&curbuf()) {
-            u_save(
-                curwin().w_cursor.get().lnum,
-                curwin().w_cursor.get().lnum + 1,
-            );
-        }
     }
 
     if ready
@@ -1481,7 +1468,7 @@ pub fn ins_redraw(ready: bool) {
         && pum_visible()
     {
         let mut aco = CtxSwitch::new();
-        let tick = buf_get_changedtick(&curbuf());
+        let origin = atom_origin();
         ctx_switch(&mut aco, None, None, Some(&curbuf()), 0);
         apply_autocmds(
             EVENT_TEXTCHANGEDP,
@@ -1494,12 +1481,7 @@ pub fn ins_redraw(ready: bool) {
         curbuf()
             .b_last_changedtick_pum
             .set(buf_get_changedtick(&curbuf()));
-        if tick != buf_get_changedtick(&curbuf()) {
-            u_save(
-                curwin().w_cursor.get().lnum,
-                curwin().w_cursor.get().lnum + 1,
-            );
-        }
+        ins_autocmd_done(EVENT_TEXTCHANGEDP, origin);
     }
 
     if ready {
@@ -4209,7 +4191,7 @@ pub fn set_can_cindent(val: bool) {
 
 /// Trigger `event` and take care of fixing undo.
 pub fn ins_apply_autocmds(event: AuEvent) -> i32 {
-    let tick = buf_get_changedtick(&curbuf());
+    let origin = atom_origin();
     let r = i32::from(apply_autocmds(
         event,
         None,
@@ -4217,13 +4199,20 @@ pub fn ins_apply_autocmds(event: AuEvent) -> i32 {
         false,
         curbuf_opt().as_deref(),
     ));
-    if event != EVENT_INSERTLEAVE && tick != buf_get_changedtick(&curbuf()) {
+    ins_autocmd_done(event, origin);
+    r
+}
+
+fn ins_autocmd_done(event: AuEvent, origin: CmdOrigin) {
+    if event != EVENT_INSERTLEAVE && origin.tick != buf_get_changedtick(&curbuf()) {
         u_save(
             curwin().w_cursor.get().lnum,
             curwin().w_cursor.get().lnum + 1,
         );
     }
-    r
+    if event != EVENT_INSERTENTER && event != EVENT_INSERTLEAVEPRE && event != EVENT_INSERTLEAVE {
+        atom_ins_opaque_end(origin);
+    }
 }
 
 #[cfg(test)]

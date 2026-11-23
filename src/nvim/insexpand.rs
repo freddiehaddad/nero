@@ -3119,6 +3119,7 @@ fn ins_compl_stop(c: i32, prev_mode: i32, mut retval: bool) -> bool {
     };
     do_autocmd_completedone(c, prev_mode, Some(&word));
 
+    crate::mcursor::mc_ins_compl_done();
     retval
 }
 

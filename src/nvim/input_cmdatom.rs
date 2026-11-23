@@ -28,7 +28,7 @@ use crate::keycodes::{
 use crate::mbyte::utf_char2bytes;
 use crate::mcursor::{
     mc_buf_has_cursors, mc_clock_edge, mc_following, mc_ins_cascade_start, mc_ins_cascaded,
-    mc_ins_commit, mc_mark_at, mc_replaying, mc_vsel_clear, mc_vsel_refresh,
+    mc_ins_commit, mc_ins_opaque_change, mc_mark_at, mc_replaying, mc_vsel_clear, mc_vsel_refresh,
 };
 use crate::memory::bytes_to_cstring;
 use crate::normal::{
@@ -479,7 +479,7 @@ pub fn atom_cmd_spec(cap: &Cmdarg) -> CmdSpec {
     }
 }
 
-fn atom_origin() -> CmdOrigin {
+pub fn atom_origin() -> CmdOrigin {
     let mut origin = CmdOrigin {
         win: crate::globals::curwin(),
         pos: curwin().w_cursor.get(),
@@ -493,7 +493,7 @@ fn atom_origin() -> CmdOrigin {
 }
 
 #[inline]
-fn atom_origin_changed(origin: CmdOrigin) -> bool {
+pub fn atom_origin_changed(origin: CmdOrigin) -> bool {
     bufref_valid(Some(&origin.buf))
         && origin
             .buf
@@ -1681,6 +1681,14 @@ pub fn atom_ins_start(cmd: i32, count: i64, vis: VisualIns, vblock: bool) -> Ins
     );
 
     session
+}
+
+pub fn atom_ins_opaque_end(before: CmdOrigin) {
+    if workspace_state().curbuf.get() == before.buf.br_buf
+        && (atom_origin_changed(before.clone()) || atom_origin_moved(before))
+    {
+        mc_ins_opaque_change();
+    }
 }
 
 pub fn atom_ins_end(session: &mut InsSession, busy: bool) {

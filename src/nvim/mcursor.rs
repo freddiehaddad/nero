@@ -53,7 +53,7 @@ use crate::lua::executor::nlua_call_typval;
 use crate::mapping::REMAP_NONE;
 use crate::mark::mark_get_visual;
 use crate::marktree::{
-    DECOR_HIGHLIGHT_INLINE_INIT, DecorInlineData, MT_FLAG_DECOR_HL, MTPair, MarkTreeIter,
+    DECOR_HIGHLIGHT_INLINE_INIT, DecorInlineData, MT_FLAG_DECOR_HL, MarkTreeIter,
     marktree_itr_current, marktree_itr_get, marktree_itr_next, mt_end,
 };
 use crate::memline::{dec, inc, ml_get_len, ml_region_text};
@@ -125,11 +125,18 @@ struct McInsSaved {
     last_changedtick_i: Varnumber,
 }
 
+#[derive(Clone, Copy)]
+struct McInsPreview {
+    region: u32,
+    cursor: u32,
+}
+
 struct McInsSpan {
     origin: crate::globals::CloneCell<CmdOrigin>,
-    regions: std::cell::RefCell<Vec<u32>>,
+    previews: std::cell::RefCell<Vec<McInsPreview>>,
     active: std::cell::Cell<bool>,
     first: std::cell::Cell<bool>,
+    restart: std::cell::Cell<bool>,
     frame: std::cell::Cell<u64>,
     done_len: std::cell::Cell<usize>,
     region: std::cell::Cell<u32>,
@@ -170,9 +177,10 @@ impl McursorState {
                     tick: 0,
                     maptick: 0,
                 }),
-                regions: std::cell::RefCell::new(Vec::new()),
+                previews: std::cell::RefCell::new(Vec::new()),
                 active: std::cell::Cell::new(false),
                 first: std::cell::Cell::new(false),
+                restart: std::cell::Cell::new(false),
                 frame: std::cell::Cell::new(0),
                 done_len: std::cell::Cell::new(0),
                 region: std::cell::Cell::new(0),
@@ -678,12 +686,13 @@ pub fn mc_ins_cascade_start(
         st.mc_ins_joined.set(false);
         st.mc_ins_span.active.set(active);
         st.mc_ins_span.first.set(true);
+        st.mc_ins_span.restart.set(false);
         st.mc_ins_span.frame.set(root_frame);
         st.mc_ins_span.done_len.set(0);
         st.mc_ins_span.origin.set(origin);
         st.mc_ins_span.region.set(0);
     });
-    mc_ins_regions_clear();
+    mc_ins_previews_clear();
 
     if active {
         let mut lo = curwin().w_cursor.get().lnum;
@@ -743,9 +752,9 @@ fn mc_ins_span_push(keys: std::ffi::CString, text: Option<std::ffi::CString>) {
     with_mc(|st| st.mc_ins_span.first.set(false));
 }
 
-fn mc_ins_regions_clear() {
-    while let Some(id) = with_mc(|st| st.mc_ins_span.regions.borrow_mut().pop()) {
-        extmark_del_id(&curbuf(), mc_session_ns(), id);
+fn mc_ins_previews_clear() {
+    while let Some(p) = with_mc(|st| st.mc_ins_span.previews.borrow_mut().pop()) {
+        extmark_del_id(&curbuf(), mc_session_ns(), p.region);
     }
 }
 
@@ -782,7 +791,7 @@ fn mc_ins_preview_rebase() {
     let mut region = with_mc(|st| st.mc_ins_span.region.get());
     mc_region_mark_set(&mut region, curwin().w_cursor.get());
     with_mc(|st| st.mc_ins_span.region.set(region));
-    mc_ins_regions_clear();
+    mc_ins_previews_clear();
     let origin_mcursor = with_mc(|st| st.mc_ins_span.origin.get().mcursor);
     for i in 0..cursors_len() {
         let (ctx_buf, ctx_mark) = with_mc(|st| {
@@ -793,24 +802,21 @@ fn mc_ins_preview_rebase() {
         let mut mark = 0;
         if mc_cur_resolve(ctx_buf, ctx_mark, Some(&mut pos)) && ctx_mark != origin_mcursor {
             mc_region_mark_set(&mut mark, pos);
-            with_mc(|st| st.mc_ins_span.regions.borrow_mut().push(mark));
+            with_mc(|st| {
+                st.mc_ins_span.previews.borrow_mut().push(McInsPreview {
+                    region: mark,
+                    cursor: ctx_mark,
+                });
+            });
         }
     }
 }
 
-fn mc_ins_region_first() -> MTPair {
-    let regions = with_mc(|st| st.mc_ins_span.regions.borrow().clone());
-    for id in regions {
-        let p = extmark_from_id(&curbuf(), mc_session_ns(), id);
-        if p.start.id != 0 {
-            return p;
-        }
+fn mc_region_mark_range(mark: u32, start: &mut CursorPos, end: &mut CursorPos) -> bool {
+    let p = extmark_from_id(&curbuf(), mc_session_ns(), mark);
+    if p.start.id == 0 {
+        return false;
     }
-    MTPair::new()
-}
-
-#[inline]
-fn mc_region_range(p: MTPair, start: &mut CursorPos, end: &mut CursorPos) {
     *start = CursorPos {
         lnum: p.start.pos.row + 1,
         col: p.start.pos.col,
@@ -821,15 +827,17 @@ fn mc_region_range(p: MTPair, start: &mut CursorPos, end: &mut CursorPos) {
         col: p.end_pos.col,
         coladd: 0,
     };
+    true
 }
 
-fn mc_region_mark_range(mark: u32, start: &mut CursorPos, end: &mut CursorPos) -> bool {
-    let p = extmark_from_id(&curbuf(), mc_session_ns(), mark);
-    if p.start.id == 0 {
-        return false;
+fn mc_ins_preview_first(start: &mut CursorPos, end: &mut CursorPos) -> bool {
+    let previews = with_mc(|st| st.mc_ins_span.previews.borrow().clone());
+    for p in previews {
+        if mc_region_mark_range(p.region, start, end) {
+            return true;
+        }
     }
-    mc_region_range(p, &mut *start, &mut *end);
-    true
+    false
 }
 
 fn mc_ins_preview_replace(start: CursorPos, end: CursorPos, text: &NvimString) {
@@ -862,17 +870,27 @@ fn mc_ins_preview_replace(start: CursorPos, end: CursorPos, text: &NvimString) {
 }
 
 fn mc_ins_preview_set(new_text: &NvimString) {
+    let mut fs = INIT_POS;
+    let mut fe = INIT_POS;
+    if !mc_ins_preview_first(&mut fs, &mut fe) {
+        return;
+    }
+    let cur = ml_region_text(&crate::globals::curbuf(), fs, fe);
+    if cur == new_text.as_bytes() {
+        return;
+    }
+
     let saved = mc_ins_save_state();
     let mut primary: u32 = 0;
     mc_track_upd(&curbuf(), &mut primary, curwin().w_cursor.get());
     let save_cmod_flags = cmdline_state().cmod_flags();
     cmdline_state().add_cmod_flags(CMOD_KEEPJUMPS);
     set_vim_var_bool(VV_CASCADING, K_BOOL_VAR_TRUE_CONST);
-    let regions = with_mc(|st| st.mc_ins_span.regions.borrow().clone());
-    for region_id in regions {
+    let previews = with_mc(|st| st.mc_ins_span.previews.borrow().clone());
+    for p in previews {
         let mut rs = INIT_POS;
         let mut re = INIT_POS;
-        if !mc_region_mark_range(region_id, &mut rs, &mut re) {
+        if !mc_region_mark_range(p.region, &mut rs, &mut re) {
             continue;
         }
         mc_ins_preview_replace(rs, re, new_text);
@@ -919,7 +937,54 @@ pub fn mc_ins_cascade_restart() {
             .done_len
             .set(ins.as_ref().map_or(0, |s| s.as_bytes().len()));
     });
+
+    let region = with_mc(|st| st.mc_ins_span.region.get());
+    let mut rs = INIT_POS;
+    let mut re = INIT_POS;
+    if mc_region_mark_range(region, &mut rs, &mut re) {
+        let text = ml_region_text(&crate::globals::curbuf(), rs, re);
+        let text_str = NvimString::from_bytes(&text);
+        mc_ins_preview_set(&text_str);
+    }
+    let c = curwin().w_cursor.get();
+    if mc_region_mark_range(region, &mut rs, &mut re) && !lt(c, rs) && lt(c, re) {
+        let previews = with_mc(|st| st.mc_ins_span.previews.borrow().clone());
+        for mut p in previews {
+            let mut ps = INIT_POS;
+            let mut pe = INIT_POS;
+            if mc_region_mark_range(p.region, &mut ps, &mut pe)
+                && extmark_get_pos(&curbuf(), mc_ns(), p.cursor, &mut INIT_POS)
+            {
+                let mut pos = CursorPos {
+                    lnum: ps.lnum + c.lnum - rs.lnum,
+                    col: c.col,
+                    coladd: 0,
+                };
+                if c.lnum == rs.lnum {
+                    pos.col += ps.col - rs.col;
+                }
+                mc_mark_upd(&curbuf(), &mut p.cursor, pos);
+            }
+        }
+    }
     mc_ins_preview_rebase();
+}
+
+pub fn mc_ins_opaque_change() {
+    if !with_mc(|st| st.mc_ins_span.active.get()) || mc_replaying() {
+        return;
+    }
+    if ins_compl_active() {
+        with_mc(|st| st.mc_ins_span.restart.set(true));
+        return;
+    }
+    mc_ins_cascade_restart();
+}
+
+pub fn mc_ins_compl_done() {
+    if with_mc(|st| st.mc_ins_span.restart.replace(false)) {
+        mc_ins_opaque_change();
+    }
 }
 
 pub fn mc_ins_replaying() -> bool {
@@ -977,22 +1042,13 @@ pub fn mc_ins_cascade() {
             mc_ins_span_flush(&ins, false);
         }
     } else if mc_region_mark_range(region, &mut start, &mut end) {
-        let text = ml_region_text(&crate::globals::curbuf(), start, end);
         let mut update = true;
-        let fp = mc_ins_region_first();
-        if fp.start.id != 0 {
-            let mut frs = INIT_POS;
-            let mut fre = INIT_POS;
-            mc_region_range(fp, &mut frs, &mut fre);
-            let cur = ml_region_text(&crate::globals::curbuf(), frs, fre);
-            update = cur != text;
-        }
-        if update && (ins_compl_active() || pum_visible()) {
-            let regions = with_mc(|st| st.mc_ins_span.regions.borrow().clone());
-            for id in regions {
+        if ins_compl_active() || pum_visible() {
+            let previews = with_mc(|st| st.mc_ins_span.previews.borrow().clone());
+            for p in previews {
                 let mut rs = INIT_POS;
                 let mut re = INIT_POS;
-                if !mc_region_mark_range(id, &mut rs, &mut re) {
+                if !mc_region_mark_range(p.region, &mut rs, &mut re) {
                     continue;
                 }
                 if !lt(end, rs)
@@ -1004,6 +1060,7 @@ pub fn mc_ins_cascade() {
             }
         }
         if update {
+            let text = ml_region_text(&crate::globals::curbuf(), start, end);
             let text_str = NvimString::from_bytes(&text);
             mc_ins_preview_set(&text_str);
         }
@@ -1013,12 +1070,7 @@ pub fn mc_ins_cascade() {
 
 fn mc_ins_span_flush(ins: &NvimString, commit: bool) {
     let empty = NvimString::new();
-    let fp = mc_ins_region_first();
-    if fp.start.id != 0
-        && (fp.start.pos.row != fp.end_pos.row || fp.start.pos.col != fp.end_pos.col)
-    {
-        mc_ins_preview_set(&empty);
-    }
+    mc_ins_preview_set(&empty);
     let done = with_mc(|st| st.mc_ins_span.done_len.get());
     let ins_bytes = ins.as_bytes();
     let dlen = ins_bytes.len() - done;
@@ -1313,7 +1365,7 @@ pub fn mc_ins_commit() -> bool {
     if region != 0 {
         extmark_del_id(&curbuf(), mc_session_ns(), region);
     }
-    mc_ins_regions_clear();
+    mc_ins_previews_clear();
 
     let origin = with_mc(|st| st.mc_ins_span.origin.get());
     if active && buf_get_changedtick(&curbuf()) == origin.tick {
@@ -1900,7 +1952,7 @@ pub fn mc_free_all() {
     }
     with_mc(|st| {
         *st.mc_cursors.borrow_mut() = Vec::new();
-        *st.mc_ins_span.regions.borrow_mut() = Vec::new();
+        *st.mc_ins_span.previews.borrow_mut() = Vec::new();
         ctx_free(&mut st.mc_start.ctx.borrow_mut());
     });
 }
