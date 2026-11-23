@@ -2220,6 +2220,7 @@ fn cmdline_pum_create(
 }
 
 pub fn cmdline_pum_display(changed_array: bool) {
+    crate::ex_getln::cmdline_ui_flush();
     let arr = COMPL_MATCH_ARRAY.with(|cell| cell.borrow().clone());
     pum_display(
         arr,

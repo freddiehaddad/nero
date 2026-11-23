@@ -74,8 +74,8 @@ use crate::main_init::getout;
 use crate::mark::{copy_jumplist, free_jumplist, setmark, setpcmark};
 use crate::r#match::clear_matches;
 use crate::message::{
-    K_ZINDEX_MESSAGES, emsg, iemsg, internal_error, msg, msg_clr_eos_force, msg_grid_validate,
-    msg_ui_flush, semsg, set_keep_msg,
+    emsg, iemsg, internal_error, msg, msg_clr_eos_force, msg_grid_validate, msg_ui_flush, semsg,
+    set_keep_msg,
 };
 use crate::mouse::{reset_dragwin, setmouse};
 use crate::r#move::{
@@ -2187,15 +2187,14 @@ pub fn ui_ext_win_position(wp: &WinInfoInfo, validate: bool) {
 
         let mut comp_row = (row as i32) - if south { wp.w_height_outer.get() } else { 0 };
         let mut comp_col = (col as i32) - if east { wp.w_width_outer.get() } else { 0 };
-        let above_ch = if wp.w_config.borrow().zindex < K_ZINDEX_MESSAGES {
-            opt_vars().p_ch.get() as i32
-        } else {
-            0
-        };
         comp_row += grid_comp_row;
         comp_col += grid_comp_col;
         comp_row = comp_row
-            .min(screen_state().rows_global.get() - wp.w_height_outer.get() - above_ch)
+            .min(
+                screen_state().rows_global.get()
+                    - wp.w_height_outer.get()
+                    - crate::winfloat::win_float_above_ch(wp),
+            )
             .max(0);
         if !c.fixed || east {
             comp_col = comp_col

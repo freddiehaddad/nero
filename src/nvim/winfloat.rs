@@ -204,6 +204,21 @@ pub fn win_border_width(wp: &WinInfoInfo) -> i32 {
     wp.w_border_adj[1].get() + wp.w_border_adj[3].get()
 }
 
+pub fn win_float_above_ch(wp: &WinInfoInfo) -> i32 {
+    if wp.config_zindex() >= K_ZINDEX_MESSAGES {
+        return 0;
+    }
+    let mut rows = opt_vars().p_ch.get() as i32;
+    let cw = cmdline_state().cmdline_win.get();
+    if (edit_state().state_global.get() & crate::state::MODE_CMDLINE) != 0
+        && let Some(cw_ref) = cw.opt()
+        && !cw_ref.config_hide()
+    {
+        rows = rows.max(cw_ref.w_height_outer.get());
+    }
+    rows
+}
+
 pub fn win_config_float(wp: &WinInfoInfo, mut fconfig: WinConfig) {
     // Process statusline changes before applying new height from config
     let show_stl = !wp.w_onebuf_opt.wo_stl.is_empty()
@@ -253,12 +268,8 @@ pub fn win_config_float(wp: &WinInfoInfo, mut fconfig: WinConfig) {
     }
 
     if !ui_has(K_UIMULTIGRID) {
-        let above_ch = if wp.config_zindex() < K_ZINDEX_MESSAGES {
-            opt_vars().p_ch.get() as i32
-        } else {
-            0
-        };
-        let max_h = screen_state().rows_global.get() - win_border_height(wp) - above_ch;
+        let max_h =
+            screen_state().rows_global.get() - win_border_height(wp) - win_float_above_ch(wp);
         wp.w_height.set(wp.w_height.get().min(max_h));
         let max_w = screen_state().columns_global.get() - win_border_width(wp);
         wp.w_width.set(wp.w_width.get().min(max_w));
