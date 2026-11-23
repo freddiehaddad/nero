@@ -88,7 +88,7 @@ Compatibility with Vim's `if_lua` is explicitly a non-goal.
 
                                                              *dev-lua-builtin*
 Lua modules that are necessary even if VIMRUNTIME is invalid (generally, data
-structures and essential utilities), must be compiled into the `nero` binary.
+structures and essential utilities), must be compiled into the `nvim` binary.
 There are two ways to do that:
 - if they are private, put the code file in `runtime/lua/vim/_core/`
 - if they are public, choose a new filepath in `runtime/lua/vim/`
@@ -697,6 +697,7 @@ Examples where RHS replay behaves better than LHS:
   - `nnoremap X Gdd`: RHS replays only dd, per cursor.
   - `nnoremap <Down> ]C`: LHS (follow-mode) moves each cursor to its neighbor.
   - `nnoremap u u`: LHS would undo N times.
+  - `nnoremap X <Cmd>lua place_cursors()<CR>`: LHS would replay at the cursors it placed.
 - Editor state outside of current buffer:
   - `nnoremap ]x <Cmd>cnext<CR>x`:
     - LHS is nonsense.

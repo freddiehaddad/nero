@@ -1791,6 +1791,7 @@ pub fn mc_toggle(buf: &FileBuf, pos: CursorPos, end_follow: bool, on: TriState) 
     if mc_replaying() {
         return;
     }
+    atom_did_global_op();
     if end_follow {
         mc_follow_set(K_FALSE);
     }
@@ -1835,12 +1836,13 @@ pub fn mc_on_extmark_set(buf: &FileBuf, ns_id: u32, mut id: u32, pos: CursorPos)
         extmark_del_id(buf, ns_id, id);
         return;
     }
+    atom_visual_reset();
+    atom_did_global_op();
     if mc_mark_at(buf, pos, id) != 0 {
         extmark_del_id(buf, ns_id, id);
         return;
     }
     mc_mark_upd(buf, &mut id, pos);
-    atom_visual_reset();
     if cursors_is_empty() {
         with_mc(|st| {
             st.mc_start.time.set(os_realtime() as Timestamp);
