@@ -2972,8 +2972,10 @@ pub fn nvim_redraw(opts: &mut KeyDictRedraw) -> Result<(), Error> {
     }
 
     if opts.flush && !cmdline_state().cmdpreview.get() {
-        validate_cursor(&curwin());
-        update_topline(&curwin());
+        if (edit_state().state_global.get() & crate::state::MODE_CMDLINE) == 0 {
+            validate_cursor(&curwin());
+            update_topline(&curwin());
+        }
         update_screen();
     }
 

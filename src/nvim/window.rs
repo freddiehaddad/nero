@@ -7840,6 +7840,7 @@ fn win_fix_cursor(normal: bool) {
 
     if !wp.w_do_win_fix_cursor.get()
         || (*wp).buf().b_ml.ml_line_count.get() < wp.w_view_height.get()
+        || (get_real_state() & MODE_CMDLINE) != 0
     {
         return;
     }
