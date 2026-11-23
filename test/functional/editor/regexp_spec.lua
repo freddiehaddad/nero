@@ -762,4 +762,26 @@ describe('regexp engine', function()
       )
     end
   end)
+
+  it('matches a line break with a collection at the end of a line in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          -- The line break right after "a" is a match of its own.
+          count = '5 matches on 3 lines',
+          newline_item = { 'XcXaX' },
+        },
+        n.exec_lua(function(p)
+          local api = vim.api
+          api.nvim_buf_set_lines(0, 0, -1, false, { 'a', '', 'b1' })
+          local r = {}
+          r.count = api.nvim_exec2('%s/' .. p .. [[\_[a-z]//gn]], { output = true }).output
+          api.nvim_buf_set_lines(0, 0, -1, false, { 'ca' })
+          vim.cmd('silent s/' .. p .. [=[[\n]\|y*/X/g]=])
+          r.newline_item = api.nvim_buf_get_lines(0, 0, -1, false)
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

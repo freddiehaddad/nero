@@ -1314,6 +1314,7 @@ fn nfa_regatom_collection(extra: &mut i32, startc: &mut i32, c: &mut i32) -> Opt
                     emit_fn(result - NFA_ADD_NL);
                     emit_fn(NFA_NEWL);
                     emit_fn(NFA_OR);
+                    re_s.regflags.set(re_s.regflags.get() | RF_HASNL);
                 } else {
                     emit_fn(result);
                 }
@@ -1543,6 +1544,7 @@ fn nfa_regatom_collection(extra: &mut i32, startc: &mut i32, c: &mut i32) -> Opt
                     NFA_NEWL
                 });
                 emit_fn(NFA_OR);
+                re_s.regflags.set(re_s.regflags.get() | RF_HASNL);
             }
 
             return Some(true);
