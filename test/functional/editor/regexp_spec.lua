@@ -204,6 +204,23 @@ describe('regexp engine', function()
     end
   end)
 
+  it('moves back after a backreference to a group that ends before it starts', function()
+    eq(
+      { string = { 'ax', 'a' }, buffer = '[ax|a]xx' },
+      n.exec_lua(function()
+        -- The look-behind lets \1 appear inside its own group. In the second pass the group
+        -- starts after the end it kept from the first pass.
+        local pat = [[\%#=1\%(\(a\|\1\)x\)*\%(q\)\@<!]]
+        vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'axxx' })
+        vim.cmd('s/' .. pat .. [[/[&|\1]/]])
+        return {
+          string = vim.list_slice(vim.fn.matchlist('axxx', pat), 1, 2),
+          buffer = vim.api.nvim_get_current_line(),
+        }
+      end)
+    )
+  end)
+
   it('finds matches after \\@> in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(

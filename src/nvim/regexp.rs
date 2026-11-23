@@ -2738,7 +2738,8 @@ fn mb_decompose(c: i32, c1: &mut i32, c2: &mut i32, c3: &mut i32) {
 
 impl Regexec<'_> {
     /// Compares at most `*n` bytes of `s1` and `s2`, strings without NUL, ignoring case when
-    /// `reg_ic` is set; on a match ignoring case `*n` is set to the length matched in `s2`.
+    /// `reg_ic` is set; on a match ignoring case `*n` is set to the length matched in `s2`. A
+    /// negative `*n` is a huge length, as upstream's conversion to `size_t` makes it.
     pub(super) fn cstrncmp(&self, s1_b: &[u8], s2_b: &[u8], n: &mut i32) -> i32 {
         let mut result = if !self.reg_ic {
             let max_n = *n as usize;

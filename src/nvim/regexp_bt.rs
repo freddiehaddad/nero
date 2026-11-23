@@ -3793,7 +3793,7 @@ fn regmatch_inner(
                                 if let (Some(start), Some(end)) =
                                     (rex.rm_startp[no], rex.rm_endp[no])
                                 {
-                                    len = end.saturating_sub(start) as i32;
+                                    len = end as i32 - start as i32;
                                     if rex.cstrncmp(rex.line_from(start), rex.rest(), &mut len) != 0
                                     {
                                         status = RegAction::NoMatch;
@@ -3819,7 +3819,9 @@ fn regmatch_inner(
                                     }
                                 }
                             }
-                            rex.advance_input(len as usize);
+                            // A group that ends before it starts gives a negative length, and like
+                            // upstream the input then moves back.
+                            rex.set_input(rex.input.saturating_add_signed(len as isize));
                         }
                         x if (ZREF + 1..=ZREF + 9).contains(&x) => {
                             rex.cleanup_zsubexpr();
