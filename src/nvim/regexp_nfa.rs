@@ -3051,20 +3051,85 @@ fn addstate_here(
     true
 }
 
+/// Returns whether character `curc` matches the character `c` of a pattern, with `reg_ic` for
+/// 'ignorecase'.
+#[inline(always)]
+fn char_matches(c: i32, curc: i32, reg_ic: bool) -> bool {
+    c == curc || (reg_ic && utf_fold(c) == utf_fold(curc))
+}
+
+/// Returns whether the collection `coll`, a `[]` or `[^]`, matches character `curc`, which is
+/// not NUL, with `reg_ic` for 'ignorecase' and the 'iskeyword' table `chartab`; `None` when it
+/// reaches a composing character before an item that matches.
+#[inline(always)]
+fn collection_matches(
+    states: &[NfaState],
+    coll: &NfaState,
+    curc: i32,
+    reg_ic: bool,
+    chartab: &[u64; 4],
+) -> Option<bool> {
+    let result_if_matched = coll.c == NFA_START_COLL;
+    let mut state = coll.out;
+    while let Some(s_idx) = state {
+        let st = states[s_idx];
+        if st.c == NFA_COMPOSING {
+            return None;
+        }
+        if st.c == NFA_END_COLL {
+            return Some(!result_if_matched);
+        }
+        if st.c == NFA_RANGE_MIN {
+            let mut c1 = st.val;
+            let next_st = states[st.out.unwrap()];
+            let c2 = next_st.val;
+            if curc >= c1 && curc <= c2 {
+                return Some(result_if_matched);
+            }
+            if reg_ic {
+                let curc_low = utf_fold(curc);
+                while c1 <= c2 {
+                    if utf_fold(c1) == curc_low {
+                        return Some(result_if_matched);
+                    }
+                    c1 += 1;
+                }
+            }
+            state = next_st.out;
+            continue;
+        }
+        let listed = if st.c < 0 {
+            check_char_class(st.c, curc, chartab)
+        } else {
+            char_matches(st.c, curc, reg_ic)
+        };
+        if listed {
+            return Some(result_if_matched);
+        }
+        state = st.out;
+    }
+    Some(false)
+}
+
 /// Returns whether character `curc` is in the class that state `c` tests: `\i` to `\U`, and the
 /// `[a-z]`-like collections compiled to a class.
-// Not inlined, nor is check_char_class(): when they are, LLVM moves every class test out of the
-// loop over the states, so each character pays for every test, used by the pattern or not.
+// Not inlined: when it is, LLVM moves every class test out of the loop over the states, so each
+// character pays for every test, used by the pattern or not.
 #[inline(never)]
 fn class_matches(rex: &Regexec<'_>, c: i32, curc: i32) -> bool {
+    class_test(c, curc, rex.reg_ic, &rex.reg_chartab)
+}
+
+/// The test of [`class_matches`], with `reg_ic` for 'ignorecase' and the 'iskeyword' table
+/// `chartab`.
+#[inline(always)]
+fn class_test(c: i32, curc: i32, reg_ic: bool, chartab: &[u64; 4]) -> bool {
     let nul = NUL as i32;
     match c {
         NFA_IDENT => vim_is_idc(curc),
         NFA_SIDENT => !ascii_isdigit(curc) && vim_is_idc(curc),
-        NFA_KWORD => crate::charset::vim_iswordc_tab(curc, &rex.reg_chartab),
-        NFA_SKWORD => {
-            !ascii_isdigit(curc) && crate::charset::vim_iswordc_tab(curc, &rex.reg_chartab)
-        }
+        NFA_KWORD => crate::charset::vim_iswordc_tab(curc, chartab),
+        NFA_SKWORD => !ascii_isdigit(curc) && crate::charset::vim_iswordc_tab(curc, chartab),
         NFA_FNAME => vim_isfilec(curc),
         NFA_SFNAME => !ascii_isdigit(curc) && vim_isfilec(curc),
         NFA_PRINT => vim_isprintc(curc),
@@ -3087,16 +3152,19 @@ fn class_matches(rex: &Regexec<'_>, c: i32, curc: i32) -> bool {
         NFA_NLOWER => curc != nul && !ri_lower(curc),
         NFA_UPPER => ri_upper(curc),
         NFA_NUPPER => curc != nul && !ri_upper(curc),
-        NFA_LOWER_IC => ri_lower(curc) || (rex.reg_ic && ri_upper(curc)),
-        NFA_NLOWER_IC => curc != nul && !(ri_lower(curc) || (rex.reg_ic && ri_upper(curc))),
-        NFA_UPPER_IC => ri_upper(curc) || (rex.reg_ic && ri_lower(curc)),
-        NFA_NUPPER_IC => curc != nul && !(ri_upper(curc) || (rex.reg_ic && ri_lower(curc))),
+        NFA_LOWER_IC => ri_lower(curc) || (reg_ic && ri_upper(curc)),
+        NFA_NLOWER_IC => curc != nul && !(ri_lower(curc) || (reg_ic && ri_upper(curc))),
+        NFA_UPPER_IC => ri_upper(curc) || (reg_ic && ri_lower(curc)),
+        NFA_NUPPER_IC => curc != nul && !(ri_upper(curc) || (reg_ic && ri_lower(curc))),
         _ => unreachable!("state {c} is not a character class"),
     }
 }
 
+/// Returns whether character `c` is in the `[:name:]` class `cls` of a collection, with the
+/// 'iskeyword' table `chartab`.
+// Not inlined, like class_matches().
 #[inline(never)]
-fn check_char_class(rex: &Regexec<'_>, cls: i32, c: i32) -> bool {
+fn check_char_class(cls: i32, c: i32, chartab: &[u64; 4]) -> bool {
     match cls {
         NFA_CLASS_ALNUM => {
             if (1..128).contains(&c) && (c as u8).is_ascii_alphanumeric() {
@@ -3184,7 +3252,7 @@ fn check_char_class(rex: &Regexec<'_>, cls: i32, c: i32) -> bool {
             }
         }
         NFA_CLASS_KEYWORD => {
-            if rex.iswordc(c) {
+            if crate::charset::vim_iswordc_tab(c, chartab) {
                 return true;
             }
         }
@@ -4039,15 +4107,17 @@ fn nfa_regmatch_ctx(
                 }
                 NFA_START_COLL | NFA_START_NEG_COLL => {
                     if curc != NUL as i32 {
-                        let mut state = t_st.out;
-                        let result_if_matched = t_st.c == NFA_START_COLL;
-                        let mut matched = false;
-                        while let Some(s_idx) = state {
-                            let st = (&prog.state)[s_idx];
-                            if st.c == NFA_COMPOSING {
-                                let t_out = t_st.out.unwrap();
-                                let t_out_st = (&prog.state)[t_out];
-                                matched =
+                        let matched = match collection_matches(
+                            &prog.state,
+                            t_st,
+                            curc,
+                            rex.reg_ic,
+                            &rex.reg_chartab,
+                        ) {
+                            Some(matched) => matched,
+                            None => {
+                                let t_out_st = (&prog.state)[t_st.out.unwrap()];
+                                let matched =
                                     match_composing(rex, &prog.state, t_out_st.out, curc, clen);
                                 if matched
                                     && let Some(end_idx) = t_out_st.out1
@@ -4056,48 +4126,9 @@ fn nfa_regmatch_ctx(
                                     add_state = (&prog.state)[end_idx].out;
                                     add_off = clen;
                                 }
-                                break;
+                                matched
                             }
-                            if st.c == NFA_END_COLL {
-                                matched = !result_if_matched;
-                                break;
-                            }
-                            if st.c == NFA_RANGE_MIN {
-                                let mut c1 = st.val;
-                                let next_idx = st.out.unwrap();
-                                let next_st = (&prog.state)[next_idx];
-                                let c2 = next_st.val;
-                                if curc >= c1 && curc <= c2 {
-                                    matched = result_if_matched;
-                                    break;
-                                }
-                                if rex.reg_ic {
-                                    let curc_low = utf_fold(curc);
-                                    let mut done = false;
-                                    while c1 <= c2 {
-                                        if utf_fold(c1) == curc_low {
-                                            matched = result_if_matched;
-                                            done = true;
-                                            break;
-                                        }
-                                        c1 += 1;
-                                    }
-                                    if done {
-                                        break;
-                                    }
-                                }
-                                state = next_st.out;
-                                continue;
-                            } else if if st.c < 0 {
-                                check_char_class(rex, st.c, curc)
-                            } else {
-                                curc == st.c || (rex.reg_ic && utf_fold(curc) == utf_fold(st.c))
-                            } {
-                                matched = result_if_matched;
-                                break;
-                            }
-                            state = st.out;
-                        }
+                        };
                         if matched {
                             add_state = t_st.out1.and_then(|o1| (&prog.state)[o1].out);
                             add_off = clen;
@@ -4291,10 +4322,7 @@ fn nfa_regmatch_ctx(
                 }
                 NFA_MOPEN1..=NFA_MOPEN9 | NFA_ZOPEN..=NFA_ZOPEN9 | NFA_NOPEN | NFA_ZSTART => {}
                 c => {
-                    let mut matched = c == curc;
-                    if !matched && rex.reg_ic {
-                        matched = utf_fold(c) == utf_fold(curc);
-                    }
+                    let matched = char_matches(c, curc, rex.reg_ic);
                     if matched && !rex.reg_icombine {
                         clen = utf_ptr2len(rex.rest());
                     }
