@@ -830,10 +830,16 @@ fn mc_region_mark_range(mark: u32, start: &mut CursorPos, end: &mut CursorPos) -
     true
 }
 
+fn mc_ins_preview_range(p: McInsPreview, start: &mut CursorPos, end: &mut CursorPos) -> bool {
+    let mut dummy = INIT_POS;
+    extmark_get_pos(&curbuf(), mc_ns(), p.cursor, &mut dummy)
+        && mc_region_mark_range(p.region, start, end)
+}
+
 fn mc_ins_preview_first(start: &mut CursorPos, end: &mut CursorPos) -> bool {
     let previews = with_mc(|st| st.mc_ins_span.previews.borrow().clone());
     for p in previews {
-        if mc_region_mark_range(p.region, start, end) {
+        if mc_ins_preview_range(p, start, end) {
             return true;
         }
     }
@@ -890,7 +896,7 @@ fn mc_ins_preview_set(new_text: &NvimString) {
     for p in previews {
         let mut rs = INIT_POS;
         let mut re = INIT_POS;
-        if !mc_region_mark_range(p.region, &mut rs, &mut re) {
+        if !mc_ins_preview_range(p, &mut rs, &mut re) {
             continue;
         }
         mc_ins_preview_replace(rs, re, new_text);
@@ -952,9 +958,7 @@ pub fn mc_ins_cascade_restart() {
         for mut p in previews {
             let mut ps = INIT_POS;
             let mut pe = INIT_POS;
-            if mc_region_mark_range(p.region, &mut ps, &mut pe)
-                && extmark_get_pos(&curbuf(), mc_ns(), p.cursor, &mut INIT_POS)
-            {
+            if mc_ins_preview_range(p, &mut ps, &mut pe) {
                 let mut pos = CursorPos {
                     lnum: ps.lnum + c.lnum - rs.lnum,
                     col: c.col,
@@ -1048,7 +1052,7 @@ pub fn mc_ins_cascade() {
             for p in previews {
                 let mut rs = INIT_POS;
                 let mut re = INIT_POS;
-                if !mc_region_mark_range(p.region, &mut rs, &mut re) {
+                if !mc_ins_preview_range(p, &mut rs, &mut re) {
                     continue;
                 }
                 if !lt(end, rs)
