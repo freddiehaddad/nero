@@ -9,7 +9,6 @@ use crate::event::r#loop::main_loop_events;
 use crate::event::multiqueue::{multiqueue_empty, multiqueue_get};
 use crate::ex_getln::{K_EVENT, cmdline_overstrike, get_cmdline_info};
 use crate::globals::*;
-use crate::hashtab::Hashtab;
 use crate::input::{
     char_avail, check_end_reg_executing, may_sync_undo, safe_vgetc, stuff_empty, using_script,
     vpeekc,
@@ -63,7 +62,6 @@ use crate::regexp::CTRL_V_CONST;
 
 pub struct SaveVEvent {
     pub sve_did_save: bool,
-    pub sve_hashtab: Hashtab,
 }
 
 impl SaveVEvent {
@@ -71,7 +69,6 @@ impl SaveVEvent {
     pub const fn new() -> Self {
         Self {
             sve_did_save: false,
-            sve_hashtab: Hashtab::new(),
         }
     }
 }

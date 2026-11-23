@@ -290,6 +290,8 @@ thread_local! {
     };
     static EVAL_TIMERS: std::cell::RefCell<std::collections::BTreeMap<u64, std::rc::Rc<VimTimer>>> =
         const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    static SAVED_V_EVENTS: std::cell::RefCell<Vec<Hashtab>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -421,7 +423,7 @@ pub fn get_v_event(sve: &mut SaveVEvent) -> crate::eval::typval::DictId {
 
     if v_event.dv_hashtab.ht_used.get() > 0 {
         sve.sve_did_save = true;
-        sve.sve_hashtab = v_event.dv_hashtab.take();
+        SAVED_V_EVENTS.with(|saved| saved.borrow_mut().push(v_event.dv_hashtab.take()));
     } else {
         sve.sve_did_save = false;
     }
@@ -430,11 +432,24 @@ pub fn get_v_event(sve: &mut SaveVEvent) -> crate::eval::typval::DictId {
 
 pub fn restore_v_event(v_event: &TvDict, sve: &mut SaveVEvent) {
     tv_dict_free_contents(v_event);
-    if sve.sve_did_save {
-        v_event
-            .dv_hashtab
-            .replace(std::mem::take(&mut sve.sve_hashtab));
+    if sve.sve_did_save
+        && let Some(ht) = SAVED_V_EVENTS.with(|saved| saved.borrow_mut().pop())
+    {
+        v_event.dv_hashtab.replace(ht);
     }
+}
+
+pub fn set_ref_in_saved_v_event(copy_id: i32) -> bool {
+    SAVED_V_EVENTS.with(|saved| {
+        let mut abort = false;
+        for ht in saved.borrow().iter().rev() {
+            if abort {
+                break;
+            }
+            abort = set_ref_in_ht(Some(ht), copy_id, None);
+        }
+        abort
+    })
 }
 
 /// @return  "n1" divided by "n2", taking care of dividing by zero.
@@ -4176,6 +4191,7 @@ pub fn garbage_collect(testing: bool) -> bool {
 
     abort = abort || set_ref_in_func_args(copy_id);
     abort = abort || garbage_collect_vimvars(copy_id);
+    abort = abort || set_ref_in_saved_v_event(copy_id);
     {
         abort = abort || set_ref_in_quickfix(copy_id);
     }
