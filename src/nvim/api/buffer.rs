@@ -10,7 +10,6 @@ use crate::api::private::helpers::{
 };
 use crate::api::private::validate::{
     Array, Dict, Error, ErrorType, NvimString, Object, api_err_invalid, api_err_range,
-    check_string_array,
 };
 use crate::api::tabpage::Buffer;
 use crate::buffer::{
@@ -299,7 +298,7 @@ pub fn nvim_buf_detach(channel_id: u64, buf: Buffer) -> Result<Boolean, Error> {
 /// @param end              Last line index, exclusive
 /// @param strict_indexing  Whether out-of-bounds should be an error.
 /// @param[out] err         Error details, if any
-/// @return Array of lines, or empty array for unloaded buffer.
+/// @return Lines, or empty array for unloaded buffer. |api-lines|
 // DLLEXPORT ArrayOf(String) nvim_buf_get_lines(uint64_t channel_id, Buffer buf, Integer start,
 //                                              Integer end, Boolean strict_indexing, Arena *arena,
 //                                              lua_State *lstate, Error *err)
@@ -360,7 +359,7 @@ pub fn nvim_buf_get_lines(
 /// or delete the last line use start=-2 and end=-1.
 ///
 /// To insert lines at a given index, set `start` and `end` to the same index.
-/// To delete a range of lines, set `replacement` to an empty array.
+/// To delete a range of lines, set `lines` to an empty array.
 ///
 /// Out-of-bounds indices are clamped to the nearest valid value, unless
 /// `strict_indexing` is set.
@@ -372,10 +371,10 @@ pub fn nvim_buf_get_lines(
 /// @param start            First line index
 /// @param end              Last line index, exclusive
 /// @param strict_indexing  Whether out-of-bounds should be an error.
-/// @param replacement      Array of lines to use as replacement
+/// @param lines            List of lines |api-lines|, or a multiline String |api-string|: `"a\nb\n"` => `{ "a", "b" }`.
 /// @param[out] err         Error details, if any
 // DLLEXPORT void nvim_buf_set_lines(uint64_t channel_id, Buffer buf, Integer start, Integer end,
-//                                   Boolean strict_indexing, ArrayOf(String) replacement,
+//                                   Boolean strict_indexing, Union(String, ArrayOf(String)) lines,
 //                                   Arena *arena, Error *err)
 //   FUNC_API_SINCE(1)
 //   FUNC_API_TEXTLOCK;
@@ -385,7 +384,7 @@ pub fn nvim_buf_set_lines(
     mut start: Integer,
     mut end: Integer,
     strict_indexing: Boolean,
-    replacement: Array,
+    lines: Object,
 ) -> Result<(), Error> {
     let b = api_buf_ensure_loaded(buf)?;
 
@@ -408,11 +407,46 @@ pub fn nvim_buf_set_lines(
         ));
     }
 
-    let disallow_nl = channel_id != VIML_INTERNAL_CALL;
-    check_string_array(&replacement, c"replacement string", disallow_nl)?;
+    enum ReplLines<'a> {
+        Slices(Vec<&'a [u8]>),
+        Objects(&'a [Object]),
+    }
 
-    let replacement_slice = replacement.as_slice();
-    let new_len = replacement_slice.len();
+    let disallow_nl = channel_id != VIML_INTERNAL_CALL;
+    let repl_lines = match &lines {
+        Object::String(str_) => {
+            let mut bytes = str_.as_bytes();
+            if bytes.is_empty() {
+                ReplLines::Slices(Vec::new())
+            } else {
+                if bytes.last() == Some(&b'\n') {
+                    bytes = &bytes[..bytes.len() - 1];
+                }
+                let count = 1 + bytes.iter().filter(|&&b| b == b'\n').count();
+                let mut slices = Vec::with_capacity(count);
+                for line in bytes.split(|&b| b == b'\n') {
+                    slices.push(line);
+                }
+                ReplLines::Slices(slices)
+            }
+        }
+        Object::Array(arr) => {
+            crate::api::private::validate::check_string_array(arr, c"lines", disallow_nl)?;
+            ReplLines::Objects(arr.as_slice())
+        }
+        other => {
+            return Err(crate::api::private::validate::api_err_exp(
+                c"lines",
+                c"String or Array",
+                Some(crate::api::private::helpers::api_typename(other.obj_type())),
+            ));
+        }
+    };
+
+    let new_len = match &repl_lines {
+        ReplLines::Slices(s) => s.len(),
+        ReplLines::Objects(o) => o.len(),
+    };
     let old_len = (end - start) as usize;
     let mut extra: isize = 0;
 
@@ -450,7 +484,7 @@ pub fn nvim_buf_set_lines(
         let to_replace = old_len.min(new_len);
         let mut inserted_bytes: Bcount = 0;
         let mut scratch: Vec<u8> = Vec::new();
-        for (i, item) in replacement_slice.iter().enumerate().take(to_replace) {
+        for i in 0..to_replace {
             let lnum = start + (i as i64);
             if lnum >= MAXLNUM {
                 return Err(api_error!(
@@ -460,22 +494,28 @@ pub fn nvim_buf_set_lines(
                 ));
             }
 
-            if let Some(rc_cstr) = item
-                .as_string()
-                .and_then(|value| value.to_rc_cstr_if_clean())
-            {
-                let len = rc_cstr.to_bytes().len();
-                if !crate::memline::ml_replace_buf_cstr(&b, lnum as Linenr, rc_cstr) {
-                    return Err(api_error!(
-                        ErrorType::ErrorTypeException,
-                        c"Failed to replace line",
-                    ));
+            let raw: &[u8] = match &repl_lines {
+                ReplLines::Slices(s) => s[i],
+                ReplLines::Objects(o) => {
+                    let item = &o[i];
+                    if let Some(rc_cstr) = item
+                        .as_string()
+                        .and_then(|value| value.to_rc_cstr_if_clean())
+                    {
+                        let len = rc_cstr.to_bytes().len();
+                        if !crate::memline::ml_replace_buf_cstr(&b, lnum as Linenr, rc_cstr) {
+                            return Err(api_error!(
+                                ErrorType::ErrorTypeException,
+                                c"Failed to replace line",
+                            ));
+                        }
+                        inserted_bytes += len as Bcount + 1;
+                        continue;
+                    }
+                    item.as_string().expect("string Object").as_bytes()
                 }
-                inserted_bytes += len as Bcount + 1;
-                continue;
-            }
+            };
 
-            let raw = item.as_string().expect("string Object").as_bytes();
             let line: &[u8] = if raw.contains(&0) {
                 scratch.clear();
                 scratch.extend_from_slice(raw);
@@ -506,12 +546,7 @@ pub fn nvim_buf_set_lines(
             inserted_bytes += line.len() as Bcount + 1;
         }
 
-        for (i, item) in replacement_slice
-            .iter()
-            .enumerate()
-            .take(new_len)
-            .skip(to_replace)
-        {
+        for i in to_replace..new_len {
             let lnum = start + (i as i64) - 1;
             if lnum >= MAXLNUM {
                 return Err(api_error!(
@@ -521,23 +556,29 @@ pub fn nvim_buf_set_lines(
                 ));
             }
 
-            if let Some(rc_cstr) = item
-                .as_string()
-                .and_then(|value| value.to_rc_cstr_if_clean())
-            {
-                let len = rc_cstr.to_bytes().len();
-                if !crate::memline::ml_append_buf_cstr(&b, lnum as Linenr, rc_cstr, false) {
-                    return Err(api_error!(
-                        ErrorType::ErrorTypeException,
-                        c"Failed to insert line",
-                    ));
+            let raw: &[u8] = match &repl_lines {
+                ReplLines::Slices(s) => s[i],
+                ReplLines::Objects(o) => {
+                    let item = &o[i];
+                    if let Some(rc_cstr) = item
+                        .as_string()
+                        .and_then(|value| value.to_rc_cstr_if_clean())
+                    {
+                        let len = rc_cstr.to_bytes().len();
+                        if !crate::memline::ml_append_buf_cstr(&b, lnum as Linenr, rc_cstr, false) {
+                            return Err(api_error!(
+                                ErrorType::ErrorTypeException,
+                                c"Failed to insert line",
+                            ));
+                        }
+                        inserted_bytes += len as Bcount + 1;
+                        extra += 1;
+                        continue;
+                    }
+                    item.as_string().expect("string Object").as_bytes()
                 }
-                inserted_bytes += len as Bcount + 1;
-                extra += 1;
-                continue;
-            }
+            };
 
-            let raw = item.as_string().expect("string Object").as_bytes();
             let line: &[u8] = if raw.contains(&0) {
                 scratch.clear();
                 scratch.extend_from_slice(raw);
@@ -621,7 +662,7 @@ pub fn nvim_buf_set_lines(
 ///
 /// To insert text at a given `(row, column)` location, use `start_row = end_row
 /// = row` and `start_col = end_col = col`. To delete the text in a range, use
-/// `replacement = {}`.
+/// `text = {}`.
 ///
 /// @note Prefer |nvim_buf_set_lines()| (for performance) to add or delete entire lines.
 /// @note Prefer |nvim_paste()| or |nvim_put()| to insert (instead of replace) text at cursor.
@@ -632,11 +673,12 @@ pub fn nvim_buf_set_lines(
 /// @param start_col        Starting column (byte offset) on first line
 /// @param end_row          Last line index, inclusive
 /// @param end_col          Ending column (byte offset) on last line, exclusive
-/// @param replacement      Array of lines to use as replacement
+/// @param text             List of lines (|api-lines| binary mode), or a multiline String
+///                         |api-string|: `"a\nb"` => `{ "a", "b" }`, `"a\n"` => `{ "a", "" }`.
 /// @param[out] err         Error details, if any
 // DLLEXPORT void nvim_buf_set_text(uint64_t channel_id, Buffer buf, Integer start_row,
 //                                  Integer start_col, Integer end_row, Integer end_col,
-//                                  ArrayOf(String) replacement, Arena *arena, Error *err)
+//                                  Union(String, ArrayOf(String)) text, Arena *arena, Error *err)
 //   FUNC_API_SINCE(7)
 //   FUNC_API_TEXTLOCK;
 pub fn nvim_buf_set_text(
@@ -646,13 +688,15 @@ pub fn nvim_buf_set_text(
     mut start_col: Integer,
     mut end_row: Integer,
     mut end_col: Integer,
-    replacement: Array,
+    text: Object,
 ) -> Result<(), Error> {
+    let disallow_nl = channel_id != VIML_INTERNAL_CALL;
+    let repl = crate::api::private::helpers::api_object_to_lines(text, c"text", disallow_nl, true)?;
     let scratch_items = [static_cstr_as_obj(c"")];
-    let replacement_slice: &[Object] = if replacement.size == 0 {
+    let replacement_slice: &[Object] = if repl.size == 0 {
         &scratch_items
     } else {
-        replacement.as_slice()
+        repl.as_slice()
     };
 
     let b = api_buf_ensure_loaded(buf)?;
@@ -696,11 +740,6 @@ pub fn nvim_buf_set_text(
             c"%s",
             c"'start' is higher than 'end'",
         ));
-    }
-
-    let disallow_nl = channel_id != VIML_INTERNAL_CALL;
-    if replacement.size != 0 {
-        check_string_array(&replacement, c"replacement string", disallow_nl)?;
     }
 
     let new_len = replacement_slice.len();
@@ -977,7 +1016,7 @@ pub fn nvim_buf_set_text(
 /// @param end_col    Ending column (byte offset) on last line, exclusive
 /// @param opts       Optional parameters. Currently unused.
 /// @param[out] err   Error details, if any
-/// @return Array of lines, or empty array for unloaded buffer.
+/// @return Lines (|api-lines| binary mode), or empty array for unloaded buffer.
 // DLLEXPORT ArrayOf(String) nvim_buf_get_text(uint64_t channel_id, Buffer buf, Integer start_row,
 //                                             Integer start_col, Integer end_row, Integer end_col,
 //                                             Dict(empty) *opts, Arena *arena, lua_State *lstate,

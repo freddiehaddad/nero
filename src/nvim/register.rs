@@ -2959,7 +2959,7 @@ pub fn write_reg_contents_ex(
     }
 }
 
-pub fn prepare_yankreg_from_object(reg: &mut Yankreg, regtype: NvimString, _lines: usize) -> bool {
+pub fn prepare_yankreg_from_object(reg: &mut Yankreg, regtype: NvimString) -> bool {
     let type_ch = if !regtype.data.is_null() {
         regtype.first_byte()
     } else {

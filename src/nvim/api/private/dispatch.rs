@@ -4987,10 +4987,7 @@ pub fn handle_nvim_buf_set_lines(channel_id: u64, args: Array) -> Result<Object,
         args[3].clone(),
         c"Wrong type for argument 4 when calling nvim_buf_set_lines, expecting Boolean",
     )?;
-    let arg_5: Array = extract_array(
-        args[4].clone(),
-        c"Wrong type for argument 5 when calling nvim_buf_set_lines, expecting ArrayOf(String)",
-    )?;
+    let arg_5: Object = args[4].clone();
     if text_locked() {
         return Err(api_error_str(
             ErrorType::ErrorTypeException,
@@ -5035,10 +5032,7 @@ pub fn handle_nvim_buf_set_text(channel_id: u64, args: Array) -> Result<Object, 
         args[4].clone(),
         c"Wrong type for argument 5 when calling nvim_buf_set_text, expecting Integer",
     )?;
-    let arg_6: Array = extract_array(
-        args[5].clone(),
-        c"Wrong type for argument 6 when calling nvim_buf_set_text, expecting ArrayOf(String)",
-    )?;
+    let arg_6: Object = args[5].clone();
     if text_locked() {
         return Err(api_error_str(
             ErrorType::ErrorTypeException,
@@ -8691,10 +8685,7 @@ pub fn handle_nvim_put(channel_id: u64, args: Array) -> Result<Object, Error> {
             args.size
         ));
     }
-    let arg_1: Array = extract_array(
-        args[0].clone(),
-        c"Wrong type for argument 1 when calling nvim_put, expecting ArrayOf(String)",
-    )?;
+    let arg_1: Object = args[0].clone();
     let arg_2: NvimString = extract_string(
         args[1].clone(),
         c"Wrong type for argument 2 when calling nvim_put, expecting String",
@@ -12670,7 +12661,7 @@ extern "C-unwind" fn nlua_api_nvim_buf_get_lines(lstate: *mut lua_State) -> i32 
 extern "C-unwind" fn nlua_api_nvim_buf_set_lines(lstate: *mut lua_State) -> i32 {
     let mut err = Error::new();
     let mut err_param: Option<&'static std::ffi::CStr> = None;
-    let arg5: Array;
+    let arg5: Object;
     let arg4: Boolean;
     let arg3: Integer;
     let arg2: Integer;
@@ -12695,11 +12686,11 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_lines(lstate: *mut lua_State) -> i32 
                                 api_error_str(ErrorType::ErrorTypeException, get_text_locked_msg());
                             break 'exit_0;
                         }
-                        arg5 = match nlua_pop_array(lstate) {
+                        arg5 = match nlua_pop_object(lstate, true) {
                             Ok(v) => v,
                             Err(e) => {
                                 err = e;
-                                err_param = Some(c"replacement");
+                                err_param = Some(c"lines");
                                 break 'exit_0;
                             }
                         };
@@ -12730,9 +12721,14 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_lines(lstate: *mut lua_State) -> i32 
                         };
                         let save_active_lstate = active_lstate();
                         set_active_lstate(lstate);
-                        if let Err(e) =
-                            nvim_buf_set_lines(LUA_INTERNAL_CALL, arg1, arg2, arg3, arg4, arg5)
-                        {
+                        if let Err(e) = nvim_buf_set_lines(
+                            LUA_INTERNAL_CALL,
+                            arg1,
+                            arg2,
+                            arg3,
+                            arg4,
+                            arg5.clone(),
+                        ) {
                             err = e;
                         }
                         set_active_lstate(save_active_lstate);
@@ -12740,6 +12736,7 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_lines(lstate: *mut lua_State) -> i32 
                 }
             }
         }
+        api_luarefs_free_object(arg5);
     }
     nlua_finish_api_call(lstate, err, err_param, 0)
 }
@@ -12747,7 +12744,7 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_lines(lstate: *mut lua_State) -> i32 
 extern "C-unwind" fn nlua_api_nvim_buf_set_text(lstate: *mut lua_State) -> i32 {
     let mut err = Error::new();
     let mut err_param: Option<&'static std::ffi::CStr> = None;
-    let arg6: Array;
+    let arg6: Object;
     let arg5: Integer;
     let arg4: Integer;
     let arg3: Integer;
@@ -12776,11 +12773,11 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_text(lstate: *mut lua_State) -> i32 {
                                 );
                                 break 'exit_0;
                             }
-                            arg6 = match nlua_pop_array(lstate) {
+                            arg6 = match nlua_pop_object(lstate, true) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     err = e;
-                                    err_param = Some(c"replacement");
+                                    err_param = Some(c"text");
                                     break 'exit_0;
                                 }
                             };
@@ -12833,7 +12830,7 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_text(lstate: *mut lua_State) -> i32 {
                                 arg3,
                                 arg4,
                                 arg5,
-                                arg6,
+                                arg6.clone(),
                             ) {
                                 err = e;
                             }
@@ -12843,6 +12840,7 @@ extern "C-unwind" fn nlua_api_nvim_buf_set_text(lstate: *mut lua_State) -> i32 {
                 }
             }
         }
+        api_luarefs_free_object(arg6);
     }
     nlua_finish_api_call(lstate, err, err_param, 0)
 }
@@ -17889,7 +17887,7 @@ extern "C-unwind" fn nlua_api_nvim_put(lstate: *mut lua_State) -> i32 {
     let arg4: Boolean;
     let arg3: Boolean;
     let arg2: NvimString;
-    let arg1: Array;
+    let arg1: Object;
     'exit_0: {
         {
             'exit_2: {
@@ -17916,7 +17914,7 @@ extern "C-unwind" fn nlua_api_nvim_put(lstate: *mut lua_State) -> i32 {
                             break 'exit_2;
                         }
                     };
-                    arg1 = match nlua_pop_array(lstate) {
+                    arg1 = match nlua_pop_object(lstate, true) {
                         Ok(v) => v,
                         Err(e) => {
                             err = e;
@@ -17926,10 +17924,11 @@ extern "C-unwind" fn nlua_api_nvim_put(lstate: *mut lua_State) -> i32 {
                     };
                     let save_active_lstate = active_lstate();
                     set_active_lstate(lstate);
-                    if let Err(e) = nvim_put(arg1, arg2, arg3, arg4) {
+                    if let Err(e) = nvim_put(arg1.clone(), arg2, arg3, arg4) {
                         err = e;
                     }
                     set_active_lstate(save_active_lstate);
+                    api_luarefs_free_object(arg1);
                 }
             }
         }

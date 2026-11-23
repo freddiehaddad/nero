@@ -3,9 +3,7 @@
 
 use crate::api::buffer::{LUA_INTERNAL_CALL, nvim_buf_set_text};
 use crate::api::extmark::nvim_create_namespace;
-use crate::api::private::helpers::{
-    boolean_obj, cstr_as_string, static_cstr_as_string, string_to_array,
-};
+use crate::api::private::helpers::{boolean_obj, cstr_as_string, static_cstr_as_string};
 use crate::api::private::validate::NvimString;
 use crate::api::vim::nvim_feedkeys;
 use crate::autocmd::{block_autocmds, unblock_autocmds};
@@ -847,12 +845,6 @@ fn mc_ins_preview_first(start: &mut CursorPos, end: &mut CursorPos) -> bool {
 }
 
 fn mc_ins_preview_replace(start: CursorPos, end: CursorPos, text: &NvimString) {
-    let input = if !text.data.is_null() {
-        text.clone()
-    } else {
-        NvimString::new()
-    };
-    let lines = string_to_array(input, false);
     if let Err(err) = nvim_buf_set_text(
         LUA_INTERNAL_CALL,
         0,
@@ -860,7 +852,7 @@ fn mc_ins_preview_replace(start: CursorPos, end: CursorPos, text: &NvimString) {
         i64::from(start.col),
         i64::from(end.lnum - 1),
         i64::from(end.col),
-        lines,
+        crate::api::private::helpers::string_obj(text.clone()),
     ) && min_log_level() <= LOGLVL_DBG
     {
         logmsg!(

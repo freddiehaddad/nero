@@ -217,7 +217,7 @@ fn parse_map_cmd(arg_str: &CStr) -> Array {
 ///
 /// Doesn't check the validity of command arguments.
 ///
-/// @param str       Command line string to parse. Cannot contain "\n".
+/// @param str       Command line string to parse. Cannot contain NL.
 /// @param opts      Optional parameters. Reserved for future use.
 /// @param[out] err  Error details, if any.
 /// @return Dict containing command information, with these keys:

@@ -366,7 +366,7 @@ pub fn nvim_get_hl_by_name(name: NvimString, rgb: Boolean) -> Result<Dict, Error
 //                              Error *err)
 //   FUNC_API_DEPRECATED_SINCE(1);
 pub fn buffer_insert(buffer: Buffer, lnum: Integer, lines: Array) -> Result<(), Error> {
-    nvim_buf_set_lines(0, buffer, lnum, lnum, true, lines)
+    nvim_buf_set_lines(0, buffer, lnum, lnum, true, array_obj(lines))
 }
 
 /// Gets a buffer line
@@ -391,7 +391,7 @@ pub fn buffer_get_line(buffer: Buffer, mut index: Integer) -> Result<NvimString,
 
 /// Sets a buffer line
 ///
-/// @deprecated use nvim_buf_set_lines instead.
+/// @deprecated use nvim_buf_get_lines instead.
 ///
 /// @param buffer   Buffer id
 /// @param index    Line index
@@ -403,7 +403,7 @@ pub fn buffer_set_line(buffer: Buffer, mut index: Integer, line: NvimString) -> 
     let mut l = [string_obj(line)];
     let array = Array::from_slice(&mut l);
     index = convert_index(index);
-    nvim_buf_set_lines(0, buffer, index, index + 1, true, array)
+    nvim_buf_set_lines(0, buffer, index, index + 1, true, array_obj(array))
 }
 
 /// Deletes a buffer line
@@ -418,7 +418,7 @@ pub fn buffer_set_line(buffer: Buffer, mut index: Integer, line: NvimString) -> 
 pub fn buffer_del_line(buffer: Buffer, mut index: Integer) -> Result<(), Error> {
     let array = Array::new();
     index = convert_index(index);
-    nvim_buf_set_lines(0, buffer, index, index + 1, true, array)
+    nvim_buf_set_lines(0, buffer, index, index + 1, true, array_obj(array))
 }
 
 /// Retrieves a line range from the buffer
@@ -474,7 +474,7 @@ pub fn buffer_set_line_slice(
 ) -> Result<(), Error> {
     start = convert_index(start) + i64::from(!include_start);
     end = convert_index(end) + i64::from(include_end);
-    nvim_buf_set_lines(0, buffer, start, end, false, replacement)
+    nvim_buf_set_lines(0, buffer, start, end, false, array_obj(replacement))
 }
 
 /// Sets a buffer-scoped (b:) variable

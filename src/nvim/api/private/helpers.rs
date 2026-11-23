@@ -817,6 +817,39 @@ pub fn api_object_to_bool(obj: Object, what: &CStr, nil_value: bool) -> Result<b
     }
 }
 
+pub fn api_object_to_lines(
+    obj: Object,
+    what: &CStr,
+    disallow_nl: bool,
+    binary: bool,
+) -> Result<Array, Error> {
+    match obj {
+        Object::String(str_) => {
+            let mut bytes = str_.as_bytes();
+            if bytes.is_empty() {
+                return Ok(Array::new());
+            } else if !binary && bytes.last() == Some(&b'\n') {
+                bytes = &bytes[..bytes.len() - 1];
+            }
+            let count = 1 + bytes.iter().filter(|&&b| b == b'\n').count();
+            let mut lines = Array::with_capacity(count);
+            for line in bytes.split(|&b| b == b'\n') {
+                lines.push(string_obj(NvimString::from_bytes(line)));
+            }
+            Ok(lines)
+        }
+        Object::Array(arr) => {
+            crate::api::private::validate::check_string_array(&arr, what, disallow_nl)?;
+            Ok(arr)
+        }
+        other => Err(api_err_exp(
+            what,
+            c"String or Array",
+            Some(api_typename(other.obj_type())),
+        )),
+    }
+}
+
 pub fn object_to_hl_id(obj: Object, what: &CStr) -> Result<i32, Error> {
     match obj {
         Object::String(str_) => {
@@ -1394,7 +1427,7 @@ static API_FUNCTIONS: [ApiFunctionMeta; 263] = [
             ("Integer", "start", false),
             ("Integer", "end", false),
             ("Boolean", "strict_indexing", false),
-            ("ArrayOf(String)", "replacement", false),
+            ("Object", "lines", false),
         ],
     ),
     api_fn(
@@ -1409,7 +1442,7 @@ static API_FUNCTIONS: [ApiFunctionMeta; 263] = [
             ("Integer", "start_col", false),
             ("Integer", "end_row", false),
             ("Integer", "end_col", false),
-            ("ArrayOf(String)", "replacement", false),
+            ("Object", "text", false),
         ],
     ),
     api_fn(
@@ -2604,7 +2637,7 @@ static API_FUNCTIONS: [ApiFunctionMeta; 263] = [
         None,
         "void",
         &[
-            ("ArrayOf(String)", "lines", false),
+            ("Object", "lines", false),
             ("String", "type", false),
             ("Boolean", "after", false),
             ("Boolean", "follow", false),

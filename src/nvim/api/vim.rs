@@ -8,15 +8,14 @@ use crate::api::deprecated::{KeyDictEmpty, buffer_del_line, buffer_get_line, buf
 use crate::api::private::converter::vim_to_object;
 use crate::api::private::helpers::{
     ArrayBuilder, HlMessageChunk, TryState, add_c, api_error, api_metadata, api_set_sctx,
-    api_typename, array_obj, boolean_obj, buffer_obj, copy_array, copy_dict, copy_object,
-    copy_string, dict_get_value, dict_obj, dict_set_var, find_buffer_by_handle,
-    find_window_by_handle, get_default_stl_hl, integer_obj, nil_obj, parse_hl_msg, put_c, set_mark,
-    static_cstr_as_string, string_obj, string_to_array, tabpage_obj, try_enter, try_leave,
-    window_obj,
+    array_obj, boolean_obj, buffer_obj, copy_array, copy_dict, copy_object, copy_string,
+    dict_get_value, dict_obj, dict_set_var, find_buffer_by_handle, find_window_by_handle,
+    get_default_stl_hl, integer_obj, nil_obj, parse_hl_msg, put_c, set_mark, static_cstr_as_string,
+    string_obj, string_to_array, tabpage_obj, try_enter, try_leave, window_obj,
 };
 use crate::api::private::validate::{
-    Array, Dict, Error, ErrorType, KeyValuePair, NvimString, Object, ObjectType, api_err_exp,
-    api_err_invalid, api_err_required,
+    Array, Dict, Error, ErrorType, KeyValuePair, NvimString, Object, api_err_exp, api_err_invalid,
+    api_err_required,
 };
 use crate::api::tabpage::{Buffer, Tabpage, Window};
 use crate::autocmd::{
@@ -298,23 +297,6 @@ fn validate_r(cond: bool, name: &std::ffi::CStr) -> Result<(), Error> {
 fn validate_range(cond: bool, name: &std::ffi::CStr) -> Result<(), Error> {
     if !cond {
         Err(api_err_invalid(name, Some(c"out of range"), 0, false))
-    } else {
-        Ok(())
-    }
-}
-
-#[inline]
-fn validate_t(
-    name: &std::ffi::CStr,
-    expected_t: ObjectType,
-    actual_t: ObjectType,
-) -> Result<(), Error> {
-    if expected_t != actual_t {
-        Err(api_err_exp(
-            name,
-            api_typename(expected_t),
-            Some(api_typename(actual_t)),
-        ))
     } else {
         Ok(())
     }
@@ -1483,7 +1465,7 @@ pub fn nvim_open_term(buf: Buffer, opts: &mut KeyDictOpenTerm) -> Result<Integer
 /// To write data to the |TUI| host terminal, see |nvim_ui_send()|.
 ///
 /// @param chan Channel id
-/// @param data Data to write. 8-bit clean: may contain NUL bytes.
+/// @param data Data to write. |api-string|
 /// @param[out] err Error details, if any
 // DLLEXPORT void nvim_chan_send(Integer chan, String data,
 //                               Error *err) FUNC_API_SINCE(7) FUNC_API_REMOTE_ONLY FUNC_API_LUA_ONLY;
@@ -1559,7 +1541,7 @@ pub fn nvim_set_current_tabpage(tabpage: Tabpage) -> Result<(), Error> {
 /// end, { buf = 0 })
 /// ```
 ///
-/// @param data  Multiline input. Lines break at LF ("\n"). May be binary (containing NUL bytes).
+/// @param data  Input text. |api-string|
 /// @param crlf  Also break lines at CR and CRLF.
 /// @param phase  -1: paste in a single call (i.e. without streaming).
 ///               To "stream" a paste, call `nvim_paste` sequentially with
@@ -1636,7 +1618,8 @@ pub fn nvim_paste(
 ///
 /// Compare |:put| and |p| which are always linewise.
 ///
-/// @param lines  |readfile()|-style list of lines. |channel-lines|
+/// @param lines  Input text: List of lines (|api-lines| binary mode), or a multiline String |api-string|
+///               (split like |setreg()|).
 /// @param type  Edit behavior: any |getregtype()| result, or:
 ///              - "b" |blockwise-visual| mode (may include width, e.g. "b3")
 ///              - "c" |charwise| mode
@@ -1645,28 +1628,30 @@ pub fn nvim_paste(
 /// @param after  If true insert after cursor (like |p|), or before (like |P|).
 /// @param follow  If true place cursor at end of inserted text.
 /// @param[out] err Error details, if any
-// DLLEXPORT void nvim_put(ArrayOf(String) lines, String type, Boolean after, Boolean follow,
-//                         Arena *arena, Error *err) FUNC_API_SINCE(6) FUNC_API_TEXTLOCK;
+// DLLEXPORT void nvim_put(Union(String, ArrayOf(String)) lines, String type, Boolean after,
+//                         Boolean follow, Arena *arena, Error *err) FUNC_API_SINCE(6) FUNC_API_TEXTLOCK;
 pub fn nvim_put(
-    lines: Array,
+    lines: Object,
     reg_type: NvimString,
     after: Boolean,
     follow: Boolean,
 ) -> Result<(), Error> {
     let mut reg = crate::register::EMPTY_YANKREG;
     validate_s(
-        prepare_yankreg_from_object(&mut reg, reg_type.clone(), lines.size),
+        prepare_yankreg_from_object(&mut reg, reg_type.clone()),
         c"type",
         reg_type.as_opt_cstr(),
     )?;
-    if lines.size == 0 {
+    let binary = reg.y_type == crate::register::MotionType::MtCharWise
+        || reg.y_type == crate::register::MotionType::MtUnknown;
+    let arr = crate::api::private::helpers::api_object_to_lines(lines, c"lines", false, binary)?;
+    if arr.size == 0 {
         return Ok(());
     }
 
-    reg.y_array = Vec::with_capacity(lines.size);
+    reg.y_array = Vec::with_capacity(arr.size);
     reg.y_allocated = true;
-    for item in lines.as_slice() {
-        validate_t(c"line", ObjectType::ObjectTypeString, item.obj_type())?;
+    for item in arr.as_slice() {
         let line = item.as_string().expect("string Object").clone();
         let line_size = line.size;
         let mut copied = copy_string(line);

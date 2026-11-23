@@ -1368,7 +1368,7 @@ pub fn remote_ui_event(ui: &mut RemoteUI, mut name: &'static CStr, args: Array) 
 /// write the received data to a connected TTY if one exists.
 ///
 /// @param channel_id
-/// @param content Content to write to the TTY
+/// @param content Content to write to the TTY. |api-string|
 /// @param[out] err Error details, if any
 // DLLEXPORT void nvim_ui_send(uint64_t channel_id, String content, Error *err) FUNC_API_SINCE(14);
 pub fn nvim_ui_send(_channel_id: u64, content: NvimString) -> Result<(), Error> {

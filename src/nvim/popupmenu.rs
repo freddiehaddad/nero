@@ -3,7 +3,7 @@
 
 use crate::api::buffer::nvim_buf_set_lines;
 use crate::api::private::helpers::{
-    add_c, api_free_array, array_obj, boolean_obj, cstr_as_obj, cstr_as_string, string_obj,
+    add_c, array_obj, boolean_obj, cstr_as_obj, cstr_as_string, string_obj,
 };
 use crate::api::private::validate::{Array, ErrorType, NvimString};
 use crate::api::win_config::{K_UIMULTIGRID, WIN_CONFIG_INIT, parse_winborder};
@@ -216,8 +216,6 @@ fn pum_has_items() -> bool {
 fn pum_item(idx: i32) -> Pumitem {
     PUM_ITEMS.with(|c| c.borrow().as_ref().unwrap()[idx as usize].clone())
 }
-
-use crate::api::private::helpers::cstr_to_string;
 
 fn pum_compute_size() {
     PUM.with(|s| s.base_width.set(0));
@@ -1250,11 +1248,11 @@ fn pum_preview_set_text(
     lnum: &mut Linenr,
     max_width: &mut i32,
 ) {
-    let mut replacement = Array::new();
     let buf = win.w_buffer.get();
     buf.b_p_ma.set(true);
 
-    if let Some(info_bytes) = info.map(crate::memory::bytes_until_nul) {
+    let info_bytes = info.map_or(&[][..], crate::memory::bytes_until_nul);
+    if !info_bytes.is_empty() {
         let mut rem_opt: Option<&[u8]> = Some(info_bytes);
         while let Some(rem) = rem_opt {
             let (curr_slice, next_opt) = if let Some(nl_idx) = rem.iter().position(|&b| b == b'\n')
@@ -1272,7 +1270,6 @@ fn pum_preview_set_text(
             let line_width = win_linetabsize(win, 0, &curr_cstr, MAXCOL);
             win.w_onebuf_opt.wo_wrap.set(save_wrap);
             *max_width = (*max_width).max(line_width);
-            replacement.push(string_obj(cstr_to_string(Some(&*curr_cstr))));
             *lnum += 1;
             rem_opt = next_opt;
         }
@@ -1280,12 +1277,18 @@ fn pum_preview_set_text(
 
     let set_lines_res = {
         let _save_textlock = input_state().override_textlock(0);
-        nvim_buf_set_lines(0, buf.b_fnum.get(), 0, -1, false, replacement.clone())
+        nvim_buf_set_lines(
+            0,
+            buf.b_fnum.get(),
+            0,
+            -1,
+            false,
+            string_obj(NvimString::from_bytes(info_bytes)),
+        )
     };
     if let Err(err) = set_lines_res {
         emsg(err.msg_cstr().unwrap_or(c""));
     }
-    api_free_array(replacement);
     buf.b_p_ma.set(false);
 }
 
