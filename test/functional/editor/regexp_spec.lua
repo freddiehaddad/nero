@@ -611,4 +611,79 @@ describe('regexp engine', function()
       end)
     )
   end)
+
+  it('matches with the DFA of an NFA program what the NFA engine matches', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          loop_exit = { 'x', 40, 41 },
+          isk_before = { 0, 1 },
+          isk_after = { 0, 3 },
+          ic_off = { 'abc', 5, 8 },
+          ic_on = { 'Abc', 5, 8 },
+          byte_read = { 4, 5 },
+          byte_before = { 7, 8 },
+          byte_after = { 0, 1 },
+        },
+        n.exec_lua(function(p)
+          -- A program gets its DFA after some matches in a release build, at once in a debug
+          -- build, which also checks each of its matches against the NFA engine.
+          local function each(f)
+            local first = f()
+            for _ = 1, 15 do
+              assert(vim.deep_equal(f(), first), 'a repeated match changed')
+            end
+            return first
+          end
+          local fn = vim.fn
+          local r = {}
+          -- The empty pass of the loop reaches the end of the pattern before "y" is read.
+          r.loop_exit = each(function()
+            return fn.matchstrpos(('-'):rep(40) .. 'xy', p .. [[x\%(y\{-}\)\+]])
+          end)
+          local keyword = vim.regex(p .. [[\<\k\+\>]])
+          r.isk_before = each(function()
+            return { keyword:match_str('a-b c') }
+          end)
+          vim.bo.iskeyword = vim.bo.iskeyword .. ',-'
+          r.isk_after = each(function()
+            return { keyword:match_str('a-b c') }
+          end)
+          r.ic_off = each(function()
+            return fn.matchstrpos('xAbc abc', p .. [[\<abc\>]])
+          end)
+          vim.o.ignorecase = true
+          r.ic_on = each(function()
+            return fn.matchstrpos('xAbc Abc', p .. [[\<abc\>]])
+          end)
+          -- "é" is a word character: read while matching, before the match and after it.
+          local eow = vim.regex(p .. [[b\>]])
+          r.byte_read = each(function()
+            return { eow:match_str('bé b') }
+          end)
+          local word = vim.regex(p .. [[\<b\w*]])
+          r.byte_before = each(function()
+            return { word:match_str('éb xb bé') }
+          end)
+          r.byte_after = each(function()
+            return { word:match_str('b é') }
+          end)
+          return r
+        end, [[\%#=]] .. engine)
+      )
+      n.clear()
+    end
+  end)
+
+  it('leaves a match the automatic engine gives up on to the NFA engine', function()
+    -- After 100000 positions the NFA engine gives up and the backtracking engine takes over.
+    eq(
+      [[Switching to backtracking RE engine for pattern: \<x\|y\>]],
+      n.exec_lua(function()
+        vim.g.text = ('ab'):rep(50001)
+        vim.o.verbose = 1
+        return vim.trim(vim.fn.execute([[echo matchstr(g:text, '\<x\|y\>')]]))
+      end)
+    )
+  end)
 end)

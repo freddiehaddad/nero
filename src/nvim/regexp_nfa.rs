@@ -9,6 +9,11 @@ use std::ops::Range;
 
 use super::*;
 
+#[path = "regexp_dfa.rs"]
+mod dfa;
+
+pub(super) use self::dfa::{DfaCache, DfaRun};
+
 const NFA_ADD_NL: i32 = 31;
 
 const NFA_SPLIT: i32 = -1024;

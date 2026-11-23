@@ -211,6 +211,8 @@ pub struct RegprogInner {
     pub re_flags: u32,
     pub re_in_use: std::cell::Cell<bool>,
     pub(super) engine: std::cell::RefCell<RegProgEngine>,
+    /// The DFA of an NFA program, see `regexp_dfa.rs`.
+    dfa: DfaCache,
 }
 
 #[derive(Clone)]
@@ -224,6 +226,7 @@ impl Regprog {
             re_flags,
             re_in_use: std::cell::Cell::new(false),
             engine: std::cell::RefCell::new(engine),
+            dfa: DfaCache::new(),
         }))
     }
 
@@ -261,6 +264,7 @@ impl Regprog {
             RegProgEngine::Nfa(nfa) => RegProgEngine::Nfa(nfa.clone()),
         };
         *self.0.engine.borrow_mut() = new_eng;
+        self.0.dfa.clear();
     }
 
     #[inline(always)]
@@ -3724,7 +3728,102 @@ fn report_re_switch(pat: &[u8]) {
     }
 }
 
+/// Whether an NFA program with flags `regflags` ignores case when the caller asks for `ic`.
+fn nfa_reg_ic(regflags: u32, ic: bool) -> bool {
+    if (regflags & RF_ICASE) != 0 {
+        true
+    } else if (regflags & RF_NOICASE) != 0 {
+        false
+    } else {
+        ic
+    }
+}
+
+/// Matches `rmp` in `line` from byte `col` with the DFA of its NFA program, when the DFA
+/// handles the program and the text (see `regexp_dfa.rs`); `None` when it does not.
+fn dfa_regmatch(rmp: &mut Regmatch, line: &[u8], col: Colnr) -> Option<i32> {
+    let (run, start_col) = {
+        let prog = rmp.regprog.opt()?;
+        let eng = prog.0.engine.borrow();
+        let RegProgEngine::Nfa(nfa) = &*eng else {
+            return None;
+        };
+        if prog.0.dfa.is_off() {
+            return None;
+        }
+        let reg_ic = nfa_reg_ic(nfa.regflags, rmp.rm_ic);
+        let mut col = usize::try_from(col).ok().filter(|&c| c <= line.len())?;
+        if nfa.reganch && col > 0 {
+            return Some(0);
+        }
+        if nfa.regstart != NUL as i32 {
+            match cstrchr_ic(&line[col..], nfa.regstart, reg_ic) {
+                Some(off) => col += off,
+                None => return Some(0),
+            }
+        }
+        if !prog.0.dfa.enabled(nfa, line.len() - col) {
+            return None;
+        }
+        let chartab = workspace_state().curbuf.get().opt()?.b_chartab.get();
+        if (prog.re_flags() & RE_NOBREAK as u32) == 0 {
+            fast_breakcheck();
+        }
+        if input_state().got_int.get() {
+            return Some(0);
+        }
+        (prog.0.dfa.run(nfa, line, col, reg_ic, &chartab), col)
+    };
+    let res = match run {
+        DfaRun::Declined => return None,
+        DfaRun::NoMatch => 0,
+        DfaRun::Match(start, end) => {
+            RE_STATE.with(|s| s.re_extmatch_out.set(None));
+            rmp.startp = [None; NSUBEXP];
+            rmp.endp = [None; NSUBEXP];
+            rmp.startp[0] = Some(start);
+            rmp.endp[0] = Some(end);
+            rmp.rm_matchcol = start_col as Colnr;
+            1
+        }
+    };
+    #[cfg(debug_assertions)]
+    check_dfa_regmatch(rmp, line, col, res);
+    Some(res)
+}
+
+/// Checks that the NFA engine finds the match the DFA found in `line`.
+#[cfg(debug_assertions)]
+fn check_dfa_regmatch(rmp: &Regmatch, line: &[u8], col: Colnr, res: i32) {
+    let prog = rmp.regprog.opt().unwrap();
+    let eng = prog.0.engine.borrow();
+    let RegProgEngine::Nfa(nfa) = &*eng else {
+        unreachable!();
+    };
+    let mut rex = Regexec::for_string(rmp, line, false);
+    rex.reg_nobreak = true;
+    let nfa_res = nfa_regexec_both(nfa, &mut rex, col, None, None);
+    assert_eq!(
+        nfa_res > 0,
+        res > 0,
+        "DFA and NFA disagree on {:?}",
+        nfa.pattern
+    );
+    if res > 0 {
+        assert_eq!(
+            (rex.rm_startp, rex.rm_endp, rex.rm_matchcol),
+            (rmp.startp, rmp.endp, rmp.rm_matchcol),
+            "DFA and NFA disagree on {:?} in {:?}",
+            nfa.pattern,
+            String::from_utf8_lossy(line)
+        );
+    }
+}
+
 fn exec_regmatch_nl(rmp: &mut Regmatch, line: &[u8], col: Colnr, nl: bool) -> i32 {
+    if let Some(res) = dfa_regmatch(rmp, line, col) {
+        return res;
+    }
     let mut rex = Regexec::for_string(rmp, line, nl);
     let res = {
         let prog = rmp.regprog.opt().unwrap();
@@ -3748,7 +3847,7 @@ fn exec_regmmatch_multi(
     lnum: Linenr,
     mut col: Colnr,
     tm: Option<Proftime>,
-    timed_out: Option<&mut i32>,
+    mut timed_out: Option<&mut i32>,
 ) -> i32 {
     if lnum >= 1 && lnum <= buf.b_ml.ml_line_count.get() {
         let pre_action = {
@@ -3757,14 +3856,13 @@ fn exec_regmmatch_multi(
             if let RegProgEngine::Nfa(nfa) = &*eng {
                 if nfa.reganch && col > 0 {
                     Some(None)
+                } else if !prog.0.dfa.is_off()
+                    && let Some(found) =
+                        dfa_lines(prog, nfa, rmp, buf, lnum, col, tm, timed_out.as_deref_mut())
+                {
+                    Some(found)
                 } else if nfa.regstart != NUL as i32 {
-                    let reg_ic = if (nfa.regflags & RF_ICASE) != 0 {
-                        true
-                    } else if (nfa.regflags & RF_NOICASE) != 0 {
-                        false
-                    } else {
-                        rmp.rmm_ic
-                    };
+                    let reg_ic = nfa_reg_ic(nfa.regflags, rmp.rmm_ic);
                     let reg_icombine = (nfa.regflags & RF_ICOMBINE) != 0;
                     let pre = crate::memline::with_ml_buf_line(buf, lnum, |line_bytes| {
                         let start_off = (col as usize).min(line_bytes.len());
@@ -3838,6 +3936,91 @@ fn exec_regmmatch_multi(
         rmp.rmm_matchcol = rex.rmm_matchcol;
     }
     res
+}
+
+/// Matches the NFA program `nfa` of `rmp` in line `lnum` of `buf` from byte `col` with its
+/// DFA (see `regexp_dfa.rs`): `Some(None)` for no match, `Some(Some((start, end)))` for a
+/// match, `None` when the DFA does not handle the line.
+#[allow(clippy::too_many_arguments)]
+fn dfa_lines(
+    prog: &Regprog,
+    nfa: &NfaRegprog,
+    rmp: &Regmmatch,
+    buf: &FileBuf,
+    lnum: Linenr,
+    col: Colnr,
+    tm: Option<Proftime>,
+    timed_out: Option<&mut i32>,
+) -> Option<Option<(Colnr, Colnr)>> {
+    // The work of a match is not known before the line is read: count only the match.
+    if !prog.0.dfa.enabled(nfa, 0) {
+        return None;
+    }
+    let reg_ic = nfa_reg_ic(nfa.regflags, rmp.rmm_ic);
+    let line = crate::memline::ml_get_buf(buf, lnum);
+    let text = line.to_bytes();
+    if rmp.rmm_maxcol > 0 && text.len() >= rmp.rmm_maxcol as usize {
+        return None;
+    }
+    let mut start = usize::try_from(col).ok().filter(|&c| c <= text.len())?;
+    if nfa.regstart != NUL as i32 {
+        match cstrchr_ic(&text[start..], nfa.regstart, reg_ic) {
+            Some(off) => start += off,
+            None => return Some(None),
+        }
+    }
+    if (prog.re_flags() & RE_NOBREAK as u32) == 0 {
+        fast_breakcheck();
+    }
+    if input_state().got_int.get() {
+        return Some(None);
+    }
+    if tm.is_some_and(profile_passed_limit) {
+        if let Some(timed_out) = timed_out {
+            *timed_out = 1;
+        }
+        return Some(None);
+    }
+    let found = match prog
+        .0
+        .dfa
+        .run(nfa, text, start, reg_ic, &buf.b_chartab.get())
+    {
+        DfaRun::Declined => return None,
+        DfaRun::NoMatch => None,
+        DfaRun::Match(start, end) => Some((start as Colnr, end as Colnr)),
+    };
+    #[cfg(debug_assertions)]
+    check_dfa_lines(nfa, rmp, buf, lnum, col, found);
+    Some(found)
+}
+
+/// Checks that the NFA engine finds the match the DFA found in line `lnum` of `buf`.
+#[cfg(debug_assertions)]
+fn check_dfa_lines(
+    nfa: &NfaRegprog,
+    rmp: &Regmmatch,
+    buf: &FileBuf,
+    lnum: Linenr,
+    col: Colnr,
+    found: Option<(Colnr, Colnr)>,
+) {
+    let mut rex = Regexec::for_lines(rmp, None, buf, lnum);
+    rex.reg_nobreak = true;
+    let res = nfa_regexec_both(nfa, &mut rex, col, None, None);
+    let nfa_found = (res > 0).then(|| {
+        let unset =
+            (1..NSUBEXP).all(|i| rex.rmm_startpos[i].lnum < 0 && rex.rmm_endpos[i].lnum < 0);
+        assert!(unset, "the NFA set a group of {:?}", nfa.pattern);
+        let (start, end) = (rex.rmm_startpos[0], rex.rmm_endpos[0]);
+        assert!(start.lnum == 0 && end.lnum == 0 && rex.rmm_matchcol == start.col);
+        (start.col, end.col)
+    });
+    assert_eq!(
+        found, nfa_found,
+        "DFA and NFA disagree on {:?} in line {lnum}",
+        nfa.pattern
+    );
 }
 
 fn vim_regexec_string(rmp: &mut Regmatch, line: &[u8], col: Colnr, nl: bool) -> bool {
