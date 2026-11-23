@@ -528,8 +528,8 @@ pub fn atom_origin_pos(buf: &FileBuf) -> CursorPos {
     {
         return o.pos;
     }
-    if curwin().w_buffer.get() != buf {
-        return INIT_POS;
+    if curwin().w_buffer.get() != buf || crate::context::is_ctx_win(&curwin()) {
+        return CursorPos::default();
     }
     curwin().w_cursor.get()
 }

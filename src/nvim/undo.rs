@@ -424,6 +424,7 @@ pub fn u_savecommon(buf: &FileBuf, top: Linenr, bot: Linenr, newbot: Linenr, rel
         let origin_cursor = atom_origin_pos(buf);
         let cursor_vcol = if virtual_active(&curwin())
             && curwin().w_cursor.get().coladd > 0
+            && curwin().w_buffer.get() == buf
             && equalpos(origin_cursor, curwin().w_cursor.get())
         {
             getviscol()
@@ -2056,7 +2057,7 @@ fn u_undoredo(undo: bool, do_buf_event: bool) {
 
         {
             let lnum = curhead.uh_cursor.lnum;
-            if lnum >= top && lnum <= top + newsize + 1 {
+            if lnum >= 1 && lnum >= top && lnum <= top + newsize + 1 {
                 new_curpos = curhead.uh_cursor;
                 newlnum = -1;
             } else if top < newlnum {
