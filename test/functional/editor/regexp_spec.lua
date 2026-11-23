@@ -182,6 +182,28 @@ describe('regexp engine', function()
     )
   end)
 
+  it('stops a loop pass at a zero-width state it passed at the same position', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          lookahead = { 'A', 'A' },
+          lookbehind = { 'A', 'A' },
+          word_end = { 'A', 'A' },
+        },
+        n.exec_lua(function(p)
+          local function ml(str, pat)
+            return vim.list_slice(vim.fn.matchlist(str, p .. pat), 1, 2)
+          end
+          local r = {}
+          r.lookahead = ml('Ab', [[\(\u\=\*\@!\)*]])
+          r.lookbehind = ml('Ab', [[\(\u\=\%(x\)\@<!\)*]])
+          r.word_end = ml('A b', [[\(\u\=\>\)*]])
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
+
   it('finds matches after \\@> in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(

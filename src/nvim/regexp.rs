@@ -873,6 +873,10 @@ pub(super) struct NfaList {
     /// While addstate_here() inserts at a thread, the end of the threads still queued
     /// behind it; zero otherwise.
     pub queued_end: usize,
+    /// While addstate_here() adds what follows the thread at this index, the positions being
+    /// added are that thread's: upstream edits them in place. Once the list grows, upstream
+    /// edits a copy and the thread keeps the positions it had then.
+    pub expanding: Option<usize>,
 }
 
 #[derive(Clone, Copy)]

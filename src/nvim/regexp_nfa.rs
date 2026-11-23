@@ -2499,8 +2499,9 @@ fn has_state_with_pos(
     for (i, thread) in l.t[..l.n as usize].iter().enumerate() {
         if !skip.contains(&i)
             && thread.state == Some(state)
-            && sub_equal(rex, &thread.subs.norm, &subs.norm)
-            && (!has_zsub || sub_equal(rex, &thread.subs.synt, &subs.synt))
+            && (l.expanding == Some(i)
+                || (sub_equal(rex, &thread.subs.norm, &subs.norm)
+                    && (!has_zsub || sub_equal(rex, &thread.subs.synt, &subs.synt))))
             && pim_equal(rex, Some(&thread.pim), pim)
         {
             return true;
@@ -2680,6 +2681,9 @@ fn addstate_idx(
                 if ((newsize >> 10) as i64) >= opt_vars().p_mmp.get() {
                     emsg(tr(E_PATTERN_USES_MORE_MEMORY_THAN_MAXMEMPATTERN));
                     return false;
+                }
+                if let Some(h) = l.expanding.take() {
+                    l.t[h].subs = *subs;
                 }
                 l.len = newlen;
                 l.t.reserve(newlen.saturating_sub(l.t.len()));
@@ -3004,6 +3008,7 @@ fn addstate_here(
 
     // Threads after `listidx` stay queued behind the states inserted here.
     l.queued_end = tlen as usize;
+    l.expanding = Some(listidx as usize);
     let added = addstate(
         rex,
         states,
@@ -3016,6 +3021,7 @@ fn addstate_here(
         0,
     );
     l.queued_end = 0;
+    l.expanding = None;
     if !added {
         return false;
     }
@@ -3764,6 +3770,7 @@ fn nfa_regmatch_ctx(
             id: rex.nfa_listid + 1,
             has_pim: false,
             queued_end: 0,
+            expanding: None,
         },
         NfaList {
             t: t1,
@@ -3772,6 +3779,7 @@ fn nfa_regmatch_ctx(
             id: 0,
             has_pim: false,
             queued_end: 0,
+            expanding: None,
         },
     ];
 
