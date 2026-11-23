@@ -171,6 +171,17 @@ describe('regexp engine', function()
     )
   end)
 
+  it('fails when the NFA thread lists outgrow maxmempattern', function()
+    eq(
+      'E363',
+      n.exec_lua(function()
+        local pat = [[\%#=2\(a*\)\(a*\)\(a*\)\1\2\3x]]
+        local ok, err = pcall(vim.fn.matchlist, ('a'):rep(12), pat)
+        return ok and 'no error' or tostring(err):match('E%d+')
+      end)
+    )
+  end)
+
   it('finds matches after \\@> in both engines', function()
     for _, engine in ipairs({ 1, 2 }) do
       eq(

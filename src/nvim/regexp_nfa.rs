@@ -2674,14 +2674,15 @@ fn addstate_idx(
                 }
             }
 
-            if l.n as usize == l.t.capacity() {
-                let newlen = l.t.capacity() * 3 / 2 + 50;
+            if l.n as usize == l.len {
+                let newlen = l.len * 3 / 2 + 50;
                 let newsize = newlen * size_of::<NfaThread>();
                 if ((newsize >> 10) as i64) >= opt_vars().p_mmp.get() {
                     emsg(tr(E_PATTERN_USES_MORE_MEMORY_THAN_MAXMEMPATTERN));
                     return false;
                 }
-                l.t.reserve(newlen - l.t.len());
+                l.len = newlen;
+                l.t.reserve(newlen.saturating_sub(l.t.len()));
             }
 
             lastlist[state_idx][ll_idx] = l.id;
@@ -3033,14 +3034,18 @@ fn addstate_here(
             copy_thread(rex, &mut left[dst_idx], &mut right[0]);
         }
     } else if count > 1 {
-        if (l.n + count) as usize > l.t.len() {
-            let newlen = l.t.len() * 3 / 2 + 50;
+        let needed = (l.n + count - 1) as usize;
+        if needed >= l.len {
+            let newlen = l.len * 3 / 2 + 50;
             let newsize = newlen * size_of::<NfaThread>();
             if ((newsize >> 10) as i64) >= opt_vars().p_mmp.get() {
                 emsg(tr(E_PATTERN_USES_MORE_MEMORY_THAN_MAXMEMPATTERN));
                 return false;
             }
-            l.t.resize(newlen, NfaThread::new());
+            l.len = newlen;
+        }
+        if needed > l.t.len() {
+            l.t.resize(needed, NfaThread::new());
         }
         l.t.copy_within(
             (listidx as usize + 1)..(l.n as usize),
@@ -3755,6 +3760,7 @@ fn nfa_regmatch_ctx(
         NfaList {
             t: t0,
             n: 0,
+            len: init_len,
             id: rex.nfa_listid + 1,
             has_pim: false,
             queued_end: 0,
@@ -3762,6 +3768,7 @@ fn nfa_regmatch_ctx(
         NfaList {
             t: t1,
             n: 0,
+            len: init_len,
             id: 0,
             has_pim: false,
             queued_end: 0,

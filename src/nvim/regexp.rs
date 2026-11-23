@@ -865,6 +865,9 @@ impl Default for NfaThread {
 pub(super) struct NfaList {
     pub t: Vec<NfaThread>,
     pub n: i32,
+    /// The number of threads the list has room for, counted like upstream: the list grows
+    /// when it is full, and fails when that would take more than 'maxmempattern'.
+    pub len: usize,
     pub id: i32,
     pub has_pim: bool,
     /// While addstate_here() inserts at a thread, the end of the threads still queued
