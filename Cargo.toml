@@ -55,6 +55,10 @@ vendor-bit = []
 
 [profile.dev]
 codegen-units = 256
+# Without optimization every temporary gets its own stack slot: a nested Vimscript
+# call took about 57 KB of stack, so 8 MB held about 140 levels, fewer than the
+# recursion that 'maxfuncdepth' and the 200 levels of Ex commands allow.
+opt-level = 1
 
 [profile.release]
 lto = "thin"
