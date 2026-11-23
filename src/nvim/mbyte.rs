@@ -31,9 +31,10 @@ use crate::utf8proc::{
     UTF8PROC_BOUNDCLASS_CONTROL, UTF8PROC_BOUNDCLASS_CR, UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC,
     UTF8PROC_BOUNDCLASS_OTHER, UTF8PROC_BOUNDCLASS_PREPEND, UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR,
     UTF8PROC_BOUNDCLASS_SPACINGMARK, UTF8PROC_CASEFOLD, UTF8PROC_CATEGORY_LU, UTF8PROC_CATEGORY_ME,
-    UTF8PROC_CATEGORY_MN, UTF8PROC_CATEGORY_NO, utf8proc_decompose_char, utf8proc_get_property,
-    utf8proc_grapheme_break, utf8proc_grapheme_break_stateful, utf8proc_property_t,
-    utf8proc_tolower, utf8proc_toupper,
+    UTF8PROC_CATEGORY_MN, UTF8PROC_CATEGORY_NO, UTF8PROC_INDIC_CONJUNCT_BREAK_CONSONANT,
+    UTF8PROC_INDIC_CONJUNCT_BREAK_EXTEND, UTF8PROC_INDIC_CONJUNCT_BREAK_LINKER,
+    utf8proc_decompose_char, utf8proc_get_property, utf8proc_grapheme_break,
+    utf8proc_grapheme_break_stateful, utf8proc_property_t, utf8proc_tolower, utf8proc_toupper,
 };
 use crate::window::WinInfoInfo;
 use std::ffi::CStr;
@@ -2449,8 +2450,12 @@ const fn always_break(bc: u32) -> bool {
 }
 
 #[inline]
-const fn always_break_two(bc1: u32, bc2: u32) -> bool {
-    (bc1 != UTF8PROC_BOUNDCLASS_PREPEND && bc2 == UTF8PROC_BOUNDCLASS_OTHER)
+const fn always_break_two(bc1: u32, bc2: u32, icb1: u32, icb2: u32) -> bool {
+    // GB9c may join a consonant after a linker and intervening Extend characters.
+    let indic_context = icb2 == UTF8PROC_INDIC_CONJUNCT_BREAK_CONSONANT
+        && (icb1 == UTF8PROC_INDIC_CONJUNCT_BREAK_LINKER
+            || icb1 == UTF8PROC_INDIC_CONJUNCT_BREAK_EXTEND);
+    (bc1 != UTF8PROC_BOUNDCLASS_PREPEND && bc2 == UTF8PROC_BOUNDCLASS_OTHER && !indic_context)
         || (bc1 >= UTF8PROC_BOUNDCLASS_CR && bc1 <= UTF8PROC_BOUNDCLASS_CONTROL)
         || (bc2 == UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC
             && (bc1 == UTF8PROC_BOUNDCLASS_OTHER
@@ -2477,8 +2482,8 @@ pub fn utf_head_off_slice(bytes: &[u8], idx: usize) -> i32 {
     }
     let safe_end = start + last_len;
 
-    let mut cur_bc = utf8proc_get_property(cur_code).boundclass();
-    if always_break(cur_bc) || start == 0 {
+    let mut cur_prop = utf8proc_get_property(cur_code);
+    if always_break(cur_prop.boundclass()) || start == 0 {
         return (idx - start) as i32;
     }
 
@@ -2507,15 +2512,21 @@ pub fn utf_head_off_slice(bytes: &[u8], idx: usize) -> i32 {
             break;
         }
 
-        let prev_bc = utf8proc_get_property(prev_code).boundclass();
-        if always_break_two(prev_bc, cur_bc) && !arabic_combine(prev_code, cur_code) {
+        let prev_prop = utf8proc_get_property(prev_code);
+        if always_break_two(
+            prev_prop.boundclass(),
+            cur_prop.boundclass(),
+            prev_prop.indic_conjunct_break(),
+            cur_prop.indic_conjunct_break(),
+        ) && !arabic_combine(prev_code, cur_code)
+        {
             start = cur_pos;
             break;
         } else if start == 0 {
             break;
         }
         cur_pos = start;
-        cur_bc = prev_bc;
+        cur_prop = prev_prop;
         cur_code = prev_code;
     }
 
@@ -3636,15 +3647,17 @@ mod tests {
                 b")\xcc\x80\xcc\x81"
             );
 
-            let emoji = c"🏳️‍⚧️🧑‍🌾❤️😂🏴‍☠️";
-            let e_bytes = emoji.to_bytes();
-            let mut pos = 0usize;
-            while pos < e_bytes.len() {
-                let clen = utfc_ptr2len(&e_bytes[pos..]) as usize;
-                for p in pos..(pos + clen) {
-                    assert_eq!(utf_head_off(e_bytes, p), (p - pos) as i32);
+            for sample in [c"🏳️‍⚧️🧑‍🌾❤️😂🏴‍☠️", c"क्ष", c"क्‍ष", c"्क", c"़्क", c"a्क"]
+            {
+                let e_bytes = sample.to_bytes();
+                let mut pos = 0usize;
+                while pos < e_bytes.len() {
+                    let clen = utfc_ptr2len(&e_bytes[pos..]) as usize;
+                    for p in pos..(pos + clen) {
+                        assert_eq!(utf_head_off(e_bytes, p), (p - pos) as i32);
+                    }
+                    pos += clen;
                 }
-                pos += clen;
             }
 
             let cp_str = c"iÀⱠ𐀀i";
