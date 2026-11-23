@@ -615,7 +615,6 @@ pub fn do_record(c: i32) -> bool {
             retval = false;
         } else {
             input_state().reg_recording.set(c);
-            showmode();
             REG_STATE.with(|s| s.do_record_regname.set(c));
             retval = true;
             apply_autocmds(
@@ -625,6 +624,7 @@ pub fn do_record(c: i32) -> bool {
                 false,
                 curbuf_opt().as_deref(),
             );
+            showmode();
         }
     } else {
         let mut save_v_event: SaveVEvent = SaveVEvent::new();
