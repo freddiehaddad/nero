@@ -795,6 +795,12 @@ fn savecursor(state: &mut VTermStateFull, save: i32) {
         let oldpos = state.pos;
 
         state.pos = state.saved.pos;
+        if state.pos.row > state.rows - 1 {
+            state.pos.row = state.rows - 1;
+        }
+        if state.pos.col > state.cols - 1 {
+            state.pos.col = state.cols - 1;
+        }
 
         let cv = (state.saved.mode & 0x01) as i32;
         let cb = ((state.saved.mode >> 1) & 0x01) as i32;
