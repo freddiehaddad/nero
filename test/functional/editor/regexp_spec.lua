@@ -736,4 +736,30 @@ describe('regexp engine', function()
       end)
     )
   end)
+
+  it('reads a "-" after a class in a collection in both engines', function()
+    for _, engine in ipairs({ 1, 2 }) do
+      eq(
+        {
+          classes = { 'x', '-', 'A', '' },
+          substitute = { 'XXX0' },
+          -- A range cannot end with a class: this is "a" to "[".
+          class_range_end = 'E944',
+        },
+        n.exec_lua(function(p)
+          local pat = p .. '[[:lower:]-[:upper:]]'
+          local r = { classes = {} }
+          for _, s in ipairs({ 'x', '-', 'A', '0' }) do
+            table.insert(r.classes, vim.fn.matchstr(s, pat))
+          end
+          vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'a-B0' })
+          vim.cmd('silent s/' .. pat .. '/X/g')
+          r.substitute = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+          local ok, err = pcall(vim.fn.matchstr, 'x', p .. '[a-[:upper:]]')
+          r.class_range_end = not ok and err:match('E%d+') or 'no error'
+          return r
+        end, [[\%#=]] .. engine)
+      )
+    end
+  end)
 end)

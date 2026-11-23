@@ -1347,9 +1347,17 @@ fn nfa_regatom_collection(extra: &mut i32, startc: &mut i32, c: &mut i32) -> Opt
                 if re_st().regparse_byte() == b'[' {
                     let mut equiclass: i32 = 0;
                     let mut collclass: i32 = 0;
-                    let charclass = re_st().regparse_get_char_class();
+                    // As in the backtracking engine, the end of a range can be a collating
+                    // element but not a class.
+                    let charclass = if emit_range {
+                        CLASS_NONE
+                    } else {
+                        re_st().regparse_get_char_class()
+                    };
                     if charclass == CLASS_NONE {
-                        equiclass = re_st().regparse_get_equi_class();
+                        if !emit_range {
+                            equiclass = re_st().regparse_get_equi_class();
+                        }
                         if equiclass == 0 {
                             collclass = re_st().regparse_get_coll_element();
                         }

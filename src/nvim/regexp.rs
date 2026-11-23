@@ -2006,14 +2006,19 @@ pub(super) fn get_cpo_flags() {
     });
 }
 
-/// Skip over a `[]` range in a byte slice.
+/// Skip over a `[]` range in a byte slice, reading its items as the backtracking engine's
+/// parser does, so that both engines end the collection at the same `]`.
 pub(super) fn skip_anyof_slice(bytes: &[u8]) -> &[u8] {
     let mut rem = crate::memory::bytes_until_nul(bytes);
     if let Some(rest) = rem.strip_prefix(b"^") {
         rem = rest;
     }
+    // Whether the previous item can start a range. A "-" right after a character class, an
+    // equivalence class, a collating element, "\n" or a range is a plain "-".
+    let mut range_start = false;
     if matches!(rem.first(), Some(b']' | b'-')) {
         rem = &rem[1..];
+        range_start = true;
     }
     while let Some(&b0) = rem.first() {
         if b0 == b']' {
@@ -2022,13 +2027,18 @@ pub(super) fn skip_anyof_slice(bytes: &[u8]) -> &[u8] {
         let l = crate::mbyte::utfc_slice2len(rem);
         if l > 1 {
             rem = &rem[l..];
+            range_start = true;
         } else if b0 == b'-' {
             rem = &rem[1..];
-            if let Some(&b1) = rem.first()
-                && b1 != b']'
-            {
-                let step = crate::mbyte::utfc_slice2len(rem);
-                rem = &rem[step..];
+            if !range_start || matches!(rem, [] | [b']', ..] | [b'\\', b'n', ..]) {
+                range_start = true;
+            } else {
+                // The end of a range is a collating element or one character.
+                if rem[0] != b'[' || get_coll_element(&mut rem) == 0 {
+                    let step = crate::mbyte::utfc_slice2len(rem);
+                    rem = &rem[step..];
+                }
+                range_start = false;
             }
         } else if b0 == b'\\'
             && let Some(&b1) = rem.get(1)
@@ -2037,16 +2047,17 @@ pub(super) fn skip_anyof_slice(bytes: &[u8]) -> &[u8] {
                     && REGEXP_ABBR.to_bytes().contains(&b1)))
         {
             rem = &rem[2..];
+            range_start = b1 != b'n';
         } else if b0 == b'[' {
-            if get_char_class(&mut rem) == CLASS_NONE
+            range_start = get_char_class(&mut rem) == CLASS_NONE
                 && get_equi_class(&mut rem) == 0
-                && get_coll_element(&mut rem) == 0
-                && !rem.is_empty()
-            {
+                && get_coll_element(&mut rem) == 0;
+            if range_start {
                 rem = &rem[1..];
             }
         } else {
             rem = &rem[1..];
+            range_start = true;
         }
     }
     rem
