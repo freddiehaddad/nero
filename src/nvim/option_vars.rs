@@ -940,7 +940,9 @@ pub struct Synblock {
     pub b_syn_ic: std::cell::Cell<bool>,
     pub b_syn_foldlevel: std::cell::Cell<i32>,
     pub b_syn_spell: std::cell::Cell<i32>,
-    pub b_syn_patterns: std::cell::RefCell<Vec<std::rc::Rc<Synpat>>>,
+    /// The syntax patterns in the order they were defined, stored by value: finding a match reads
+    /// each of them in turn.
+    pub b_syn_patterns: std::cell::RefCell<Vec<Synpat>>,
     pub b_syn_clusters: std::cell::RefCell<Vec<std::rc::Rc<SynCluster>>>,
     pub b_spell_cluster_id: std::cell::Cell<i32>,
     pub b_nospell_cluster_id: std::cell::Cell<i32>,
