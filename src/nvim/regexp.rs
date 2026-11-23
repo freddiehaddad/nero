@@ -2510,6 +2510,16 @@ pub(super) fn getdecchrs() -> i64 {
     if i == 0 { -1 } else { nr }
 }
 
+/// Read a `\@` limit, saturating at `i32::MAX` to fit both regexp engines.
+pub(super) fn get_at_limit() -> i32 {
+    let nr = getdecchrs();
+    if nr > i64::from(i32::MAX) {
+        i32::MAX
+    } else {
+        nr as i32
+    }
+}
+
 pub(super) fn getoctchrs() -> i64 {
     let mut nr: i64 = 0;
     let mut i: i32 = 0;

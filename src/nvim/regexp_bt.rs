@@ -2040,7 +2040,7 @@ fn regpiece(flagp: &mut i32) -> Option<usize> {
         *flagp = WORST | HASWIDTH | (flags & (HASNL | HASLOOKBH));
     } else if op == magic_fn(b'@' as i32) {
         let mut lop = END;
-        let mut nr = getdecchrs();
+        let mut nr = get_at_limit();
         match no_magic(getchr()) as u8 {
             b'=' => lop = MATCH,
             b'!' => lop = NOMATCH,

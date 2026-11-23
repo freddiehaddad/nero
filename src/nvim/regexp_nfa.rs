@@ -1596,7 +1596,7 @@ fn nfa_regpiece_multi(op: i32, old_state: &mut ParseState, my_post_start: usize)
         emit_fn(NFA_CONCAT);
         skipchr();
     } else if op == magic_fn(b'@' as i32) {
-        let c2 = getdecchrs();
+        let c2 = get_at_limit();
         let mut op2 = no_magic(getchr());
         let mut i: i32 = 0;
         match op2 as u8 {
@@ -1619,7 +1619,7 @@ fn nfa_regpiece_multi(op: i32, old_state: &mut ParseState, my_post_start: usize)
         }
         emit_fn(i);
         if i == NFA_PREV_ATOM_JUST_BEFORE || i == NFA_PREV_ATOM_JUST_BEFORE_NEG {
-            emit_fn(c2 as i32);
+            emit_fn(c2);
         }
     } else if op == magic_fn(b'?' as i32) || op == magic_fn(b'=' as i32) {
         emit_fn(NFA_QUEST);
