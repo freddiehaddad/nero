@@ -3432,6 +3432,9 @@ fn recursive_regmatch(
 
         // Go back the specified number of characters, or as far as the start of the previous
         // line, to try matching "\@<=" or not matching "\@<!".
+        // The earliest start that matches wins, while the backtracking engine tries the nearest
+        // start first, so their groups can differ: `\%(\(.\)\|\)\@<=b` on "ab" gives group 1 "a"
+        // here and "" there. Upstream does the same, and `:help /\@<=` says the engines differ.
         if st.val <= 0 {
             if rex.reg_multi() {
                 rex.lnum -= 1;

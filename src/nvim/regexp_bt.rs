@@ -177,6 +177,10 @@ impl LoopState {
     /// until E363: `\(x\=\)\+y` on "x" (#163). Moving entries back fixes that, but nested loops
     /// then try every way to split the text: `\%(\%(\a\)*\)*c$` on "c" and 24 letters takes
     /// seconds instead of failing with E363 at once.
+    ///
+    /// A pass that matches nothing ends the loop here, while the NFA engine takes one such pass
+    /// first, so their groups can differ: `\(a\|\)*` on "aa" gives group 1 "a" here and "" in
+    /// the NFA engine. Upstream does the same and `:help` does not say which is right.
     #[inline(always)]
     fn pass(&mut self, rex: &Regexec<'_>, scan: usize) -> bool {
         if let Some(idx) = self.backpos.iter().position(|bp| bp.bp_scan == scan) {
@@ -1747,6 +1751,12 @@ fn regatom(flagp: &mut i32) -> Option<usize> {
                 {
                     RE_STATE.with(|s| s.regparse_off.set(s.regparse_off.get() + (1)));
                     if re_st().regparse_byte() == b'n' {
+                        // A "\n" in a collection that starts with "^" changes nothing here. The
+                        // NFA engine reads it otherwise: in a pattern for a string "[^x\n]" does
+                        // not match a newline, a collection it reads as a class, such as
+                        // "[^0-9\n]", also matches a line break, and "\n" before "-" is the
+                        // newline character. Upstream does the same; `:help /[\n]` and the
+                        // patterns in use disagree on which is right, so all are kept.
                         if let Some(ret_idx) = ret
                             && ret_idx != JUST_CALC_SIZE
                             && bt_st(|st| st.reg_program.borrow()[ret_idx] == ANYOF as u8)
