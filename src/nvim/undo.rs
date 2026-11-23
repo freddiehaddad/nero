@@ -1248,6 +1248,62 @@ fn uhp_table_find(uhp_table: &[(UHeader, [i32; 4])], seq: i32) -> i32 {
     -1
 }
 
+fn undo_tree_valid(
+    uhp_table: &mut [(UHeader, [i32; 4])],
+    oldhead: Option<usize>,
+    newhead: Option<usize>,
+) -> bool {
+    let (Some(old_idx), Some(new_idx)) = (oldhead, newhead) else {
+        return false;
+    };
+    if uhp_table[old_idx].0.uh_next.is_some()
+        || uhp_table[old_idx].0.uh_alt_prev.is_some()
+        || uhp_table[new_idx].0.uh_prev.is_some()
+    {
+        return false;
+    }
+
+    let mut stack = Vec::with_capacity(uhp_table.len());
+    let mut count = 0usize;
+    let mut ok = true;
+
+    uhp_table[old_idx].0.uh_walk = 1;
+    stack.push(old_idx);
+    while ok && let Some(uhp_idx) = stack.pop() {
+        count += 1;
+        let uhp = &uhp_table[uhp_idx].0;
+        let alt_next = uhp.uh_alt_next;
+        let alt_prev = uhp.uh_alt_prev;
+        let prev = uhp.uh_prev;
+        if alt_next.is_some_and(|an| uhp_table[an].0.uh_alt_prev != Some(uhp_idx))
+            || alt_prev.is_some_and(|ap| uhp_table[ap].0.uh_alt_next != Some(uhp_idx))
+        {
+            ok = false;
+        }
+
+        for next_opt in [prev, alt_next] {
+            if !ok {
+                break;
+            }
+            let Some(next_idx) = next_opt else {
+                continue;
+            };
+            if uhp_table[next_idx].0.uh_walk != 0 {
+                ok = false;
+            } else {
+                uhp_table[next_idx].0.uh_walk = 1;
+                stack.push(next_idx);
+            }
+        }
+    }
+
+    for (uhp, _) in &mut *uhp_table {
+        uhp.uh_walk = 0;
+    }
+
+    ok && count == uhp_table.len()
+}
+
 /// Loads the undo tree from an undo file.
 pub fn u_read_undo(name: Option<&CStr>, hash: &[u8; UNDO_HASH_SIZE], orig_name: Option<&CStr>) {
     #[cfg(not(unix))]
@@ -1482,6 +1538,11 @@ pub fn u_read_undo(name: Option<&CStr>, hash: &[u8; UNDO_HASH_SIZE], orig_name: 
                 if cur_header_seq > 0 && cur_idx.is_none() && uhp.uh_seq == cur_header_seq {
                     cur_idx = Some(i as usize);
                 }
+            }
+
+            if num_head > 0 && !undo_tree_valid(&mut uhp_table, old_idx, new_idx) {
+                corruption_error(c"header links", file_name_cstr);
+                break 'error;
             }
 
             u_blockfree(&curbuf());
