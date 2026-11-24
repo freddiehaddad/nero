@@ -347,6 +347,33 @@ fn readfile_progress<'a>(
     rv
 }
 
+/// Returns the index of the first newline in `bytes`, after turning each NUL
+/// before it into a newline as buffer lines store NULs. Without a newline,
+/// turns every NUL and returns `None`.
+fn find_newline_fixing_nuls(bytes: &mut [u8]) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([1; 8]);
+    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+    let has_zero_byte = |word: u64| word.wrapping_sub(ONES) & !word & HIGHS != 0;
+
+    // Skip eight bytes at a time while none is a newline or NUL.
+    let mut start = 0;
+    for word in bytes.as_chunks::<8>().0 {
+        let word = u64::from_ne_bytes(*word);
+        if has_zero_byte(word) || has_zero_byte(word ^ (ONES * u64::from(b'\n'))) {
+            break;
+        }
+        start += 8;
+    }
+    for (i, b) in bytes.iter_mut().enumerate().skip(start) {
+        match *b {
+            b'\n' => return Some(i),
+            0 => *b = b'\n',
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Read lines from file "fname" into the buffer after line "from".
 pub fn readfile(
     fname_opt: Option<&CStr>,
@@ -1797,8 +1824,7 @@ pub fn readfile(
                                     let len = ((ptr_idx - line_start_idx) + 1) as Colnr;
                                     if !ml_append(
                                         lnum,
-                                        &buffer_vec[line_start_idx
-                                            ..line_start_idx + (len as usize).saturating_sub(1)],
+                                        &buffer_vec[line_start_idx..=ptr_idx],
                                         len,
                                         newfile,
                                     ) {
@@ -1828,28 +1854,14 @@ pub fn readfile(
                         let end_idx = ptr_idx + (size as usize);
 
                         while ptr_idx < end_idx {
-                            let rem = end_idx - ptr_idx;
-                            let slice = &buffer_vec[ptr_idx..ptr_idx + rem];
-                            let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') else {
-                                for b in &mut buffer_vec[ptr_idx..ptr_idx + rem] {
-                                    if *b == 0 {
-                                        *b = b'\n';
-                                    }
-                                }
+                            let Some(nl_pos) =
+                                find_newline_fixing_nuls(&mut buffer_vec[ptr_idx..end_idx])
+                            else {
                                 ptr_idx = end_idx;
                                 break;
                             };
 
-                            let nl_idx = ptr_idx + nl_pos;
-                            if nl_pos > 0 {
-                                for b in &mut buffer_vec[ptr_idx..nl_idx] {
-                                    if *b == 0 {
-                                        *b = b'\n';
-                                    }
-                                }
-                            }
-
-                            ptr_idx = nl_idx;
+                            ptr_idx += nl_pos;
                             if skip_count == 0 {
                                 buffer_vec[ptr_idx] = 0;
                                 let mut len = ((ptr_idx - line_start_idx) + 1) as Colnr;
@@ -1875,8 +1887,7 @@ pub fn readfile(
                                 }
                                 if !ml_append(
                                     lnum,
-                                    &buffer_vec[line_start_idx
-                                        ..line_start_idx + (len as usize).saturating_sub(1)],
+                                    &buffer_vec[line_start_idx..line_start_idx + len as usize],
                                     len,
                                     newfile,
                                 ) {
@@ -1963,12 +1974,7 @@ pub fn readfile(
                 }
                 buffer_vec[ptr_idx] = 0;
                 let len = ((ptr_idx - line_start_idx) + 1) as Colnr;
-                if !ml_append(
-                    lnum,
-                    &buffer_vec[line_start_idx..line_start_idx + (len as usize).saturating_sub(1)],
-                    len,
-                    newfile,
-                ) {
+                if !ml_append(lnum, &buffer_vec[line_start_idx..=ptr_idx], len, newfile) {
                     error = true;
                 } else {
                     if read_undo_file && len > 0 {
@@ -4163,6 +4169,27 @@ pub use printf;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_newline_fixing_nuls_finds_the_first_newline() {
+        for len in 0..40 {
+            for nl in 0..len {
+                let mut bytes = vec![b'x'; len];
+                bytes[nl] = b'\n';
+                assert_eq!(find_newline_fixing_nuls(&mut bytes), Some(nl), "{len} {nl}");
+            }
+            let mut bytes = vec![b'x'; len];
+            assert_eq!(find_newline_fixing_nuls(&mut bytes), None);
+        }
+
+        let mut bytes = *b"ab\0cdefghij\0kl\nmn\0";
+        assert_eq!(find_newline_fixing_nuls(&mut bytes), Some(14));
+        assert_eq!(&bytes, b"ab\ncdefghij\nkl\nmn\0");
+
+        let mut bytes = *b"\0abcdefgh\0";
+        assert_eq!(find_newline_fixing_nuls(&mut bytes), None);
+        assert_eq!(&bytes, b"\nabcdefgh\n");
+    }
 
     #[test]
     fn test_is_dev_fd_file() {
