@@ -109,6 +109,15 @@ pub fn bytes_until_nul(bytes: &[u8]) -> &[u8] {
     CStr::from_bytes_until_nul(bytes).map_or(bytes, CStr::to_bytes)
 }
 
+/// Where `part` starts in `whole`, or `None` when it does not start within
+/// `whole` (its end included). Unlike `whole.len() - part.len()`, this does not
+/// require the two slices to end in the same place.
+#[inline]
+pub fn offset_in(whole: &[u8], part: &[u8]) -> Option<usize> {
+    let offset = (part.as_ptr() as usize).checked_sub(whole.as_ptr() as usize)?;
+    (offset <= whole.len()).then_some(offset)
+}
+
 /// View a byte slice up to the first NUL byte as a `&CStr` (or `c""` if no NUL is present).
 #[inline(always)]
 pub fn bytes_as_cstr(bytes: &[u8]) -> &CStr {
@@ -628,6 +637,17 @@ mod tests {
             let keys: Vec<u64> = items.iter().map(|&(k, _)| k).collect();
             assert_eq!(keys, [1, 2, 3, 4, 5, 6, 7, 8, 9], "{name}");
         }
+    }
+
+    #[test]
+    fn offset_in_finds_parts_that_end_elsewhere() {
+        let text = b"abc\0def";
+        assert_eq!(offset_in(text, &text[2..]), Some(2));
+        assert_eq!(offset_in(text, &text[2..3]), Some(2));
+        assert_eq!(offset_in(&text[..3], &text[2..]), Some(2));
+        assert_eq!(offset_in(&text[..3], &text[3..]), Some(3));
+        assert_eq!(offset_in(&text[..3], &text[4..]), None);
+        assert_eq!(offset_in(&text[2..], text), None);
     }
 
     #[test]

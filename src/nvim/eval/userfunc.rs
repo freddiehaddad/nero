@@ -529,12 +529,11 @@ fn one_function_arg<'a>(
     newargs: Option<&mut Vec<std::ffi::CString>>,
     skip: bool,
 ) -> &'a [u8] {
-    let bytes = crate::memory::bytes_until_nul(arg_in);
-    let len = bytes
+    let len = arg_in
         .iter()
         .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_')
         .count();
-    let arg_slice = &bytes[..len];
+    let arg_slice = &arg_in[..len];
     if len == 0
         || arg_slice[0].is_ascii_digit()
         || arg_slice == b"firstline"
@@ -543,7 +542,7 @@ fn one_function_arg<'a>(
         if !skip {
             semsg!(
                 gettext(c"E125: Illegal argument: %s"),
-                bytes_to_cstring(bytes).as_c_str()
+                bytes_to_cstring(arg_in).as_c_str()
             );
         }
         return arg_in;
@@ -574,7 +573,7 @@ fn get_function_args(
     skip: bool,
 ) -> bool {
     let mut mustend = false;
-    let mut p_slice = crate::memory::bytes_until_nul(argp);
+    let mut p_slice = *argp;
 
     if let Some(ref mut p) = varargs {
         **p = 0;
@@ -606,7 +605,8 @@ fn get_function_args(
                 let expr_slice = p_slice;
                 let eval_ok = eval1(&mut p_slice, &mut rettv, None);
                 if eval_ok {
-                    let mut expr_len = expr_slice.len() - p_slice.len();
+                    let mut expr_len = crate::memory::offset_in(expr_slice, p_slice)
+                        .expect("eval1() stops within its input");
                     while expr_len > 0 && ascii_iswhite(expr_slice[expr_len - 1]) {
                         expr_len -= 1;
                     }
@@ -765,7 +765,7 @@ pub fn get_lambda_tv(
     let mut varargs: i32 = 0;
     let old_eval_lavars = eval_lavars_used();
 
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     if arg_bytes.is_empty() {
         return None;
     }
@@ -828,7 +828,8 @@ pub fn get_lambda_tv(
         let fp = alloc_ufunc(name.as_bytes());
         let pt = crate::eval::typval::tv_partial_alloc();
 
-        let expr_len = start_slice.len() - end_slice.len();
+        let expr_len = crate::memory::offset_in(start_slice, end_slice)
+            .expect("skip_expr() stops within its input");
         let mut line_bytes = Vec::with_capacity(7 + expr_len);
         line_bytes.extend_from_slice(b"return ");
         line_bytes.extend_from_slice(&start_slice[..expr_len]);

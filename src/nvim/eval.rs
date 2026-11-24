@@ -2112,7 +2112,7 @@ pub fn eval1(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evala
         return false;
     }
 
-    let mut p_bytes = crate::memory::bytes_until_nul(arg);
+    let mut p_bytes = *arg;
     if p_bytes.first() == Some(&b'?') {
         let op_falsy = p_bytes.get(1) == Some(&b'?');
         let mut local_evalarg = Evalarg::new();
@@ -2154,7 +2154,7 @@ pub fn eval1(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evala
         }
 
         if !op_falsy {
-            p_bytes = crate::memory::bytes_until_nul(arg);
+            p_bytes = *arg;
             if p_bytes.first().copied().unwrap_or(0) != b':' {
                 emsg(gettext(c"E109: Missing ':' after '?'"));
                 if evaluate && result {
@@ -2194,7 +2194,7 @@ fn eval2(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evalarg>)
         return false;
     }
 
-    let mut p = crate::memory::bytes_until_nul(arg);
+    let mut p = *arg;
     if p.starts_with(b"||") {
         let mut local_evalarg = Evalarg::new();
         let evalarg_used: &mut Evalarg = evalarg.unwrap_or(&mut local_evalarg);
@@ -2240,7 +2240,7 @@ fn eval2(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evalarg>)
                 rettv.value = crate::eval::typval::TvValue::Number(Varnumber::from(result));
             }
 
-            p = crate::memory::bytes_until_nul(arg);
+            p = *arg;
         }
 
         evalarg_used.eval_flags = orig_flags;
@@ -2255,7 +2255,7 @@ fn eval3(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evalarg>)
         return false;
     }
 
-    let mut p = crate::memory::bytes_until_nul(arg);
+    let mut p = *arg;
     if p.starts_with(b"&&") {
         let mut local_evalarg = Evalarg::new();
         let evalarg_used: &mut Evalarg = evalarg.unwrap_or(&mut local_evalarg);
@@ -2301,7 +2301,7 @@ fn eval3(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evalarg>)
                 rettv.value = crate::eval::typval::TvValue::Number(Varnumber::from(result));
             }
 
-            p = crate::memory::bytes_until_nul(arg);
+            p = *arg;
         }
 
         evalarg_used.eval_flags = orig_flags;
@@ -2365,7 +2365,7 @@ fn eval4(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evalarg>)
         return false;
     }
 
-    let p_bytes = crate::memory::bytes_until_nul(arg);
+    let p_bytes = *arg;
     let mut len: usize = 2;
     let expr_type = get_compare_type(p_bytes, &mut len);
 
@@ -2537,7 +2537,7 @@ fn eval5(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evalarg>)
     }
 
     loop {
-        let arg_bytes = crate::memory::bytes_until_nul(arg);
+        let arg_bytes = *arg;
         let op = i32::from(arg_bytes.first().copied().unwrap_or(0));
         let concat = op == b'.' as i32;
         if op != b'+' as i32 && op != b'-' as i32 && !concat {
@@ -2684,7 +2684,7 @@ fn eval6(
     }
 
     loop {
-        let arg_bytes = crate::memory::bytes_until_nul(arg);
+        let arg_bytes = *arg;
         let op = i32::from(arg_bytes.first().copied().unwrap_or(0));
         if op != b'*' as i32 && op != b'/' as i32 && op != b'%' as i32 {
             break;
@@ -2721,7 +2721,7 @@ fn eval7(
 
     rettv.value = crate::eval::typval::TvValue::Unknown;
 
-    let start_arg = crate::memory::bytes_until_nul(arg);
+    let start_arg = *arg;
     let mut cur_arg = start_arg;
     while matches!(cur_arg.first().copied().unwrap_or(0), b'!' | b'-' | b'+') {
         cur_arg = crate::charset::skipwhite_slice(&cur_arg[1..]);
@@ -2805,7 +2805,7 @@ fn eval7(
     let mut ok = if let Some(r) = ret {
         r
     } else {
-        let mut s = crate::memory::bytes_until_nul(arg);
+        let mut s = *arg;
         let mut alias: Option<std::ffi::CString> = None;
         let len = get_name_len(arg, &mut alias, evaluate, true);
         if let Some(ref a) = alias {
@@ -2820,8 +2820,7 @@ fn eval7(
             } else {
                 evalarg.as_deref_mut().unwrap().eval_flags
             };
-            let next_nonwhite =
-                crate::charset::skipwhite_slice(crate::memory::bytes_until_nul(arg));
+            let next_nonwhite = crate::charset::skipwhite_slice(arg);
             if next_nonwhite.first() == Some(&b'(') {
                 *arg = next_nonwhite;
                 eval_func(
@@ -2852,7 +2851,7 @@ fn eval7(
         res
     };
 
-    *arg = crate::charset::skipwhite_slice(crate::memory::bytes_until_nul(arg));
+    *arg = crate::charset::skipwhite_slice(arg);
 
     if ok {
         ok = handle_subscript(arg, start_arg, &mut *rettv, evalarg, true);
@@ -3558,7 +3557,7 @@ pub fn eval_option(arg: &mut &[u8], rettv: Option<&mut TypVal>, evaluate: bool) 
 
 /// Allocate a variable for a number constant. Also deals with "0z" for blob.
 fn eval_number(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool, want_string: bool) -> bool {
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     let mut get_float = false;
 
     if !want_string && !arg_bytes.is_empty() {
@@ -3651,13 +3650,13 @@ fn eval_number(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool, want_string:
 
 /// Evaluate a string constant and put the result in "rettv".
 fn eval_string(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool, interpolate: bool) -> bool {
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     let mut extra: isize = if interpolate { 1 } else { 0 };
     let off: usize = if interpolate { 0 } else { 1 };
 
     let mut idx = off.min(arg_bytes.len());
-    while idx < arg_bytes.len() && arg_bytes[idx] != b'"' {
-        if arg_bytes[idx] == b'\\' && idx + 1 < arg_bytes.len() {
+    while idx < arg_bytes.len() && !matches!(arg_bytes[idx], b'"' | 0) {
+        if arg_bytes[idx] == b'\\' && arg_bytes.get(idx + 1).is_some_and(|&b| b != 0) {
             idx += 1;
             if arg_bytes[idx] == b'<' {
                 let mut modifiers: i32 = 0;
@@ -3668,7 +3667,8 @@ fn eval_string(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool, interpolate:
                 if arg_bytes.get(idx + 1) != Some(&b'*') {
                     flags |= FSK_SIMPLIFY;
                 }
-                let mut p_slice = &arg_bytes[idx..];
+                // find_special_key() looks ahead up to the end of its input.
+                let mut p_slice = crate::memory::bytes_until_nul(&arg_bytes[idx..]);
                 let rem_len = p_slice.len();
                 if find_special_key(&mut p_slice, &mut modifiers, flags, None) != 0 {
                     idx = (idx + (rem_len - p_slice.len())).saturating_sub(1);
@@ -3819,12 +3819,12 @@ fn eval_string(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool, interpolate:
 
 /// Allocate a variable for a 'str''ing' constant.
 fn eval_lit_string(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool, interpolate: bool) -> bool {
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     let mut reduce: isize = if interpolate { -1 } else { 0 };
     let off: usize = if interpolate { 0 } else { 1 };
 
     let mut idx = off.min(arg_bytes.len());
-    while idx < arg_bytes.len() {
+    while idx < arg_bytes.len() && arg_bytes[idx] != 0 {
         if arg_bytes[idx] == b'\'' {
             if arg_bytes.get(idx + 1) != Some(&b'\'') {
                 break;
@@ -3902,7 +3902,7 @@ pub fn eval_interp_string(arg: &mut &[u8], rettv: &mut TypVal, evaluate: bool) -
         Vec::new()
     };
 
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     let quote = i32::from(arg_bytes.get(1).copied().unwrap_or(0));
     *arg = arg_bytes.get(2..).unwrap_or(&[]);
 
@@ -3981,7 +3981,7 @@ fn eval_list(arg: &mut &[u8], rettv: &mut TypVal, mut evalarg: Option<&mut Evala
         l = tv_list_alloc(K_LIST_LEN_SHOULD_KNOW);
     }
 
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     *arg = crate::charset::skipwhite_slice(arg_bytes.get(1..).unwrap_or(&[]));
     while !matches!(arg.first().copied().unwrap_or(0), b']' | 0) {
         let mut tv = tv_initial_value();
@@ -4461,7 +4461,7 @@ pub fn set_ref_in_item(
 
 /// Get the key for #{key: val} into "tv" and advance "arg".
 fn get_literal_key(arg: &mut &[u8], tv: &mut TypVal) -> bool {
-    let bytes = crate::memory::bytes_until_nul(arg);
+    let bytes = *arg;
     let Some(&b0) = bytes.first() else {
         return false;
     };
@@ -4490,7 +4490,7 @@ fn eval_dict(
         .is_some_and(|p| (p.eval_flags & EVAL_EVALUATE) != 0);
     let mut tv = tv_initial_value();
     let mut key: Option<std::ffi::CString> = None;
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     let mut curly_expr = crate::charset::skipwhite_slice(arg_bytes.get(1..).unwrap_or(&[]));
     let mut buf = [0u8; NUMBUFLEN];
 
@@ -4619,7 +4619,7 @@ fn eval_lit_dict(
     rettv: &mut TypVal,
     evalarg: Option<&mut Evalarg>,
 ) -> Option<bool> {
-    let arg_bytes = crate::memory::bytes_until_nul(arg);
+    let arg_bytes = *arg;
     if arg_bytes.get(1) == Some(&b'{') {
         *arg = &arg_bytes[1..];
         eval_dict(arg, rettv, evalarg, true)
@@ -4629,8 +4629,7 @@ fn eval_lit_dict(
 }
 
 /// Convert the string to a floating point number.
-pub fn string2float(text: &[u8], ret_value: &mut TvFloat) -> usize {
-    let bytes = crate::memory::bytes_until_nul(text);
+pub fn string2float(bytes: &[u8], ret_value: &mut TvFloat) -> usize {
     if bytes.len() >= 3 && bytes[..3].eq_ignore_ascii_case(b"inf") {
         *ret_value = f64::INFINITY;
         return 3;
@@ -5948,9 +5947,6 @@ pub fn handle_subscript<'a>(
     let mut selfdict = crate::eval::typval::DictId::NULL;
     let mut lua_funcname: Option<&'a [u8]> = None;
 
-    let start_bytes = crate::memory::bytes_until_nul(start_arg);
-    *arg = crate::memory::bytes_until_nul(arg);
-
     if tv_is_luafunc(rettv) {
         if !evaluate {
             tv_clear(rettv);
@@ -5978,8 +5974,9 @@ pub fn handle_subscript<'a>(
             || (b0 == b'.' && rettv.var_type() == VarType::VarDict)
             || (b0 == b'(' && (!evaluate || tv_is_func(rettv))))
             && !ascii_iswhite(i32::from(
-                start_bytes
-                    .get(start_bytes.len().saturating_sub(arg.len() + 1))
+                crate::memory::offset_in(start_arg, arg)
+                    .and_then(|offset| offset.checked_sub(1))
+                    .and_then(|i| start_arg.get(i))
                     .copied()
                     .unwrap_or(0),
             )))
