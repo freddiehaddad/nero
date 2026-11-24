@@ -577,12 +577,14 @@ fn string_compare(s1: &CStr, s2: &CStr) -> i32 {
 fn sort_compare(l1: &Sorti, l2: &Sorti, ic: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    if EXCMDS_STATE.with(|s| s.sort_abort.get()) {
-        return Ordering::Equal;
-    }
-    fast_breakcheck();
-    if input_state().got_int.get() {
-        EXCMDS_STATE.with(|s| s.sort_abort.set(true));
+    // Upstream compares all lines as equal once interrupted, so that qsort()
+    // returns sooner. That would break the total order that `sort_by()`
+    // needs, so keep comparing; ex_sort() drops the result.
+    if !EXCMDS_STATE.with(|s| s.sort_abort.get()) {
+        fast_breakcheck();
+        if input_state().got_int.get() {
+            EXCMDS_STATE.with(|s| s.sort_abort.set(true));
+        }
     }
 
     let result = match (&l1.st_u, &l2.st_u) {
