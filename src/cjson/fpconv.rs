@@ -1,15 +1,17 @@
 //! Floating point conversion routines (`src/cjson/fpconv.c`).
 #![forbid(unsafe_code)]
 
-use std::ffi::CStr;
 use std::io::Write;
 
-use crate::strings::strtod;
+use crate::strings::strtod_slice;
 
 pub const FPCONV_G_FMT_BUFSIZE: usize = 32;
 
-pub fn fpconv_strtod(nptr: &CStr) -> (f64, &CStr) {
-    strtod(nptr)
+/// Parses the number at the start of `bytes`, returning its value and how many bytes it spans, or
+/// `None` when `bytes` does not start with a number. Only the number's bytes are read.
+pub fn fpconv_strtod(bytes: &[u8]) -> Option<(f64, usize)> {
+    let (value, len) = strtod_slice(bytes);
+    (len > 0).then_some((value, len))
 }
 
 pub fn fpconv_g_fmt(buf: &mut [u8; FPCONV_G_FMT_BUFSIZE], num: f64, precision: i32) -> usize {

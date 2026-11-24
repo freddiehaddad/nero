@@ -26,8 +26,7 @@ mod tests {
         let bytes = strbuf_string(&mut sb, &mut len);
         assert_eq!(&bytes[..len], b"hello!");
 
-        let (v, rest) = fpconv_strtod(c"3.25");
-        assert!((v - 3.25).abs() < f64::EPSILON);
-        assert_eq!(rest.to_bytes(), b"");
+        assert_eq!(fpconv_strtod(b"3.25"), Some((3.25, 4)));
+        assert_eq!(fpconv_strtod(b"x"), None);
     }
 }

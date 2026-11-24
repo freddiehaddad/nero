@@ -1033,15 +1033,13 @@ fn json_next_number_token(json: &mut JsonParse<'_>, token: &mut JsonToken) {
     };
     let end_ch = rem.get(end_off).copied().unwrap_or(0);
     if end_off == 0 || end_ch == b'.' || end_ch == b'e' || end_ch == b'E' || end_ch == b'x' {
-        token.r#type = TNumber;
-        let cstr = CStr::from_bytes_until_nul(rem).unwrap_or(c"");
-        let (val, rest) = fpconv_strtod(cstr);
-        end_off = cstr.to_bytes().len() - rest.to_bytes().len();
-        token.value = JsonTokenValue::Number(val);
-        if end_off == 0 {
+        let Some((val, len)) = fpconv_strtod(rem) else {
             json_set_token_error(token, json, c"invalid number");
             return;
-        }
+        };
+        token.r#type = TNumber;
+        token.value = JsonTokenValue::Number(val);
+        end_off = len;
     } else if tmpval > (isize::MAX as i64) || tmpval < (isize::MIN as i64) {
         token.r#type = TNumber;
         token.value = JsonTokenValue::Number(tmpval as f64);
@@ -1407,4 +1405,48 @@ pub extern "C-unwind" fn lua_cjson_new(l: *mut lua_State) -> i32 {
 
 pub fn luaopen_cjson(l: *mut lua_State) -> i32 {
     lua_cjson_new(l)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads the number token at the start of `data`; returns the token and the position after it.
+    fn number_token(data: &[u8]) -> (JsonToken, usize) {
+        let mut json = JsonParse {
+            data,
+            pos: 0,
+            tmp: Strbuf::new(),
+            options: JsonOptions {
+                luanil_object: false,
+                luanil_array: false,
+                skip_comments: false,
+            },
+            current_depth: 0,
+        };
+        let mut token = JsonToken::new();
+        json_next_number_token(&mut json, &mut token);
+        (token, json.pos)
+    }
+
+    #[test]
+    fn number_token_reads_only_the_number() {
+        for (data, value, len) in [
+            (b"1.5".as_slice(), 1.5, 3),
+            (b"2.5e3,[".as_slice(), 2500.0, 5),
+            (b"-0.25]\0".as_slice(), -0.25, 5),
+            (b"1.5\0x".as_slice(), 1.5, 3),
+            (b"1e,\0".as_slice(), 1.0, 1),
+        ] {
+            let (token, pos) = number_token(data);
+            assert!(token.r#type == TNumber, "{data:?}");
+            assert_eq!(token.value.as_number(), value, "{data:?}");
+            assert_eq!(pos, len, "{data:?}");
+        }
+
+        let (token, pos) = number_token(b"-]");
+        assert!(token.r#type == TError);
+        assert_eq!(token.value.as_error(), c"invalid number");
+        assert_eq!(pos, 0);
+    }
 }
