@@ -58,7 +58,9 @@ use crate::mbyte::{
     utf_slice2_str_char_info, utfc_ptr2len,
 };
 use crate::mcursor::mc_ins_cascading;
-use crate::memline::{decl, ml_append, ml_get, ml_get_buf, ml_get_len, ml_replace};
+use crate::memline::{
+    decl, ml_append, ml_append_buf_cstr, ml_get, ml_get_buf, ml_get_len, ml_replace,
+};
 use crate::message::{
     emsg, emsg_invreg, message_filtered, msg, msg_ext_set_kind, msg_outtrans_len, msg_putchar,
     msg_puts, msg_puts_hl, msg_puts_title, msgmore, semsg, smsg,
@@ -1142,9 +1144,7 @@ pub fn op_yank_reg(oap: &mut Oparg, message: bool, reg_idx: RegIdx, append: bool
                 yank_copy_line(&mut newreg, &mut bd, y_idx, oap.excl_tr_ws);
             }
             MotionType::MtLineWise => {
-                let line_slice = crate::memline::ml_get_slice(lnum);
-
-                newreg.y_array[y_idx] = cbuf_to_string(&line_slice);
+                newreg.y_array[y_idx] = NvimString::from_rc_cstr(&ml_get(lnum));
             }
             MotionType::MtCharWise => {
                 charwise_block_prep(oap.start, oap.end, &mut bd, lnum, oap.inclusive);
@@ -2197,7 +2197,11 @@ pub fn do_put(regname: i32, mut reg: Option<PutReg<'_>>, mut dir: i32, mut count
 
                         while i < y_size {
                             if y_type != MotionType::MtCharWise || i < y_size - 1 {
-                                if !ml_append(lnum, y_array[i].cstr_bytes(), 0, false) {
+                                let appended = match y_array[i].to_rc_cstr_if_clean() {
+                                    Some(text) => ml_append_buf_cstr(&curbuf(), lnum, text, false),
+                                    None => ml_append(lnum, y_array[i].cstr_bytes(), 0, false),
+                                };
+                                if !appended {
                                     break 'error;
                                 }
                                 new_lnum += 1;

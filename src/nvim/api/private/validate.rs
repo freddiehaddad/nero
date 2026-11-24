@@ -175,6 +175,19 @@ impl NvimString {
         }
     }
 
+    /// Shares the text of `s` without copying it when `s` is a whole shared
+    /// string, as buffer lines are.
+    #[inline]
+    pub fn from_rc_cstr(s: &crate::option_vars::RcCStr) -> Self {
+        match s {
+            crate::option_vars::RcCStr::Shared(rc, 0) if !rc.is_empty() => Self {
+                data: NvimStringData::SharedCStr(rc.clone()),
+                size: rc.to_bytes().len(),
+            },
+            _ => Self::from_cstr(s.as_cstr()),
+        }
+    }
+
     #[inline]
     pub fn zeroed(size: usize) -> Self {
         if size <= NVIM_STRING_INLINE_CAP {
@@ -1178,6 +1191,30 @@ mod tests {
             err.msg.as_ref().unwrap().to_str().unwrap(),
             "Conflict: 'row' not allowed with 'win'"
         );
+    }
+
+    #[test]
+    fn nvim_string_from_rc_cstr_shares_whole_lines() {
+        let line = crate::option_vars::RcCStr::from_bytes(b"short");
+        let s = NvimString::from_rc_cstr(&line);
+        let (crate::option_vars::RcCStr::Shared(line_rc, 0), NvimStringData::SharedCStr(rc)) =
+            (&line, &s.data)
+        else {
+            panic!("a whole shared line must be shared");
+        };
+        assert!(std::sync::Arc::ptr_eq(line_rc, rc));
+        assert_eq!(s.as_bytes(), b"short");
+        let Some(crate::option_vars::RcCStr::Shared(back_rc, 0)) = s.to_rc_cstr_if_clean() else {
+            panic!("shared text must convert back without a copy");
+        };
+        assert!(std::sync::Arc::ptr_eq(line_rc, &back_rc));
+
+        let tail = NvimString::from_rc_cstr(&line.slice(2));
+        assert_eq!(tail.as_bytes(), b"ort");
+
+        let empty = NvimString::from_rc_cstr(&crate::option_vars::RcCStr::EMPTY);
+        assert_eq!(empty.as_bytes(), b"");
+        assert!(empty.is_nul_terminated());
     }
 
     #[test]
