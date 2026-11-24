@@ -43,7 +43,7 @@ use crate::mark::{Fmark, mark_adjust, setpcmark};
 use crate::mcursor::mc_undo_time;
 #[cfg(unix)]
 use crate::memline::resolve_symlink;
-use crate::memline::{ml_append_flags, ml_delete, ml_replace};
+use crate::memline::{ml_append_buf_cstr, ml_delete, ml_replace};
 use crate::message::{
     emsg, give_warning, iemsg, internal_error, messaging, msg, msg_end, msg_ext_set_kind,
     msg_putchar, msg_puts, msg_puts_hl, msg_start, semsg, smsg, smsg_keep, verb_msg, verbose_enter,
@@ -101,7 +101,8 @@ pub struct UEntry {
     pub ue_top: Linenr,
     pub ue_bot: Linenr,
     pub ue_lcount: Linenr,
-    pub ue_array: Vec<std::ffi::CString>,
+    /// The saved lines, sharing their text with the buffer they came from.
+    pub ue_array: Vec<crate::option_vars::RcCStr>,
 }
 
 impl UEntry {
@@ -950,7 +951,7 @@ fn serialize_uep(bi: &mut Bufinfo, uep: &UEntry) -> bool {
     undo_write_bytes(bi, uep.ue_size() as u64, 4);
 
     for line in &uep.ue_array {
-        let bytes = line.as_bytes();
+        let bytes = line.to_bytes();
         let len = bytes.len();
         if !undo_write_bytes(bi, len as u64, 4) {
             return false;
@@ -994,7 +995,8 @@ fn unserialize_uep(bi: &mut Bufinfo, error: &mut bool, file_name: &CStr) -> UEnt
             *error = true;
             return uep;
         };
-        uep.ue_array.push(line);
+        uep.ue_array
+            .push(crate::option_vars::RcCStr::from_cstring(line));
     }
     uep
 }
@@ -2124,7 +2126,7 @@ fn u_undoredo(undo: bool, do_buf_event: bool) {
             } else if top < newlnum {
                 let mut i: Linenr = 0;
                 while i < newsize && i < oldsize {
-                    if uep.ue_array.as_slice()[i as usize].as_bytes()
+                    if uep.ue_array.as_slice()[i as usize].to_bytes()
                         != crate::memline::ml_get_slice(top + 1 + i)
                     {
                         break;
@@ -2142,10 +2144,10 @@ fn u_undoredo(undo: bool, do_buf_event: bool) {
         }
 
         let mut empty_buffer = false;
-        let mut newarray: Vec<std::ffi::CString> = Vec::new();
+        let mut newarray: Vec<crate::option_vars::RcCStr> = Vec::new();
 
         if oldsize > 0 {
-            newarray.resize_with(oldsize as usize, std::ffi::CString::default);
+            newarray.resize_with(oldsize as usize, crate::option_vars::RcCStr::default);
             let mut lnum = bot - 1;
             let mut i = oldsize;
             while {
@@ -2166,11 +2168,11 @@ fn u_undoredo(undo: bool, do_buf_event: bool) {
         if newsize != 0 {
             for (i, line) in uep.ue_array.drain(..).enumerate() {
                 let lnum = top + i as Linenr;
-                let bytes = line.to_bytes();
                 if empty_buffer && lnum == 0 {
+                    let bytes = line.to_bytes();
                     crate::memline::ml_replace_len(1, bytes, bytes.len(), true);
                 } else {
-                    ml_append_flags(lnum, bytes, (bytes.len() + 1) as Colnr, 0);
+                    ml_append_buf_cstr(&curbuf(), lnum, line, false);
                 }
             }
         }
@@ -2613,7 +2615,7 @@ pub fn u_find_first_changed() {
         let expected = with_uhp(&cb, nh, |h| {
             h.uh_entries[0].ue_array.as_slice()[(lnum - 1) as usize].clone()
         });
-        let differs = crate::memline::ml_get_buf_slice(&cb, lnum) != expected.as_bytes();
+        let differs = crate::memline::ml_get_buf_slice(&cb, lnum) != expected.to_bytes();
         if differs {
             with_uhp_mut(&curbuf(), nh, |h| {
                 clearpos(&mut h.uh_cursor);
@@ -2813,7 +2815,7 @@ pub fn u_forget_unchanged(buf: &FileBuf) {
     for i in 0..ue_size {
         let differs = crate::memline::with_ml_buf_line(buf, ue_top + 1 + i, |line_bytes| {
             with_uhp(buf, uhp, |h| {
-                h.uh_entries[0].ue_array[i as usize].as_bytes() != line_bytes
+                h.uh_entries[0].ue_array[i as usize].to_bytes() != line_bytes
             })
         });
         if differs {
@@ -2873,7 +2875,7 @@ fn u_saveline(buf: &FileBuf, lnum: Linenr) {
         buf.b_u_line_colnr.set(0);
     }
     let saved_line = u_save_line_buf(buf, lnum);
-    buf.b_u_line_ptr.set(Some(saved_line));
+    buf.b_u_line_ptr.set(Some(saved_line.as_cstr().to_owned()));
 }
 
 /// Clear the line saved for the `"U"` command.
@@ -2914,12 +2916,12 @@ pub fn u_undoline() {
         &curbuf(),
         curbuf().b_u_line_lnum.get() - 1,
         0,
-        oldp.as_bytes().len() as Colnr,
+        oldp.to_bytes().len() as Colnr,
         new_line_len,
         K_EXTMARK_UNDO,
     );
     changed_bytes(curbuf().b_u_line_lnum.get(), 0);
-    curbuf().b_u_line_ptr.set(Some(oldp));
+    curbuf().b_u_line_ptr.set(Some(oldp.as_cstr().to_owned()));
 
     let t = curbuf().b_u_line_colnr.get();
     if curwin().w_cursor.get().lnum == curbuf().b_u_line_lnum.get() {
@@ -2930,16 +2932,12 @@ pub fn u_undoline() {
     check_cursor_col(&curwin());
 }
 
-fn u_save_line(lnum: Linenr) -> std::ffi::CString {
+fn u_save_line(lnum: Linenr) -> crate::option_vars::RcCStr {
     u_save_line_buf(&crate::globals::curbuf(), lnum)
 }
 
-fn u_save_line_buf(buf: &FileBuf, lnum: Linenr) -> std::ffi::CString {
-    crate::memline::with_ml_buf_bytes_with_nul(buf, lnum, |s| {
-        std::ffi::CStr::from_bytes_until_nul(s)
-            .unwrap_or(c"")
-            .to_owned()
-    })
+fn u_save_line_buf(buf: &FileBuf, lnum: Linenr) -> crate::option_vars::RcCStr {
+    crate::memline::ml_get_buf_shared(buf, lnum)
 }
 
 /// Check if the `'modified'` flag is set, or `'ff'` has changed.

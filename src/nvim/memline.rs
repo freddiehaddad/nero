@@ -3112,24 +3112,39 @@ pub fn ml_preserve(buf: &FileBuf, message: bool, do_fsync: bool) {
     }
 }
 
+/// The stored text of line `lnum` in `buf`, or `None` when there is no such
+/// line or it is being edited in the line buffer.
+#[inline(always)]
+fn stored_line(buf: &FileBuf, lnum: Linenr) -> Option<crate::option_vars::RcCStr> {
+    let editing = buf.b_ml.ml_line_lnum.get() == lnum
+        && (buf.b_ml.ml_flags.get() & (ML_LINE_DIRTY | ML_LINE_INPLACE)) != 0;
+    if lnum < 1
+        || lnum > buf.b_ml.ml_line_count.get()
+        || editing
+        || buf.b_ml.ml_mfp.borrow().is_none()
+    {
+        return None;
+    }
+    buf.b_ml
+        .ml_chunks
+        .borrow()
+        .line(lnum)
+        .map(|e| e.text().clone())
+}
+
+/// The text of line `lnum` in `buf`, shared with the buffer when possible.
+/// Unlike `ml_get_buf()`, it does not change the line loaded for editing.
+pub fn ml_get_buf_shared(buf: &FileBuf, lnum: Linenr) -> crate::option_vars::RcCStr {
+    stored_line(buf, lnum).unwrap_or_else(|| {
+        with_ml_buf_bytes_with_nul(buf, lnum, crate::option_vars::RcCStr::from_bytes)
+    })
+}
+
 /// Borrow the bytes (excluding NUL) of line `lnum` in `buf` directly from `Memline`.
 #[inline(always)]
 pub fn with_ml_buf_line<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce(&[u8]) -> R) -> R {
-    if lnum >= 1
-        && lnum <= buf.b_ml.ml_line_count.get()
-        && (buf.b_ml.ml_line_lnum.get() != lnum
-            || (buf.b_ml.ml_flags.get() & (ML_LINE_DIRTY | ML_LINE_INPLACE)) == 0)
-        && buf.b_ml.ml_mfp.borrow().is_some()
-    {
-        let cstr_opt = buf
-            .b_ml
-            .ml_chunks
-            .borrow()
-            .line(lnum)
-            .map(|e| e.text().clone());
-        if let Some(cstr) = cstr_opt {
-            return f(cstr.to_bytes());
-        }
+    if let Some(cstr) = stored_line(buf, lnum) {
+        return f(cstr.to_bytes());
     }
     if !ml_load_line(buf, lnum, false) {
         return f(&[]);
@@ -3147,21 +3162,8 @@ pub fn with_ml_buf_line<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce(&[u8]) ->
 /// Borrow the NUL-terminated bytes (including trailing NUL) of line `lnum` in `buf`.
 #[inline(always)]
 pub fn with_ml_buf_bytes_with_nul<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce(&[u8]) -> R) -> R {
-    if lnum >= 1
-        && lnum <= buf.b_ml.ml_line_count.get()
-        && (buf.b_ml.ml_line_lnum.get() != lnum
-            || (buf.b_ml.ml_flags.get() & (ML_LINE_DIRTY | ML_LINE_INPLACE)) == 0)
-        && buf.b_ml.ml_mfp.borrow().is_some()
-    {
-        let cstr_opt = buf
-            .b_ml
-            .ml_chunks
-            .borrow()
-            .line(lnum)
-            .map(|e| e.text().clone());
-        if let Some(cstr) = cstr_opt {
-            return f(cstr.to_bytes_with_nul());
-        }
+    if let Some(cstr) = stored_line(buf, lnum) {
+        return f(cstr.to_bytes_with_nul());
     }
     if !ml_load_line(buf, lnum, false) {
         return f(b"\0");
