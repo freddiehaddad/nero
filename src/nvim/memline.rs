@@ -66,32 +66,596 @@ use crate::undo::buf_is_changed_fn;
 use std::ffi::CStr;
 use std::ptr;
 
-#[derive(Clone)]
-struct LineEntry {
-    text: crate::option_vars::RcCStr,
-    marked: bool,
-}
+use chunks::{Chunks, LineChunk, LineEntry};
 
-impl LineEntry {
-    const EMPTY: Self = Self {
-        text: crate::option_vars::RcCStr::EMPTY,
-        marked: false,
-    };
-}
+/// The buffer text, split into chunks of consecutive lines.
+///
+/// Only this module adds or removes lines, so the line count of every chunk
+/// and the line number each chunk starts at stay consistent.
+mod chunks {
+    use super::{MLCS_MAXL, MLCS_MINL, PointerEntry};
+    use crate::cursor::Linenr;
+    use crate::memfile::BhdrId;
+    use crate::option_vars::RcCStr;
+    use std::cell::Cell;
 
-#[derive(Clone)]
-struct LineChunk {
-    lines: Vec<LineEntry>,
-    start_lnum: Linenr,
-    totalsize: i32,
-    swap_blocks: Vec<(PointerEntry, BhdrId)>,
+    #[derive(Clone)]
+    pub(super) struct LineEntry {
+        text: RcCStr,
+        pub(super) marked: bool,
+    }
+
+    impl LineEntry {
+        pub(super) const EMPTY: Self = Self {
+            text: RcCStr::EMPTY,
+            marked: false,
+        };
+
+        pub(super) fn new(text: RcCStr, marked: bool) -> Self {
+            Self { text, marked }
+        }
+
+        pub(super) fn text(&self) -> &RcCStr {
+            &self.text
+        }
+
+        /// Bytes the line takes in the buffer, counting its newline.
+        pub(super) fn size(&self) -> i32 {
+            self.text.to_bytes().len() as i32 + 1
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct LineChunk {
+        lines: Vec<LineEntry>,
+        start_lnum: Linenr,
+        totalsize: i32,
+        /// Swap file blocks holding this chunk; empty when the chunk changed
+        /// after the last swap file sync.
+        pub(super) swap_blocks: Vec<(PointerEntry, BhdrId)>,
+    }
+
+    impl LineChunk {
+        fn new(start_lnum: Linenr, entry: LineEntry) -> Self {
+            let totalsize = entry.size();
+            let mut lines = Vec::with_capacity(MLCS_MINL as usize);
+            lines.push(entry);
+            Self {
+                lines,
+                start_lnum,
+                totalsize,
+                swap_blocks: Vec::new(),
+            }
+        }
+
+        pub(super) fn lines(&self) -> &[LineEntry] {
+            &self.lines
+        }
+
+        pub(super) fn lines_mut(&mut self) -> &mut [LineEntry] {
+            &mut self.lines
+        }
+
+        /// Bytes the chunk's lines take in the buffer, counting newlines.
+        pub(super) fn totalsize(&self) -> i32 {
+            self.totalsize
+        }
+
+        fn contains(&self, lnum: Linenr) -> bool {
+            lnum >= self.start_lnum && lnum < self.start_lnum + self.lines.len() as Linenr
+        }
+
+        /// Moves the lines of `right`, the chunk after this one, into this one.
+        fn append(&mut self, right: Self) {
+            self.totalsize += right.totalsize;
+            self.lines.extend(right.lines);
+            self.swap_blocks.clear();
+        }
+    }
+
+    /// Where a line is stored: chunk number and index within the chunk.
+    #[derive(Clone, Copy)]
+    struct LinePos {
+        chunk: usize,
+        index: usize,
+    }
+
+    pub(super) struct Chunks {
+        list: Vec<LineChunk>,
+        /// The chunk the last lookup found, tried first by the next one.
+        cur: Cell<usize>,
+    }
+
+    impl Chunks {
+        pub(super) const fn new() -> Self {
+            Self {
+                list: Vec::new(),
+                cur: Cell::new(0),
+            }
+        }
+
+        /// Chunks holding the single line `entry`.
+        pub(super) fn with_line(entry: LineEntry) -> Self {
+            Self {
+                list: vec![LineChunk::new(1, entry)],
+                cur: Cell::new(0),
+            }
+        }
+
+        /// Number of chunks.
+        pub(super) fn len(&self) -> usize {
+            self.list.len()
+        }
+
+        pub(super) fn is_empty(&self) -> bool {
+            self.list.is_empty()
+        }
+
+        pub(super) fn line_count(&self) -> Linenr {
+            self.list
+                .last()
+                .map_or(0, |ch| ch.start_lnum + ch.lines.len() as Linenr - 1)
+        }
+
+        #[inline(always)]
+        fn locate(&self, lnum: Linenr) -> Option<LinePos> {
+            let pos_in = |chunk: usize| {
+                self.list
+                    .get(chunk)
+                    .filter(|ch| ch.contains(lnum))
+                    .map(|ch| LinePos {
+                        chunk,
+                        index: (lnum - ch.start_lnum) as usize,
+                    })
+            };
+            let cur = self.cur.get();
+            if let Some(pos) = pos_in(cur) {
+                return Some(pos);
+            }
+            let pos = pos_in(cur + 1)
+                .or_else(|| pos_in(cur.wrapping_sub(1)))
+                .or_else(|| {
+                    let chunk = self.list.partition_point(|ch| ch.start_lnum <= lnum);
+                    pos_in(chunk.saturating_sub(1))
+                })?;
+            self.cur.set(pos.chunk);
+            Some(pos)
+        }
+
+        #[inline(always)]
+        pub(super) fn line(&self, lnum: Linenr) -> Option<&LineEntry> {
+            let pos = self.locate(lnum)?;
+            Some(&self.list[pos.chunk].lines[pos.index])
+        }
+
+        pub(super) fn line_mut(&mut self, lnum: Linenr) -> Option<&mut LineEntry> {
+            let pos = self.locate(lnum)?;
+            Some(&mut self.list[pos.chunk].lines[pos.index])
+        }
+
+        /// Each chunk with the number of its first line.
+        pub(super) fn iter(&self) -> impl Iterator<Item = (Linenr, &LineChunk)> {
+            self.list.iter().scan(1, |next, ch| {
+                let first = *next;
+                *next += ch.lines.len() as Linenr;
+                Some((first, ch))
+            })
+        }
+
+        /// Each chunk with the number of its first line.
+        pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = (Linenr, &mut LineChunk)> {
+            self.list.iter_mut().scan(1, |next, ch| {
+                let first = *next;
+                *next += ch.lines.len() as Linenr;
+                Some((first, ch))
+            })
+        }
+
+        /// The chunks holding the lines in `lnums`, each with the number of
+        /// its first line, or `None` when `lnums` is empty or reaches outside
+        /// the stored lines.
+        pub(super) fn span_mut(
+            &mut self,
+            lnums: std::ops::RangeInclusive<Linenr>,
+        ) -> Option<Vec<(Linenr, &mut LineChunk)>> {
+            if lnums.is_empty() {
+                return None;
+            }
+            let start = self.locate(*lnums.start())?;
+            let end = self.locate(*lnums.end())?;
+            let mut next = *lnums.start() - start.index as Linenr;
+            let span = self.list[start.chunk..=end.chunk].iter_mut().map(|ch| {
+                let first = next;
+                next += ch.lines.len() as Linenr;
+                (first, ch)
+            });
+            Some(span.collect())
+        }
+
+        /// Inserts `entry` after line `lnum`, or before the first line when
+        /// `lnum` is 0. Hands `entry` back when there is no line `lnum`.
+        pub(super) fn insert_after(
+            &mut self,
+            lnum: Linenr,
+            entry: LineEntry,
+        ) -> Result<(), LineEntry> {
+            let line_count = self.line_count();
+            if !(0..=line_count).contains(&lnum) {
+                return Err(entry);
+            }
+            let Some(last) = self.list.len().checked_sub(1) else {
+                self.list.push(LineChunk::new(1, entry));
+                self.cur.set(0);
+                return Ok(());
+            };
+            if lnum == line_count {
+                if self.list[last].lines.len() >= MLCS_MINL as usize {
+                    self.list.push(LineChunk::new(line_count + 1, entry));
+                    self.cur.set(last + 1);
+                } else {
+                    let ch = &mut self.list[last];
+                    ch.totalsize += entry.size();
+                    ch.lines.push(entry);
+                    ch.swap_blocks.clear();
+                    self.cur.set(last);
+                }
+                return Ok(());
+            }
+            let (c, index) = if lnum == 0 {
+                (0, 0)
+            } else {
+                let Some(pos) = self.locate(lnum) else {
+                    return Err(entry);
+                };
+                (pos.chunk, pos.index + 1)
+            };
+            let ch = &mut self.list[c];
+            ch.totalsize += entry.size();
+            ch.lines.insert(index, entry);
+            ch.swap_blocks.clear();
+            for later in &mut self.list[c + 1..] {
+                later.start_lnum += 1;
+            }
+            if self.list[c].lines.len() >= MLCS_MAXL as usize {
+                let ch = &mut self.list[c];
+                let right_lines = ch.lines.split_off(MLCS_MINL as usize);
+                let right_size: i32 = right_lines.iter().map(LineEntry::size).sum();
+                ch.totalsize -= right_size;
+                let right = LineChunk {
+                    lines: right_lines,
+                    start_lnum: ch.start_lnum + MLCS_MINL,
+                    totalsize: right_size,
+                    swap_blocks: Vec::new(),
+                };
+                self.list.insert(c + 1, right);
+            }
+            self.cur.set(c);
+            Ok(())
+        }
+
+        /// Removes line `lnum`, or returns `None` when it is not stored.
+        pub(super) fn remove(&mut self, lnum: Linenr) -> Option<LineEntry> {
+            let LinePos { chunk: c, index } = self.locate(lnum)?;
+            let ch = &mut self.list[c];
+            let entry = ch.lines.remove(index);
+            ch.totalsize -= entry.size();
+            ch.swap_blocks.clear();
+            for later in &mut self.list[c + 1..] {
+                later.start_lnum -= 1;
+            }
+            let fits =
+                |a: &LineChunk, b: &LineChunk| a.lines.len() + b.lines.len() <= MLCS_MINL as usize;
+            if self.list[c].lines.is_empty() && self.list.len() > 1 {
+                self.list.remove(c);
+                if self.cur.get() >= self.list.len() {
+                    self.cur.set(self.list.len() - 1);
+                }
+            } else if c + 1 < self.list.len() && fits(&self.list[c], &self.list[c + 1]) {
+                let right = self.list.remove(c + 1);
+                self.list[c].append(right);
+                self.cur.set(c);
+            } else if c > 0 && fits(&self.list[c - 1], &self.list[c]) {
+                let ch = self.list.remove(c);
+                self.list[c - 1].append(ch);
+                self.cur.set(c - 1);
+            }
+            Some(entry)
+        }
+
+        /// Replaces the text of line `lnum` and returns the old text, or
+        /// returns `None` when the line is not stored.
+        pub(super) fn replace(&mut self, lnum: Linenr, text: RcCStr) -> Option<RcCStr> {
+            let pos = self.locate(lnum)?;
+            let ch = &mut self.list[pos.chunk];
+            let entry = &mut ch.lines[pos.index];
+            let old_size = entry.size();
+            let old = std::mem::replace(&mut entry.text, text);
+            ch.totalsize += entry.size() - old_size;
+            ch.swap_blocks.clear();
+            Some(old)
+        }
+
+        /// Clears the mark of the first marked line from line `from` on and
+        /// returns its number, or `None` when no such line is marked.
+        pub(super) fn take_first_marked(&mut self, from: Linenr) -> Option<Linenr> {
+            let start = self.locate(from)?;
+            let mut first = from - start.index as Linenr;
+            let mut skip = start.index;
+            for (c, ch) in self.list.iter_mut().enumerate().skip(start.chunk) {
+                if let Some(i) = ch.lines.iter().skip(skip).position(|e| e.marked) {
+                    let index = skip + i;
+                    ch.lines[index].marked = false;
+                    self.cur.set(c);
+                    return Some(first + index as Linenr);
+                }
+                first += ch.lines.len() as Linenr;
+                skip = 0;
+            }
+            None
+        }
+
+        /// Clears the marks of all lines from the chunk holding line `from`
+        /// on.
+        pub(super) fn clear_marks_from(&mut self, from: Linenr) {
+            let Some(start) = self.locate(from) else {
+                return;
+            };
+            for ch in &mut self.list[start.chunk..] {
+                for entry in &mut ch.lines {
+                    entry.marked = false;
+                }
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn assert_invariants(&self) {
+            let mut expected_start: Linenr = 1;
+            for ch in &self.list {
+                assert_eq!(ch.start_lnum, expected_start);
+                assert!(!ch.lines.is_empty());
+                assert!(ch.lines.len() < MLCS_MAXL as usize);
+                let actual_total: i32 = ch.lines.iter().map(LineEntry::size).sum();
+                assert_eq!(ch.totalsize, actual_total);
+                expected_start += ch.lines.len() as Linenr;
+            }
+            assert_eq!(expected_start - 1, self.line_count());
+        }
+    }
+
+    #[cfg(test)]
+    impl std::ops::Index<usize> for Chunks {
+        type Output = LineChunk;
+
+        fn index(&self, chunk: usize) -> &LineChunk {
+            &self.list[chunk]
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Xorshift generator with a fixed seed, so failures reproduce.
+        struct Rng(u64);
+
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+
+        fn entry(text: &str) -> LineEntry {
+            LineEntry::new(RcCStr::from_bytes(text.as_bytes()), false)
+        }
+
+        /// Checks `chunks` against `model`, a plain list of (text, marked).
+        fn assert_matches(chunks: &Chunks, model: &[(String, bool)], rng: &mut Rng) {
+            chunks.assert_invariants();
+            assert_eq!(chunks.line_count() as usize, model.len());
+            for (lnum, (text, marked)) in (1..).zip(model) {
+                let line = chunks.line(lnum).expect("line is stored");
+                assert_eq!(line.text().to_bytes(), text.as_bytes(), "line {lnum}");
+                assert_eq!(line.marked, *marked, "line {lnum}");
+            }
+            for _ in 0..200 {
+                let lnum = rng.below(model.len()) + 1;
+                let line = chunks.line(lnum as Linenr).expect("line is stored");
+                assert_eq!(line.text().to_bytes(), model[lnum - 1].0.as_bytes());
+            }
+            assert!(chunks.line(0).is_none());
+            assert!(chunks.line(model.len() as Linenr + 1).is_none());
+        }
+
+        #[test]
+        fn edits_match_a_plain_list_across_splits_and_merges() {
+            for seed in [0x9e37_79b9, 0x2545_f491, 0x6a09_e667, 0xbb67_ae85] {
+                let mut rng = Rng(seed);
+                let mut chunks = Chunks::with_line(LineEntry::EMPTY);
+                let mut model = vec![(String::new(), false)];
+                let mut next_text = 0;
+                let mut new_text = || {
+                    next_text += 1;
+                    format!("line {next_text}")
+                };
+
+                // Inserts all over a growing buffer split chunks repeatedly.
+                for _ in 0..3000 {
+                    let after = rng.below(model.len() + 1);
+                    let text = new_text();
+                    assert!(chunks.insert_after(after as Linenr, entry(&text)).is_ok());
+                    model.insert(after, (text, false));
+                }
+                assert_matches(&chunks, &model, &mut rng);
+
+                // Mixed edits, with marks that must follow their lines.
+                for step in 0..6000 {
+                    let lnum = rng.below(model.len()) + 1;
+                    match rng.below(4) {
+                        0 => {
+                            let text = new_text();
+                            assert!(chunks.insert_after(lnum as Linenr, entry(&text)).is_ok());
+                            model.insert(lnum, (text, false));
+                        }
+                        1 if model.len() > 1 => {
+                            let removed = chunks.remove(lnum as Linenr).expect("line is stored");
+                            let (text, marked) = model.remove(lnum - 1);
+                            assert_eq!(removed.text().to_bytes(), text.as_bytes());
+                            assert_eq!(removed.marked, marked);
+                        }
+                        2 => {
+                            let text = new_text();
+                            let old =
+                                chunks.replace(lnum as Linenr, RcCStr::from_bytes(text.as_bytes()));
+                            assert_eq!(
+                                old.expect("line is stored").to_bytes(),
+                                model[lnum - 1].0.as_bytes()
+                            );
+                            model[lnum - 1].0 = text;
+                        }
+                        _ => {
+                            chunks
+                                .line_mut(lnum as Linenr)
+                                .expect("line is stored")
+                                .marked = true;
+                            model[lnum - 1].1 = true;
+                        }
+                    }
+                    if step % 1000 == 0 {
+                        assert_matches(&chunks, &model, &mut rng);
+                    }
+                }
+                assert_matches(&chunks, &model, &mut rng);
+
+                // Deletes all over a shrinking buffer merge chunks.
+                while model.len() > 1 {
+                    let lnum = rng.below(model.len()) + 1;
+                    assert!(chunks.remove(lnum as Linenr).is_some());
+                    model.remove(lnum - 1);
+                    if model.len() % 700 == 0 {
+                        assert_matches(&chunks, &model, &mut rng);
+                    }
+                }
+                assert_matches(&chunks, &model, &mut rng);
+
+                // Appending at the end and inserting at the top.
+                for i in 0..1700 {
+                    let text = new_text();
+                    if i % 2 == 0 {
+                        assert!(
+                            chunks
+                                .insert_after(model.len() as Linenr, entry(&text))
+                                .is_ok()
+                        );
+                        model.push((text, false));
+                    } else {
+                        assert!(chunks.insert_after(0, entry(&text)).is_ok());
+                        model.insert(0, (text, false));
+                    }
+                }
+                assert_matches(&chunks, &model, &mut rng);
+            }
+        }
+
+        #[test]
+        fn lines_outside_the_buffer_are_rejected() {
+            let mut chunks = Chunks::with_line(entry("only"));
+            let rejected = chunks.insert_after(2, entry("past the end"));
+            assert_eq!(
+                rejected.err().map(|e| e.text().to_bytes().to_vec()),
+                Some(b"past the end".to_vec())
+            );
+            assert!(chunks.insert_after(-1, entry("before the start")).is_err());
+            assert!(chunks.remove(0).is_none());
+            assert!(chunks.remove(2).is_none());
+            assert!(chunks.replace(2, RcCStr::EMPTY).is_none());
+            assert!(chunks.span_mut(1..=2).is_none());
+            let reversed = std::ops::RangeInclusive::new(2, 1);
+            assert!(chunks.span_mut(reversed).is_none());
+            assert_eq!(chunks.line_count(), 1);
+            assert_eq!(
+                chunks.line(1).map(|e| e.text().to_bytes()),
+                Some(&b"only"[..])
+            );
+
+            let mut empty = Chunks::new();
+            assert!(empty.line(1).is_none());
+            assert!(empty.insert_after(1, entry("x")).is_err());
+            assert!(empty.insert_after(0, entry("x")).is_ok());
+            assert_eq!(empty.line_count(), 1);
+        }
+
+        #[test]
+        fn marks_are_taken_in_line_order() {
+            let mut rng = Rng(0x3c6e_f372);
+            let mut chunks = Chunks::with_line(entry("1"));
+            for lnum in 2..=3000 {
+                assert!(
+                    chunks
+                        .insert_after(lnum - 1, entry(&lnum.to_string()))
+                        .is_ok()
+                );
+            }
+            let mut marked: Vec<Linenr> = (0..300).map(|_| rng.below(3000) as Linenr + 1).collect();
+            marked.sort_unstable();
+            marked.dedup();
+            for &lnum in &marked {
+                chunks.line_mut(lnum).expect("line is stored").marked = true;
+            }
+
+            let from = marked[marked.len() / 2];
+            let mut taken = Vec::new();
+            while let Some(lnum) = chunks.take_first_marked(from) {
+                taken.push(lnum);
+            }
+            assert_eq!(taken, marked[marked.len() / 2..]);
+            assert_eq!(chunks.take_first_marked(3001), None);
+
+            chunks.clear_marks_from(1);
+            assert_eq!(chunks.take_first_marked(1), None);
+        }
+
+        #[test]
+        fn span_numbers_the_chunks_holding_a_range() {
+            let mut rng = Rng(0xa54f_f53a);
+            let mut chunks = Chunks::with_line(entry("1"));
+            for _ in 2..=5000 {
+                let after = rng.below(chunks.line_count() as usize + 1) as Linenr;
+                assert!(chunks.insert_after(after, entry("x")).is_ok());
+            }
+            let all: Vec<(Linenr, usize)> = chunks
+                .iter()
+                .map(|(first, ch)| (first, ch.lines().len()))
+                .collect();
+            for _ in 0..200 {
+                let a = rng.below(5000) as Linenr + 1;
+                let b = a + rng.below((5001 - a) as usize) as Linenr;
+                let span: Vec<(Linenr, usize)> = chunks
+                    .span_mut(a..=b)
+                    .expect("range is stored")
+                    .into_iter()
+                    .map(|(first, ch)| (first, ch.lines().len()))
+                    .collect();
+                let (first, len) = span[0];
+                assert!(first <= a && a < first + len as Linenr);
+                let (last, len) = span[span.len() - 1];
+                assert!(last <= b && b < last + len as Linenr);
+                let start = all
+                    .iter()
+                    .position(|&c| c == span[0])
+                    .expect("span starts at a chunk");
+                assert_eq!(span, all[start..start + span.len()]);
+            }
+        }
+    }
 }
 
 pub struct Memline {
     pub ml_line_count: std::cell::Cell<i32>,
     pub ml_mfp: std::cell::RefCell<Option<Box<crate::memfile::Memfile>>>,
-    ml_chunks: std::cell::RefCell<Vec<LineChunk>>,
-    ml_cur_chunk: std::cell::Cell<usize>,
+    ml_chunks: std::cell::RefCell<Chunks>,
     ml_swap_dirty: std::cell::Cell<bool>,
     pub ml_flags: std::cell::Cell<i32>,
     ml_line_textlen: std::cell::Cell<i32>,
@@ -107,8 +671,7 @@ impl Memline {
         Self {
             ml_line_count: std::cell::Cell::new(0),
             ml_mfp: std::cell::RefCell::new(None),
-            ml_chunks: std::cell::RefCell::new(Vec::new()),
-            ml_cur_chunk: std::cell::Cell::new(0),
+            ml_chunks: std::cell::RefCell::new(Chunks::new()),
             ml_swap_dirty: std::cell::Cell::new(false),
             ml_flags: std::cell::Cell::new(0),
             ml_line_textlen: std::cell::Cell::new(0),
@@ -117,41 +680,6 @@ impl Memline {
             ml_line_cstr: crate::globals::CloneCell::new(None),
             ml_line_offset: std::cell::Cell::new(0),
             ml_usedchunks: std::cell::Cell::new(0),
-        }
-    }
-
-    #[inline(always)]
-    fn find_chunk_idx(&self, chunks: &[LineChunk], lnum: Linenr) -> Option<usize> {
-        let cur = self.ml_cur_chunk.get();
-        if let Some(ch) = chunks.get(cur) {
-            if lnum >= ch.start_lnum && lnum < ch.start_lnum + (ch.lines.len() as Linenr) {
-                return Some(cur);
-            }
-            if let Some(next_ch) = chunks.get(cur + 1)
-                && lnum >= next_ch.start_lnum
-                && lnum < next_ch.start_lnum + (next_ch.lines.len() as Linenr)
-            {
-                self.ml_cur_chunk.set(cur + 1);
-                return Some(cur + 1);
-            }
-            if cur > 0
-                && let Some(prev_ch) = chunks.get(cur - 1)
-                && lnum >= prev_ch.start_lnum
-                && lnum < prev_ch.start_lnum + (prev_ch.lines.len() as Linenr)
-            {
-                self.ml_cur_chunk.set(cur - 1);
-                return Some(cur - 1);
-            }
-        }
-        let idx = chunks
-            .partition_point(|ch| ch.start_lnum <= lnum)
-            .saturating_sub(1);
-        let ch = chunks.get(idx)?;
-        if lnum >= ch.start_lnum && lnum < ch.start_lnum + (ch.lines.len() as Linenr) {
-            self.ml_cur_chunk.set(idx);
-            Some(idx)
-        } else {
-            None
         }
     }
 
@@ -641,15 +1169,7 @@ fn sb_push_cstr(sb: &mut Vec<u8>, s: &CStr) {
 
 /// Open a new memline for `buf`.
 pub fn ml_open(buf: &FileBuf) -> bool {
-    let mut first_lines = Vec::with_capacity(MLCS_MINL as usize);
-    first_lines.push(LineEntry::EMPTY);
-    *buf.b_ml.ml_chunks.borrow_mut() = vec![LineChunk {
-        lines: first_lines,
-        start_lnum: 1,
-        totalsize: 1,
-        swap_blocks: Vec::new(),
-    }];
-    buf.b_ml.ml_cur_chunk.set(0);
+    *buf.b_ml.ml_chunks.borrow_mut() = Chunks::with_line(LineEntry::EMPTY);
     buf.b_ml.ml_swap_dirty.set(true);
     buf.b_ml.ml_line_lnum.set(0);
     buf.b_ml.ml_line_cstr.set(None);
@@ -905,8 +1425,7 @@ pub fn ml_close(buf: &FileBuf, del_file: i32) {
     mf_close(buf.b_ml.ml_mfp.borrow_mut().take(), del_file != 0);
     buf.b_ml.ml_line_cstr.set(None);
     buf.b_ml.ml_swap_dirty.set(false);
-    buf.b_ml.ml_cur_chunk.set(0);
-    *buf.b_ml.ml_chunks.borrow_mut() = Vec::new();
+    *buf.b_ml.ml_chunks.borrow_mut() = Chunks::new();
     *buf.b_ml.ml_line_buf.borrow_mut() = Vec::new();
 
     buf.b_flags.set(buf.b_flags.get() & (!BF_RECOVERED));
@@ -2073,7 +2592,7 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
     };
     let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
 
-    let has_any_clean_chunk = chunks.iter().any(|ch| !ch.swap_blocks.is_empty());
+    let has_any_clean_chunk = chunks.iter().any(|(_, ch)| !ch.swap_blocks.is_empty());
     let root_pb_id = if !has_any_clean_chunk {
         let b0_id_opt = mfp.find_bhdr(0);
         let b0_bhdr = b0_id_opt.and_then(|id| mfp.remove_bhdr(id));
@@ -2114,7 +2633,7 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
             keep_slot[b0_id.0] = true;
         }
         keep_slot[pb_id.0] = true;
-        for ch in chunks.iter() {
+        for (_, ch) in chunks.iter() {
             for &(_, db_id) in &ch.swap_blocks {
                 if db_id.0 < keep_slot.len() {
                     keep_slot[db_id.0] = true;
@@ -2154,15 +2673,16 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
         });
     } else {
         fn serialize_chunk_blocks(
-            ch: &LineChunk,
+            first_lnum: Linenr,
+            lines: &[LineEntry],
             page_size: u32,
         ) -> Vec<(crate::memfile::Bhdr, PointerEntry)> {
             let mut blocks = Vec::with_capacity(8);
-            let mut line_iter = ch.lines.iter().peekable();
-            let mut cur_lnum = ch.start_lnum;
+            let mut line_iter = lines.iter().peekable();
+            let mut cur_lnum = first_lnum;
             loop {
                 let first_entry = line_iter.peek().copied().unwrap_or(&LineEntry::EMPTY);
-                let first_len = first_entry.text.to_bytes().len() + 1;
+                let first_len = first_entry.text().to_bytes().len() + 1;
                 let first_needed = HEADER_SIZE + INDEX_SIZE + first_len;
                 let page_count = first_needed.div_ceil(page_size as usize).max(1) as u32;
                 let txt_end = page_count.wrapping_mul(page_size);
@@ -2183,7 +2703,7 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
                 let mut db_line_count: i32 = 0;
 
                 while let Some(&entry) = line_iter.peek() {
-                    let text_bytes = entry.text.to_bytes();
+                    let text_bytes = entry.text().to_bytes();
                     let len = text_bytes.len() + 1;
                     let needed = (len + INDEX_SIZE) as u32;
 
@@ -2231,10 +2751,13 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
             blocks
         }
 
-        let dirty_count = chunks.iter().filter(|ch| ch.swap_blocks.is_empty()).count();
+        let dirty_count = chunks
+            .iter()
+            .filter(|(_, ch)| ch.swap_blocks.is_empty())
+            .count();
         let mut prebuilt: Vec<Option<Vec<(crate::memfile::Bhdr, PointerEntry)>>> =
             if dirty_count >= 8 {
-                let chunk_refs: &[LineChunk] = &chunks;
+                let chunk_refs: Vec<(Linenr, &LineChunk)> = chunks.iter().collect();
                 let nthreads = std::thread::available_parallelism()
                     .map_or(4, |n| n.get().min(8))
                     .min(chunk_refs.len());
@@ -2245,10 +2768,10 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
                         handles.push(s.spawn(move || {
                             slice
                                 .iter()
-                                .map(|ch| {
-                                    ch.swap_blocks
-                                        .is_empty()
-                                        .then(|| serialize_chunk_blocks(ch, page_size))
+                                .map(|&(first_lnum, ch)| {
+                                    ch.swap_blocks.is_empty().then(|| {
+                                        serialize_chunk_blocks(first_lnum, ch.lines(), page_size)
+                                    })
                                 })
                                 .collect::<Vec<_>>()
                         }));
@@ -2265,9 +2788,9 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
                 Vec::new()
             };
 
-        for (c_idx, ch) in chunks.iter_mut().enumerate() {
+        for (c_idx, (first_lnum, ch)) in chunks.iter_mut().enumerate() {
             if !ch.swap_blocks.is_empty() {
-                let mut cur_lnum = ch.start_lnum;
+                let mut cur_lnum = first_lnum;
                 for &mut (ref mut pe, _) in &mut ch.swap_blocks {
                     pe.pe_old_lnum = cur_lnum;
                     cur_lnum += pe.pe_line_count;
@@ -2279,7 +2802,7 @@ fn ml_sync_swap_blocks(buf: &FileBuf) {
             let blocks = prebuilt
                 .get_mut(c_idx)
                 .and_then(Option::take)
-                .unwrap_or_else(|| serialize_chunk_blocks(ch, page_size));
+                .unwrap_or_else(|| serialize_chunk_blocks(first_lnum, ch.lines(), page_size));
 
             for (bhdr, mut pe) in blocks {
                 let (db_id, db_bnum) = crate::memfile::mf_insert_new_bhdr(&mut mfp, bhdr);
@@ -2411,15 +2934,12 @@ pub fn with_ml_buf_line<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce(&[u8]) ->
             || (buf.b_ml.ml_flags.get() & (ML_LINE_DIRTY | ML_LINE_INPLACE)) == 0)
         && buf.b_ml.ml_mfp.borrow().is_some()
     {
-        let cstr_opt = {
-            let chunks = buf.b_ml.ml_chunks.borrow();
-            buf.b_ml.find_chunk_idx(&chunks, lnum).and_then(|c| {
-                let ch = &chunks[c];
-                ch.lines
-                    .get((lnum - ch.start_lnum) as usize)
-                    .map(|e| e.text.clone())
-            })
-        };
+        let cstr_opt = buf
+            .b_ml
+            .ml_chunks
+            .borrow()
+            .line(lnum)
+            .map(|e| e.text().clone());
         if let Some(cstr) = cstr_opt {
             return f(cstr.to_bytes());
         }
@@ -2446,15 +2966,12 @@ pub fn with_ml_buf_bytes_with_nul<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce
             || (buf.b_ml.ml_flags.get() & (ML_LINE_DIRTY | ML_LINE_INPLACE)) == 0)
         && buf.b_ml.ml_mfp.borrow().is_some()
     {
-        let cstr_opt = {
-            let chunks = buf.b_ml.ml_chunks.borrow();
-            buf.b_ml.find_chunk_idx(&chunks, lnum).and_then(|c| {
-                let ch = &chunks[c];
-                ch.lines
-                    .get((lnum - ch.start_lnum) as usize)
-                    .map(|e| e.text.clone())
-            })
-        };
+        let cstr_opt = buf
+            .b_ml
+            .ml_chunks
+            .borrow()
+            .line(lnum)
+            .map(|e| e.text().clone());
         if let Some(cstr) = cstr_opt {
             return f(cstr.to_bytes_with_nul());
         }
@@ -2548,12 +3065,14 @@ pub fn ml_get_buf_len(buf: &FileBuf, lnum: Linenr) -> Colnr {
         return (buf.b_ml.ml_line_textlen.get() - 1).max(0);
     }
     if lnum >= 1 && lnum <= buf.b_ml.ml_line_count.get() && buf.b_ml.ml_mfp.borrow().is_some() {
-        let chunks = buf.b_ml.ml_chunks.borrow();
-        if let Some(c) = buf.b_ml.find_chunk_idx(&chunks, lnum) {
-            let ch = &chunks[c];
-            if let Some(entry) = ch.lines.get((lnum - ch.start_lnum) as usize) {
-                return entry.text.to_bytes().len() as Colnr;
-            }
+        let len = buf
+            .b_ml
+            .ml_chunks
+            .borrow()
+            .line(lnum)
+            .map(|e| e.text().to_bytes().len());
+        if let Some(len) = len {
+            return len as Colnr;
         }
     }
     if !ml_load_line(buf, lnum, false) {
@@ -2630,15 +3149,12 @@ fn ml_load_line(buf: &FileBuf, mut lnum: Linenr, will_change: bool) -> bool {
     if buf.b_ml.ml_line_lnum.get() != lnum {
         ml_flush_line(buf, false);
 
-        let cstr_opt = {
-            let chunks = buf.b_ml.ml_chunks.borrow();
-            buf.b_ml.find_chunk_idx(&chunks, lnum).and_then(|c| {
-                let ch = &chunks[c];
-                ch.lines
-                    .get((lnum - ch.start_lnum) as usize)
-                    .map(|e| e.text.clone())
-            })
-        };
+        let cstr_opt = buf
+            .b_ml
+            .ml_chunks
+            .borrow()
+            .line(lnum)
+            .map(|e| e.text().clone());
         let Some(cstr) = cstr_opt else {
             if ml_st(|st| {
                 let r = st.ml_get_recursive.get();
@@ -2769,17 +3285,20 @@ fn ml_append_cstr_int(
         return false;
     }
 
+    let entry = LineEntry::new(text, (flags & ML_APPEND_MARK) != 0);
+    {
+        let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
+        if chunks.insert_after(lnum, entry).is_err() {
+            return false;
+        }
+        buf.b_ml.ml_usedchunks.set(chunks.len() as i32);
+    }
+
     ml_st(|st| {
         if st.lowest_marked.get() != 0 && st.lowest_marked.get() > lnum {
             st.lowest_marked.set(lnum + 1);
         }
     });
-
-    let len = (text.to_bytes().len() as i32) + 1;
-    let entry = LineEntry {
-        text,
-        marked: (flags & ML_APPEND_MARK) != 0,
-    };
 
     buf.b_ml.ml_flags.set(buf.b_ml.ml_flags.get() & (!ML_EMPTY));
 
@@ -2787,73 +3306,6 @@ fn ml_append_cstr_int(
         buf.b_prev_line_count.set(old_line_count);
     }
     buf.b_ml.ml_line_count.set(old_line_count + 1);
-
-    {
-        let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
-        if chunks.is_empty() {
-            let mut first_lines = Vec::with_capacity(MLCS_MINL as usize);
-            first_lines.push(entry);
-            chunks.push(LineChunk {
-                lines: first_lines,
-                start_lnum: 1,
-                totalsize: len,
-                swap_blocks: Vec::new(),
-            });
-            buf.b_ml.ml_cur_chunk.set(0);
-        } else if lnum == old_line_count {
-            let last_idx = chunks.len() - 1;
-            if chunks[last_idx].lines.len() >= MLCS_MINL as usize {
-                let mut new_lines = Vec::with_capacity(MLCS_MINL as usize);
-                new_lines.push(entry);
-                chunks.push(LineChunk {
-                    lines: new_lines,
-                    start_lnum: old_line_count + 1,
-                    totalsize: len,
-                    swap_blocks: Vec::new(),
-                });
-                buf.b_ml.ml_cur_chunk.set(last_idx + 1);
-            } else {
-                chunks[last_idx].lines.push(entry);
-                chunks[last_idx].totalsize += len;
-                chunks[last_idx].swap_blocks.clear();
-                buf.b_ml.ml_cur_chunk.set(last_idx);
-            }
-        } else {
-            let (c, in_chunk_idx) = if lnum == 0 {
-                (0usize, 0usize)
-            } else {
-                let c = buf.b_ml.find_chunk_idx(&chunks, lnum).unwrap_or(0);
-                let in_idx = (lnum - chunks[c].start_lnum + 1) as usize;
-                (c, in_idx)
-            };
-            chunks[c].lines.insert(in_chunk_idx, entry);
-            chunks[c].totalsize += len;
-            chunks[c].swap_blocks.clear();
-            for ch in &mut chunks[(c + 1)..] {
-                ch.start_lnum += 1;
-            }
-            if chunks[c].lines.len() >= MLCS_MAXL as usize {
-                let right_lines = chunks[c].lines.split_off(MLCS_MINL as usize);
-                let right_size: i32 = right_lines
-                    .iter()
-                    .map(|e| e.text.to_bytes().len() as i32 + 1)
-                    .sum();
-                chunks[c].totalsize -= right_size;
-                let right_start = chunks[c].start_lnum + (MLCS_MINL as Linenr);
-                chunks.insert(
-                    c + 1,
-                    LineChunk {
-                        lines: right_lines,
-                        start_lnum: right_start,
-                        totalsize: right_size,
-                        swap_blocks: Vec::new(),
-                    },
-                );
-            }
-            buf.b_ml.ml_cur_chunk.set(c);
-        }
-        buf.b_ml.ml_usedchunks.set(chunks.len() as i32);
-    }
 
     buf.b_ml.mark_swap_dirty();
     true
@@ -3000,28 +3452,13 @@ pub fn ml_replace_buf_len(
 }
 
 fn ml_update_chunk_line(buf: &FileBuf, lnum: Linenr, new_cstr: crate::option_vars::RcCStr) -> bool {
-    let actual_new_len = (new_cstr.to_bytes().len() as i32) + 1;
     let updated = {
         let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
-        if let Some(c) = buf.b_ml.find_chunk_idx(&chunks, lnum) {
-            let ch = &mut chunks[c];
-            let in_idx = (lnum - ch.start_lnum) as usize;
-            if let Some(entry) = ch.lines.get_mut(in_idx) {
-                let old_len = (entry.text.to_bytes().len() as i32) + 1;
-                entry.text = new_cstr;
-                let extra = actual_new_len - old_len;
-                ch.totalsize += extra;
-                ch.swap_blocks.clear();
-                if buf.b_ml.ml_usedchunks.get() == 0 {
-                    buf.b_ml.ml_usedchunks.set(chunks.len() as i32);
-                }
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let replaced = chunks.replace(lnum, new_cstr).is_some();
+        if replaced && buf.b_ml.ml_usedchunks.get() == 0 {
+            buf.b_ml.ml_usedchunks.set(chunks.len() as i32);
         }
+        replaced
     };
     if !updated {
         siemsg!(tr(c"E320: Cannot find line %lld"), i64::from(lnum));
@@ -3113,6 +3550,17 @@ fn ml_delete_int(buf: &FileBuf, lnum: Linenr, flags: i32) -> bool {
         return false;
     }
 
+    let removed = {
+        let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
+        let Some(removed) = chunks.remove(lnum) else {
+            return false;
+        };
+        if buf.b_ml.ml_usedchunks.get() > 0 {
+            buf.b_ml.ml_usedchunks.set(chunks.len() as i32);
+        }
+        removed
+    };
+
     if buf.b_prev_line_count.get() == 0 {
         buf.b_prev_line_count.set(buf.b_ml.ml_line_count.get());
     }
@@ -3120,47 +3568,7 @@ fn ml_delete_int(buf: &FileBuf, lnum: Linenr, flags: i32) -> bool {
         .ml_line_count
         .set(buf.b_ml.ml_line_count.get() - (1));
 
-    let removed = {
-        let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
-        let Some(c) = buf.b_ml.find_chunk_idx(&chunks, lnum) else {
-            return false;
-        };
-        let in_chunk_idx = (lnum - chunks[c].start_lnum) as usize;
-        let rem = chunks[c].lines.remove(in_chunk_idx);
-        let line_size = (rem.text.to_bytes().len() + 1) as i32;
-        chunks[c].totalsize -= line_size;
-        chunks[c].swap_blocks.clear();
-        for ch in &mut chunks[(c + 1)..] {
-            ch.start_lnum -= 1;
-        }
-
-        if chunks[c].lines.is_empty() && chunks.len() > 1 {
-            chunks.remove(c);
-            if buf.b_ml.ml_cur_chunk.get() >= chunks.len() {
-                buf.b_ml.ml_cur_chunk.set(chunks.len() - 1);
-            }
-        } else if c + 1 < chunks.len()
-            && chunks[c].lines.len() + chunks[c + 1].lines.len() <= MLCS_MINL as usize
-        {
-            let right = chunks.remove(c + 1);
-            chunks[c].totalsize += right.totalsize;
-            chunks[c].lines.extend(right.lines);
-            chunks[c].swap_blocks.clear();
-            buf.b_ml.ml_cur_chunk.set(c);
-        } else if c > 0 && chunks[c - 1].lines.len() + chunks[c].lines.len() <= MLCS_MINL as usize {
-            let cur_ch = chunks.remove(c);
-            chunks[c - 1].totalsize += cur_ch.totalsize;
-            chunks[c - 1].lines.extend(cur_ch.lines);
-            chunks[c - 1].swap_blocks.clear();
-            buf.b_ml.ml_cur_chunk.set(c - 1);
-        }
-        if buf.b_ml.ml_usedchunks.get() > 0 {
-            buf.b_ml.ml_usedchunks.set(chunks.len() as i32);
-        }
-        rem
-    };
-
-    let text_bytes = removed.text.to_bytes();
+    let text_bytes = removed.text().to_bytes();
     let len = text_bytes.len();
 
     if edit_state().inhibit_delete_count.get() == 0 {
@@ -3206,14 +3614,8 @@ pub fn ml_setmarked(lnum: Linenr) {
         }
     });
 
-    {
-        let mut chunks = cb.b_ml.ml_chunks.borrow_mut();
-        if let Some(c) = cb.b_ml.find_chunk_idx(&chunks, lnum) {
-            let ch = &mut chunks[c];
-            if let Some(entry) = ch.lines.get_mut((lnum - ch.start_lnum) as usize) {
-                entry.marked = true;
-            }
-        }
+    if let Some(entry) = cb.b_ml.ml_chunks.borrow_mut().line_mut(lnum) {
+        entry.marked = true;
     }
 }
 
@@ -3225,35 +3627,8 @@ pub fn ml_firstmarked() -> Linenr {
         return 0;
     }
 
-    let found_lnum = {
-        let mut chunks = cb.b_ml.ml_chunks.borrow_mut();
-        let start_c = cb.b_ml.find_chunk_idx(&chunks, lnum).unwrap_or(0);
-        let mut found = 0;
-        'outer: for (c_off, ch) in chunks.get_mut(start_c..).into_iter().flatten().enumerate() {
-            let line_start_idx = if c_off == 0 && lnum > ch.start_lnum {
-                (lnum - ch.start_lnum) as usize
-            } else {
-                0
-            };
-            for (idx, entry) in ch
-                .lines
-                .get_mut(line_start_idx..)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if entry.marked {
-                    entry.marked = false;
-                    found = ch.start_lnum + ((line_start_idx + idx) as Linenr);
-                    cb.b_ml.ml_cur_chunk.set(start_c + c_off);
-                    break 'outer;
-                }
-            }
-        }
-        found
-    };
-
-    if found_lnum != 0 {
+    let found = cb.b_ml.ml_chunks.borrow_mut().take_first_marked(lnum);
+    if let Some(found_lnum) = found {
         ml_st(|st| st.lowest_marked.set(found_lnum + 1));
         found_lnum
     } else {
@@ -3270,15 +3645,7 @@ pub fn ml_clearmarked() {
         return;
     }
 
-    {
-        let mut chunks = cb.b_ml.ml_chunks.borrow_mut();
-        let start_c = cb.b_ml.find_chunk_idx(&chunks, lnum).unwrap_or(0);
-        for ch in chunks.get_mut(start_c..).into_iter().flatten() {
-            for entry in &mut ch.lines {
-                entry.marked = false;
-            }
-        }
-    }
+    cb.b_ml.ml_chunks.borrow_mut().clear_marks_from(lnum);
     ml_st(|st| st.lowest_marked.set(0));
 }
 
@@ -3307,29 +3674,23 @@ pub fn ml_try_mark_global_lines(
 
     crate::regexp::with_pure_nfa_prog(&regmatch.regprog, |nfa| {
         let mut chunks = buf.b_ml.ml_chunks.borrow_mut();
-        let Some(start_c) = buf.b_ml.find_chunk_idx(&chunks, line1) else {
+        let Some(mut active_chunks) = chunks.span_mut(line1..=line2) else {
             return Some(0);
         };
-        let Some(end_c) = buf.b_ml.find_chunk_idx(&chunks, line2) else {
-            return Some(0);
-        };
-        let active_chunks = &mut chunks[start_c..=end_c];
         let total_lines = (line2 - line1 + 1) as usize;
 
-        let scan_slice = |slice: &mut [LineChunk]| -> Result<(i32, Linenr), ()> {
+        let scan_slice = |slice: &mut [(Linenr, &mut LineChunk)]| -> Result<(i32, Linenr), ()> {
             let mut ndone: i32 = 0;
             let mut lowest: Linenr = 0;
             if rmm_maxcol == 0
                 && let Some((regstart, mt, reg_ic)) = nfa.fast_literal_params(rmm_ic)
             {
-                for ch in slice {
-                    let ch_start = ch.start_lnum;
-                    for (idx, entry) in ch.lines.iter_mut().enumerate() {
-                        let lnum = ch_start + idx as Linenr;
+                for (first_lnum, ch) in slice {
+                    for (lnum, entry) in (*first_lnum..).zip(ch.lines_mut()) {
                         if lnum < line1 || lnum > line2 {
                             continue;
                         }
-                        let line_bytes = entry.text.to_bytes();
+                        let line_bytes = entry.text().to_bytes();
                         let matched = if let Some(off) =
                             crate::regexp::cstrchr_ic(line_bytes, regstart, reg_ic)
                         {
@@ -3352,16 +3713,14 @@ pub fn ml_try_mark_global_lines(
                 }
                 return Ok((ndone, lowest));
             }
-            for ch in slice {
-                let ch_start = ch.start_lnum;
-                for (idx, entry) in ch.lines.iter_mut().enumerate() {
-                    let lnum = ch_start + idx as Linenr;
+            for (first_lnum, ch) in slice {
+                for (lnum, entry) in (*first_lnum..).zip(ch.lines_mut()) {
                     if lnum < line1 || lnum > line2 {
                         continue;
                     }
                     let matched = crate::regexp::nfa_match_line_slice(
                         nfa,
-                        entry.text.to_bytes(),
+                        entry.text().to_bytes(),
                         0,
                         rmm_ic,
                         rmm_maxcol,
@@ -3423,7 +3782,7 @@ pub fn ml_try_mark_global_lines(
                 }
             })
         } else {
-            scan_slice(active_chunks)
+            scan_slice(&mut active_chunks)
         };
 
         match res {
@@ -3439,8 +3798,8 @@ pub fn ml_try_mark_global_lines(
                 Some(ndone)
             }
             Err(()) => {
-                for ch in active_chunks {
-                    for entry in &mut ch.lines {
+                for (_, ch) in active_chunks {
+                    for entry in ch.lines_mut() {
                         entry.marked = false;
                     }
                 }
@@ -3483,20 +3842,19 @@ pub fn ml_try_vimgrep_lines(
     let b_chartab = buf.b_chartab.get();
 
     if is_fuzzy {
-        let chunks = buf.b_ml.ml_chunks.borrow();
+        let ml_chunks = buf.b_ml.ml_chunks.borrow();
+        let chunks: Vec<(Linenr, &LineChunk)> = ml_chunks.iter().collect();
         let pat_len = spat_bytes.len().min(crate::fuzzy::FUZZY_MATCH_MAX_LEN);
         if pat_len == 0 {
             return None;
         }
-        let scan_fuzzy = |slice: &[LineChunk], limit: usize| -> Vec<VgrFastMatch> {
+        let scan_fuzzy = |slice: &[(Linenr, &LineChunk)], limit: usize| -> Vec<VgrFastMatch> {
             let mut out = Vec::new();
             let mut score: i32 = 0;
             let mut matches = [0u32; crate::fuzzy::FUZZY_MATCH_MAX_LEN];
-            'outer: for ch in slice {
-                let ch_start = ch.start_lnum;
-                for (idx, entry) in ch.lines.iter().enumerate() {
-                    let lnum = ch_start + idx as Linenr;
-                    let str_bytes = entry.text.to_bytes();
+            'outer: for &(first_lnum, ch) in slice {
+                for (lnum, entry) in (first_lnum..).zip(ch.lines()) {
+                    let str_bytes = entry.text().to_bytes();
                     let linelen = str_bytes.len() as Colnr;
                     let mut col: Colnr = 0;
                     while crate::fuzzy::fuzzy_match(
@@ -3511,7 +3869,7 @@ pub fn ml_try_vimgrep_lines(
                             end_lnum: 0,
                             col: matches[0] as Colnr + col + 1,
                             end_col: 0,
-                            text: entry.text.clone(),
+                            text: entry.text().clone(),
                         });
                         if out.len() >= limit {
                             break 'outer;
@@ -3570,43 +3928,73 @@ pub fn ml_try_vimgrep_lines(
     let rmm_maxcol = regmatch.rmm_maxcol;
 
     crate::regexp::with_pure_nfa_prog(&regmatch.regprog, |nfa| {
-        let chunks = buf.b_ml.ml_chunks.borrow();
-        let scan_nfa = |slice: &[LineChunk], limit: usize| -> Result<Vec<VgrFastMatch>, ()> {
-            let mut out = Vec::new();
-            if rmm_maxcol == 0
-                && let Some((regstart, mt, reg_ic)) = nfa.fast_literal_params(rmm_ic)
-            {
-                'outer_lit: for ch in slice {
-                    let ch_start = ch.start_lnum;
-                    for (idx, entry) in ch.lines.iter().enumerate() {
-                        let lnum = ch_start + idx as Linenr;
-                        let line_bytes = entry.text.to_bytes();
-                        let linelen = line_bytes.len() as Colnr;
+        let ml_chunks = buf.b_ml.ml_chunks.borrow();
+        let chunks: Vec<(Linenr, &LineChunk)> = ml_chunks.iter().collect();
+        let scan_nfa =
+            |slice: &[(Linenr, &LineChunk)], limit: usize| -> Result<Vec<VgrFastMatch>, ()> {
+                let mut out = Vec::new();
+                if rmm_maxcol == 0
+                    && let Some((regstart, mt, reg_ic)) = nfa.fast_literal_params(rmm_ic)
+                {
+                    'outer_lit: for &(first_lnum, ch) in slice {
+                        for (lnum, entry) in (first_lnum..).zip(ch.lines()) {
+                            let line_bytes = entry.text().to_bytes();
+                            let linelen = line_bytes.len() as Colnr;
+                            let mut col: Colnr = 0;
+                            loop {
+                                let start_off = (col as usize).min(line_bytes.len());
+                                let Some(off) = crate::regexp::cstrchr_ic(
+                                    &line_bytes[start_off..],
+                                    regstart,
+                                    reg_ic,
+                                ) else {
+                                    break;
+                                };
+                                let mut mcol = col + off as Colnr;
+                                let Some(e_col) = crate::regexp::find_match_text_in_bytes(
+                                    line_bytes, &mut mcol, regstart, mt, reg_ic,
+                                ) else {
+                                    break;
+                                };
+                                out.push(VgrFastMatch {
+                                    lnum,
+                                    end_lnum: lnum,
+                                    col: mcol + 1,
+                                    end_col: e_col + 1,
+                                    text: entry.text().clone(),
+                                });
+                                if out.len() >= limit {
+                                    break 'outer_lit;
+                                }
+                                if !is_global {
+                                    break;
+                                }
+                                col = e_col + Colnr::from(col == e_col);
+                                if col > linelen {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return Ok(out);
+                }
+                'outer: for &(first_lnum, ch) in slice {
+                    for (lnum, entry) in (first_lnum..).zip(ch.lines()) {
+                        let str_bytes = entry.text().to_bytes();
+                        let linelen = str_bytes.len() as Colnr;
                         let mut col: Colnr = 0;
-                        loop {
-                            let start_off = (col as usize).min(line_bytes.len());
-                            let Some(off) = crate::regexp::cstrchr_ic(
-                                &line_bytes[start_off..],
-                                regstart,
-                                reg_ic,
-                            ) else {
-                                break;
-                            };
-                            let mut mcol = col + off as Colnr;
-                            let Some(e_col) = crate::regexp::find_match_text_in_bytes(
-                                line_bytes, &mut mcol, regstart, mt, reg_ic,
-                            ) else {
-                                break;
-                            };
+                        while let Some((s_col, e_col)) = crate::regexp::nfa_match_line_slice(
+                            nfa, str_bytes, col, rmm_ic, rmm_maxcol, b_chartab,
+                        )? {
                             out.push(VgrFastMatch {
                                 lnum,
                                 end_lnum: lnum,
-                                col: mcol + 1,
+                                col: s_col + 1,
                                 end_col: e_col + 1,
-                                text: entry.text.clone(),
+                                text: entry.text().clone(),
                             });
                             if out.len() >= limit {
-                                break 'outer_lit;
+                                break 'outer;
                             }
                             if !is_global {
                                 break;
@@ -3618,40 +4006,8 @@ pub fn ml_try_vimgrep_lines(
                         }
                     }
                 }
-                return Ok(out);
-            }
-            'outer: for ch in slice {
-                let ch_start = ch.start_lnum;
-                for (idx, entry) in ch.lines.iter().enumerate() {
-                    let lnum = ch_start + idx as Linenr;
-                    let str_bytes = entry.text.to_bytes();
-                    let linelen = str_bytes.len() as Colnr;
-                    let mut col: Colnr = 0;
-                    while let Some((s_col, e_col)) = crate::regexp::nfa_match_line_slice(
-                        nfa, str_bytes, col, rmm_ic, rmm_maxcol, b_chartab,
-                    )? {
-                        out.push(VgrFastMatch {
-                            lnum,
-                            end_lnum: lnum,
-                            col: s_col + 1,
-                            end_col: e_col + 1,
-                            text: entry.text.clone(),
-                        });
-                        if out.len() >= limit {
-                            break 'outer;
-                        }
-                        if !is_global {
-                            break;
-                        }
-                        col = e_col + Colnr::from(col == e_col);
-                        if col > linelen {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(out)
-        };
+                Ok(out)
+            };
 
         let use_parallel = chunks.len() >= 4
             && tomatch >= 512
@@ -4350,14 +4706,15 @@ pub fn ml_find_line_or_offset(
             return -1;
         }
         let mut size: i32 = 0;
-        for ch in chunks.iter() {
-            let ch_end_lnum = ch.start_lnum + (ch.lines.len() as Linenr);
+        for (first_lnum, ch) in chunks.iter() {
+            let lines = ch.lines();
+            let ch_end_lnum = first_lnum + (lines.len() as Linenr);
             if lnum >= ch_end_lnum {
-                size += ch.totalsize;
+                size += ch.totalsize();
             } else {
-                let in_cnt = (lnum - ch.start_lnum).max(0) as usize;
-                for entry in &ch.lines[..in_cnt.min(ch.lines.len())] {
-                    size += entry.text.to_bytes().len() as i32 + 1;
+                let in_cnt = (lnum - first_lnum).max(0) as usize;
+                for entry in &lines[..in_cnt.min(lines.len())] {
+                    size += entry.size();
                 }
                 break;
             }
@@ -4376,15 +4733,15 @@ pub fn ml_find_line_or_offset(
 
     if offset != 0 {
         let mut size: i32 = 0;
-        for ch in chunks.iter() {
-            let ch_lines = ch.lines.len() as i32;
-            let ch_bytes = ch.totalsize + ffdos * ch_lines;
+        for (first_lnum, ch) in chunks.iter() {
+            let ch_lines = ch.lines().len() as i32;
+            let ch_bytes = ch.totalsize() + ffdos * ch_lines;
             if offset > size + ch_bytes {
                 size += ch_bytes;
                 continue;
             }
-            for (curline, entry) in (ch.start_lnum..).zip(ch.lines.iter()) {
-                let line_len = entry.text.to_bytes().len() as i32 + 1;
+            for (curline, entry) in (first_lnum..).zip(ch.lines()) {
+                let line_len = entry.size();
                 let total_line_bytes = line_len + ffdos;
                 if offset <= size + total_line_bytes {
                     if offset == size + total_line_bytes {
@@ -4574,19 +4931,8 @@ mod tests {
 
     fn assert_chunk_invariants(buf: &FileBuf) {
         let chunks = buf.b_ml.ml_chunks.borrow();
-        let mut expected_start: Linenr = 1;
-        for ch in chunks.iter() {
-            assert_eq!(ch.start_lnum, expected_start);
-            assert!(!ch.lines.is_empty());
-            let actual_total: i32 = ch
-                .lines
-                .iter()
-                .map(|e| e.text.to_bytes().len() as i32 + 1)
-                .sum();
-            assert_eq!(ch.totalsize, actual_total);
-            expected_start += ch.lines.len() as Linenr;
-        }
-        assert_eq!(expected_start - 1, buf.b_ml.ml_line_count.get());
+        chunks.assert_invariants();
+        assert_eq!(chunks.line_count(), buf.b_ml.ml_line_count.get());
     }
 
     #[test]
@@ -4882,7 +5228,7 @@ mod tests {
         {
             let chunks = buf.b_ml.ml_chunks.borrow();
             let mut expected_lnum = 1;
-            for ch in chunks.iter() {
+            for (_, ch) in chunks.iter() {
                 assert!(!ch.swap_blocks.is_empty());
                 for &(pe, _) in &ch.swap_blocks {
                     assert_eq!(pe.pe_old_lnum, expected_lnum);
