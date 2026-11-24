@@ -77,7 +77,7 @@ mod chunks {
     use crate::cursor::Linenr;
     use crate::memfile::BhdrId;
     use crate::option_vars::RcCStr;
-    use std::cell::Cell;
+    use std::cell::{Cell, OnceCell};
 
     #[derive(Clone)]
     pub(super) struct LineEntry {
@@ -153,6 +153,7 @@ mod chunks {
 
     /// Line counts of the chunks, as a Fenwick tree: changing one count and
     /// finding the lines before a chunk both take O(log chunks).
+    #[cfg_attr(test, derive(Debug, PartialEq))]
     struct LineCounts {
         /// Node `i` (1-based) holds the line count of chunks
         /// `i - (i & -i) .. i` (0-based, end excluded).
@@ -161,24 +162,17 @@ mod chunks {
     }
 
     impl LineCounts {
-        const fn new() -> Self {
-            Self {
-                tree: Vec::new(),
-                total: 0,
-            }
-        }
-
-        /// Replaces all counts, in O(chunks).
-        fn rebuild(&mut self, counts: impl Iterator<Item = Linenr>) {
-            self.tree.clear();
-            self.tree.extend(counts);
-            self.total = self.tree.iter().sum();
-            for node in 1..=self.tree.len() {
+        /// Counts the lines of the chunks in `list`, in O(chunks).
+        fn new(list: &[LineChunk]) -> Self {
+            let mut tree: Vec<Linenr> = list.iter().map(LineChunk::line_count).collect();
+            let total = tree.iter().sum();
+            for node in 1..=tree.len() {
                 let parent = node + (node & node.wrapping_neg());
-                if parent <= self.tree.len() {
-                    self.tree[parent - 1] += self.tree[node - 1];
+                if parent <= tree.len() {
+                    tree[parent - 1] += tree[node - 1];
                 }
             }
+            Self { tree, total }
         }
 
         /// Adds a chunk of `count` lines after the last one.
@@ -249,7 +243,11 @@ mod chunks {
 
     pub(super) struct Chunks {
         list: Vec<LineChunk>,
-        counts: LineCounts,
+        line_count: Linenr,
+        /// For searching lines. Dropped when chunks are split, merged or
+        /// removed and counted again by the next search, so that a run of
+        /// such edits, like a paste, counts once.
+        counts: OnceCell<LineCounts>,
         /// The chunk the last lookup found, tried first by the next one.
         cur: Cell<ChunkStart>,
     }
@@ -258,7 +256,8 @@ mod chunks {
         pub(super) const fn new() -> Self {
             Self {
                 list: Vec::new(),
-                counts: LineCounts::new(),
+                line_count: 0,
+                counts: OnceCell::new(),
                 cur: Cell::new(ChunkStart { chunk: 0, first: 1 }),
             }
         }
@@ -280,7 +279,26 @@ mod chunks {
         }
 
         pub(super) fn line_count(&self) -> Linenr {
-            self.counts.total
+            self.line_count
+        }
+
+        fn counts(&self) -> &LineCounts {
+            self.counts.get_or_init(|| LineCounts::new(&self.list))
+        }
+
+        /// Adds `lines` to the line count of chunk `chunk`.
+        fn count(&mut self, chunk: usize, lines: Linenr) {
+            self.line_count += lines;
+            if let Some(counts) = self.counts.get_mut() {
+                counts.add(chunk, lines);
+            }
+        }
+
+        /// Counts a line added or removed after chunks were split, merged or
+        /// removed.
+        fn count_restructured(&mut self, lines: Linenr) {
+            self.line_count += lines;
+            self.counts = OnceCell::new();
         }
 
         /// Where line `lnum` is stored, if it is in the chunk at `start`.
@@ -315,7 +333,10 @@ mod chunks {
             let cur = self.cur.get();
             debug_assert!(
                 cur.chunk >= self.list.len()
-                    || cur.first == self.counts.lines_before(cur.chunk) + 1
+                    || self
+                        .counts
+                        .get()
+                        .is_none_or(|counts| cur.first == counts.lines_before(cur.chunk) + 1)
             );
             if let Some(pos) = self.pos_in(cur, lnum) {
                 return Some(pos);
@@ -323,15 +344,19 @@ mod chunks {
             let start = self
                 .neighbors(cur)
                 .find(|&start| self.pos_in(start, lnum).is_some())
-                .or_else(|| {
-                    let (chunk, before) = self.counts.find(lnum)?;
-                    Some(ChunkStart {
-                        chunk,
-                        first: before + 1,
-                    })
-                })?;
+                .or_else(|| self.search(lnum))?;
             self.cur.set(start);
             self.pos_in(start, lnum)
+        }
+
+        /// Finds the chunk holding line `lnum` by searching the line counts.
+        #[cold]
+        fn search(&self, lnum: Linenr) -> Option<ChunkStart> {
+            let (chunk, before) = self.counts().find(lnum)?;
+            Some(ChunkStart {
+                chunk,
+                first: before + 1,
+            })
         }
 
         #[inline(always)]
@@ -407,7 +432,7 @@ mod chunks {
                     ch.totalsize += entry.size();
                     ch.lines.push(entry);
                     ch.swap_blocks.clear();
-                    self.counts.add(last, 1);
+                    self.count(last, 1);
                     self.cur.set(ChunkStart {
                         chunk: last,
                         first: line_count + 2 - self.list[last].line_count(),
@@ -437,9 +462,9 @@ mod chunks {
                     swap_blocks: Vec::new(),
                 };
                 self.list.insert(c + 1, right);
-                self.recount();
+                self.count_restructured(1);
             } else {
-                self.counts.add(c, 1);
+                self.count(c, 1);
             }
             self.cur.set(ChunkStart { chunk: c, first });
             Ok(())
@@ -449,17 +474,14 @@ mod chunks {
         fn push_chunk(&mut self, entry: LineEntry) {
             let first = self.line_count() + 1;
             self.list.push(LineChunk::new(entry));
-            self.counts.push(1);
+            self.line_count += 1;
+            if let Some(counts) = self.counts.get_mut() {
+                counts.push(1);
+            }
             self.cur.set(ChunkStart {
                 chunk: self.list.len() - 1,
                 first,
             });
-        }
-
-        /// Recounts after chunks were split, merged or removed.
-        fn recount(&mut self) {
-            self.counts
-                .rebuild(self.list.iter().map(LineChunk::line_count));
         }
 
         /// Removes line `lnum`, or returns `None` when it is not stored.
@@ -492,11 +514,11 @@ mod chunks {
                 };
                 self.list[c - 1].append(ch);
             } else {
-                self.counts.add(c, -1);
+                self.count(c, -1);
                 self.cur.set(cur);
                 return Some(entry);
             }
-            self.recount();
+            self.count_restructured(-1);
             self.cur.set(cur);
             Some(entry)
         }
@@ -548,14 +570,14 @@ mod chunks {
 
         #[cfg(test)]
         pub(super) fn assert_invariants(&self) {
-            assert_eq!(self.counts.tree.len(), self.list.len());
+            let fresh = LineCounts::new(&self.list);
+            if let Some(kept) = self.counts.get() {
+                assert_eq!(*kept, fresh, "counts kept while editing");
+            }
             let mut expected_start: Linenr = 1;
             for (c, ch) in self.list.iter().enumerate() {
-                assert_eq!(self.counts.lines_before(c) + 1, expected_start);
-                assert_eq!(
-                    self.counts.find(expected_start),
-                    Some((c, expected_start - 1))
-                );
+                assert_eq!(fresh.lines_before(c) + 1, expected_start);
+                assert_eq!(fresh.find(expected_start), Some((c, expected_start - 1)));
                 assert!(!ch.lines.is_empty());
                 assert!(ch.lines.len() < MLCS_MAXL as usize);
                 let actual_total: i32 = ch.lines.iter().map(LineEntry::size).sum();
@@ -563,9 +585,10 @@ mod chunks {
                 expected_start += ch.lines.len() as Linenr;
             }
             assert_eq!(expected_start - 1, self.line_count());
+            assert_eq!(expected_start - 1, fresh.total);
             let cur = self.cur.get();
             if cur.chunk < self.list.len() {
-                assert_eq!(cur.first, self.counts.lines_before(cur.chunk) + 1);
+                assert_eq!(cur.first, fresh.lines_before(cur.chunk) + 1);
             }
         }
     }
@@ -735,6 +758,10 @@ mod chunks {
                         .is_ok()
                 );
                 if lnum % MLCS_MINL == 1 {
+                    // Finding line 1 from the last chunk searches the counts,
+                    // which must then follow the lines appended next.
+                    let first = chunks.line(1).map(|e| e.text().to_bytes());
+                    assert_eq!(first, Some(&b"1"[..]));
                     chunks.assert_invariants();
                 }
             }
