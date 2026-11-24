@@ -2467,7 +2467,8 @@ pub fn charwise_block_prep(
             {
                 if start.lnum == end.lnum && start.col == end.col {
                     bdp.is_one_char = true;
-                    bdp.startspaces = end.coladd - start.coladd + i32::from(inclusive);
+                    // An end before the start selects nothing.
+                    bdp.startspaces = (end.coladd - start.coladd + i32::from(inclusive)).max(0);
                     endcol = startcol;
                 } else {
                     bdp.endspaces = end.coladd + i32::from(inclusive);
@@ -3765,6 +3766,14 @@ pub fn do_pending_operator(cap: &mut Cmdarg, old_col: i32, gui_yank: bool) {
                 if oap.end.col != 0 {
                     oap.end.col -= 1;
                     oap.inclusive = true;
+                    if edit_state().virtual_op.get() != 0 {
+                        // End on the last screen column of the last character, as "$"
+                        // does; a cursor inside a last tab is past its first column.
+                        let (mut cs, mut ce) = (0, 0);
+                        let mut last = oap.end;
+                        getvcol(&curwin(), &mut last, Some(&mut cs), None, Some(&mut ce), 0);
+                        oap.end.coladd = ce - cs;
+                    }
                 }
             }
         } else {
