@@ -3028,7 +3028,9 @@ fn do_sort(l: &TvList, info: &mut Sortinfo) {
     if !use_custom {
         ptrs.sort_by(|a, b| item_compare(a, b, false, info).cmp(&0));
     } else {
-        ptrs.sort_by(|a, b| item_compare2(a, b, false, info).cmp(&0));
+        // A compare function need not be a total order, which `sort_by()`
+        // requires.
+        crate::memory::qsort_by(&mut ptrs, |a, b| item_compare2(a, b, false, info).cmp(&0));
     }
     if !info.item_compare_func_err {
         l.lv_first.set(ListitemId::NULL);

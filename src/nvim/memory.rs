@@ -18,6 +18,7 @@ use crate::option_vars::*;
 use crate::register::set_expr_line;
 use crate::ui::ui_free_all_mem;
 use crate::ui_client::ui_client_free_all_mem;
+use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
 
 pub const ARENA_BLOCK_SIZE: usize = 4096;
@@ -172,6 +173,76 @@ pub fn vec_to_cstring(mut v: Vec<u8>) -> CString {
         v.push(0);
     }
     CString::from_vec_with_nul(v).unwrap_or_default()
+}
+
+/// Sorts `v` by `compare` the way glibc's `qsort()` does, which upstream uses
+/// for `sort()`: a stable merge sort that halves each run and takes the left
+/// item unless `compare` puts it after the right one. Unlike
+/// `slice::sort_by()`, which may panic when `compare` is not a total order,
+/// it accepts any `compare`, such as a user's compare function, and then
+/// orders the items as upstream does on Linux.
+pub fn qsort_by<T>(v: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
+    let mut order: Vec<usize> = (0..v.len()).collect();
+    let mut scratch = vec![0; v.len()];
+    sort_halves(&mut order, &mut scratch, &mut |a, b| compare(&v[a], &v[b]));
+    permute(v, &mut order);
+}
+
+/// Sorts the item indices in `run` as glibc's merge sort does.
+fn sort_halves(
+    run: &mut [usize],
+    scratch: &mut [usize],
+    compare: &mut impl FnMut(usize, usize) -> Ordering,
+) {
+    if run.len() <= 1 {
+        return;
+    }
+    let mid = run.len() / 2;
+    sort_halves(&mut run[..mid], scratch, compare);
+    sort_halves(&mut run[mid..], scratch, compare);
+    merge(run, mid, scratch, compare);
+}
+
+/// Merges the sorted item indices `run[..mid]` and `run[mid..]`, taking the
+/// left item unless `compare` puts it after the right one.
+fn merge(
+    run: &mut [usize],
+    mid: usize,
+    scratch: &mut [usize],
+    compare: &mut impl FnMut(usize, usize) -> Ordering,
+) {
+    let (mut left, mut right, mut merged) = (0, mid, 0);
+    while left < mid && right < run.len() {
+        if compare(run[left], run[right]) == Ordering::Greater {
+            scratch[merged] = run[right];
+            right += 1;
+        } else {
+            scratch[merged] = run[left];
+            left += 1;
+        }
+        merged += 1;
+    }
+    // The rest of the right run is in place; the rest of the left run goes
+    // before it.
+    let end = merged + mid - left;
+    scratch[merged..end].copy_from_slice(&run[left..mid]);
+    run[..end].copy_from_slice(&scratch[..end]);
+}
+
+/// Moves the item at `order[k]` to `k`, for each `k`, where `order` holds each
+/// index of `v` once.
+fn permute<T>(v: &mut [T], order: &mut [usize]) {
+    for start in 0..v.len() {
+        // Follow the cycle through `start`, moving each item into place.
+        let mut k = start;
+        while order[k] != start {
+            let from = order[k];
+            v.swap(k, from);
+            order[k] = k;
+            k = from;
+        }
+        order[k] = k;
+    }
 }
 
 /// Free everything that we allocated (`free_all_mem`).
@@ -462,6 +533,58 @@ pub const fn fx_hashset<T>() -> FxHashSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Xorshift generator with a fixed seed, so failures reproduce.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    #[test]
+    fn qsort_by_sorts_stably() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for len in (0..70).chain([257, 1000]) {
+            // Few distinct keys, so that most items have equal ones.
+            let items: Vec<(u64, usize)> = (0..len).map(|i| (rng.below(8), i)).collect();
+            let mut expected = items.clone();
+            expected.sort_by_key(|&(key, _)| key);
+            let mut sorted = items;
+            qsort_by(&mut sorted, |a, b| a.0.cmp(&b.0));
+            assert_eq!(sorted, expected, "{len} items");
+        }
+    }
+
+    #[test]
+    fn qsort_by_accepts_any_comparator() {
+        // A comparator that answers at random still leaves each item once.
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for len in [2, 21, 100, 1000] {
+            let mut items: Vec<usize> = (0..len).collect();
+            qsort_by(&mut items, |_, _| match rng.below(3) {
+                0 => Ordering::Less,
+                1 => Ordering::Equal,
+                _ => Ordering::Greater,
+            });
+            items.sort_unstable();
+            assert_eq!(items, (0..len).collect::<Vec<_>>());
+        }
+        // One that never answers `Less`, like `{a, b -> a > b}`, still sorts.
+        let mut items = [5, 3, 9, 1, 7, 2, 8, 6, 4];
+        qsort_by(&mut items, |a, b| {
+            if a > b {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        });
+        assert_eq!(items, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
 
     #[test]
     fn fx_hash_collections_work() {
