@@ -31,7 +31,7 @@ use crate::normal::Visualinfo;
 use crate::option::buf_copy_options;
 use crate::option_vars::*;
 use crate::os::fs::{os_chdir, os_dirname_cstr};
-use crate::register::{EMPTY_YANKREG, get_y_register};
+use crate::register::{Yankreg, get_y_register};
 use crate::shada::{
     K_SHA_DA_FORCEIT, K_SHA_DA_NANOS, K_SHA_DA_NO_HISTORY, K_SHA_DA_NO_OPT, K_SHA_DA_WANT_INFO,
     shada_encode_buflist, shada_encode_gvars, shada_encode_jumps, shada_encode_regs,
@@ -446,7 +446,7 @@ pub fn ctx_load(ctx: &mut Context, flags: CtxStateFlags, loadflags: CtxLoadFlags
     if (flags & K_CTX_REGS) != 0 {
         if (loadflags & K_CTX_MERGE_REG) == 0 {
             for i in 0..NUM_SAVED_REGISTERS {
-                get_y_register(i).with_mut(|r| *r = EMPTY_YANKREG);
+                get_y_register(i).with_mut(|r| *r = Yankreg::empty());
             }
         }
         shada_read_string(

@@ -1636,7 +1636,7 @@ pub fn nvim_put(
     after: Boolean,
     follow: Boolean,
 ) -> Result<(), Error> {
-    let mut reg = crate::register::EMPTY_YANKREG;
+    let mut reg = crate::register::Yankreg::empty();
     validate_s(
         prepare_yankreg_from_object(&mut reg, reg_type.clone()),
         c"type",
@@ -1649,7 +1649,7 @@ pub fn nvim_put(
         return Ok(());
     }
 
-    reg.y_array = Vec::with_capacity(arr.size);
+    let mut y_array = Vec::with_capacity(arr.size);
     reg.y_allocated = true;
     for item in arr.as_slice() {
         let line = item.as_string().expect("string Object").clone();
@@ -1662,8 +1662,9 @@ pub fn nvim_put(
                 }
             }
         }
-        reg.y_array.push(copied);
+        y_array.push(copied);
     }
+    reg.y_array = y_array.into();
 
     finish_yankreg_from_object(&mut reg, false);
 

@@ -2,6 +2,8 @@
 
 //! Functions for managing registers (`src/nvim/register.c`).
 
+use std::rc::Rc;
+
 use crate::api::private::helpers::{api_clear_string, cbuf_to_string};
 use crate::api::private::validate::NvimString;
 use crate::autocmd::{
@@ -95,7 +97,9 @@ pub enum MotionType {
 
 #[derive(Clone, Debug)]
 pub struct Yankreg {
-    pub y_array: Vec<NvimString>,
+    /// The register's lines, shared with copies of the register until one of
+    /// them changes.
+    pub y_array: Rc<Vec<NvimString>>,
     pub y_allocated: bool,
     pub y_type: MotionType,
     pub y_width: i32,
@@ -103,11 +107,21 @@ pub struct Yankreg {
     pub additional_data: Option<crate::search::AdditionalData>,
 }
 
-impl Drop for Yankreg {
-    fn drop(&mut self) {
-        for item in self.y_array.iter_mut().rev() {
-            api_clear_string(item);
+impl Yankreg {
+    pub fn empty() -> Self {
+        Self {
+            y_array: Rc::default(),
+            y_allocated: false,
+            y_type: MotionType::MtCharWise,
+            y_width: 0,
+            timestamp: 0,
+            additional_data: None,
         }
+    }
+
+    /// The lines for changing, copied first if another register shares them.
+    pub fn y_array_mut(&mut self) -> &mut Vec<NvimString> {
+        Rc::make_mut(&mut self.y_array)
     }
 }
 
@@ -186,15 +200,6 @@ impl BlockDef {
         }
     }
 }
-
-pub const EMPTY_YANKREG: Yankreg = Yankreg {
-    y_array: Vec::new(),
-    y_allocated: false,
-    y_type: MotionType::MtCharWise,
-    y_width: 0,
-    timestamp: 0,
-    additional_data: None,
-};
 
 struct RegisterCopyState {
     get_expr_line_nested: std::cell::Cell<i32>,
@@ -315,12 +320,9 @@ impl PutReg<'_> {
 }
 
 thread_local! {
-    static Y_REGS: std::cell::RefCell<[Yankreg; NUM_REGISTERS]> = const {
-        std::cell::RefCell::new([const { EMPTY_YANKREG }; NUM_REGISTERS])
-    };
-    static EMPTY_REG: std::cell::RefCell<Yankreg> = const {
-        std::cell::RefCell::new(EMPTY_YANKREG)
-    };
+    static Y_REGS: std::cell::RefCell<[Yankreg; NUM_REGISTERS]> =
+        std::cell::RefCell::new(std::array::from_fn(|_| Yankreg::empty()));
+    static EMPTY_REG: std::cell::RefCell<Yankreg> = std::cell::RefCell::new(Yankreg::empty());
 }
 
 impl RegIdx {
@@ -509,7 +511,7 @@ pub fn op_reg_set_previous(name: u8) -> bool {
 pub fn update_yankreg_width(reg: &mut Yankreg) {
     if reg.y_type == MotionType::MtBlockWise {
         let mut maxlen: usize = 0;
-        for item in &reg.y_array {
+        for item in reg.y_array.iter() {
             let rowlen = mb_string2cells_len(item.as_bytes());
             maxlen = maxlen.max(rowlen);
         }
@@ -561,13 +563,13 @@ pub fn yank_register_mline(regname: i32, reg: &mut Option<RegIdx>) -> bool {
 
 pub fn copy_register(name: i32) -> Yankreg {
     get_yank_register(name, YankRegMode::Paste).with(|reg| {
-        let y_array = reg
+        let y_array: Vec<NvimString> = reg
             .y_array
             .iter()
             .map(|s| copy_string_global(s.clone()))
             .collect();
         Yankreg {
-            y_array,
+            y_array: y_array.into(),
             y_allocated: reg.y_allocated,
             y_type: reg.y_type,
             y_width: reg.y_width,
@@ -590,7 +592,7 @@ fn stuff_yank(regname: i32, p: &[u8]) -> bool {
     let reg_idx = get_yank_register(regname, YankRegMode::Yank);
     reg_idx.with_mut(|reg| {
         if is_append_register(regname) && reg.y_allocated && !reg.y_array.is_empty() {
-            let pp = reg.y_array.last_mut().unwrap();
+            let pp = reg.y_array_mut().last_mut().unwrap();
             let tmplen = pp.size + plen;
             let mut tmp = vec![0u8; tmplen + 1];
             tmp[..pp.size].copy_from_slice(pp.as_bytes());
@@ -598,9 +600,9 @@ fn stuff_yank(regname: i32, p: &[u8]) -> bool {
             api_clear_string(pp);
             *pp = cbuf_to_string(&tmp[..tmplen]);
         } else {
-            *reg = EMPTY_YANKREG;
+            *reg = Yankreg::empty();
             reg.additional_data = None;
-            reg.y_array = vec![cbuf_to_string(p_bytes)];
+            reg.y_array = vec![cbuf_to_string(p_bytes)].into();
             reg.y_allocated = true;
             reg.y_type = MotionType::MtCharWise;
         }
@@ -1035,10 +1037,10 @@ pub fn cmdline_paste_reg(regname: i32, literally_arg: bool, remcr: bool) -> bool
 pub fn shift_delete_registers(y_append: bool) {
     Y_REGS.with(|cell| {
         let mut regs = cell.borrow_mut();
-        regs[9] = EMPTY_YANKREG;
+        regs[9] = Yankreg::empty();
         let mut n = 9;
         while n > 1 {
-            regs[n] = std::mem::replace(&mut regs[n - 1], EMPTY_YANKREG);
+            regs[n] = std::mem::replace(&mut regs[n - 1], Yankreg::empty());
             n -= 1;
         }
     });
@@ -1048,7 +1050,7 @@ pub fn shift_delete_registers(y_append: bool) {
 }
 
 pub fn clear_registers() {
-    Y_REGS.with(|cell| cell.borrow_mut().fill_with(|| EMPTY_YANKREG));
+    Y_REGS.with(|cell| cell.borrow_mut().fill_with(Yankreg::empty));
 }
 
 fn yank_copy_line(
@@ -1085,11 +1087,11 @@ fn yank_copy_line(
         }
     }
     buf_vec[out_size] = 0;
-    reg.y_array[y_idx] = cbuf_to_string(&buf_vec[..out_size]);
+    reg.y_array_mut()[y_idx] = cbuf_to_string(&buf_vec[..out_size]);
 }
 
 pub fn op_yank_reg(oap: &mut Oparg, message: bool, reg_idx: RegIdx, append: bool) {
-    let mut newreg = EMPTY_YANKREG;
+    let mut newreg = Yankreg::empty();
     let orig_motion = match oap.motion_type {
         0 => MotionType::MtCharWise,
         1 => MotionType::MtLineWise,
@@ -1103,7 +1105,7 @@ pub fn op_yank_reg(oap: &mut Oparg, message: bool, reg_idx: RegIdx, append: bool
 
     let is_append = append && reg_idx.with(|r| r.y_allocated);
     if !is_append {
-        reg_idx.with_mut(|r| *r = EMPTY_YANKREG);
+        reg_idx.with_mut(|r| *r = Yankreg::empty());
     }
 
     if orig_motion == MotionType::MtCharWise
@@ -1120,7 +1122,7 @@ pub fn op_yank_reg(oap: &mut Oparg, message: bool, reg_idx: RegIdx, append: bool
 
     newreg.y_type = yank_type;
     newreg.y_width = 0;
-    newreg.y_array = vec![NvimString::new(); yanklines];
+    newreg.y_array = vec![NvimString::new(); yanklines].into();
     newreg.y_allocated = true;
     newreg.additional_data = None;
     newreg.timestamp = os_realtime() as u64;
@@ -1144,7 +1146,7 @@ pub fn op_yank_reg(oap: &mut Oparg, message: bool, reg_idx: RegIdx, append: bool
                 yank_copy_line(&mut newreg, &mut bd, y_idx, oap.excl_tr_ws);
             }
             MotionType::MtLineWise => {
-                newreg.y_array[y_idx] = NvimString::from_rc_cstr(&ml_get(lnum));
+                newreg.y_array_mut()[y_idx] = NvimString::from_rc_cstr(&ml_get(lnum));
             }
             MotionType::MtCharWise => {
                 charwise_block_prep(oap.start, oap.end, &mut bd, lnum, oap.inclusive);
@@ -1179,19 +1181,18 @@ pub fn op_yank_reg(oap: &mut Oparg, message: bool, reg_idx: RegIdx, append: bool
                 pnew.extend_from_slice(last_old.as_bytes());
                 pnew.extend_from_slice(first_new.as_bytes());
 
-                let last_slot = curr_reg.y_array.last_mut().unwrap();
+                let last_slot = curr_reg.y_array_mut().last_mut().unwrap();
                 api_clear_string(last_slot);
                 *last_slot = cbuf_to_string(&pnew);
-                api_clear_string(&mut newreg.y_array[0]);
+                api_clear_string(&mut newreg.y_array_mut()[0]);
                 y_idx = 1;
             } else {
                 y_idx = 0;
             }
-            while y_idx < newreg.y_array.len() {
-                curr_reg.y_array.push(newreg.y_array[y_idx].clone());
-                y_idx += 1;
-            }
-            newreg.y_array.clear();
+            curr_reg
+                .y_array_mut()
+                .extend(newreg.y_array[y_idx..].iter().cloned());
+            newreg.y_array_mut().clear();
         } else {
             *curr_reg = newreg;
         }
@@ -1304,7 +1305,7 @@ pub fn do_autocmd_textyankpost(oap: &mut Oparg, reg: RegIdx) {
 
     let list = reg.with(|r| {
         let list = tv_list_alloc(r.y_array.len() as isize);
-        for item in &r.y_array {
+        for item in r.y_array.iter() {
             crate::eval::typval::tv_list_append_bytes(&list, item.as_bytes());
         }
         list
@@ -1399,7 +1400,7 @@ fn put_do_autocmd(
         crate::eval::typval::tv_list_append_bytes(&list, insert.as_bytes());
     } else if let Some(r) = reg {
         r.with(|reg| {
-            for item in &reg.y_array {
+            for item in reg.y_array.iter() {
                 crate::eval::typval::tv_list_append_bytes(&list, item.as_bytes());
             }
         });
@@ -1477,7 +1478,7 @@ pub fn do_put(regname: i32, mut reg: Option<PutReg<'_>>, mut dir: i32, mut count
     let mut vcol: Colnr = 0;
     let y_array: &[NvimString];
     let mut expr_y_array: Vec<NvimString> = Vec::new();
-    let reg_y_array: Vec<NvimString>;
+    let reg_y_array: Rc<Vec<NvimString>>;
     let mut y_allocated = true;
     let mut nr_lines: Linenr = 0;
     let orig_start = curbuf().b_op_start.get();
@@ -2481,7 +2482,7 @@ pub fn ex_display(eap: &mut Exarg) {
             yb_reg.with(|r| (r.y_allocated, r.y_type, r.y_array.clone()));
         if y_allocated {
             let mut do_show = false;
-            for item in &y_array {
+            for item in y_array.iter() {
                 if !message_filtered(item.as_cstr()) {
                     do_show = true;
                     break;
@@ -2708,7 +2709,7 @@ pub fn get_reg_contents_list(mut regname: i32, flags: i32) -> Option<crate::eval
         }
 
         let list = tv_list_alloc(reg.y_array.len() as isize);
-        for item in &reg.y_array {
+        for item in reg.y_array.iter() {
             crate::eval::typval::tv_list_append_bytes(&list, item.as_bytes());
         }
         Some(list)
@@ -2723,7 +2724,7 @@ fn init_write_reg(name: i32, must_append: bool) -> Option<RegIdx> {
 
     let reg = get_yank_register(name, YankRegMode::Yank);
     if !is_append_register(name) && !must_append {
-        reg.with_mut(|r| *r = EMPTY_YANKREG);
+        reg.with_mut(|r| *r = Yankreg::empty());
     }
     Some(reg)
 }
@@ -2736,7 +2737,7 @@ fn str_to_reg(
     str_list: Option<&[impl AsRef<CStr>]>,
 ) {
     if !y_ptr.y_allocated {
-        y_ptr.y_array.clear();
+        y_ptr.y_array_mut().clear();
     }
 
     if yank_type == MotionType::MtUnknown {
@@ -2767,12 +2768,12 @@ fn str_to_reg(
     }
 
     if y_ptr.y_array.len() + newlines == 0 {
-        y_ptr.y_array.clear();
+        y_ptr.y_array_mut().clear();
         y_ptr.y_allocated = false;
         return;
     }
 
-    y_ptr.y_array.reserve(newlines);
+    y_ptr.y_array_mut().reserve(newlines);
     y_ptr.y_allocated = true;
 
     let mut maxlen: usize = 0;
@@ -2780,7 +2781,7 @@ fn str_to_reg(
     if let Some(list) = str_list {
         for item in list {
             let s = item.as_ref();
-            y_ptr.y_array.push(cstr_to_string(Some(s)));
+            y_ptr.y_array_mut().push(cstr_to_string(Some(s)));
             if yank_type == MotionType::MtBlockWise {
                 let charlen = vim_strsize(s.to_bytes()) as usize;
                 maxlen = maxlen.max(charlen);
@@ -2821,12 +2822,12 @@ fn str_to_reg(
             let new_str = cbuf_to_string(&s_vec[..s_len]);
 
             if append {
-                let last = y_ptr.y_array.last_mut().unwrap();
+                let last = y_ptr.y_array_mut().last_mut().unwrap();
                 api_clear_string(last);
                 *last = new_str;
                 append = false;
             } else {
-                y_ptr.y_array.push(new_str);
+                y_ptr.y_array_mut().push(new_str);
             }
 
             start += line_len + 1;
@@ -3003,7 +3004,7 @@ pub fn finish_yankreg_from_object(reg: &mut Yankreg, clipboard_adjust: bool) {
     if reg.y_array.last().is_some_and(|last| last.size == 0) {
         if reg.y_type != MotionType::MtCharWise {
             if reg.y_type == MotionType::MtUnknown || clipboard_adjust {
-                reg.y_array.pop();
+                reg.y_array_mut().pop();
             }
             if reg.y_type == MotionType::MtUnknown {
                 reg.y_type = MotionType::MtLineWise;

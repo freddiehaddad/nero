@@ -1443,7 +1443,7 @@ fn shada_read(sd_reader: &mut FileDescriptor, flags: i32) {
                 if !op_reg_set(
                     r_name,
                     Yankreg {
-                        y_array,
+                        y_array: y_array.into(),
                         y_allocated: true,
                         y_type,
                         y_width: r_width as Colnr,
@@ -2395,7 +2395,7 @@ fn shada_initialize_registers(wms: &mut WriteMergerState, max_reg_lines: i32, sc
                     reg_ref.timestamp
                 },
                 data: ShadaEntryData::Reg(ShadaReg {
-                    contents: reg_ref.y_array.clone(),
+                    contents: reg_ref.y_array.to_vec(),
                     reg_type: reg_ref.y_type as u8,
                     width: if reg_ref.y_type == MotionType::MtBlockWise {
                         reg_ref.y_width as usize

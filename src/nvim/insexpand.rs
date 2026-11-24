@@ -4912,7 +4912,7 @@ fn get_register_completion() {
             continue;
         }
 
-        for str_val in &reg.y_array {
+        for str_val in reg.y_array.iter() {
             if str_val.data.is_null() {
                 continue;
             }

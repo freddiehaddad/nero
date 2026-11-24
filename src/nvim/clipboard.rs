@@ -11,8 +11,8 @@ use crate::mcursor::mc_replaying;
 use crate::message::{emsg, msg, redirecting};
 use crate::option_vars::*;
 use crate::register::{
-    EMPTY_YANKREG, MotionType, PLUS_REGISTER, RegIdx, STAR_REGISTER, get_y_previous,
-    get_y_register, update_yankreg_width,
+    MotionType, PLUS_REGISTER, RegIdx, STAR_REGISTER, Yankreg, get_y_previous, get_y_register,
+    update_yankreg_width,
 };
 
 use std::ffi::CStr;
@@ -129,7 +129,7 @@ pub fn get_clipboard(mut name: i32, target: &mut Option<RegIdx>, quiet: bool) ->
         return true;
     }
 
-    reg.with_mut(|r| *r = EMPTY_YANKREG);
+    reg.with_mut(|r| *r = Yankreg::empty());
 
     let args = tv_list_alloc(1);
     tv_list_append_bytes(&args, &[name as u8]);
@@ -137,7 +137,7 @@ pub fn get_clipboard(mut name: i32, target: &mut Option<RegIdx>, quiet: bool) ->
     let result = eval_call_provider(c"clipboard", c"get", &args, false);
 
     let fail_cleanup = |reg: RegIdx, errmsg: bool, target: &mut Option<RegIdx>| {
-        reg.with_mut(|r| *r = EMPTY_YANKREG);
+        reg.with_mut(|r| *r = Yankreg::empty());
         if errmsg {
             emsg(c"clipboard: provider returned invalid data");
         }
@@ -221,7 +221,7 @@ pub fn get_clipboard(mut name: i32, target: &mut Option<RegIdx>, quiet: bool) ->
 
     reg.with_mut(|r| {
         r.y_type = y_type;
-        r.y_array = y_array;
+        r.y_array = y_array.into();
         r.y_allocated = true;
         r.y_width = 0;
         r.additional_data = None;
@@ -243,7 +243,7 @@ pub fn set_clipboard(mut name: i32, reg_idx: RegIdx) {
         let extra = usize::from(reg.y_type != MotionType::MtCharWise);
         let lines = tv_list_alloc((reg.y_array.len() + extra) as isize);
 
-        for item in &reg.y_array {
+        for item in reg.y_array.iter() {
             tv_list_append_bytes(&lines, item.as_bytes());
         }
 
