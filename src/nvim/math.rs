@@ -81,6 +81,27 @@ pub fn xisnan(d: f64) -> bool {
     xfpclassify(d) == FP_NAN
 }
 
+/// The order of floats for `:sort f` and `sort()` with "f": NaN before every
+/// number, so that sorting is a total order. Nero-only: upstream compares NaN
+/// as smaller than everything, from either side.
+pub fn float_sort_order(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => {
+            if a == b {
+                Ordering::Equal
+            } else if a > b {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+    }
+}
+
 /// Count trailing zeroes at the end of 64-bit bitfield (`xctz`).
 pub fn xctz(x: u64) -> i32 {
     x.trailing_zeros() as i32

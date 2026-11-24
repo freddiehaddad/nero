@@ -48,4 +48,34 @@ describe('sort order', function()
       end, items)
     )
   end)
+
+  it('of :sort f and sort() with "f" puts NaN before every number', function()
+    -- Upstream compares NaN as smaller than everything, from either side,
+    -- which leaves the numbers around it unsorted. See MAINTAIN.md.
+    n.api.nvim_buf_set_lines(0, 0, -1, true, { '5', 'nan', '2', '8', 'NaN', '1', '9', '3' })
+    n.command('sort f')
+    eq({ 'nan', 'NaN', '1', '2', '3', '5', '8', '9' }, n.api.nvim_buf_get_lines(0, 0, -1, true))
+    n.command('sort! f')
+    eq({ '9', '8', '5', '3', '2', '1', 'NaN', 'nan' }, n.api.nvim_buf_get_lines(0, 0, -1, true))
+    eq(
+      "[str2float('nan'), str2float('nan'), 1.0, 2.0, 5.0]",
+      n.eval("string(sort([5.0, str2float('nan'), 2.0, str2float('nan'), 1.0], 'f'))")
+    )
+    -- A column of numbers with a few NaN made Rust's sort panic.
+    n.exec([[
+      call setline(1, map(range(60), {i, v -> v % 7 == 3 ? 'NaN' : printf('%d.%d', v * 37 % 50, v % 10)}))
+      sort f
+    ]])
+    local lines = n.api.nvim_buf_get_lines(0, 0, -1, true)
+    eq({ 'NaN', 'NaN', 'NaN', 'NaN', 'NaN', 'NaN', 'NaN', 'NaN', 'NaN' }, { unpack(lines, 1, 9) })
+    for i = 11, #lines do
+      t.ok(
+        tonumber(lines[i - 1]) <= tonumber(lines[i]),
+        'numbers in order',
+        lines[i - 1] .. ' before ' .. lines[i]
+      )
+    end
+    -- uniq() still finds NaN equal to nothing.
+    eq(2, n.eval("len(uniq([str2float('nan'), str2float('nan')], 'f'))"))
+  end)
 end)

@@ -606,15 +606,7 @@ fn sort_compare(l1: &Sorti, l2: &Sorti, ic: bool) -> std::cmp::Ordering {
                 Ordering::Less
             }
         }
-        (SortKey::Float(f1), SortKey::Float(f2)) => {
-            if f1 == f2 {
-                Ordering::Equal
-            } else if f1 > f2 {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
+        (SortKey::Float(f1), SortKey::Float(f2)) => crate::math::float_sort_order(*f1, *f2),
         (SortKey::Text { start: s1, end: e1 }, SortKey::Text { start: s2, end: e2 }) => {
             let k1 = &l1.line.to_bytes()[*s1..*e1];
             let k2 = &l2.line.to_bytes()[*s2..*e2];

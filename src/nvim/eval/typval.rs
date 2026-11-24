@@ -2833,12 +2833,11 @@ fn item_compare(si1: &ListSortItem, si2: &ListSortItem, keep_zero: bool, info: &
             tv_get_float(tv2)
         };
 
-        res = if v1 == v2 {
-            0
-        } else if v1 > v2 {
-            1
-        } else {
+        // uniq() keeps upstream's comparison, by which NaN equals nothing.
+        res = if keep_zero && (v1.is_nan() || v2.is_nan()) {
             -1
+        } else {
+            crate::math::float_sort_order(v1, v2) as i32
         };
         if res == 0 && !keep_zero {
             res = if si1.idx > si2.idx { 1 } else { -1 };
