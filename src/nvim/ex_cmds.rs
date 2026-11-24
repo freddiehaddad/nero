@@ -241,16 +241,25 @@ struct PreviewLines {
     lines_needed: Linenr,
 }
 
-#[derive(Clone, Copy)]
 enum SortKey {
-    KeyOff(usize),
-    Num { value: Varnumber, is_number: bool },
+    /// Bytes `start..end` of the line.
+    Text {
+        start: usize,
+        end: usize,
+    },
+    /// The key text, for sorting by the locale's collation (`:sort l`).
+    Collated(std::ffi::CString),
+    Num {
+        value: Varnumber,
+        is_number: bool,
+    },
     Float(TvFloat),
 }
 
-#[derive(Clone, Copy)]
 struct Sorti {
     lnum: Linenr,
+    /// The line's text, shared with the buffer.
+    line: RcCStr,
     st_u: SortKey,
 }
 
@@ -565,20 +574,18 @@ fn string_compare(s1: &CStr, s2: &CStr) -> i32 {
     }
 }
 
-fn sort_compare(l1: &Sorti, l2: &Sorti, sort_keys: &[u8]) -> i32 {
-    let l1 = *l1;
-    let l2 = *l2;
-    let result: i32;
+fn sort_compare(l1: &Sorti, l2: &Sorti, ic: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
 
     if EXCMDS_STATE.with(|s| s.sort_abort.get()) {
-        return 0;
+        return Ordering::Equal;
     }
     fast_breakcheck();
     if input_state().got_int.get() {
         EXCMDS_STATE.with(|s| s.sort_abort.set(true));
     }
 
-    match (l1.st_u, l2.st_u) {
+    let result = match (&l1.st_u, &l2.st_u) {
         (
             SortKey::Num {
                 value: v1,
@@ -589,44 +596,43 @@ fn sort_compare(l1: &Sorti, l2: &Sorti, sort_keys: &[u8]) -> i32 {
                 is_number: is_num2,
             },
         ) => {
-            if is_num1 != is_num2 {
-                result = if is_num1 && !is_num2 { 1 } else { -1 };
-            } else if v1 == v2 {
-                result = 0;
-            } else if v1 > v2 {
-                result = 1;
+            if is_num1 == is_num2 {
+                v1.cmp(v2)
+            } else if *is_num1 {
+                Ordering::Greater
             } else {
-                result = -1;
+                Ordering::Less
             }
         }
         (SortKey::Float(f1), SortKey::Float(f2)) => {
             if f1 == f2 {
-                result = 0;
+                Ordering::Equal
             } else if f1 > f2 {
-                result = 1;
+                Ordering::Greater
             } else {
-                result = -1;
+                Ordering::Less
             }
         }
-        (SortKey::KeyOff(off1), SortKey::KeyOff(off2)) => {
-            result = string_compare(
-                crate::memory::bytes_as_cstr(&sort_keys[off1..]),
-                crate::memory::bytes_as_cstr(&sort_keys[off2..]),
-            );
+        (SortKey::Text { start: s1, end: e1 }, SortKey::Text { start: s2, end: e2 }) => {
+            let k1 = &l1.line.to_bytes()[*s1..*e1];
+            let k2 = &l2.line.to_bytes()[*s2..*e2];
+            if ic {
+                k1.iter()
+                    .map(u8::to_ascii_lowercase)
+                    .cmp(k2.iter().map(u8::to_ascii_lowercase))
+            } else {
+                k1.cmp(k2)
+            }
         }
+        (SortKey::Collated(k1), SortKey::Collated(k2)) => strcoll(k1, k2).cmp(&0),
         _ => unreachable!(),
-    }
-
-    if result == 0 {
-        return l1.lnum - l2.lnum;
-    }
-    result
+    };
+    result.then(l1.lnum.cmp(&l2.lnum))
 }
 
 /// `":sort"`.
 pub fn ex_sort(eap: &mut Exarg) {
     let mut regmatch: Regmatch = Regmatch::new();
-    let mut maxlen: i32 = 0;
     let mut count = (eap.line2 - eap.line1) as usize + 1;
     let mut i: usize = 0;
     let mut unique = false;
@@ -730,22 +736,11 @@ pub fn ex_sort(eap: &mut Exarg) {
         EXCMDS_STATE.with(|s| s.sort_nr.set(s.sort_nr.get() | sort_what));
 
         let sort_str = EXCMDS_STATE.with(|s| s.sort_nr.get() == 0 && !s.sort_flt.get());
-        let mut sort_keys: Vec<u8> = Vec::new();
-        if sort_str {
-            let mut keys_size: usize = 0;
-            for lnum in eap.line1..=eap.line2 {
-                keys_size += ml_get_len(lnum) as usize + 1;
-            }
-            if sort_keys.try_reserve_exact(keys_size).is_err() {
-                emsg(gettext(crate::errors::E_OUTOFMEM));
-                break 'sortend;
-            }
-        }
+        let (sort_ic, sort_lc) = EXCMDS_STATE.with(|s| (s.sort_ic.get(), s.sort_lc.get()));
         for lnum in eap.line1..=eap.line2 {
-            let s_slice = crate::memline::ml_get_slice(lnum);
-            let s_bytes: &[u8] = &s_slice;
-            let len = ml_get_len(lnum);
-            maxlen = maxlen.max(len);
+            let line = crate::memline::ml_get_buf_shared(&curbuf(), lnum);
+            let s_bytes = line.to_bytes();
+            let len = s_bytes.len() as Colnr;
 
             let mut start_col: Colnr = 0;
             let mut end_col: Colnr = len;
@@ -761,9 +756,8 @@ pub fn ex_sort(eap: &mut Exarg) {
             }
 
             let st_u = if !sort_str {
-                let line_slice = crate::memline::ml_get_slice(lnum);
-                let sub_slice = &line_slice[(start_col.max(0) as usize).min(line_slice.len())
-                    ..(end_col.max(0) as usize).min(line_slice.len())];
+                let sub_slice = &s_bytes[(start_col.max(0) as usize).min(s_bytes.len())
+                    ..(end_col.max(0) as usize).min(s_bytes.len())];
                 if EXCMDS_STATE.with(|s| s.sort_nr.get()) != 0 {
                     let rem = if (sort_what & STR2NR_HEX) != 0 {
                         crate::charset::skiptohex_slice(sub_slice)
@@ -814,15 +808,16 @@ pub fn ex_sort(eap: &mut Exarg) {
                     }
                 }
             } else {
-                let key_off = sort_keys.len();
                 let start = (start_col.max(0) as usize).min(s_bytes.len());
                 let end = (end_col.max(0) as usize).min(s_bytes.len()).max(start);
-                sort_keys.extend_from_slice(&s_bytes[start..end]);
-                sort_keys.push(0);
-                SortKey::KeyOff(key_off)
+                if sort_lc {
+                    SortKey::Collated(crate::memory::bytes_to_cstring(&s_bytes[start..end]))
+                } else {
+                    SortKey::Text { start, end }
+                }
             };
 
-            nrs_vec.push(Sorti { lnum, st_u });
+            nrs_vec.push(Sorti { lnum, line, st_u });
 
             if !regmatch.regprog.is_null() {
                 fast_breakcheck();
@@ -832,9 +827,7 @@ pub fn ex_sort(eap: &mut Exarg) {
             }
         }
 
-        let mut sortbuf1_vec = vec![0u8; maxlen as usize + 1];
-
-        nrs_vec.sort_by(|a, b| sort_compare(a, b, &sort_keys).cmp(&0));
+        nrs_vec.sort_by(|a, b| sort_compare(a, b, sort_ic));
 
         if EXCMDS_STATE.with(|s| s.sort_abort.get()) {
             break 'sortend;
@@ -843,60 +836,28 @@ pub fn ex_sort(eap: &mut Exarg) {
         let mut old_count: Bcount = 0;
         let mut new_count: Bcount = 0;
 
-        let keys_are_lines = sort_str && regmatch.regprog.is_null();
-        let mut prev_key_off: Option<usize> = None;
+        let mut prev: Option<usize> = None;
         let mut lnum = eap.line2;
         while i < count {
-            let nr = &nrs_vec[if eap.forceit { count - i - 1 } else { i }];
-            let get_lnum = nr.lnum;
+            let idx = if eap.forceit { count - i - 1 } else { i };
+            let nr = &nrs_vec[idx];
 
-            if get_lnum + (count as Linenr - 1) != lnum {
+            if nr.lnum + (count as Linenr - 1) != lnum {
                 change_occurred = true;
             }
 
-            if keys_are_lines {
-                let SortKey::KeyOff(key_off) = nr.st_u else {
-                    unreachable!()
-                };
-                let s_cstr = crate::memory::bytes_as_cstr(&sort_keys[key_off..]);
-                let s_bytes = s_cstr.to_bytes();
-                let bytelen: Colnr = (s_bytes.len() as Colnr) + 1;
-                old_count += bytelen as Bcount;
-                if !unique
-                    || i == 0
-                    || prev_key_off.is_none_or(|prev_off| {
-                        string_compare(s_cstr, crate::memory::bytes_as_cstr(&sort_keys[prev_off..]))
-                            != 0
-                    })
-                {
-                    prev_key_off = Some(key_off);
-                    if !ml_append(lnum, s_bytes, 0, false) {
-                        break;
-                    }
-                    lnum += 1;
-                    new_count += bytelen as Bcount;
+            let bytelen = nr.line.to_bytes().len() as Bcount + 1;
+            old_count += bytelen;
+            if !unique
+                || i == 0
+                || prev.is_none_or(|prev| string_compare(&nr.line, &nrs_vec[prev].line) != 0)
+            {
+                prev = Some(idx);
+                if !crate::memline::ml_append_buf_cstr(&curbuf(), lnum, nr.line.clone(), false) {
+                    break;
                 }
-            } else {
-                let s_cstr = ml_get(get_lnum);
-                let bytelen: Colnr = ml_get_len(get_lnum) + 1;
-                old_count += bytelen as Bcount;
-                if !unique
-                    || i == 0
-                    || string_compare(&s_cstr, crate::memory::bytes_as_cstr(&sortbuf1_vec)) != 0
-                {
-                    let s_bytes = s_cstr.to_bytes_with_nul();
-                    sortbuf1_vec[..s_bytes.len()].copy_from_slice(s_bytes);
-                    if !ml_append(
-                        lnum,
-                        crate::memory::bytes_until_nul(&sortbuf1_vec),
-                        0,
-                        false,
-                    ) {
-                        break;
-                    }
-                    lnum += 1;
-                    new_count += bytelen as Bcount;
-                }
+                lnum += 1;
+                new_count += bytelen;
             }
             fast_breakcheck();
             if input_state().got_int.get() {
