@@ -22,4 +22,30 @@ describe('sort order', function()
       )
     )
   end)
+
+  it('of completion matches with "nearest" puts the nearest first', function()
+    -- Matches from other buffers have no distance and compare equal to every
+    -- match, so the comparator is not a total order.
+    n.exec([[
+      set hidden complete=.,b completeopt=menuone,noinsert,nearest
+      call setline(1, map(range(60), '"foo_b" .. v:val'))
+      enew
+      call setline(1, map(range(1, 10), '"foo_h" .. v:val'))
+      call cursor(5, 1)
+    ]])
+    n.feed('ofo<C-n>')
+    n.poke_eventloop()
+    local expected = { 'foo_h6', 'foo_h5', 'foo_h7', 'foo_h4', 'foo_h8' }
+    vim.list_extend(expected, { 'foo_h3', 'foo_h9', 'foo_h2', 'foo_h10', 'foo_h1' })
+    for i = 0, 59 do
+      expected[#expected + 1] = 'foo_b' .. i
+    end
+    local items = n.fn.complete_info({ 'items' }).items
+    eq(
+      expected,
+      vim.tbl_map(function(item)
+        return item.word
+      end, items)
+    )
+  end)
 end)

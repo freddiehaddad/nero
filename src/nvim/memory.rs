@@ -188,6 +188,32 @@ pub fn qsort_by<T>(v: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
     permute(v, &mut order);
 }
 
+/// Sorts `v` by `compare` like upstream's `mergesort_list()`: a stable merge
+/// sort that merges runs of 1, 2, 4, ... items from the left, taking the left
+/// item unless `compare` puts it after the right one. Like `qsort_by()`, it
+/// accepts a `compare` that is not a total order.
+pub fn mergesort_list<T>(v: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
+    let len = v.len();
+    let mut order: Vec<usize> = (0..len).collect();
+    let mut scratch = vec![0; len];
+    let mut compare_at = |a: usize, b: usize| compare(&v[a], &v[b]);
+    let mut size = 1;
+    while size < len {
+        for start in (0..len).step_by(2 * size) {
+            let end = (start + 2 * size).min(len);
+            let mid = (start + size).min(end);
+            merge(
+                &mut order[start..end],
+                mid - start,
+                &mut scratch,
+                &mut compare_at,
+            );
+        }
+        size *= 2;
+    }
+    permute(v, &mut order);
+}
+
 /// Sorts the item indices in `run` as glibc's merge sort does.
 fn sort_halves(
     run: &mut [usize],
@@ -546,44 +572,62 @@ mod tests {
         }
     }
 
+    type Item = (u64, usize);
+    type Sort = fn(&mut [Item], &mut dyn FnMut(&Item, &Item) -> Ordering);
+
+    /// The sorts that accept any comparator.
+    const SORTS: [(&str, Sort); 2] = [
+        ("qsort_by", |v, compare| qsort_by(v, compare)),
+        ("mergesort_list", |v, compare| mergesort_list(v, compare)),
+    ];
+
     #[test]
-    fn qsort_by_sorts_stably() {
+    fn sorts_are_stable() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for len in (0..70).chain([257, 1000]) {
-            // Few distinct keys, so that most items have equal ones.
-            let items: Vec<(u64, usize)> = (0..len).map(|i| (rng.below(8), i)).collect();
-            let mut expected = items.clone();
-            expected.sort_by_key(|&(key, _)| key);
-            let mut sorted = items;
-            qsort_by(&mut sorted, |a, b| a.0.cmp(&b.0));
-            assert_eq!(sorted, expected, "{len} items");
+        for (name, sort) in SORTS {
+            for len in (0..70).chain([257, 1000]) {
+                // Few distinct keys, so that most items have equal ones.
+                let items: Vec<Item> = (0..len).map(|i| (rng.below(8), i)).collect();
+                let mut expected = items.clone();
+                expected.sort_by_key(|&(key, _)| key);
+                let mut sorted = items;
+                sort(&mut sorted, &mut |a, b| a.0.cmp(&b.0));
+                assert_eq!(sorted, expected, "{name}, {len} items");
+            }
         }
     }
 
     #[test]
-    fn qsort_by_accepts_any_comparator() {
-        // A comparator that answers at random still leaves each item once.
+    fn sorts_accept_any_comparator() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-        for len in [2, 21, 100, 1000] {
-            let mut items: Vec<usize> = (0..len).collect();
-            qsort_by(&mut items, |_, _| match rng.below(3) {
-                0 => Ordering::Less,
-                1 => Ordering::Equal,
-                _ => Ordering::Greater,
-            });
-            items.sort_unstable();
-            assert_eq!(items, (0..len).collect::<Vec<_>>());
-        }
-        // One that never answers `Less`, like `{a, b -> a > b}`, still sorts.
-        let mut items = [5, 3, 9, 1, 7, 2, 8, 6, 4];
-        qsort_by(&mut items, |a, b| {
-            if a > b {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
+        for (name, sort) in SORTS {
+            // A comparator that answers at random still leaves each item once.
+            for len in [2, 21, 100, 1000] {
+                let mut items: Vec<Item> = (0..len).map(|i| (0, i)).collect();
+                sort(&mut items, &mut |_, _| match rng.below(3) {
+                    0 => Ordering::Less,
+                    1 => Ordering::Equal,
+                    _ => Ordering::Greater,
+                });
+                items.sort_unstable();
+                assert_eq!(
+                    items,
+                    (0..len).map(|i| (0, i)).collect::<Vec<_>>(),
+                    "{name}"
+                );
             }
-        });
-        assert_eq!(items, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            // One that never answers `Less`, like `{a, b -> a > b}`, still sorts.
+            let mut items: Vec<Item> = [5, 3, 9, 1, 7, 2, 8, 6, 4].map(|k| (k, 0)).to_vec();
+            sort(&mut items, &mut |a, b| {
+                if a.0 > b.0 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                }
+            });
+            let keys: Vec<u64> = items.iter().map(|&(k, _)| k).collect();
+            assert_eq!(keys, [1, 2, 3, 4, 5, 6, 7, 8, 9], "{name}");
+        }
     }
 
     #[test]

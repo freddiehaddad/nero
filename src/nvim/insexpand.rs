@@ -1891,16 +1891,9 @@ fn sort_compl_match_list(compare: fn(&Compl, &Compl) -> i32) {
         } else {
             0..orig_idx
         };
-        list[range].sort_by(|a, b| {
-            let cmp = compare(a, b);
-            if cmp < 0 {
-                std::cmp::Ordering::Less
-            } else if cmp > 0 {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
+        // The "nearest" comparator is not a total order, which `sort_by()`
+        // requires.
+        crate::memory::mergesort_list(&mut list[range], |a, b| compare(a, b).cmp(&0));
 
         if let Some(ref p) = saved_ptrs[0] {
             INSEXPAND.with(|s| {
