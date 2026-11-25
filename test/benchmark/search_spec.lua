@@ -75,6 +75,32 @@ describe('parallel search, fuzzy, and diff perf', function()
     t.bench_report(samples, { label = 'matchfuzzy_50k' })
   end)
 
+  it('vim.text.diff() with many separate hunks', function()
+    local samples = n.exec_lua(function()
+      local before, after = {}, {}
+      for i = 1, 20000 do
+        local line = ('local item_%06d = process_item(%d, "sample text", true) -- source line'):format(
+          i,
+          i
+        )
+        before[i] = line
+        after[i] = (i - 1) % 37 == 0 and line:gsub('process_item', 'process_changed') or line
+      end
+      local a, b = table.concat(before, '\n'), table.concat(after, '\n')
+      local opts = { result_type = 'indices', linematch = 40 }
+      assert(#vim.text.diff(a, b, opts) == 541)
+
+      local out = {}
+      for i = 1, 5 do
+        local start = vim.uv.hrtime()
+        assert(#vim.text.diff(a, b, opts) == 541)
+        out[i] = vim.uv.hrtime() - start
+      end
+      return out
+    end)
+    t.bench_report(samples, { label = 'diff_separate_hunks_20k' })
+  end)
+
   it('vim.diff() with linematch across modified blocks', function()
     local samples = n.exec_lua(function()
       local a_lines = {} --- @type string[]

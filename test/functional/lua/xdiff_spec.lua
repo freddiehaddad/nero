@@ -170,6 +170,77 @@ describe('xdiff bindings', function()
     end)
   end)
 
+  it('locates later hunks after a hunk exceeds the linematch limit', function()
+    for _, algorithm in ipairs({ 'myers', 'minimal', 'patience', 'histogram' }) do
+      eq(
+        { { 2, 1, 2, 1 }, { 4, 3, 4, 3 }, { 8, 1, 8, 1 } },
+        exec_lua(function(alg)
+          return vim.text.diff(
+            'keep0\nold1\nkeep2\nold3\nold4\nold5\nkeep6\nold7\nkeep8\n',
+            'keep0\nnew1\nkeep2\nnew3\nnew4\nnew5\nkeep6\nnew7\nkeep8\n',
+            { result_type = 'indices', linematch = 2, algorithm = alg }
+          )
+        end, algorithm)
+      )
+    end
+  end)
+
+  it('locates insertions, deletions and binary hunks at input boundaries', function()
+    local cases = {
+      { '', '', {} },
+      { '', 'new\n', { { 0, 0, 1, 1 } } },
+      { 'one\ntwo', '', { { 1, 2, 0, 0 } } },
+      { 'anchor\n', 'anchor\nlast', { { 1, 0, 2, 1 } } },
+      { 'anchor\nlast', 'anchor\n', { { 2, 1, 1, 0 } } },
+      {
+        'keep0\nremove\nkeep1\nkeep2\nkeep3\n',
+        'insert\nkeep0\nkeep1\nkeep2\nnew\nkeep3\n',
+        { { 0, 0, 1, 1 }, { 2, 1, 2, 0 }, { 4, 0, 5, 1 } },
+      },
+      {
+        'keep\nold\0\195\169\nanchor\nold ending',
+        'keep\nnew\0\195\169\nanchor\nnew ending',
+        { { 2, 1, 2, 1 }, { 4, 1, 4, 1 } },
+      },
+    }
+    for _, algorithm in ipairs({ 'myers', 'minimal', 'patience', 'histogram' }) do
+      for _, case in ipairs(cases) do
+        eq(
+          case[3],
+          exec_lua(function(a, b, alg)
+            return vim.text.diff(a, b, {
+              result_type = 'indices',
+              linematch = 40,
+              algorithm = alg,
+            })
+          end, case[1], case[2], algorithm)
+        )
+      end
+    end
+  end)
+
+  it('keeps nested diff calls independent', function()
+    eq(
+      {
+        { { 1, 1, 1, 1 }, { 3, 1, 3, 1 } },
+        { { { 1, 0, 2, 1 } }, { { 1, 0, 2, 1 } } },
+      },
+      exec_lua(function()
+        local outer, inner = {}, {}
+        vim.text.diff('old one\nanchor\nold two\n', 'new one\nanchor\nnew two\n', {
+          on_hunk = function(...)
+            outer[#outer + 1] = { ... }
+            inner[#inner + 1] = vim.text.diff('anchor\n', 'anchor\nlast', {
+              result_type = 'indices',
+              linematch = 40,
+            })
+          end,
+        })
+        return { outer, inner }
+      end)
+    )
+  end)
+
   it('can handle bad args', function()
     matches([[Expected at least 2 arguments$]], pcall_err(exec_lua, [[vim.text.diff('a')]]))
 

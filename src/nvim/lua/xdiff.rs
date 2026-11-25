@@ -3,7 +3,7 @@
 
 use crate::api::private::helpers::{api_error, api_free_string};
 use crate::api::private::validate::{Error, ErrorType, NvimString, Object};
-use crate::linematch::{fastforward_buf_to_lnum, linematch_nbuffers};
+use crate::linematch::{LineCursor, fastforward_buf_to_lnum, linematch_nbuffers};
 use crate::lua::converter::{
     LUA_TFUNCTION, LUA_TTABLE, lua_State, lua_concat_safe, lua_createtable_safe, lua_error_safe,
     lua_isnumber_safe, lua_objlen_safe, lua_pcall_safe, lua_push_bytes, lua_pushinteger_safe,
@@ -17,6 +17,7 @@ use crate::xdiff::{
     Mmbuffer, Mmfile, XDF_HISTOGRAM_DIFF, XDF_IGNORE_CR_AT_EOL, XDF_INDENT_HEURISTIC,
     XDF_NEED_MINIMAL, XDF_PATIENCE_DIFF, Xdemitcb, Xdemitconf, Xpparam,
 };
+use std::num::NonZeroUsize;
 
 const COMPARED_BUFFER0: i32 = 1 << 0;
 const COMPARED_BUFFER1: i32 = 1 << 1;
@@ -79,9 +80,9 @@ impl KeyDictXdlDiff {
 
 pub(crate) struct HunkPriv<'a> {
     lstate: *mut lua_State,
-    err: Error,
-    ma: Mmfile<'a>,
-    mb: Mmfile<'a>,
+    pub(crate) err: Error,
+    ma: LineCursor<'a>,
+    mb: LineCursor<'a>,
     linematch: i64,
     iwhite: bool,
 }
@@ -121,16 +122,34 @@ fn lua_pushhunk(
 
 fn get_linematch_results(
     lstate: *mut lua_State,
-    ma: &Mmfile<'_>,
-    mb: &Mmfile<'_>,
+    ma: &mut LineCursor<'_>,
+    mb: &mut LineCursor<'_>,
     start_a: i32,
     count_a: i32,
     start_b: i32,
     count_b: i32,
     iwhite: bool,
-) {
-    let ma0 = fastforward_buf_to_lnum(*ma, start_a + 1);
-    let mb0 = fastforward_buf_to_lnum(*mb, start_b + 1);
+) -> Result<(), Error> {
+    let invalid_hunk = || api_error!(ErrorType::ErrorTypeException, c"diff operation failed");
+    if count_a < 0 || count_b < 0 {
+        return Err(invalid_hunk());
+    }
+    let line = |start: i32| {
+        usize::try_from(start)
+            .ok()?
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+    };
+    let ma0 = Mmfile {
+        slice: line(start_a)
+            .and_then(|lnum| fastforward_buf_to_lnum(ma, lnum))
+            .ok_or_else(invalid_hunk)?,
+    };
+    let mb0 = Mmfile {
+        slice: line(start_b)
+            .and_then(|lnum| fastforward_buf_to_lnum(mb, lnum))
+            .ok_or_else(invalid_hunk)?,
+    };
 
     let decisions = linematch_nbuffers(&[&ma0, &mb0], &[count_a, count_b], iwhite);
 
@@ -172,6 +191,7 @@ fn get_linematch_results(
         hunkstartb as isize,
         hunkcountb as isize,
     );
+    Ok(())
 }
 
 pub(crate) fn write_string(out: &mut Vec<u8>, mb: &[Mmbuffer<'_>]) -> i32 {
@@ -189,20 +209,20 @@ pub(crate) fn hunk_locations_cb(
     start_b: i32,
     count_b: i32,
     cb_data: &mut HunkPriv<'_>,
-) -> i32 {
+) -> Result<(), Error> {
     let priv_ref = cb_data;
     let lstate = priv_ref.lstate;
     if priv_ref.linematch > 0 && i64::from(count_a) + i64::from(count_b) <= priv_ref.linematch {
         get_linematch_results(
             lstate,
-            &priv_ref.ma,
-            &priv_ref.mb,
+            &mut priv_ref.ma,
+            &mut priv_ref.mb,
             start_a,
             count_a,
             start_b,
             count_b,
             priv_ref.iwhite,
-        );
+        )?;
     } else {
         lua_pushhunk(
             lstate,
@@ -212,7 +232,7 @@ pub(crate) fn hunk_locations_cb(
             count_b as isize,
         );
     }
-    0
+    Ok(())
 }
 
 pub(crate) fn call_on_hunk_cb(
@@ -411,8 +431,8 @@ pub extern "C-unwind" fn nlua_xdl_diff(lstate: *mut lua_State) -> i32 {
     let mut priv_state = HunkPriv {
         lstate,
         err: Error::new(),
-        ma,
-        mb,
+        ma: LineCursor::new(ma.slice),
+        mb: LineCursor::new(mb.slice),
         linematch,
         iwhite: (params.flags & XDF_IGNORE_WHITESPACE) != 0,
     };

@@ -5,9 +5,14 @@ const LN_MAX_BUFS: usize = 8;
 const LN_DECISION_MAX: usize = (1 << LN_MAX_BUFS) - 1;
 const MATCH_CHAR_MAX_LEN: usize = 800;
 
-use crate::cursor::Linenr;
+use std::num::NonZeroUsize;
 
 use crate::xdiff::Mmfile;
+
+#[cfg(test)]
+std::thread_local! {
+    static LINE_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 struct DiffCmpPath {
     df_lev_score: i32,
@@ -75,17 +80,47 @@ fn matching_chars_slice(s1: &[u8], s2: &[u8]) -> i32 {
     matrix[icur][s2len]
 }
 
-/// Advance `s` to line `lnum` (1-based) (`fastforward_buf_to_lnum`).
-pub fn fastforward_buf_to_lnum<'a>(mut s: Mmfile<'a>, lnum: Linenr) -> Mmfile<'a> {
-    for _ in 0..(lnum - 1) {
-        if let Some(pos) = s.slice.iter().position(|&b| b == b'\n') {
-            s.slice = &s.slice[pos + 1..];
-        } else {
-            s.slice = &[];
-            break;
+pub(crate) struct LineCursor<'a> {
+    remaining: &'a [u8],
+    lnum: NonZeroUsize,
+}
+
+impl<'a> LineCursor<'a> {
+    pub(crate) fn new(input: &'a [u8]) -> Self {
+        Self {
+            remaining: input,
+            lnum: NonZeroUsize::MIN,
         }
     }
-    s
+}
+
+/// Returns the suffix at a nondecreasing 1-based line, including the EOF position.
+/// Backward or out-of-range requests leave the cursor unchanged and return `None`.
+pub(crate) fn fastforward_buf_to_lnum<'a>(
+    cursor: &mut LineCursor<'a>,
+    lnum: NonZeroUsize,
+) -> Option<&'a [u8]> {
+    let mut line = cursor.lnum.get();
+    if lnum.get() < line {
+        return None;
+    }
+    let mut remaining = cursor.remaining;
+    while line < lnum.get() {
+        if remaining.is_empty() {
+            return None;
+        }
+        let next = remaining.iter().position(|&b| b == b'\n');
+        let consumed = next.map_or(remaining.len(), |pos| pos + 1);
+        #[cfg(test)]
+        LINE_SCAN_BYTES.with(|bytes| {
+            bytes.set(bytes.get() + consumed);
+        });
+        remaining = &remaining[consumed..];
+        line += 1;
+    }
+    cursor.remaining = remaining;
+    cursor.lnum = lnum;
+    Some(remaining)
 }
 
 fn unwrap_indexes(values: &[i32], diff_len: &[i32]) -> usize {
@@ -435,6 +470,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn line_lookup_scans_each_byte_once() {
+        let input = b"line\n".repeat(256);
+        let mut cursor = LineCursor::new(&input);
+        LINE_SCAN_BYTES.with(|bytes| bytes.set(0));
+        for lnum in (1..=257).step_by(4) {
+            for _ in 0..2 {
+                let suffix = fastforward_buf_to_lnum(&mut cursor, NonZeroUsize::new(lnum).unwrap());
+                assert_eq!(suffix, Some(&input[(lnum - 1) * 5..]));
+            }
+        }
+        let scanned = LINE_SCAN_BYTES.with(|bytes| bytes.get());
+        assert!(
+            scanned <= input.len(),
+            "line lookup scanned {scanned} bytes for {} input bytes",
+            input.len(),
+        );
+    }
+
+    #[test]
+    fn line_cursors_keep_independent_positions_and_handle_eof() {
+        let a = b"first\0\xc3\xa9\nlast";
+        let b = b"x\n\ny\n";
+        let mut first = LineCursor::new(a);
+        let mut second = LineCursor::new(b);
+        assert_eq!(
+            fastforward_buf_to_lnum(&mut first, NonZeroUsize::MIN),
+            Some(a.as_slice()),
+        );
+        assert_eq!(
+            fastforward_buf_to_lnum(&mut second, NonZeroUsize::new(2).unwrap()),
+            Some(b"\ny\n".as_slice()),
+        );
+        for (lnum, expected) in [
+            (2, Some(b"last".as_slice())),
+            (2, Some(b"last".as_slice())),
+            (1, None),
+            (4, None),
+            (2, Some(b"last".as_slice())),
+            (3, Some(b"".as_slice())),
+            (3, Some(b"".as_slice())),
+            (4, None),
+        ] {
+            assert_eq!(
+                fastforward_buf_to_lnum(&mut first, NonZeroUsize::new(lnum).unwrap()),
+                expected,
+            );
+        }
+        assert_eq!(
+            fastforward_buf_to_lnum(&mut second, NonZeroUsize::new(3).unwrap()),
+            Some(b"y\n".as_slice()),
+        );
+        assert_eq!(
+            fastforward_buf_to_lnum(&mut second, NonZeroUsize::new(4).unwrap()),
+            Some(b"".as_slice()),
+        );
+        let mut empty = LineCursor::new(b"");
+        assert_eq!(
+            fastforward_buf_to_lnum(&mut empty, NonZeroUsize::MIN),
+            Some(b"".as_slice()),
+        );
+        assert_eq!(
+            fastforward_buf_to_lnum(&mut empty, NonZeroUsize::new(2).unwrap()),
+            None,
+        );
+    }
+
+    #[test]
     fn fastforward_and_two_buffer_linematch() {
         let buf1 = b"alpha\nbeta_modified\ngamma\n";
         let buf2 = b"unrelated\nbeta_mod\ngamma\n";
@@ -442,9 +544,10 @@ mod tests {
         let mm1 = Mmfile { slice: buf1 };
         let mm2 = Mmfile { slice: buf2 };
 
-        let line2 = fastforward_buf_to_lnum(mm1, 2);
-        assert!(!line2.slice.is_empty());
-        assert_eq!(line_slice(&line2), b"beta_modified");
+        let mut cursor = LineCursor::new(buf1);
+        let line2 = fastforward_buf_to_lnum(&mut cursor, NonZeroUsize::new(2).unwrap()).unwrap();
+        assert!(!line2.is_empty());
+        assert_eq!(line_slice(&Mmfile { slice: line2 }), b"beta_modified");
 
         let decisions = linematch_nbuffers(&[&mm1, &mm2], &[3, 3], false);
         // All 3 lines paired (1 | 2 == 3)

@@ -82,7 +82,15 @@ impl<'a, 'b> Xdemitcb<'a, 'b> {
                 crate::lua::xdiff::call_on_hunk_cb(start_a, count_a, start_b, count_b, priv_data)
             }
             Self::Locations(priv_data) => {
-                crate::lua::xdiff::hunk_locations_cb(start_a, count_a, start_b, count_b, priv_data)
+                match crate::lua::xdiff::hunk_locations_cb(
+                    start_a, count_a, start_b, count_b, priv_data,
+                ) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        priv_data.err = error;
+                        -1
+                    }
+                }
             }
             Self::None | Self::Unified(_) => 0,
         }
