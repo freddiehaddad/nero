@@ -1813,6 +1813,14 @@ describe('API', function()
       eq(12, api.nvim_strwidth('\255\128\194'))
     end)
 
+    it('uses display escapes across ASCII and Unicode clusters', function()
+      eq(3, api.nvim_strwidth('ae\204\129z'))
+      eq(5, api.nvim_strwidth('a\t\204\129z'))
+      command('set display+=uhex')
+      eq(7, api.nvim_strwidth('a\t\204\129z'))
+      eq(6, api.nvim_strwidth('a\tz'))
+    end)
+
     it('can handle emoji with variant selectors and ZWJ', function()
       local selector = '❤️'
       eq(2, fn.strchars(selector))

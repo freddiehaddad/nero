@@ -1483,7 +1483,24 @@ pub fn utf_slice2_char_info_impl(bytes: &[u8]) -> i32 {
 /// Count display cells up to the first NUL, using `strtrans()` widths for
 /// unprintable characters. Honors 'display', 'ambiwidth' and `setcellwidths()`.
 pub fn mb_string2cells(bytes: &[u8]) -> i32 {
-    mb_string2cells_len(crate::memory::bytes_until_nul(bytes))
+    let mut width = 0;
+    let mut bytes = crate::memory::bytes_until_nul(bytes);
+    while let Some((&first, rest)) = bytes.split_first() {
+        // A non-ASCII byte may continue the preceding ASCII character's grapheme.
+        if first < 0x80 && rest.first().is_none_or(|&next| next < 0x80) {
+            width += ascii2cells(i32::from(first));
+            bytes = rest;
+        } else {
+            let ci = StrCharInfo {
+                ptr: bytes,
+                chr: utf_ptr2_char_info(bytes),
+            };
+            let cli = utf_cluster_info(ci);
+            width += cli.cells;
+            bytes = cli.next.ptr;
+        }
+    }
+    width
 }
 
 /// Count display cells in the entire slice, including embedded NUL bytes.
@@ -3696,6 +3713,15 @@ mod tests {
         assert_eq!(mb_string2cells_len(b"\0abc"), 5);
         assert_eq!(mb_string2cells(b"\xff\xc2\x80"), 8);
         assert_eq!(mb_string2cells_len(b"\xe2\x82"), 8);
+        for (text, width) in [
+            (&b"ae\xcc\x81z"[..], 3),
+            (&b"a\t\xcc\x81z"[..], 5),
+            (&b"a\xe7\x95\x8cz"[..], 4),
+            (&b"a\xffz"[..], 6),
+        ] {
+            assert_eq!(mb_string2cells(text), width);
+            assert_eq!(mb_string2cells_len(text), width);
+        }
     }
 
     #[test]
