@@ -22,7 +22,7 @@ use crate::eval::typval::{
 };
 use crate::eval::userfunc::{FC_LUAREF, find_func, register_luafunc};
 use crate::eval::vars::{NUM_MSGPACK_TYPES, eval_msgpack_type_list};
-use crate::eval::{get_copy_id, partial_name};
+use crate::eval::{get_copy_id_for, partial_name};
 use crate::highlight_group::syn_check_group;
 
 use crate::lua::executor::{api_free_luaref, nlua_pushref, nlua_ref_global};
@@ -861,7 +861,7 @@ fn lua_convert_one_value(
 }
 
 fn encode_vim_to_lua(lstate: *mut lua_State, top_tv: &mut TypVal) -> bool {
-    let copy_id = get_copy_id();
+    let copy_id = get_copy_id_for(top_tv);
     let mut mpstack: Vec<MPConvStackVal> = Vec::new();
 
     if !lua_convert_one_value(lstate, &mut mpstack, top_tv, copy_id) {

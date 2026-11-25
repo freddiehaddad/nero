@@ -13,7 +13,7 @@ use crate::eval::typval::{
     tv_list_len,
 };
 use crate::eval::vars::{NUM_MSGPACK_TYPES, eval_msgpack_type_list};
-use crate::eval::{get_copy_id, partial_name};
+use crate::eval::{get_copy_id_for, partial_name};
 use crate::hashtab::hashitem_empty;
 use crate::keycodes::{BS, CAR, NL, TAB};
 use crate::mbyte::{utf_char2len, utf_printable, utf_slice2char, utf_slice2len};
@@ -1341,7 +1341,7 @@ fn encode_vim_with_backend(
     top_tv: &mut TypVal,
     objname: &CStr,
 ) -> bool {
-    let copy_id = get_copy_id();
+    let copy_id = get_copy_id_for(top_tv);
     let mut mpstack: Vec<MPConvStackVal> = Vec::with_capacity(8);
 
     if !convert_one_value(backend, &mut mpstack, top_tv, copy_id, objname) {

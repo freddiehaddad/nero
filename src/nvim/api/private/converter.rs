@@ -9,7 +9,7 @@ use crate::eval::typval::{
     tv_list_append_owned_tv,
 };
 use crate::eval::userfunc::{FC_LUAREF, find_func, register_luafunc};
-use crate::eval::{get_copy_id, partial_name};
+use crate::eval::{get_copy_id_for, partial_name};
 use crate::lua::converter::LUA_NOREF;
 use crate::lua::executor::api_new_luaref;
 
@@ -174,7 +174,7 @@ fn pop_into_parent_dict(stack: &mut Vec<Object>) {
 
 /// Recursively convert a Vimscript `TypVal` into an API `Object` (`vim_to_object`).
 pub fn vim_to_object(obj: &TypVal) -> Object {
-    let copy_id = get_copy_id();
+    let copy_id = get_copy_id_for(obj);
     let mut stack: Vec<Object> = Vec::with_capacity(4);
     let mut mpstack: Vec<ConvStackEntry> = Vec::new();
 

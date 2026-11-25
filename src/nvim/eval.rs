@@ -4102,6 +4102,19 @@ pub fn get_copy_id() -> i32 {
     next_copy_id
 }
 
+/// Get a copy ID for traversing `tv`. Only containers are traversed, so a
+/// scalar doesn't consume one and gets 0.
+pub fn get_copy_id_for(tv: &TypVal) -> i32 {
+    if matches!(
+        tv.var_type(),
+        VarType::VarList | VarType::VarDict | VarType::VarPartial
+    ) {
+        get_copy_id()
+    } else {
+        0
+    }
+}
+
 /// Do garbage collection for lists and dicts.
 pub fn garbage_collect(testing: bool) -> bool {
     let mut abort = false;

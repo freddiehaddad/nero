@@ -22,7 +22,8 @@ use crate::eval::vars::{
 };
 use crate::eval::{
     DICT_MAXNEST, K_LIST_LEN_MAY_KNOW_CONST, STR2NR_ALL, callback_call, callback_from_typval,
-    func_equal, get_copy_id, partial_name, partial_unref, set_selfdict, var_item_copy, var2fpos,
+    func_equal, get_copy_id_for, partial_name, partial_unref, set_selfdict, var_item_copy,
+    var2fpos,
 };
 use crate::globals::*;
 use crate::hashtab::{Hashitem, hash_add, hash_lock, hash_remove, hash_unlock};
@@ -4827,7 +4828,7 @@ fn nothing_convert_one_value(
 }
 
 fn encode_vim_to_nothing(top_tv: &mut TypVal) -> bool {
-    let copy_id = get_copy_id();
+    let copy_id = get_copy_id_for(top_tv);
 
     let mut mpstack: Vec<MPConvStackVal> = Vec::new();
     if !nothing_convert_one_value(&mut mpstack, top_tv, copy_id) {
@@ -6075,6 +6076,55 @@ mod tests {
                 tv_clear(&mut tv_d);
                 assert!(tv_d.value.list().is_null());
             }
+        }
+    }
+
+    #[test]
+    fn tv_clear_consumes_a_copy_id_only_for_containers() {
+        let _guard = crate::globals::TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _editor = crate::main_init::test_editor();
+
+        let mut cases: Vec<(TypVal, bool)> = [
+            TvValue::Null,
+            TvValue::Number(0),
+            TvValue::Bool(true),
+            TvValue::from_cstr(c"true"),
+            TvValue::from_cstr(c"FunctionName").into_funcref(),
+        ]
+        .into_iter()
+        .map(|value| {
+            let tv = TypVal {
+                v_lock: VAR_UNLOCKED,
+                value,
+            };
+            (tv, false)
+        })
+        .collect();
+        let mut blob = tv_initial_value();
+        tv_blob_alloc_ret(&mut blob);
+        cases.push((blob, false));
+        let mut list = tv_initial_value();
+        tv_list_alloc_ret(&mut list, 1);
+        tv_list_append_number(list.value.list_ref(), 1);
+        cases.push((list, true));
+        let mut dict = tv_initial_value();
+        tv_dict_alloc_ret(&mut dict);
+        assert!(tv_dict_add_nr(dict.value.dict_ref(), c"a", 1));
+        cases.push((dict, true));
+
+        for (mut tv, container) in cases {
+            let copy_id = crate::eval::get_copy_id();
+            tv_clear(&mut tv);
+            // Each get_copy_id() probe consumes one as well.
+            let consumed = if container { 2 } else { 1 };
+            assert_eq!(
+                crate::eval::get_copy_id(),
+                copy_id.wrapping_add(consumed * crate::eval::COPYID_INC),
+                "{:?}",
+                tv.var_type(),
+            );
         }
     }
 
