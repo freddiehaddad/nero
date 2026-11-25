@@ -382,6 +382,34 @@ describe('server', function()
     client:close()
   end)
 
+  it(':connect completes targets and labels detached SSH sessions', function()
+    clear()
+    n.exec_lua(function()
+      vim.fn.serverlist = function()
+        return {
+          { addr = 'nvim.own', own = true, active = 0 },
+          { addr = 'nvim-ssh.host1.abcd', own = false, active = 0 },
+        }
+      end
+      require('vim.net._ssh').get_hosts = function()
+        return { 'host1', 'host2' }
+      end
+      vim.ui.select = function(addrs, opts)
+        _G.menu = vim.tbl_map(opts.format_item, addrs)
+      end
+    end)
+
+    eq({ 'ssh://host1', 'ssh://host2' }, fn.getcompletion('connect ssh://', 'cmdline'))
+    eq({ 'nvim-ssh.host1.abcd' }, fn.getcompletion('connect nvim-ssh.', 'cmdline'))
+    eq({}, fn.getcompletion('connect nvim.own', 'cmdline'))
+    n.exec_lua([[require('vim._core.server').select_connect()]])
+    eq({
+      'nvim-ssh.host1.abcd  ? (detached, ssh://host1)',
+      'ssh://host1',
+      'ssh://host2',
+    }, n.exec_lua('return _G.menu'))
+  end)
+
   it('v:useractive advances on UI input', function()
     clear()
     local before = eval('v:useractive')

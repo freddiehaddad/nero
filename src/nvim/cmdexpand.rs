@@ -1768,6 +1768,7 @@ pub const EXPAND_LOG: i32 = 65;
 pub const EXPAND_PACKDEL: i32 = 66;
 pub const EXPAND_PACKUPDATE: i32 = 67;
 pub const EXPAND_MARKS: i32 = 68;
+pub const EXPAND_CONNECT: i32 = 69;
 
 pub(crate) const EX_NOTRLCOM: u32 = 0x800;
 
@@ -3130,6 +3131,7 @@ pub fn addstar(fname_slice: &[u8], context: i32) -> CString {
                 || context == EXPAND_PACKDEL
                 || context == EXPAND_PACKUPDATE
                 || context == EXPAND_MARKS
+                || context == EXPAND_CONNECT
                 || context == EXPAND_LUA
             {
                 bytes_to_cstring(fname_slice)
@@ -4096,6 +4098,9 @@ fn set_context_by_cmdname<'a>(
         Cmdidx::CmdPackupdate => {
             xp.xp_context = EXPAND_PACKUPDATE;
         }
+        Cmdidx::CmdConnect => {
+            xp.xp_context = EXPAND_CONNECT;
+        }
         Cmdidx::CmdRetab => {
             xp.xp_context = EXPAND_RETAB;
             xp.xp_pattern = arg;
@@ -4628,12 +4633,24 @@ fn get_arg1_from_lua<'a>(
 }
 
 fn get_marks_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
-    get_arg1_from_lua(c"return require'vim._core.marks'.complete(...)", xp, idx)
+    get_arg1_from_lua(
+        c"return require'vim._core.marks'.complete_marks(...)",
+        xp,
+        idx,
+    )
+}
+
+fn get_connect_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
+    get_arg1_from_lua(
+        c"return require'vim._core.server'.complete_connect(...)",
+        xp,
+        idx,
+    )
 }
 
 fn get_log_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
     get_arg1_from_lua(
-        c"return require'vim._core.ex_cmd'.log_complete(...)",
+        c"return require'vim._core.ex_cmd'.complete_log(...)",
         xp,
         idx,
     )
@@ -4641,7 +4658,7 @@ fn get_log_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
 
 fn get_lsp_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
     get_arg1_from_lua(
-        c"return require'vim._core.ex_cmd'.lsp_complete(...)",
+        c"return require'vim._core.ex_cmd'.complete_lsp(...)",
         xp,
         idx,
     )
@@ -4649,7 +4666,7 @@ fn get_lsp_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
 
 fn get_packdel_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
     get_arg1_from_lua(
-        c"return require'vim._core.ex_cmd'.packdel_complete(...)",
+        c"return require'vim._core.ex_cmd'.complete_packdel(...)",
         xp,
         idx,
     )
@@ -4657,7 +4674,7 @@ fn get_packdel_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
 
 fn get_packupdate_arg(xp: &mut ExpandCtx, idx: i32) -> Option<&CStr> {
     get_arg1_from_lua(
-        c"return require'vim._core.ex_cmd'.packupdate_complete(...)",
+        c"return require'vim._core.ex_cmd'.complete_packupdate(...)",
         xp,
         idx,
     )
@@ -4873,6 +4890,12 @@ fn expand_other(
         ExpGen {
             context: EXPAND_MARKS,
             func: get_marks_arg,
+            ic: true,
+            escaped: false,
+        },
+        ExpGen {
+            context: EXPAND_CONNECT,
+            func: get_connect_arg,
             ic: true,
             escaped: false,
         },
