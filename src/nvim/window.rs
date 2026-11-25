@@ -8126,7 +8126,7 @@ pub fn command_height() {
         .set(screen_state().rows_global.get() - opt_vars().p_ch.get() as i32);
     cmdline_state().redraw_cmdline.set(true);
 
-    if msg_state().msg_scrolled.get() == 0 {
+    if msg_state().msg_scrolled.get() == 0 && starting_val() != crate::api::ui::NO_SCREEN {
         let grid = if !ui_has(K_UIMESSAGES) {
             msg_grid_validate();
             &msg_state().msg_grid_adj
