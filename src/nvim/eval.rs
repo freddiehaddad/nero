@@ -45,6 +45,7 @@ pub mod decode;
 pub mod deprecated;
 pub mod encode;
 pub mod executor;
+pub(crate) mod expr_tree;
 pub mod fs;
 pub mod funcs;
 pub mod gc;

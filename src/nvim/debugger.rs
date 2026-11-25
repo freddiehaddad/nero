@@ -419,6 +419,19 @@ pub fn ex_debug(eap: &mut Exarg) {
     exc_state().debug_break_level.set(save);
 }
 
+/// Whether `dbg_check_breakpoint()` would do nothing for a command at
+/// `ex_nesting_level` `level` but clear the skipped flag: no breakpoint was
+/// reached and no step is pending.
+pub(crate) fn dbg_quiet(level: i32) -> bool {
+    DBG_STATE.with(|st| st.debug_breakpoint_name.borrow().is_none())
+        && level > exc_state().debug_break_level.get()
+}
+
+/// What `dbg_check_breakpoint()` does when `dbg_quiet()`.
+pub(crate) fn dbg_clear_skipped() {
+    DBG_STATE.with(|st| st.debug_skipped.set(false));
+}
+
 /// Check if a breakpoint or debug break level was hit (`dbg_check_breakpoint`).
 pub fn dbg_check_breakpoint(eap: &mut Exarg) {
     DBG_STATE.with(|st| st.debug_skipped.set(false));

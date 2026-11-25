@@ -273,6 +273,11 @@ impl SourceCookie {
             },
         }
     }
+
+    /// Whether the script ran `:finish`.
+    pub(crate) const fn finished(&self) -> bool {
+        self.finished
+    }
 }
 
 #[derive(Clone)]

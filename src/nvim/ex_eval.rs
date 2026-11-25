@@ -210,7 +210,7 @@ pub fn exc_state() -> &'static ExceptionGlobalState {
     EXC_GLOBAL_STATE.with(|s| *s)
 }
 
-const CSTACK_LEN: usize = 50;
+pub(crate) const CSTACK_LEN: usize = 50;
 
 pub const CSF_TRUE: i32 = 0x0001;
 pub const CSF_ACTIVE: i32 = 0x0002;
@@ -372,7 +372,7 @@ std::thread_local! {
 }
 
 #[inline]
-fn check_skip(cstack: &Cstack) -> bool {
+pub(crate) fn check_skip(cstack: &Cstack) -> bool {
     msg_state().did_emsg.get() != 0
         || input_state().got_int.get()
         || exc_state().did_throw.get()

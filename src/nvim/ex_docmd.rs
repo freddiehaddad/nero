@@ -2,6 +2,8 @@
 
 //! Functions for executing an Ex command line (`src/nvim/ex_docmd.c`).
 
+mod parsed_lines;
+
 use crate::api::command::is_user_cmdidx;
 #[cfg(windows)]
 use crate::api::private::helpers::api_free_object;
@@ -678,6 +680,8 @@ thread_local! {
 struct Wcmd {
     line: std::ffi::CString,
     lnum: Linenr,
+    /// The line parsed for `parsed_lines` when the loop repeats.
+    parsed: std::cell::OnceCell<parsed_lines::Parsed>,
 }
 
 pub struct LoopCookie {
@@ -5098,9 +5102,11 @@ pub fn do_cmdline(cmdline: Option<&[u8]>, fgetline: LineGetter, flags: i32) -> b
                 msg_state().did_emsg.set(0);
             }
 
+            let mut replaying = false;
             if cstack.cs_looplevel > 0
                 && (current_line as usize) < cmd_loop_cookie.borrow().lines.len()
             {
+                replaying = true;
                 cmdline_buf.clear();
 
                 if let Some(ref fcp) = fgetline.as_func() {
@@ -5275,7 +5281,33 @@ pub fn do_cmdline(cmdline: Option<&[u8]>, fgetline: LineGetter, flags: i32) -> b
             }
 
             RECURSIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let has_next = do_one_cmd(&mut cmdline_buf, flags, &mut cstack, cmd_getline);
+            let ran = if replaying {
+                parsed_lines::run(parsed_lines::Run {
+                    cstack: &mut cstack,
+                    cookie: &cmd_loop_cookie,
+                    current_line: &mut current_line,
+                    count: &mut count,
+                    cmdline_buf: &mut cmdline_buf,
+                    fgetline: &fgetline,
+                })
+            } else {
+                None
+            };
+            let has_next = match ran {
+                Some(parsed_lines::Ran::After { has_next }) => has_next,
+                Some(parsed_lines::Ran::Before { has_next }) => {
+                    RECURSIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    if has_next {
+                        has_cmdline_copy = true;
+                        next_cmdline = Some(b"");
+                    } else {
+                        next_cmdline = None;
+                        has_cmdline_copy = false;
+                    }
+                    continue;
+                }
+                None => do_one_cmd(&mut cmdline_buf, flags, &mut cstack, cmd_getline),
+            };
             RECURSIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             if using_loop_cookie {
@@ -5631,6 +5663,7 @@ fn store_loop_line(lines: &mut Vec<Wcmd>, line: &CStr) {
     lines.push(Wcmd {
         line: line.to_owned(),
         lnum: sourcing_lnum(),
+        parsed: std::cell::OnceCell::new(),
     });
 }
 
@@ -6797,17 +6830,7 @@ fn do_one_cmd(
             break 'doend;
         }
 
-        if exc_state().need_rethrow.get() {
-            do_throw(ea.cstack_mut());
-        } else if DOCMD_STATE.with(|s| s.check_cstack.get()) {
-            if source_finished(&fgetline) {
-                do_finish(&mut ea, true);
-            } else if fgetline.is_func() && current_func_returned() != 0 {
-                let _ = do_return(&mut ea, true, false, None);
-            }
-        }
-        exc_state().need_rethrow.set(false);
-        DOCMD_STATE.with(|s| s.check_cstack.set(false));
+        after_command(&mut ea, &fgetline);
     }
 
     *cstack = ea.cstack.take().unwrap();
@@ -6861,6 +6884,23 @@ fn do_one_cmd(
         *cmdline_buf = buf;
         true
     }
+}
+
+/// What `do_one_cmd()` does after running a command: throw the exception that
+/// a nested `do_cmdline()` left to rethrow, or redo the `:finish` or `:return`
+/// it left `check_cstack` set for.
+fn after_command(eap: &mut Exarg, fgetline: &LineGetter) {
+    if exc_state().need_rethrow.get() {
+        do_throw(eap.cstack_mut());
+    } else if DOCMD_STATE.with(|s| s.check_cstack.get()) {
+        if source_finished(fgetline) {
+            do_finish(eap, true);
+        } else if fgetline.is_func() && current_func_returned() != 0 {
+            let _ = do_return(eap, true, false, None);
+        }
+    }
+    exc_state().need_rethrow.set(false);
+    DOCMD_STATE.with(|s| s.check_cstack.set(false));
 }
 
 fn ex_range_without_command(eap: &mut Exarg) -> Option<std::borrow::Cow<'static, std::ffi::CStr>> {
