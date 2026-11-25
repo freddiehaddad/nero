@@ -4694,7 +4694,7 @@ fn expand_other(
         escaped: bool,
     }
 
-    let tab: [ExpGen; 37] = [
+    let tab = [
         ExpGen {
             context: EXPAND_COMMANDS,
             func: get_command_name,
