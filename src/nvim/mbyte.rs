@@ -2557,7 +2557,11 @@ pub fn utf_cluster_info_impl<'a>(base: StrCharInfo<'a>, max_len: &mut i32) -> Cl
         (
             ascii2cells(base.chr.value),
             false,
-            UTF8PROC_BOUNDCLASS_OTHER,
+            if (0x20..0x7f).contains(&base.chr.value) {
+                UTF8PROC_BOUNDCLASS_OTHER
+            } else {
+                utf8proc_get_property(base.chr.value).boundclass()
+            },
             0,
         )
     } else {
@@ -3575,6 +3579,24 @@ pub fn mb_strcmp_ic(ic: bool, s1: &[u8], s2: &[u8]) -> i32 {
 mod tests {
     use super::*;
     use crate::grid::schar_get;
+
+    #[test]
+    fn ascii_controls_end_grapheme_clusters() {
+        let _editor = crate::main_init::test_editor();
+        for byte in (1..=31).chain(std::iter::once(127)) {
+            let bytes = [byte, 0xcc, 0x80];
+            let ci = utf_slice2_str_char_info(&bytes);
+            assert_eq!(utf_cluster_info(ci).next.offset_from(&bytes), 1);
+
+            let mut len = bytes.len() as i32;
+            let ci = utf_ptr2_str_char_info_len(&bytes, len);
+            assert_eq!(
+                utf_cluster_info_len(ci, &mut len).next.offset_from(&bytes),
+                1
+            );
+            assert_eq!(len, 2);
+        }
+    }
 
     #[test]
     fn utf8_char_encoding_and_bounds_work() {
