@@ -2968,7 +2968,9 @@ pub fn find_script_by_name(name: &std::ffi::CStr) -> Option<i32> {
 /// ":scriptnames"
 pub fn ex_scriptnames(eap: &mut Exarg) {
     if eap.addr_count > 0 || !eap.arg.is_empty() {
-        if eap.addr_count > 0 && !script_id_valid(eap.line2) {
+        if eap.addr_count > 0
+            && (!script_id_valid(eap.line2) || script_item_name(eap.line2).is_none())
+        {
             emsg(gettext(E_INVARG));
         } else {
             if eap.addr_count > 0 {
