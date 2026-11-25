@@ -1757,16 +1757,16 @@ pub fn do_window(mut nchar: i32, mut prenum: i32, mut xchar: i32) {
             }
         }
         c if c == b'j' as i32 || c == K_DOWN || c == CTRL_J_CONST => {
-            win_goto_ver(false, prenum1);
+            win_goto_neighbor(NeighborDir::Down, prenum1);
         }
         c if c == b'k' as i32 || c == K_UP || c == CTRL_K_CONST => {
-            win_goto_ver(true, prenum1);
+            win_goto_neighbor(NeighborDir::Up, prenum1);
         }
         c if c == b'h' as i32 || c == K_LEFT || c == CTRL_H_CONST || c == K_BS => {
-            win_goto_hor(true, prenum1);
+            win_goto_neighbor(NeighborDir::Left, prenum1);
         }
         c if c == b'l' as i32 || c == K_RIGHT || c == CTRL_L_CONST => {
-            win_goto_hor(false, prenum1);
+            win_goto_neighbor(NeighborDir::Right, prenum1);
         }
         c if c == b'T' as i32 => {
             if one_window(&curwin(), None) {
@@ -6176,28 +6176,69 @@ fn win_float_neighbor(tp: &TabPageInfo) -> Option<crate::globals::WinPtr> {
     (!res.is_null()).then_some(res)
 }
 
-pub fn win_vert_neighbor(
+/// Direction of a neighbor window, named after its `CTRL-W` key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NeighborDir {
+    /// `h`: to the left.
+    Left,
+    /// `j`: below.
+    Down,
+    /// `k`: above.
+    Up,
+    /// `l`: to the right.
+    Right,
+}
+
+impl NeighborDir {
+    /// The direction for an `h`, `j`, `k` or `l` key.
+    pub fn from_key(key: u8) -> Option<Self> {
+        match key {
+            b'h' => Some(Self::Left),
+            b'j' => Some(Self::Down),
+            b'k' => Some(Self::Up),
+            b'l' => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+/// Get the above/below or left/right neighbor window of the specified window.
+///
+/// Returns the specified window if the neighbor is not found.
+/// Returns the previous window if the specified window is a floating window.
+///
+/// @param count  nth neighbor window
+pub fn win_neighbor(
     tp: &TabPageInfo,
     wp: &WinInfoInfo,
-    up: bool,
+    dir: NeighborDir,
     mut count: i32,
 ) -> Option<crate::globals::WinPtr> {
     if wp.w_floating.get() {
         return win_float_neighbor(tp);
     }
 
+    let vert = matches!(dir, NeighborDir::Down | NeighborDir::Up);
+    let back = matches!(dir, NeighborDir::Up | NeighborDir::Left);
+    let layout = if vert { FR_COL } else { FR_ROW };
+    let pos = if vert {
+        wp.w_wincol.get() + wp.w_wcol.get()
+    } else {
+        wp.w_winrow.get() + wp.w_wrow.get()
+    };
     let mut foundfr = wp.frame();
 
     'outer: while count > 0 {
         count -= 1;
         let mut nfr: crate::globals::FramePtr;
+        // First go upwards in the tree of frames until we find a neighbor.
         let mut fr = foundfr.clone();
         loop {
             if tp.tp_topframe.get() == fr {
                 break 'outer;
             }
-            let cand = if up { fr.prev_opt() } else { fr.next_opt() };
-            if fr.parent().fr_layout.get() == FR_COL
+            let cand = if back { fr.prev_opt() } else { fr.next_opt() };
+            if fr.parent().fr_layout.get() == layout
                 && let Some(c) = cand
             {
                 nfr = c;
@@ -6206,21 +6247,27 @@ pub fn win_vert_neighbor(
             fr = fr.parent();
         }
 
+        // Now go downwards to find the first or last frame in it.
         loop {
             if nfr.fr_layout.get() == FR_LEAF {
                 foundfr = nfr;
                 break;
             }
             fr = nfr.child();
-            if nfr.fr_layout.get() == FR_ROW {
-                while frame2win(&fr).w_wincol.get() + fr.fr_width.get()
-                    <= wp.w_wincol.get() + wp.w_wcol.get()
-                    && let Some(next) = fr.next_opt()
-                {
+            if nfr.fr_layout.get() != layout {
+                // Find the frame at the cursor position.
+                while let Some(next) = fr.next_opt() {
+                    let edge = if vert {
+                        frame2win(&fr).w_wincol.get() + fr.fr_width.get()
+                    } else {
+                        frame2win(&fr).w_winrow.get() + fr.fr_height.get()
+                    };
+                    if edge > pos {
+                        break;
+                    }
                     fr = next;
                 }
-            }
-            if nfr.fr_layout.get() == FR_COL && up {
+            } else if back {
                 while let Some(next) = fr.next_opt() {
                     fr = next;
                 }
@@ -6232,70 +6279,9 @@ pub fn win_vert_neighbor(
     (!w.is_null()).then_some(w)
 }
 
-fn win_goto_ver(up: bool, count: i32) {
-    if let Some(win) = win_vert_neighbor(&curtab(), &curwin(), up, count) {
-        win_goto(&win);
-    }
-}
-
-pub fn win_horz_neighbor(
-    tp: &TabPageInfo,
-    wp: &WinInfoInfo,
-    left: bool,
-    mut count: i32,
-) -> Option<crate::globals::WinPtr> {
-    if wp.w_floating.get() {
-        return win_float_neighbor(tp);
-    }
-
-    let mut foundfr = wp.frame();
-
-    'outer: while count > 0 {
-        count -= 1;
-        let mut nfr: crate::globals::FramePtr;
-        let mut fr = foundfr.clone();
-        loop {
-            if tp.tp_topframe.get() == fr {
-                break 'outer;
-            }
-            let cand = if left { fr.prev_opt() } else { fr.next_opt() };
-            if fr.parent().fr_layout.get() == FR_ROW
-                && let Some(c) = cand
-            {
-                nfr = c;
-                break;
-            }
-            fr = fr.parent();
-        }
-
-        loop {
-            if nfr.fr_layout.get() == FR_LEAF {
-                foundfr = nfr;
-                break;
-            }
-            fr = nfr.child();
-            if nfr.fr_layout.get() == FR_COL {
-                while frame2win(&fr).w_winrow.get() + fr.fr_height.get()
-                    <= wp.w_winrow.get() + wp.w_wrow.get()
-                    && let Some(next) = fr.next_opt()
-                {
-                    fr = next;
-                }
-            }
-            if nfr.fr_layout.get() == FR_ROW && left {
-                while let Some(next) = fr.next_opt() {
-                    fr = next;
-                }
-            }
-            nfr = fr;
-        }
-    }
-    let w = foundfr.fr_win.get();
-    (!w.is_null()).then_some(w)
-}
-
-fn win_goto_hor(left: bool, count: i32) {
-    if let Some(win) = win_horz_neighbor(&curtab(), &curwin(), left, count) {
+/// Move to window above/below or left/right "count" times.
+fn win_goto_neighbor(dir: NeighborDir, count: i32) {
+    if let Some(win) = win_neighbor(&curtab(), &curwin(), dir, count) {
         win_goto(&win);
     }
 }

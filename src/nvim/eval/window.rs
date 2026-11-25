@@ -25,10 +25,10 @@ use crate::msgpack_rpc::packer::ObjHandle;
 use crate::normal::end_visual_mode;
 use crate::strings::gettext;
 use crate::window::{
-    Frame, LOWEST_WIN_ID, TabPageInfo, WSP_ABOVE, WSP_BELOW, WSP_VERT, WinInfoInfo,
+    Frame, LOWEST_WIN_ID, NeighborDir, TabPageInfo, WSP_ABOVE, WSP_BELOW, WSP_VERT, WinInfoInfo,
     check_split_disallowed, find_tabpage, goto_tabpage_win, tabpage_index, valid_tabpage,
-    win_drag_status_line, win_drag_vsep_line, win_get_tabwin, win_goto, win_horz_neighbor,
-    win_is_focusable, win_splitmove, win_valid, win_vert_neighbor,
+    win_drag_status_line, win_drag_vsep_line, win_get_tabwin, win_goto, win_is_focusable,
+    win_neighbor, win_splitmove, win_valid,
 };
 use std::ffi::CStr;
 use std::fmt::Write as _;
@@ -325,28 +325,11 @@ fn get_winnr(tp: &TabPageInfo, argvar: &mut TypVal) -> i32 {
                 if count <= 0 {
                     count = 1;
                 }
-                if !rem.is_empty() {
-                    let tail = rem;
-                    let twin_ref = twin.borrow();
-                    if tail == b"j" {
-                        twin = crate::globals::WinPtr::from(win_vert_neighbor(
-                            tp, twin_ref, false, count,
-                        ));
-                    } else if tail == b"k" {
-                        twin = crate::globals::WinPtr::from(win_vert_neighbor(
-                            tp, twin_ref, true, count,
-                        ));
-                    } else if tail == b"h" {
-                        twin = crate::globals::WinPtr::from(win_horz_neighbor(
-                            tp, twin_ref, true, count,
-                        ));
-                    } else if tail == b"l" {
-                        twin = crate::globals::WinPtr::from(win_horz_neighbor(
-                            tp, twin_ref, false, count,
-                        ));
-                    } else {
-                        invalid_arg = true;
-                    }
+                if let [key] = rem
+                    && let Some(dir) = NeighborDir::from_key(*key)
+                {
+                    twin =
+                        crate::globals::WinPtr::from(win_neighbor(tp, twin.borrow(), dir, count));
                 } else {
                     invalid_arg = true;
                 }
