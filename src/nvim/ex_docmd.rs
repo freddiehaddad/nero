@@ -10538,7 +10538,9 @@ fn ex_connect(eap: &mut Exarg) {
     }
 
     ex_detach(&mut crate::ex_docmd::Exarg::new());
-    if stop_server {
+    // `stop_server` was decided before connecting; socket_alive() and relink() ran the event loop
+    // meanwhile, so re-check unsaved changes before getout().
+    if stop_server && !check_changed_any(false, false) {
         exc_state().exiting.set(true);
         getout(0);
     }
