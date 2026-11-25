@@ -3063,7 +3063,7 @@ pub fn set_curbuf(buf_in: &FileBuf, action: i32, update_jumplist: bool) {
                 && ((edit_state().state_global.get() & MODE_INSERT) == 0
                     || curbuf().b_nwindows.get() <= 1)
             {
-                u_sync(false);
+                u_sync(&curbuf(), false);
             }
             close_buffer(
                 curwin().opt(),

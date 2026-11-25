@@ -6330,7 +6330,7 @@ fn win_enter_ext(wp_in: &WinInfoInfo, flags: i32) {
 
     let wp = wp.borrow();
     if (flags & WEE_UNDO_SYNC) != 0 && workspace_state().curbuf.get() != wp.w_buffer.get() {
-        u_sync(false);
+        u_sync(&curbuf(), false);
     }
 
     if opt_vars().p_spk.first_byte() == b'c' && !curwin_invalid {

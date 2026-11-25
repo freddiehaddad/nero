@@ -209,7 +209,7 @@ fn set_buffer_lines(
 
         if edit_state().u_sync_once.get() == 2 {
             edit_state().u_sync_once.set(1);
-            u_sync(true);
+            u_sync(&curbuf(), true);
         }
 
         if !append && lnum <= curbuf().b_ml.ml_line_count.get() {
@@ -662,7 +662,7 @@ pub fn f_deletebufline(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFu
 
     if edit_state().u_sync_once.get() == 2 {
         edit_state().u_sync_once.set(1);
-        u_sync(true);
+        u_sync(&curbuf(), true);
     }
 
     if u_save(first - 1, last + 1) {

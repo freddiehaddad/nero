@@ -3317,7 +3317,7 @@ fn cmdpreview_prepare() -> CpInfo {
     cmdline_state().set_cmod_tab(0);
     cmdline_state().add_cmod_flags(CMOD_NOSWAPFILE);
 
-    u_sync(true);
+    u_sync(&curbuf(), true);
     cpinfo
 }
 

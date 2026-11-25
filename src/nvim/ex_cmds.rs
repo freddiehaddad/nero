@@ -2803,7 +2803,7 @@ pub fn do_ecmd(
                     // The window-local syntax does not apply to the new buffer.
                     crate::syntax::reset_synblock(&curwin());
 
-                    u_sync(false);
+                    u_sync(&curbuf(), false);
                     close_buffer(
                         curwin().opt(),
                         workspace_state().curbuf.get().opt(),
@@ -2911,7 +2911,7 @@ pub fn do_ecmd(
                 && (opt_vars().p_ur.get() < 0
                     || (curbuf().b_ml.ml_line_count.get() as OptInt) <= opt_vars().p_ur.get())
             {
-                u_sync(false);
+                u_sync(&curbuf(), false);
                 if !u_savecommon(&curbuf(), 0, curbuf().b_ml.ml_line_count.get() + 1, 0, true) {
                     break 'theend;
                 }

@@ -3447,7 +3447,7 @@ pub fn buf_reload(buf: &FileBuf, orig_mode: i32, reload_options: bool) {
     if opt_vars().p_ur.get() < 0
         || i64::from(curbuf().b_ml.ml_line_count.get()) <= opt_vars().p_ur.get()
     {
-        u_sync(false);
+        u_sync(&curbuf(), false);
         saved = u_savecommon(&curbuf(), 0, curbuf().b_ml.ml_line_count.get() + 1, 0, true);
         flags |= READ_KEEP_UNDO;
     }

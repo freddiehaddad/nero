@@ -1157,7 +1157,7 @@ pub fn u_write_undo(
             break 'theend;
         };
 
-        u_sync(true);
+        u_sync(&curbuf(), true);
 
         let mut write_ok = false;
         let mut bi = Bufinfo {
@@ -1662,7 +1662,7 @@ fn undo_read_string(bi: &mut Bufinfo, len: usize) -> Option<std::ffi::CString> {
 /// Undo `count` times.
 pub fn u_undo(mut count: i32) {
     if !curbuf().b_u_synced.get() {
-        u_sync(true);
+        u_sync(&curbuf(), true);
         count = 1;
     }
 
@@ -1686,7 +1686,7 @@ pub fn u_redo(count: i32) {
 /// Undo and remove the branch from the undo tree.
 pub fn u_undo_and_forget(mut count: i32, do_buf_event: bool) -> bool {
     if !curbuf().b_u_synced.get() {
-        u_sync(true);
+        u_sync(&curbuf(), true);
         count = 1;
     }
     undo_st(|st| st.undo_undoes.set(true));
@@ -1777,7 +1777,7 @@ pub fn undo_time(step: i32, sec: bool, file: bool, absolute: bool) {
     mc_undo_time();
 
     if !curbuf().b_u_synced.get() {
-        u_sync(true);
+        u_sync(&curbuf(), true);
     }
 
     let empty = (curbuf().b_ml.ml_flags.get() & ML_EMPTY) != 0;
@@ -2462,17 +2462,17 @@ pub fn undo_fmt_time(buf: &mut [u8], tt: time_t) {
     }
 }
 
-/// `u_sync`: stop adding to the current entry list.
-pub fn u_sync(force: bool) {
-    if curbuf().b_u_synced.get() || (!force && edit_state().no_u_sync.get() > 0) {
+/// Stop adding to the current entry list of `buf`.
+pub fn u_sync(buf: &FileBuf, force: bool) {
+    if buf.b_u_synced.get() || (!force && edit_state().no_u_sync.get() > 0) {
         return;
     }
 
-    if get_undolevel(&curbuf()) < 0 {
-        curbuf().b_u_synced.set(true);
+    if get_undolevel(buf) < 0 {
+        buf.b_u_synced.set(true);
     } else {
-        u_getbot(&curbuf());
-        curbuf().b_u_curhead.set(None);
+        u_getbot(buf);
+        buf.b_u_curhead.set(None);
     }
 }
 
@@ -3108,7 +3108,7 @@ pub fn u_rollback(uc: &mut UndoCheckpoint, buf: &FileBuf) {
         let mut cs: CtxSwitch = CtxSwitch::new();
         ctx_switch(&mut cs, None, None, Some(buf), 0);
         if !curbuf().b_u_synced.get() {
-            u_sync(true);
+            u_sync(&curbuf(), true);
         }
         let save_ma = buf.b_p_ma.replace(true); // |:command-preview| may set 'nomodifiable'. #42893
         let ok = u_undo_and_forget(count, false);

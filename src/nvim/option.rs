@@ -3178,7 +3178,11 @@ pub fn did_set_undofile<'a>(args: &mut Optset<'a>) -> Option<&'a CStr> {
 /// Process the new global 'undolevels' option value.
 pub fn did_set_global_undolevels(value: OptInt, old_value: OptInt) -> Option<&'static CStr> {
     opt_vars().p_ul.set(old_value);
-    u_sync(true);
+    for buf in for_all_buffers_ptr() {
+        if buf == curbuf() || buf.b_p_ul.get() == NO_LOCAL_UNDOLEVEL {
+            u_sync(&buf, true);
+        }
+    }
     opt_vars().p_ul.set(value);
     None
 }
@@ -3190,7 +3194,7 @@ pub fn did_set_buflocal_undolevels(
     old_value: OptInt,
 ) -> Option<&'static CStr> {
     buf.b_p_ul.set(old_value);
-    u_sync(true);
+    u_sync(buf, true);
     buf.b_p_ul.set(value);
     None
 }

@@ -1474,7 +1474,7 @@ pub fn may_sync_undo() {
         || edit_state().ins_global.moved.get() != K_INS_NONE)
         && INP_STATE.with(|s| s.curscript.get()) < 0
     {
-        u_sync(false);
+        u_sync(&curbuf(), false);
     }
 }
 

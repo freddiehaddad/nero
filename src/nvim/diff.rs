@@ -3280,7 +3280,7 @@ pub fn ex_diffgetput(eap: &mut Exarg) {
         );
         if eap.cmdidx != Cmdidx::CmdDiffget {
             if input_state().key_typed.get() {
-                u_sync(false);
+                u_sync(&curbuf(), false);
             }
             ctx_restore(&mut aco);
         }

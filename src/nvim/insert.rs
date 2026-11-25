@@ -2838,7 +2838,7 @@ fn ins_ctrl_g() {
         K_DOWN | CTRL_J_CONST => ins_down(true),
         c if c == b'j' as i32 => ins_down(true),
         c if c == b'u' as i32 => {
-            u_sync(true);
+            u_sync(&curbuf(), true);
             edit_state().ins_global.need_undo.set(true);
             edit_state().ins_global.update_start_orig.set(false);
             edit_state().ins_global.start.set(curwin().w_cursor.get());
