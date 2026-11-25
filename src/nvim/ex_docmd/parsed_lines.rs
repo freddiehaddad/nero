@@ -1,6 +1,7 @@
 //! Runs Ex command lines that run again and again from statements parsed once:
-//! the lines of a `:while` or `:for` loop as it repeats, instead of passing
-//! each one to `do_one_cmd()` and its expression to `eval0()`.
+//! the lines of a `:while` or `:for` loop as it repeats and the lines of a
+//! function, instead of passing each one to `do_one_cmd()` and its expression
+//! to `eval0()`.
 //!
 //! A run takes the steps that `do_cmdline()` and `do_one_cmd()` take for a
 //! line when nothing unusual is going on. It stops after a line that ends with
@@ -10,12 +11,12 @@
 //! compare both ways.
 //!
 //! The statements mirror `ex_let()`, `ex_if()`, `ex_else()`, `ex_endif()`,
-//! `ex_while()`, `ex_endwhile()`, `ex_continue()` and `ex_break()`; MAINTAIN.md
-//! lists what a change to those, to `do_cmdline()` or to `do_one_cmd()` needs
-//! here.
+//! `ex_while()`, `ex_endwhile()`, `ex_continue()`, `ex_break()` and
+//! `ex_return()`; MAINTAIN.md lists what a change to those, to `do_cmdline()`,
+//! to `do_one_cmd()` or to `get_func_line()` needs here.
 #![forbid(unsafe_code)]
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::rc::Rc;
@@ -26,12 +27,14 @@ use crate::debugger::{dbg_clear_skipped, dbg_quiet};
 use crate::eval::expr_tree::{Expr, is_simple_var};
 use crate::eval::next_for_item;
 use crate::eval::typval::{tv_clear, tv_get_number_chk};
+use crate::eval::userfunc::{UserFunc, do_return_in, get_current_funccal};
 use crate::eval::vars::{ex_let_vars, skip_var_list};
 use crate::ex_eval::{
     CSF_ACTIVE, CSF_ELSE, CSF_FOR, CSF_TRUE, CSF_TRY, CSF_WHILE, CSL_HAD_CONT, CSL_HAD_ENDLOOP,
-    CSL_HAD_LOOP, CSTACK_LEN, Cstack, check_skip, cleanup_conditionals, do_errthrow,
-    rewind_conditionals,
+    CSL_HAD_LOOP, CSTACK_LEN, Cstack, aborting, check_skip, cleanup_conditionals, do_errthrow,
+    rewind_conditionals, update_force_abort,
 };
+use crate::profile::Funccall;
 
 /// A line parsed once.
 pub(super) struct Line {
@@ -82,6 +85,10 @@ enum Stmt {
     },
     Continue,
     Break,
+    /// `:return` with its expression, if any, and the text from it on.
+    Return {
+        expr: Option<(Box<[u8]>, Expr)>,
+    },
 }
 
 /// Command flags that allow a command in the sandbox and when text or the
@@ -98,11 +105,23 @@ impl Stmt {
             | Self::If { .. }
             | Self::Elseif { .. }
             | Self::While { .. }
-            | Self::For { .. } => EX_EXTRA | EX_NOTRLCOM | RUN_OK,
+            | Self::For { .. }
+            | Self::Return { .. } => EX_EXTRA | EX_NOTRLCOM | RUN_OK,
             Self::Else | Self::Endif | Self::EndLoop { .. } | Self::Continue | Self::Break => {
                 EX_TRLBAR | RUN_OK
             }
         }
+    }
+}
+
+/// What was parsed of the lines of a function, kept with the function.
+#[derive(Default)]
+pub(crate) struct FuncLines(RefCell<Vec<OnceCell<Parsed>>>);
+
+impl FuncLines {
+    /// Drops what was parsed, for when the lines change.
+    pub(crate) fn clear(&self) {
+        self.0.borrow_mut().clear();
     }
 }
 
@@ -126,13 +145,34 @@ pub(super) struct Run<'a> {
     pub(super) fgetline: &'a LineGetter,
 }
 
+/// The state of `do_cmdline()` a function run uses.
+pub(super) struct FuncRun<'a> {
+    pub(super) cstack: &'a mut Box<Cstack>,
+    pub(super) cookie: &'a RefCell<LoopCookie>,
+    pub(super) count: &'a mut i32,
+    pub(super) cmdline_buf: &'a mut Vec<u8>,
+    pub(super) fgetline: &'a LineGetter,
+    pub(super) flags: i32,
+}
+
 /// How a statement left the run.
 enum Flow {
     /// Go on with the next line.
     Next,
-    /// `do_cmdline()` takes over after the line: it jumps or ends the loop, or
-    /// the line left something for `do_cmdline()` to handle, such as an error.
+    /// `do_cmdline()` takes over after the line: it jumps or ends the loop, a
+    /// `:return` waits for a `:finally`, or the line left something for
+    /// `do_cmdline()` to handle, such as an error.
     Stop,
+    /// `:return` returned, which leaves no next command.
+    Returned,
+}
+
+/// The command after `line` when it ran with `flow`.
+fn next_of<'a>(line: &'a Line, flow: &Flow) -> Option<&'a [u8]> {
+    match flow {
+        Flow::Returned => None,
+        _ => line.next.as_deref(),
+    }
 }
 
 thread_local! {
@@ -164,6 +204,8 @@ fn finish(saved: Saved) {
 
 /// Runs `line` with the steps of `do_one_cmd()` around it, and returns how it
 /// left the run.
+// As a call from both runs, it made loop lines up to 7% slower on Windows.
+#[inline(always)]
 fn step(line: &Line, cstack: &mut Box<Cstack>, fgetline: &LineGetter, level: i32) -> Flow {
     let save_reg_executing = input_state().reg_executing.get();
     let save_pending_end_reg_executing = input_state().pending_end_reg_executing.get();
@@ -269,10 +311,11 @@ pub(super) fn run(mut r: Run<'_>) -> Option<Ran> {
     let mut idx = *r.current_line;
     let ran = loop {
         let flow = step(&line, r.cstack, r.fgetline, level);
-        let has_next = line.next.is_some();
+        let next = next_of(&line, &flow);
+        let has_next = next.is_some();
         if !matches!(flow, Flow::Next) {
             r.cookie.borrow_mut().current_line = idx;
-            leave_next(r.cmdline_buf, line.next.as_deref());
+            leave_next(r.cmdline_buf, next);
             break Ran::After { has_next };
         }
 
@@ -291,7 +334,7 @@ pub(super) fn run(mut r: Run<'_>) -> Option<Ran> {
             Some(following) => line = following,
             None => {
                 *r.current_line = idx;
-                leave_next(r.cmdline_buf, line.next.as_deref());
+                leave_next(r.cmdline_buf, next);
                 break Ran::Before { has_next };
             }
         }
@@ -299,6 +342,90 @@ pub(super) fn run(mut r: Run<'_>) -> Option<Ran> {
 
     finish(saved);
     Some(ran)
+}
+
+/// Runs the lines of the function that `fgetline` gets lines from, from the
+/// one `do_cmdline()` has just got and taken the steps before `do_one_cmd()`
+/// for. Returns `None` when it runs none.
+pub(super) fn run_func(r: FuncRun<'_>) -> Option<Ran> {
+    let fcp = r.fgetline.as_func()?;
+    let fp = fcp.func_rc();
+    let level = exc_state().ex_nesting_level.get() + 1;
+    if !ENABLED.with(|e| *e)
+        || !quiet(level)
+        || (r.flags & DOCMD_KEEPLINE) != 0
+        || r.cstack.cs_looplevel != 0
+        || !r.cookie.borrow().lines.is_empty()
+    {
+        return None;
+    }
+    // Lines with a next command are left to do_one_cmd(), which knows how
+    // far an expression that fails gets.
+    let mut line = func_line_at(&fp, fcp.fc_linenr.get() - 1)?;
+    if line.next.is_some() || !can_run(&line, r.cstack) {
+        return None;
+    }
+    let saved = start(level);
+
+    let ran = loop {
+        if !matches!(step(&line, r.cstack, r.fgetline, level), Flow::Next) {
+            break Ran::After { has_next: false };
+        }
+
+        // do_cmdline() after the line, when nothing unusual happened, and
+        // get_func_line() for the next one.
+        if exc_state().trylevel.get() == 0 {
+            exc_state().force_abort.set(false);
+        }
+        match next_func_line(&fcp, &fp, r.cstack) {
+            Some(following) => {
+                exc_state().did_endif.set(false);
+                *r.count += 1;
+                line = following;
+            }
+            None => break Ran::Before { has_next: false },
+        }
+    };
+
+    r.cmdline_buf.clear();
+    finish(saved);
+    Some(ran)
+}
+
+/// `get_func_line()` for function `fp` of `fcp`, when a run can run the line
+/// it gets.
+fn next_func_line(fcp: &Funccall, fp: &UserFunc, cstack: &Cstack) -> Option<Rc<Line>> {
+    if fcp.fc_dbg_tick.get() != exc_state().debug_tick.get() || func_has_ended(fcp) != 0 {
+        return None;
+    }
+    let idx = fcp.fc_linenr.get();
+    let lnum = idx + 1;
+    if fcp.fc_breakpoint.get() != 0 && fcp.fc_breakpoint.get() <= lnum {
+        return None;
+    }
+    let line = func_line_at(fp, idx)?;
+    if line.next.is_some() || !can_run(&line, cstack) {
+        return None;
+    }
+    fcp.fc_linenr.set(lnum);
+    set_sourcing_lnum(lnum);
+    Some(line)
+}
+
+/// Line `idx` of function `fp`, parsed. `None` when a run does not run it, and
+/// for a line that the line before it continues.
+fn func_line_at(fp: &UserFunc, idx: i32) -> Parsed {
+    let idx = usize::try_from(idx).ok()?;
+    if let Some(parsed) = fp.uf_parsed.0.borrow().get(idx).and_then(OnceCell::get) {
+        return parsed.clone();
+    }
+    let text = fp.uf_lines.borrow().get(idx)?.clone()?;
+    let found = parsed(text.to_bytes());
+    let mut cache = fp.uf_parsed.0.borrow_mut();
+    if cache.len() <= idx {
+        cache.resize_with(idx + 1, OnceCell::new);
+    }
+    cache[idx].get_or_init(|| found).clone()
 }
 
 /// Puts `next` in the command line, as `do_one_cmd()` does.
@@ -409,12 +536,27 @@ fn compile(text: &[u8]) -> Option<Line> {
         Cmdidx::CmdEndwhile => (Stmt::EndLoop { csf: CSF_WHILE }, bar_next(arg)?),
         Cmdidx::CmdContinue => (Stmt::Continue, bar_next(arg)?),
         Cmdidx::CmdBreak => (Stmt::Break, bar_next(arg)?),
+        Cmdidx::CmdReturn => compile_return(arg)?,
         _ => return None,
     };
     if CMDNAMES[cmdidx as usize].cmd_argt != stmt.flags() {
         return None;
     }
     Some(Line { stmt, cmdidx, next })
+}
+
+/// `:return`, whose next command is the one after it when it does not return.
+fn compile_return(arg: &[u8]) -> Option<(Stmt, NextCmd)> {
+    if matches!(arg.first(), None | Some(b'|' | b'\n')) {
+        return Some((Stmt::Return { expr: None }, nonempty(check_nextcmd(arg))));
+    }
+    let (expr, next) = compile_expr(arg)?;
+    Some((
+        Stmt::Return {
+            expr: Some((arg.into(), expr)),
+        },
+        next,
+    ))
 }
 
 /// The command of `line` and the offset after its name, when the line has no
@@ -537,6 +679,10 @@ fn can_run(line: &Line, cstack: &Cstack) -> bool {
         Stmt::EndLoop { csf } => cstack.cs_looplevel > 0 && top >= 0 && flags(top) & csf != 0,
         Stmt::Continue | Stmt::Break => {
             skipping(cstack) || (cstack.cs_looplevel > 0 && loop_without_try(cstack))
+        }
+        // Not "E133: :return not inside a function".
+        Stmt::Return { expr } => {
+            get_current_funccal().is_some() && expr.as_ref().is_none_or(|(_, e)| e.fits())
         }
     }
 }
@@ -663,6 +809,25 @@ fn exec(line: &Line, cstack: &mut Cstack) -> Flow {
             cleanup_conditionals(cstack, CSF_WHILE | CSF_FOR, true);
             Flow::Stop
         }
+        // ex_return(), which does nothing more when skipped.
+        Stmt::Return { expr } => {
+            if skipping(cstack) {
+                return Flow::Next;
+            }
+            let returning = match expr.as_ref().map(|(text, expr)| expr.eval0(text)) {
+                Some(Ok(rettv)) => do_return_in(cstack, false, Some(rettv)),
+                // It is safer to return also on an error, unless it aborts.
+                _ => {
+                    update_force_abort();
+                    !aborting() && do_return_in(cstack, false, None)
+                }
+            };
+            if returning {
+                Flow::Returned
+            } else {
+                Flow::Stop
+            }
+        }
     }
 }
 
@@ -758,6 +923,8 @@ mod tests {
             "endfor",
             "continue",
             "break",
+            "return",
+            "return x",
         ] {
             assert!(compile(line.as_bytes()).is_some(), "{line}");
         }

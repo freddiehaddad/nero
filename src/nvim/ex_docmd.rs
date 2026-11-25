@@ -4,6 +4,8 @@
 
 mod parsed_lines;
 
+pub(crate) use parsed_lines::FuncLines;
+
 use crate::api::command::is_user_cmdidx;
 #[cfg(windows)]
 use crate::api::private::helpers::api_free_object;
@@ -5103,6 +5105,7 @@ pub fn do_cmdline(cmdline: Option<&[u8]>, fgetline: LineGetter, flags: i32) -> b
             }
 
             let mut replaying = false;
+            let mut fetched = false;
             if cstack.cs_looplevel > 0
                 && (current_line as usize) < cmd_loop_cookie.borrow().lines.len()
             {
@@ -5209,6 +5212,7 @@ pub fn do_cmdline(cmdline: Option<&[u8]>, fgetline: LineGetter, flags: i32) -> b
                 cmdline_buf.clear();
                 cmdline_buf.extend_from_slice(bytes);
                 used_getline = true;
+                fetched = true;
 
                 if ui_has(K_UICMDLINE) && count > 0 && fgetline.is_exline() {
                     ui_ext_cmdline_block_append(
@@ -5289,6 +5293,15 @@ pub fn do_cmdline(cmdline: Option<&[u8]>, fgetline: LineGetter, flags: i32) -> b
                     count: &mut count,
                     cmdline_buf: &mut cmdline_buf,
                     fgetline: &fgetline,
+                })
+            } else if fetched && !using_loop_cookie && fgetline.is_func() {
+                parsed_lines::run_func(parsed_lines::FuncRun {
+                    cstack: &mut cstack,
+                    cookie: &cmd_loop_cookie,
+                    count: &mut count,
+                    cmdline_buf: &mut cmdline_buf,
+                    fgetline: &fgetline,
+                    flags,
                 })
             } else {
                 None

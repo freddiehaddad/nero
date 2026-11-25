@@ -262,6 +262,16 @@ pub struct UserFunc {
     pub uf_namelen: usize,
     pub uf_name: std::ffi::CString,
     pub uf_id: UfuncId,
+    /// What `ex_docmd` parsed of `uf_lines` to run them from statements.
+    pub(crate) uf_parsed: crate::ex_docmd::FuncLines,
+}
+
+impl UserFunc {
+    /// Replaces the body, and drops what was parsed of the old one.
+    pub(crate) fn set_lines(&self, lines: Vec<Option<std::ffi::CString>>) {
+        *self.uf_lines.borrow_mut() = lines;
+        self.uf_parsed.clear();
+    }
 }
 use crate::api::private::helpers::{DI_FLAGS_FIX, DI_FLAGS_RO};
 use crate::buffer::{DO_NOT_FREE_CNT, VAR_FIXED, VAR_SCOPE};
@@ -744,6 +754,7 @@ fn alloc_ufunc(name: &[u8]) -> std::rc::Rc<UserFunc> {
         uf_namelen: namelen,
         uf_name: name_cstr,
         uf_id: id,
+        uf_parsed: crate::ex_docmd::FuncLines::default(),
     });
     if popped.is_some() {
         UFUNC_ARENA.with(|a| a.borrow_mut()[idx] = Some(fp.clone()));
@@ -845,7 +856,7 @@ pub fn get_lambda_tv(
         func_hashtab_add(&fp);
         *fp.uf_args.borrow_mut() = newargs;
         *fp.uf_def_args.borrow_mut() = Vec::new();
-        *fp.uf_lines.borrow_mut() = newlines;
+        fp.set_lines(newlines);
         if !UF_STATE.with(|s| s.current_funccal.get()).is_null() && eval_lavars_used() == Some(true)
         {
             flags |= FC_CLOSURE;
@@ -1358,7 +1369,7 @@ fn func_remove(fp: &UserFunc) -> bool {
 fn func_clear_items(fp: &UserFunc) {
     fp.uf_args.borrow_mut().clear();
     fp.uf_def_args.borrow_mut().clear();
-    fp.uf_lines.borrow_mut().clear();
+    fp.set_lines(Vec::new());
 
     if (fp.uf_flags.get() & FC_LUAREF) != 0 {
         api_free_luaref(fp.uf_luaref.get());
@@ -3561,7 +3572,7 @@ pub fn ex_function(eap: &mut Exarg) {
     let fp = fp.unwrap_rc();
     *fp.uf_args.borrow_mut() = newargs;
     *fp.uf_def_args.borrow_mut() = default_args;
-    *fp.uf_lines.borrow_mut() = newlines;
+    fp.set_lines(newlines);
     if (flags & FC_CLOSURE) != 0 {
         register_closure(&fp);
     } else {
@@ -4184,14 +4195,18 @@ pub fn ex_call(eap: &mut Exarg) {
 }
 
 /// Return from a function. Possibly makes the return pending.
-pub fn do_return(
-    eap: &mut Exarg,
+pub fn do_return(eap: &mut Exarg, reanimate: bool, _is_cmd: bool, rettv: Option<TypVal>) -> bool {
+    do_return_in(eap.cstack_mut(), reanimate, rettv)
+}
+
+/// `do_return()` for a command with condition stack `cstack`. Returns `true`
+/// when the function returns now, and `false` when the return waits for a
+/// `:finally` to end.
+pub(crate) fn do_return_in(
+    cstack: &mut crate::ex_eval::Cstack,
     reanimate: bool,
-    _is_cmd: bool,
     mut rettv: Option<TypVal>,
 ) -> bool {
-    let cstack = eap.cstack_mut();
-
     if reanimate {
         cur_funccal().fc_returned.set(0);
     }

@@ -1,6 +1,7 @@
--- The lines of a repeating loop run from statements parsed once. Each case
--- here runs with that and with NERO_NO_PARSED_LINES set, which turns it off,
--- and has to leave the same exceptions, errors, messages and variables.
+-- Lines that run again and again (the lines of a repeating loop and of a
+-- function) run from statements parsed once. Each case here runs with that
+-- and with NERO_NO_PARSED_LINES set, which turns it off, and has to leave the
+-- same exceptions, errors, messages and variables.
 
 local t = require('test.testutil')
 local n = require('test.functional.testnvim')()
@@ -205,6 +206,41 @@ local loop_cases = {
   { 'let g:final = 0', 'for i in range(3)', 'let g:final += i', 'endfor' },
 }
 
+local function_cases = {
+  { 'let x = 1', 'if x', 'return x + 1', 'endif', 'return 0' },
+  { 'for i in range(5)', 'if i == 3', 'return i', 'endif', 'endfor', 'return -1' },
+  { 'try', 'return 1', 'finally', 'let g:a = 9', 'endtry' },
+  { 'try', 'return 1', 'finally', 'return 2', 'endtry' },
+  { 'let g:a = g:nope', 'return 5' },
+  { 'return g:nope' },
+  { 'return g:l - 1' },
+  { 'let x = 0', 'while x < 3', 'let x += 1', 'return 3', 'endwhile' },
+  { 'let x = 1', 'let x .= 2', 'return x' },
+  { 'return' },
+  { 'if 0', 'return 1', 'endif', 'let g:a = 5' },
+  {
+    'for i in range(3)',
+    'try',
+    'return i',
+    'finally',
+    'continue',
+    'endtry',
+    'endfor',
+    'return -1',
+  },
+  { 'let x = 1 | return x' },
+  { 'return 1 | let g:a = 2' },
+  { 'let g:a = 1', 'let g:b = g:a + 1', 'let g:s = g:a . g:b', 'return g:s' },
+  { 'let x = 0', 'while x < 3', 'let x += 1', 'endwhile', 'return x' },
+  { 'let g:a = a:0', 'let g:b = a:firstline', 'return a:lastline' },
+  { 'throw "oops"', 'return 1' },
+  { 'if 1', 'let g:a = 2', 'else', 'return 3', 'endif', 'return g:a' },
+  { 'let x = 1', 'unlet x', 'return exists("x")' },
+  { 'try', 'let g:a = g:nope', 'catch', 'return 7', 'endtry', 'return 8' },
+  { 'let g:a = 1', 'return g:a ? "yes" : "no"' },
+  { 'let x = 5', 'return -x' },
+}
+
 --- Runs each case in a new Nero with `env` and returns what each way left.
 --- Each way is an API call of its own: after an error is caught, lines do
 --- not run from statements until the outermost try ends, which for an API
@@ -237,5 +273,9 @@ end
 describe('lines run from parsed statements', function()
   it('do what do_one_cmd() does in repeating loops', function()
     check(loop_cases)
+  end)
+
+  it('do what do_one_cmd() does in functions', function()
+    check(function_cases)
   end)
 end)
