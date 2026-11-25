@@ -178,7 +178,7 @@ pub struct Funccall {
     pub fc_prof_child: std::cell::Cell<Proftime>,
     pub fc_caller: std::cell::Cell<crate::eval::userfunc::FunccalId>,
     pub fc_refcount: std::cell::Cell<i32>,
-    pub fc_copy_id: std::cell::Cell<i32>,
+    pub fc_copy_id: std::cell::Cell<i64>,
     pub fc_ufuncs: std::cell::RefCell<Vec<crate::eval::userfunc::UfuncId>>,
     pub fc_id: crate::eval::userfunc::FunccalId,
 }
@@ -202,7 +202,7 @@ impl Funccall {
             fc_prof_child: std::cell::Cell::new(0),
             fc_caller: std::cell::Cell::new(crate::eval::userfunc::FunccalId::NULL),
             fc_refcount: std::cell::Cell::new(0),
-            fc_copy_id: std::cell::Cell::new(i32::MIN),
+            fc_copy_id: std::cell::Cell::new(i64::MIN),
             fc_ufuncs: std::cell::RefCell::new(Vec::new()),
             fc_id: crate::eval::userfunc::FunccalId::NULL,
         }

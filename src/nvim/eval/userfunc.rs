@@ -3821,7 +3821,7 @@ fn fc_referenced(fc: &Funccall) -> bool {
         || fc.fc_refcount.get() > 0
 }
 
-fn can_free_funccal(fc: &Funccall, copy_id: i32) -> bool {
+fn can_free_funccal(fc: &Funccall, copy_id: i64) -> bool {
     fc.fc_l_varlist.get().lv_copy_id.get() != copy_id
         && fc.fc_l_vars.get().dv_copy_id.get() != copy_id
         && fc.fc_l_avars.get().dv_copy_id.get() != copy_id
@@ -4410,7 +4410,7 @@ pub fn current_func_returned() -> i32 {
     cur_funccal().fc_returned.get()
 }
 
-pub fn free_unref_funccal(copy_id: i32, testing: i32) -> bool {
+pub fn free_unref_funccal(copy_id: i64, testing: i32) -> bool {
     let mut did_free = false;
     let mut did_free_funccal = false;
 
@@ -4624,7 +4624,7 @@ pub fn find_var_in_scoped_ht(
     v
 }
 
-pub fn set_ref_in_previous_funccal(copy_id: i32) -> bool {
+pub fn set_ref_in_previous_funccal(copy_id: i64) -> bool {
     let items = PREVIOUS_FUNCCAL.with(|c| c.borrow().clone());
     for fc_id in items {
         let Some(fc) = fc_id.rc() else {
@@ -4643,7 +4643,7 @@ pub fn set_ref_in_previous_funccal(copy_id: i32) -> bool {
 
 /// Set `copy_id` in the arguments of the deferred functions of `fc`.
 /// Returns `true` if setting references failed somehow.
-fn set_ref_in_defer(fc: &Funccall, copy_id: i32) -> bool {
+fn set_ref_in_defer(fc: &Funccall, copy_id: i64) -> bool {
     for dr in &mut *fc.fc_defer.borrow_mut() {
         let argcount = dr.dr_argvars.len().saturating_sub(1);
         for tv in dr.dr_argvars.iter_mut().take(argcount) {
@@ -4655,7 +4655,7 @@ fn set_ref_in_defer(fc: &Funccall, copy_id: i32) -> bool {
     false
 }
 
-fn set_ref_in_funccal(fc: &Funccall, copy_id: i32) -> bool {
+fn set_ref_in_funccal(fc: &Funccall, copy_id: i64) -> bool {
     if fc.fc_copy_id.get() != copy_id {
         fc.fc_copy_id.set(copy_id);
         if set_ref_in_ht(Some(&fc.fc_l_vars.get().dv_hashtab), copy_id, None)
@@ -4670,7 +4670,7 @@ fn set_ref_in_funccal(fc: &Funccall, copy_id: i32) -> bool {
     false
 }
 
-pub fn set_ref_in_call_stack(copy_id: i32) -> bool {
+pub fn set_ref_in_call_stack(copy_id: i64) -> bool {
     for fc in FunccalCallerIter(UF_STATE.with(|s| s.current_funccal.get())) {
         if set_ref_in_funccal(&fc, copy_id) {
             return true;
@@ -4688,7 +4688,7 @@ pub fn set_ref_in_call_stack(copy_id: i32) -> bool {
     false
 }
 
-pub fn set_ref_in_functions(copy_id: i32) -> bool {
+pub fn set_ref_in_functions(copy_id: i64) -> bool {
     for fp_id in func_tbl_values() {
         if input_state().got_int.get() {
             break;
@@ -4703,7 +4703,7 @@ pub fn set_ref_in_functions(copy_id: i32) -> bool {
     false
 }
 
-pub fn set_ref_in_func_args(copy_id: i32) -> bool {
+pub fn set_ref_in_func_args(copy_id: i64) -> bool {
     let mut args = FUNCARGS.with(|c| c.borrow().clone());
     for tv in &mut args {
         if set_ref_in_item(tv, copy_id, None, None) {
@@ -4713,7 +4713,7 @@ pub fn set_ref_in_func_args(copy_id: i32) -> bool {
     false
 }
 
-pub fn set_ref_in_func(name: Option<&CStr>, fp_in: Option<&UserFunc>, copy_id: i32) -> bool {
+pub fn set_ref_in_func(name: Option<&CStr>, fp_in: Option<&UserFunc>, copy_id: i64) -> bool {
     let fp_found: Option<std::rc::Rc<UserFunc>>;
     let mut fp = fp_in;
     let mut error = FCERR_NONE;

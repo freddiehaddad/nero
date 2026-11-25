@@ -6889,7 +6889,7 @@ pub fn set_errorlist(
     retval
 }
 
-fn mark_quickfix_user_data(qi: &QfInfo, copy_id: i32) -> bool {
+fn mark_quickfix_user_data(qi: &QfInfo, copy_id: i64) -> bool {
     let mut abort = false;
     let mut i: i32 = 0;
     while i < qi.qf_maxcount.get() && !abort {
@@ -6914,7 +6914,7 @@ fn mark_quickfix_user_data(qi: &QfInfo, copy_id: i32) -> bool {
     abort
 }
 
-fn mark_quickfix_ctx(qi: &QfInfo, copy_id: i32) -> bool {
+fn mark_quickfix_ctx(qi: &QfInfo, copy_id: i64) -> bool {
     let mut abort = false;
     let mut i: i32 = 0;
     while i < qi.qf_maxcount.get() && !abort {
@@ -6935,7 +6935,7 @@ fn mark_quickfix_ctx(qi: &QfInfo, copy_id: i32) -> bool {
     abort
 }
 
-pub fn set_ref_in_quickfix(copy_id: i32) -> bool {
+pub fn set_ref_in_quickfix(copy_id: i64) -> bool {
     if mark_quickfix_ctx(&ql_info(), copy_id)
         || mark_quickfix_user_data(&ql_info(), copy_id)
         || set_ref_in_callback(&opt_vars().p_qftf, copy_id, None, None)

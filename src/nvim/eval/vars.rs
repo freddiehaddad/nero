@@ -757,15 +757,15 @@ pub fn evalvars_clear() {
     }
 }
 
-pub fn garbage_collect_globvars(copy_id: i32) -> bool {
+pub fn garbage_collect_globvars(copy_id: i64) -> bool {
     set_ref_in_ht(Some(&get_globvar_dict().dv_hashtab), copy_id, None)
 }
 
-pub fn garbage_collect_vimvars(copy_id: i32) -> bool {
+pub fn garbage_collect_vimvars(copy_id: i64) -> bool {
     set_ref_in_ht(Some(&get_vimvar_dict().dv_hashtab), copy_id, None)
 }
 
-pub fn garbage_collect_scriptvars(copy_id: i32) -> bool {
+pub fn garbage_collect_scriptvars(copy_id: i64) -> bool {
     let mut abort = false;
 
     for i in 1..=crate::runtime::script_items_len() {

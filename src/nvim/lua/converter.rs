@@ -517,9 +517,9 @@ fn lua_conv_dict_start(lstate: *mut lua_State, len: usize) {
 fn lua_check_self_reference(
     lstate: *mut lua_State,
     container: MPContainerRef,
-    val_copy_id: &mut i32,
+    val_copy_id: &mut i64,
     mpstack: &[MPConvStackVal],
-    copy_id: i32,
+    copy_id: i64,
 ) -> bool {
     if *val_copy_id != copy_id {
         *val_copy_id = copy_id;
@@ -548,7 +548,7 @@ fn lua_convert_one_value(
     lstate: *mut lua_State,
     mpstack: &mut Vec<MPConvStackVal>,
     tv: &mut TypVal,
-    copy_id: i32,
+    copy_id: i64,
 ) -> bool {
     if !lua_checkstack_safe(lstate, 3) {
         semsg!(

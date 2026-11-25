@@ -101,7 +101,7 @@ pub(crate) enum MPConvStackData {
 
 #[derive(Clone)]
 pub(crate) struct MPConvStackVal {
-    pub(crate) saved_copy_id: i32,
+    pub(crate) saved_copy_id: i64,
     pub(crate) data: MPConvStackData,
 }
 
@@ -929,9 +929,9 @@ impl EncodeBackend<'_> {
     fn check_self_reference(
         &mut self,
         container: MPContainerRef,
-        val_copy_id: &mut i32,
+        val_copy_id: &mut i64,
         mpstack: &[MPConvStackVal],
-        copy_id: i32,
+        copy_id: i64,
         objname: &CStr,
     ) -> Option<bool> {
         if *val_copy_id != copy_id {
@@ -1011,7 +1011,7 @@ fn convert_one_value(
     backend: &mut EncodeBackend,
     mpstack: &mut Vec<MPConvStackVal>,
     tv_ref: &mut TypVal,
-    copy_id: i32,
+    copy_id: i64,
     objname: &CStr,
 ) -> bool {
     backend.check_before();

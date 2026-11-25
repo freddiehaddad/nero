@@ -372,7 +372,7 @@ pub fn free_tagfunc_option() {
 
 /// Mark the global `'tagfunc'` callback with `copyID` so that it is not garbage
 /// collected.
-pub fn set_ref_in_tagfunc(copy_id: i32) -> bool {
+pub fn set_ref_in_tagfunc(copy_id: i64) -> bool {
     set_ref_in_callback(&opt_vars().p_tfu, copy_id, None, None)
 }
 

@@ -25,14 +25,14 @@ enum ConvStackEntry {
     List {
         list: crate::eval::typval::ListId,
         li: crate::eval::typval::ListitemId,
-        saved_copy_id: i32,
+        saved_copy_id: i64,
         first: bool,
     },
     Dict {
         dict: crate::eval::typval::DictId,
         hi_idx: usize,
         todo: usize,
-        saved_copy_id: i32,
+        saved_copy_id: i64,
         first: bool,
     },
 }
@@ -41,7 +41,7 @@ fn convert_one_value(
     stack: &mut Vec<Object>,
     mpstack: &mut Vec<ConvStackEntry>,
     tv: &TypVal,
-    copy_id: i32,
+    copy_id: i64,
 ) {
     match &tv.value {
         TvValue::String(_) | TvValue::InlineString(_) => {

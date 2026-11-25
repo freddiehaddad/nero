@@ -167,8 +167,8 @@ pub const EXPR_IS: Exprtype = 9;
 pub const EXPR_ISNOT: Exprtype = 10;
 
 pub const EVAL_EVALUATE: i32 = 1;
-pub const COPYID_INC: i32 = 2;
-pub const COPYID_MASK: i32 = !1;
+pub const COPYID_INC: i64 = 2;
+pub const COPYID_MASK: i64 = !1;
 
 const GLV_FAIL: GlvStatus = 0;
 const GLV_OK: GlvStatus = 1;
@@ -235,7 +235,7 @@ pub(crate) struct EvalModuleState {
     echo_hl_id: std::cell::Cell<i32>,
     last_timer_id: std::cell::Cell<u64>,
     callback_depth: std::cell::Cell<i32>,
-    current_copy_id: std::cell::Cell<i32>,
+    current_copy_id: std::cell::Cell<i64>,
     eval7_recurse: std::cell::Cell<i32>,
     /// Active curly-braces expression checks in `eval_dict()`.
     curly_expr_check_depth: std::cell::Cell<u32>,
@@ -402,7 +402,7 @@ pub fn tv_dict_set_ret(tv: &mut TypVal, d: Option<&TvDict>) {
 }
 
 #[inline]
-fn tv_list_copyid(l: &TvList) -> i32 {
+fn tv_list_copyid(l: &TvList) -> i64 {
     l.lv_copy_id.get()
 }
 
@@ -443,7 +443,7 @@ pub fn restore_v_event(v_event: &TvDict, sve: &mut SaveVEvent) {
     }
 }
 
-pub fn set_ref_in_saved_v_event(copy_id: i32) -> bool {
+pub fn set_ref_in_saved_v_event(copy_id: i64) -> bool {
     SAVED_V_EVENTS.with(|saved| {
         let mut abort = false;
         for ht in saved.borrow().iter().rev() {
@@ -4094,7 +4094,7 @@ pub fn func_equal(tv1: &TypVal, tv2: &TypVal, ic: bool) -> bool {
 }
 
 /// Get next (unique) copy ID.
-pub fn get_copy_id() -> i32 {
+pub fn get_copy_id() -> i64 {
     let next_copy_id = EVAL_STATE
         .with(|s| s.current_copy_id.get())
         .wrapping_add(COPYID_INC);
@@ -4104,7 +4104,7 @@ pub fn get_copy_id() -> i32 {
 
 /// Get a copy ID for traversing `tv`. Only containers are traversed, so a
 /// scalar doesn't consume one and gets 0.
-pub fn get_copy_id_for(tv: &TypVal) -> i32 {
+pub fn get_copy_id_for(tv: &TypVal) -> i64 {
     if matches!(
         tv.var_type(),
         VarType::VarList | VarType::VarDict | VarType::VarPartial
@@ -4220,7 +4220,7 @@ pub fn garbage_collect(testing: bool) -> bool {
 }
 
 /// Free lists and dictionaries that are no longer referenced.
-fn free_unref_items(copy_id: i32) -> bool {
+fn free_unref_items(copy_id: i64) -> bool {
     let mut did_free = false;
 
     crate::eval::typval::set_tv_in_free_unref_items(true);
@@ -4269,7 +4269,7 @@ fn free_unref_items(copy_id: i32) -> bool {
 /// Mark all lists and dicts referenced through hashtab "ht" with "copyID".
 pub fn set_ref_in_ht(
     ht: Option<&Hashtab>,
-    copy_id: i32,
+    copy_id: i64,
     mut list_stack: Option<&mut ListStack>,
 ) -> bool {
     let Some(ht_ref) = ht else {
@@ -4310,7 +4310,7 @@ pub fn set_ref_in_ht(
 /// Mark all lists and dicts referenced through list "l" with "copyID".
 pub fn set_ref_in_list_items(
     l: Option<&TvList>,
-    copy_id: i32,
+    copy_id: i64,
     mut ht_stack: Option<&mut HtStack>,
 ) -> bool {
     let mut abort = false;
@@ -4344,7 +4344,7 @@ pub fn set_ref_in_list_items(
 
 fn set_ref_in_item_dict(
     dd: Option<&TvDict>,
-    copy_id: i32,
+    copy_id: i64,
     mut ht_stack: Option<&mut HtStack>,
     mut list_stack: Option<&mut ListStack>,
 ) -> bool {
@@ -4376,7 +4376,7 @@ fn set_ref_in_item_dict(
 
 fn set_ref_in_item_list(
     ll: Option<&TvList>,
-    copy_id: i32,
+    copy_id: i64,
     ht_stack: Option<&mut HtStack>,
     list_stack: Option<&mut ListStack>,
 ) -> bool {
@@ -4398,7 +4398,7 @@ fn set_ref_in_item_list(
 
 fn set_ref_in_item_partial(
     pt: Option<&TvPartial>,
-    copy_id: i32,
+    copy_id: i64,
     mut ht_stack: Option<&mut HtStack>,
     mut list_stack: Option<&mut ListStack>,
 ) -> bool {
@@ -4443,7 +4443,7 @@ fn set_ref_in_item_partial(
 /// Mark all lists and dicts referenced through typval "tv" with "copyID".
 pub fn set_ref_in_item(
     tv: &mut TypVal,
-    copy_id: i32,
+    copy_id: i64,
     ht_stack: Option<&mut HtStack>,
     list_stack: Option<&mut ListStack>,
 ) -> bool {
@@ -5052,7 +5052,7 @@ pub fn callback_call(
 
 pub fn set_ref_in_callback(
     callback: &Callback,
-    copy_id: i32,
+    copy_id: i64,
     ht_stack: Option<&mut HtStack>,
     list_stack: Option<&mut ListStack>,
 ) -> bool {
@@ -5070,7 +5070,7 @@ pub fn set_ref_in_callback(
 
 fn set_ref_in_callback_reader(
     reader: &CallbackReader,
-    copy_id: i32,
+    copy_id: i64,
     mut ht_stack: Option<&mut HtStack>,
     mut list_stack: Option<&mut ListStack>,
 ) -> bool {
@@ -6098,7 +6098,7 @@ pub fn var_item_copy(
     from: &mut TypVal,
     to: &mut TypVal,
     deep: bool,
-    copy_id: i32,
+    copy_id: i64,
 ) -> bool {
     let mut ret = true;
 

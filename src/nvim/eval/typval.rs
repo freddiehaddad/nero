@@ -222,7 +222,7 @@ impl std::ops::Deref for PartialId {
 
 pub struct TvPartial {
     pub pt_refcount: std::cell::Cell<i32>,
-    pub pt_copy_id: std::cell::Cell<i32>,
+    pub pt_copy_id: std::cell::Cell<i64>,
     pub pt_name: std::cell::OnceCell<std::ffi::CString>,
     pub pt_func: std::cell::OnceCell<std::rc::Rc<crate::eval::userfunc::UserFunc>>,
     pub pt_auto: std::cell::Cell<bool>,
@@ -878,7 +878,7 @@ pub struct TvList {
     pub lv_refcount: std::cell::Cell<i32>,
     pub lv_len: std::cell::Cell<i32>,
     pub lv_idx: std::cell::Cell<i32>,
-    pub lv_copy_id: std::cell::Cell<i32>,
+    pub lv_copy_id: std::cell::Cell<i64>,
     pub lv_lock: std::cell::Cell<i32>,
     pub lua_table_ref: std::cell::Cell<i32>,
 }
@@ -1336,7 +1336,7 @@ pub struct TvDict {
     pub dv_lock: std::cell::Cell<i32>,
     pub dv_scope: std::cell::Cell<i32>,
     pub dv_refcount: std::cell::Cell<i32>,
-    pub dv_copy_id: std::cell::Cell<i32>,
+    pub dv_copy_id: std::cell::Cell<i64>,
     pub dv_hashtab: crate::hashtab::Hashtab,
     pub dv_copydict: crate::api::private::validate::CloneCell<DictId>,
     pub dv_gc_idx: std::cell::Cell<Option<usize>>,
@@ -2252,7 +2252,7 @@ pub fn tv_list_copy(
     conv: Option<&Vimconv>,
     orig: Option<&TvList>,
     deep: bool,
-    copy_id: i32,
+    copy_id: i64,
 ) -> Option<ListId> {
     let orig = orig?;
 
@@ -4211,7 +4211,7 @@ pub fn tv_dict_copy(
     conv: Option<&Vimconv>,
     orig: Option<&TvDict>,
     deep: bool,
-    copy_id: i32,
+    copy_id: i64,
 ) -> Option<DictId> {
     let orig = orig?;
 
@@ -4706,7 +4706,7 @@ fn nothing_conv_func_start(tv: &mut TypVal) -> bool {
 }
 
 #[inline]
-fn nothing_conv_func_end(pt: PartialId, copy_id: i32) {
+fn nothing_conv_func_end(pt: PartialId, copy_id: i64) {
     let Some(pt) = pt.opt() else {
         return;
     };
@@ -4721,7 +4721,7 @@ fn nothing_conv_func_end(pt: PartialId, copy_id: i32) {
 fn nothing_convert_one_value(
     mpstack: &mut Vec<MPConvStackVal>,
     tv: &mut TypVal,
-    copy_id: i32,
+    copy_id: i64,
 ) -> bool {
     tv.v_lock = VAR_UNLOCKED;
     match tv.var_type() {
@@ -6125,6 +6125,64 @@ mod tests {
                 "{:?}",
                 tv.var_type(),
             );
+        }
+    }
+
+    #[test]
+    fn deep_list_copy_reuses_copies_only_for_the_same_copy_id() {
+        let _guard = crate::globals::TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _editor = crate::main_init::test_editor();
+
+        fn item_lists(l: &TvList) -> (ListId, ListId) {
+            assert_eq!(tv_list_len_inline(Some(l)), 2);
+            let first = ListId::from(l.lv_first.get().tv().value.list_opt());
+            let last = ListId::from(l.lv_last.get().tv().value.list_opt());
+            for item in [&first, &last] {
+                assert_eq!(tv_list_len_inline(item.opt()), 0);
+            }
+            (first, last)
+        }
+
+        let inner = tv_list_alloc(0);
+        inner.lv_refcount.set(1);
+        let l = tv_list_alloc(2);
+        l.lv_refcount.set(1);
+        tv_list_append_list(&l, Some(&inner));
+        tv_list_append_list(&l, Some(&inner));
+        // Ref'd by `inner` and both items of `l`.
+        assert_eq!(inner.lv_refcount.get(), 3);
+        // `l` contains the same (empty) inner list twice.
+        let (first, last) = item_lists(&l);
+        assert_eq!(first, last);
+
+        // Deep-copy, copyID=0: no reuse, each item is copied.
+        let copy1 = tv_list_copy(None, Some(&l), true, 0).unwrap();
+        let (first1, last1) = item_lists(&copy1);
+        assert_ne!(first1, last1);
+
+        // Deep-copy, copyID=2: first copy marks the inner list; second item
+        // reuses/refs that copy.
+        let copy2 = tv_list_copy(None, Some(&l), true, 2).unwrap();
+        let (first2, last2) = item_lists(&copy2);
+        assert_eq!(first2, last2);
+
+        // Deep-copy, copyID=2+2^32: copyID is 64 bits so doesn't overflow/wrap.
+        // neovim/neovim#42231
+        let copy3 = tv_list_copy(None, Some(&l), true, 2 + (1 << 32)).unwrap();
+        let (first3, last3) = item_lists(&copy3);
+        // A 32-bit copyID would truncate `2 + 2^32` to 2 and reuse copy2's copy.
+        assert_ne!(first2, first3);
+        // copyID `2 + 2^32` is stored correctly; the second item reuses the
+        // first item's copy.
+        assert_eq!(first3, last3);
+
+        // Deep copies don't reference the original.
+        assert_eq!(inner.lv_refcount.get(), 3);
+
+        for list in [copy1, copy2, copy3, l, inner] {
+            tv_list_unref(Some(&list));
         }
     }
 

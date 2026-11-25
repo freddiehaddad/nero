@@ -10123,7 +10123,7 @@ pub fn free_findfunc_option() {
     callback_free(&opt_vars().p_ffu);
 }
 
-pub fn set_ref_in_findfunc(copy_id: i32) -> bool {
+pub fn set_ref_in_findfunc(copy_id: i64) -> bool {
     set_ref_in_callback(&opt_vars().p_ffu, copy_id, None, None)
 }
 

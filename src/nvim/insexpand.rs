@@ -3418,7 +3418,7 @@ pub fn set_cpt_callbacks(args: &mut Optset) -> bool {
     true
 }
 
-pub fn set_ref_in_cpt_callbacks(callbacks: &mut [Callback], copy_id: i32) -> bool {
+pub fn set_ref_in_cpt_callbacks(callbacks: &mut [Callback], copy_id: i64) -> bool {
     let mut abort = false;
     for cb in callbacks {
         abort = abort || set_ref_in_callback(cb, copy_id, None, None);
@@ -3426,7 +3426,7 @@ pub fn set_ref_in_cpt_callbacks(callbacks: &mut [Callback], copy_id: i32) -> boo
     abort
 }
 
-pub fn set_ref_in_insexpand_funcs(copy_id: i32) -> bool {
+pub fn set_ref_in_insexpand_funcs(copy_id: i64) -> bool {
     let mut abort = set_ref_in_callback(&opt_vars().p_cfu, copy_id, None, None);
     abort = abort || set_ref_in_callback(&opt_vars().p_ofu, copy_id, None, None);
     abort = abort || set_ref_in_callback(&opt_vars().p_tsrfu, copy_id, None, None);
