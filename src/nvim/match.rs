@@ -371,6 +371,7 @@ pub fn init_search_hl(wp: &WinInfoInfo, search_hl: &mut SynMatch) {
 fn next_search_hl_pos(
     shl: &mut SynMatch,
     lnum: Linenr,
+    line_len: Colnr,
     mit_pos: &mut [Llpos],
     mit_pos_cur: &mut i32,
     mincol: Colnr,
@@ -403,13 +404,23 @@ fn next_search_hl_pos(
         let start = if found_pos.col == 0 {
             0
         } else {
-            found_pos.col - 1
+            i64::from(found_pos.col) - 1
         };
         let end = if found_pos.col == 0 {
-            MAXCOL
+            i64::from(MAXCOL)
         } else {
-            start + found_pos.len
+            start + i64::from(found_pos.len)
         };
+
+        // The column and length are given by the user.  A position after the
+        // end of the line, or one that ends before the start of the line, does
+        // not match.  Otherwise clamp the columns, so that they can be used to
+        // index the line and don't overflow.
+        if start > i64::from(line_len) || (start < 0 && end <= 0) {
+            return false;
+        }
+        let start = start.max(0) as Colnr;
+        let end = end.min(i64::from(MAXCOL)) as Colnr;
 
         shl.lnum = lnum;
         shl.rm.startpos[0] = Some(Lpos {
@@ -605,11 +616,13 @@ fn next_search_hl(
                 break;
             }
         } else if let Some((idx, id)) = match_key {
+            let line_len = crate::memline::ml_get_buf_len(&win.w_buffer.get(), lnum);
             let Some(matched) = win.with_match_head_mut(|matches| {
                 find_match_mut(matches, idx, id).map(|cur| {
                     i32::from(next_search_hl_pos(
                         &mut cur.mit_hl,
                         lnum,
+                        line_len,
                         &mut cur.mit_pos,
                         &mut cur.mit_pos_cur,
                         matchcol,
