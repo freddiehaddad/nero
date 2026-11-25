@@ -236,38 +236,43 @@ impl LineGetter {
         matches!(self, Self::None)
     }
 
+    /// This getter, or the one a ":while" or ":for" loop gets its new lines
+    /// from.
     #[inline]
-    pub fn inner(&self) -> Self {
+    pub fn inner(&self) -> std::borrow::Cow<'_, Self> {
+        if !matches!(self, Self::Loop(_)) {
+            return std::borrow::Cow::Borrowed(self);
+        }
         let mut gp = self.clone();
         while let Self::Loop(cp) = gp {
             gp = cp.borrow().lc_getline.clone();
         }
-        gp
+        std::borrow::Cow::Owned(gp)
     }
 
     #[inline]
     pub fn is_exline(&self) -> bool {
-        matches!(self.inner(), Self::ExLine)
+        matches!(*self.inner(), Self::ExLine)
     }
 
     #[inline]
     pub fn is_autocmd(&self) -> bool {
-        matches!(self.inner(), Self::AutoCmd(_))
+        matches!(*self.inner(), Self::AutoCmd(_))
     }
 
     #[inline]
     pub fn is_func(&self) -> bool {
-        matches!(self.inner(), Self::Func(_))
+        matches!(*self.inner(), Self::Func(_))
     }
 
     #[inline]
     pub fn is_source(&self) -> bool {
-        matches!(self.inner(), Self::Source(_))
+        matches!(*self.inner(), Self::Source(_))
     }
 
     #[inline]
     pub fn as_func(&self) -> Option<std::rc::Rc<crate::profile::Funccall>> {
-        match self.inner() {
+        match &*self.inner() {
             Self::Func(id) => id.rc(),
             _ => None,
         }
@@ -277,15 +282,15 @@ impl LineGetter {
     pub fn as_source(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::runtime::SourceCookie>>> {
-        match self.inner() {
-            Self::Source(p) => Some(p),
+        match &*self.inner() {
+            Self::Source(p) => Some(p.clone()),
             _ => None,
         }
     }
 
     #[inline]
     pub fn breakpoint_get(&self) -> Option<crate::cursor::Linenr> {
-        match self.inner() {
+        match &*self.inner() {
             Self::Func(id) => id.rc().map(|fc| fc.fc_breakpoint.get()),
             Self::Source(p) => Some(p.borrow().breakpoint),
             _ => None,
@@ -294,7 +299,7 @@ impl LineGetter {
 
     #[inline]
     pub fn breakpoint_set(&self, val: crate::cursor::Linenr) {
-        match self.inner() {
+        match &*self.inner() {
             Self::Func(id) => {
                 if let Some(fc) = id.rc() {
                     fc.fc_breakpoint.set(val);
@@ -309,7 +314,7 @@ impl LineGetter {
 
     #[inline]
     pub fn dbg_tick_get(&self) -> Option<i32> {
-        match self.inner() {
+        match &*self.inner() {
             Self::Func(id) => id.rc().map(|fc| fc.fc_dbg_tick.get()),
             Self::Source(p) => Some(p.borrow().dbg_tick),
             _ => None,
@@ -318,7 +323,7 @@ impl LineGetter {
 
     #[inline]
     pub fn dbg_tick_set(&self, val: i32) {
-        match self.inner() {
+        match &*self.inner() {
             Self::Func(id) => {
                 if let Some(fc) = id.rc() {
                     fc.fc_dbg_tick.set(val);
