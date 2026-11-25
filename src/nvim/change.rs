@@ -8,9 +8,7 @@ use crate::buffer::{
     buf_inc_changedtick, buf_meta_total,
 };
 use crate::buffer_updates::buf_updates_send_changes;
-use crate::charset::{
-    ascii_isdigit, ascii_iswhite, getdigits_int, getwhitecols_curline, vim_strnsize,
-};
+use crate::charset::{ascii_isdigit, ascii_iswhite, getdigits_int, getwhitecols_curline};
 use crate::context::INIT_FMARKV;
 use crate::cursor::{
     Colnr, CursorPos, Linenr, check_cursor_lnum, check_visual_pos, coladvance_force, getviscol,
@@ -36,8 +34,9 @@ use crate::insexpand::ins_compl_active;
 use crate::mark::{JUMPLISTSIZE, mark_adjust, mark_col_adjust, mark_view_make};
 use crate::marktree::{K_MTMETA_INLINE, K_MTMETA_LINES};
 use crate::mbyte::{
-    mb_adjust_cursor, ptr2cells, utf_char2slice, utf_composinglike, utf_iscomposing_first,
-    utf_ptr2char, utf_ptr2len, utfc_ptr2len,
+    mb_adjust_cursor, mb_string2cells_len, ptr2cells, utf_char2slice, utf_cluster_info_len,
+    utf_composinglike, utf_iscomposing_first, utf_ptr2_str_char_info_len, utf_ptr2char,
+    utf_ptr2len, utfc_ptr2len,
 };
 use crate::mcursor::mc_replaying;
 use crate::memline::{
@@ -1370,7 +1369,7 @@ pub fn open_line(
                     p_idx += 1;
 
                     {
-                        let repl_size = vim_strnsize(repl_slice, lead_repl_len);
+                        let repl_size = mb_string2cells_len(repl_slice);
                         let mut old_size: i32 = 0;
                         let endp_idx = p_idx;
 
@@ -1425,17 +1424,20 @@ pub fn open_line(
                 } else {
                     let mut p_idx = crate::charset::skipwhite_len(&allocated_vec);
                     {
-                        let repl_size = vim_strnsize(repl_slice, lead_repl_len);
-                        let mut i: i32 = 0;
-                        while i < lead_len && allocated_vec[p_idx + (i as usize)] != 0 {
-                            let l = utfc_ptr2len(&allocated_vec[p_idx + (i as usize)..]);
-                            let span = (i + l).max(0) as usize;
-                            if vim_strnsize(&allocated_vec[p_idx..p_idx + span], i + l) > repl_size
-                            {
+                        let repl_size = mb_string2cells_len(repl_slice);
+                        let text = &allocated_vec[p_idx..];
+                        let mut len_left = lead_len;
+                        let mut ci = utf_ptr2_str_char_info_len(text, len_left);
+                        let mut rep_width = 0;
+                        while len_left > 0 && ci.ptr.first().is_some_and(|&b| b != 0) {
+                            let cli = utf_cluster_info_len(ci, &mut len_left);
+                            rep_width += cli.cells;
+                            if rep_width > repl_size {
                                 break;
                             }
-                            i += l;
+                            ci = cli.next;
                         }
+                        let i = ci.offset_from(text) as i32;
                         if i != lead_repl_len {
                             let src_start = p_idx + (i as usize);
                             let copy_len = (lead_len - i - (p_idx as i32)) as usize;

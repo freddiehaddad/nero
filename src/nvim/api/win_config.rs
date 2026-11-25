@@ -1259,7 +1259,7 @@ pub fn parse_bordertext(
                 return Ok(());
             }
             let text_cstr = transstr(value.cstr_bytes(), true);
-            *width = mb_string2cells(text_cstr.as_bytes()) as i32;
+            *width = mb_string2cells(text_cstr.as_bytes());
             chunks.clear();
             chunks.push(VirtTextChunk {
                 text: Some(crate::option_vars::RcCStr::from_cstring(text_cstr)),

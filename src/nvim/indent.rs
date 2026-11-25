@@ -9,7 +9,7 @@ use crate::change::{
 };
 use crate::charset::{
     K_OPT_DY_FLAG_UHEX, ascii_isdigit, ascii_iswhite, ascii_iswhite_or_nul, char2cells, getdigits,
-    getwhitecols_curline, vim_strsize,
+    getwhitecols_curline,
 };
 use crate::cursor::{
     Colnr, CursorPos, Linenr, check_cursor, coladvance, get_cursor_line_len, get_cursor_line_ptr,
@@ -27,7 +27,9 @@ use crate::indent_c::{cindent_on, do_c_expr_indent, in_cinkeys};
 use crate::insert::{
     backspace_until_column, beginline, get_nolist_virtcol, replace_join, replace_push_nul,
 };
-use crate::mbyte::{utf_cluster_info, utf_ptr2_char_info, utf_slice2_str_char_info, utfc_ptr2len};
+use crate::mbyte::{
+    mb_string2cells, utf_cluster_info, utf_ptr2_char_info, utf_slice2_str_char_info, utfc_ptr2len,
+};
 use crate::memline::{ml_get, ml_get_len, ml_replace};
 use crate::message::{emsg, msg_progress};
 use crate::r#move::{changed_cline_bef_curs, win_col_off, win_col_off2};
@@ -912,7 +914,7 @@ pub fn get_breakindent_win(wp: &WinInfoInfo, line: &[u8]) -> i32 {
     bri += off2;
 
     if wp.w_briopt_sbr.get() {
-        bri -= vim_strsize(get_showbreak_value(wp).as_bytes());
+        bri -= mb_string2cells(get_showbreak_value(wp).as_bytes());
     }
 
     if bri < 0 {

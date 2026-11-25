@@ -15,7 +15,7 @@ use crate::change::{changed, deleted_lines_mark, file_ff_differs, save_file_ff, 
 use crate::channel::channel_job_running;
 use crate::charset::{
     ascii_isdigit, ascii_isspace, buf_init_isk_chartab, getdigits_int, trans_characters,
-    try_getdigits, vim_strsize,
+    try_getdigits,
 };
 use crate::cmdexpand::{
     BUF_DIFF_FILTER, Cmdidx, WILD_BUFLASTUSED, WILD_HOME_REPLACE, cmdline_fuzzy_complete,
@@ -69,7 +69,7 @@ use crate::mark::{
     Fmark, WinInfo, clrallmarks, fmarks_check_names, mark_adjust_buf, mark_forget_file,
     mark_jumplist_forget_file, mark_view_make, mark_view_restore, set_last_cursor, setpcmark,
 };
-use crate::mbyte::utf_cp_bounds;
+use crate::mbyte::{mb_string2cells, utf_cp_bounds};
 use crate::mcursor::{mc_buf_clear, mc_buf_free};
 use crate::memline::{
     ml_close, ml_delete, ml_get_buf_slice, ml_open, ml_recover, ml_setname, ml_timestamp,
@@ -4223,7 +4223,7 @@ pub fn buflist_list(eap: &mut Exarg) {
         )
         .min(IOSIZE - 20);
 
-        let mut i = 40 - vim_strsize(crate::memory::bytes_until_nul(&iobuff));
+        let mut i = 40 - mb_string2cells(crate::memory::bytes_until_nul(&iobuff));
         loop {
             iobuff[len] = b' ';
             len += 1;

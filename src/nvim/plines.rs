@@ -4,7 +4,7 @@
 use crate::api::extmark::ns_in_win;
 use crate::api::ui::MAX_SCHAR_SIZE;
 use crate::buffer::{FileBuf, buf_meta_total};
-use crate::charset::{NUL, vim_isprintc, vim_strsize};
+use crate::charset::{NUL, vim_isprintc};
 use crate::cursor::{Colnr, CursorPos, Linenr, lt, ltoreq};
 use crate::decoration::{
     DecorState, K_MTFILTER_SELECT, K_VPOS_INLINE, K_VTIS_LINES, decor_conceal_char,
@@ -24,6 +24,7 @@ use crate::marktree::{
     marktree_itr_current, marktree_itr_get_filter, marktree_itr_next_filter, mt_decor, mt_invalid,
     mt_right,
 };
+use crate::mbyte::mb_string2cells;
 pub use crate::mbyte::{CharInfo, ClusterInfo, StrCharInfo};
 use crate::mbyte::{utf_cluster_info, utf_slice2_str_char_info};
 use crate::memline::{ml_get_buf, ml_get_buf_len};
@@ -370,7 +371,7 @@ pub fn init_charsize_arg<'a>(
         {
             let mut indent_width = 0;
             if csarg.has_sbr {
-                indent_width += vim_strsize(sbr.as_bytes());
+                indent_width += mb_string2cells(sbr.as_bytes());
             }
             if csarg.wo_bri {
                 indent_width += get_breakindent_win(wp, csarg.line.to_bytes());
@@ -731,7 +732,7 @@ pub fn charsize_regular(
                     head_prev = 0;
                     if csarg.has_sbr {
                         let sbr = get_showbreak_value(wp);
-                        head_prev += vim_strsize(sbr.as_bytes());
+                        head_prev += mb_string2cells(sbr.as_bytes());
                     }
                     if csarg.wo_bri {
                         head_prev += get_breakindent_win(wp, line_bytes);
@@ -757,7 +758,7 @@ pub fn charsize_regular(
                     head_mid = 0;
                     if csarg.has_sbr {
                         let sbr = get_showbreak_value(wp);
-                        head_mid += vim_strsize(sbr.as_bytes());
+                        head_mid += mb_string2cells(sbr.as_bytes());
                     }
                     if csarg.wo_bri {
                         head_mid += get_breakindent_win(wp, line_bytes);

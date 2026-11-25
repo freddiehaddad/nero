@@ -5,7 +5,6 @@ use crate::api::private::helpers::api_free_object;
 use crate::api::private::validate::{Array, NvimString, Object};
 use crate::api::win_config::K_UIMULTIGRID;
 use crate::buffer::{K_UIMESSAGES, buf_is_empty};
-use crate::charset::vim_strsize;
 use crate::drawscreen::screenclear;
 use crate::ex_docmd::Exarg;
 use crate::globals::*;
@@ -14,7 +13,7 @@ use crate::highlight_group::{syn_id2attr, syn_name2id};
 use crate::input::plain_vgetc;
 use crate::insert::HLF_8;
 use crate::lua::executor::{K_RET_OBJECT, nlua_exec};
-use crate::mbyte::{utf_ptr2char, utfc_ptr2len};
+use crate::mbyte::{mb_string2cells, utf_ptr2char, utfc_ptr2len};
 use crate::message::{msg_ext_set_kind, msg_putchar, msg_puts};
 use crate::option_vars::*;
 use crate::strings::gettext;
@@ -4037,7 +4036,7 @@ pub fn ex_version(eap: &mut Exarg) {
 }
 
 fn version_msg_wrap(s: &CStr, wrap: bool) {
-    let len = vim_strsize(s.to_bytes()) + if wrap { 2 } else { 0 };
+    let len = mb_string2cells(s.to_bytes()) + if wrap { 2 } else { 0 };
     if !input_state().got_int.get()
         && len < screen_state().columns_global.get()
         && msg_state().msg_col.get() + len >= screen_state().columns_global.get()
@@ -4066,7 +4065,7 @@ pub fn list_in_columns(items: &[&CStr], current: i32) {
     let mut width: i32 = 0;
 
     for (i, &item) in items.iter().enumerate() {
-        let l = vim_strsize(item.to_bytes()) + if i as i32 == current { 2 } else { 0 };
+        let l = mb_string2cells(item.to_bytes()) + if i as i32 == current { 2 } else { 0 };
         if l > width {
             width = l;
         }
@@ -4285,7 +4284,7 @@ pub fn intro_message(colon: bool) {
 fn do_intro_line(row: i32, mesg_cstr: &CStr, colon: bool, is_logo: bool) {
     let mesg_bytes = mesg_cstr.to_bytes();
     {
-        let mut col = (screen_state().columns_global.get() - vim_strsize(mesg_bytes)) / 2;
+        let mut col = (screen_state().columns_global.get() - mb_string2cells(mesg_bytes)) / 2;
         if col < 0 {
             col = 0;
         }

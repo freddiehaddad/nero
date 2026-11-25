@@ -1480,31 +1480,15 @@ pub fn utf_slice2_char_info_impl(bytes: &[u8]) -> i32 {
     }
 }
 
-pub fn mb_string2cells(bytes: &[u8]) -> usize {
-    let bytes = match bytes.iter().position(|&b| b == 0) {
-        Some(pos) => &bytes[..pos],
-        None => bytes,
-    };
-    let mut clen = 0usize;
-    let mut len = bytes.len() as i32;
-    if len <= 0 {
-        return 0;
-    }
-    let mut ci = utf_ptr2_str_char_info_len(bytes, len);
-    while len > 0 {
-        let cli = utf_cluster_info_len(ci, &mut len);
-        clen += if ci.chr.value < 0x80 {
-            1
-        } else {
-            cli.cells as usize
-        };
-        ci = cli.next;
-    }
-    clen
+/// Count display cells up to the first NUL, using `strtrans()` widths for
+/// unprintable characters. Honors 'display', 'ambiwidth' and `setcellwidths()`.
+pub fn mb_string2cells(bytes: &[u8]) -> i32 {
+    mb_string2cells_len(crate::memory::bytes_until_nul(bytes))
 }
 
-pub fn mb_string2cells_len(bytes: &[u8]) -> usize {
-    let mut clen = 0usize;
+/// Count display cells in the entire slice, including embedded NUL bytes.
+pub fn mb_string2cells_len(bytes: &[u8]) -> i32 {
+    let mut clen = 0;
     let mut len = bytes.len() as i32;
     if len <= 0 {
         return 0;
@@ -1512,7 +1496,7 @@ pub fn mb_string2cells_len(bytes: &[u8]) -> usize {
     let mut ci = utf_ptr2_str_char_info_len(bytes, len);
     while len > 0 {
         let cli = utf_cluster_info_len(ci, &mut len);
-        clen += cli.cells as usize;
+        clen += cli.cells;
         ci = cli.next;
     }
     clen
@@ -3655,15 +3639,16 @@ mod tests {
             ] {
                 assert_eq!(utf_ptr2cells(s.to_bytes()), exp_cells);
                 assert_eq!(utf_slice2cells(s.to_bytes()), exp_cells);
-                assert_eq!(mb_string2cells_len(s.to_bytes()), exp_cells as usize);
+                assert_eq!(mb_string2cells_len(s.to_bytes()), exp_cells);
             }
             assert_eq!(utf_ptr2cells(b"\xff"), 4);
 
-            let mut firstc: i32 = 0;
             let mut sbuf = [0u8; 32];
-            let sc = crate::grid::unittest_schar_from_cluster(c")\xcc\x80\xcc\x81", &mut firstc);
+            let (sc, firstc, cells) =
+                crate::grid::unittest_schar_from_cluster(c")\xcc\x80\xcc\x81");
             schar_get(&mut sbuf, sc);
             assert_eq!(firstc, 0x29);
+            assert_eq!(cells, 1);
             assert_eq!(
                 CStr::from_bytes_until_nul(&sbuf).unwrap().to_bytes(),
                 b")\xcc\x80\xcc\x81"
@@ -3696,6 +3681,70 @@ mod tests {
             let ci = utf_slice2_str_char_info(cp_str.to_bytes());
             let cli = utf_cluster_info(ci);
             assert_eq!(cli.next.offset_from(cp_str.to_bytes()), 1);
+        }
+    }
+
+    #[test]
+    fn string_width_counts_translated_characters_and_bounded_slices() {
+        let _editor = crate::main_init::test_editor();
+        let buf = b"hello\x01world";
+        assert_eq!(mb_string2cells(&buf[..5]), 5);
+        assert_eq!(mb_string2cells(&buf[..6]), 7);
+        assert_eq!(mb_string2cells_len(&buf[..5]), 5);
+        assert_eq!(mb_string2cells_len(&buf[..6]), 7);
+        assert_eq!(mb_string2cells(b"\0abc"), 0);
+        assert_eq!(mb_string2cells_len(b"\0abc"), 5);
+        assert_eq!(mb_string2cells(b"\xff\xc2\x80"), 8);
+        assert_eq!(mb_string2cells_len(b"\xe2\x82"), 8);
+    }
+
+    #[test]
+    fn screen_clusters_preserve_characters_and_display_widths() {
+        let _editor = crate::main_init::test_editor();
+        for byte in 0..=u8::MAX {
+            let bytes = [byte, 0];
+            let input = CStr::from_bytes_until_nul(&bytes).unwrap();
+            let (sc, firstc, cells) = crate::grid::unittest_schar_from_cluster(input);
+            let expected = match byte {
+                0..=31 | 127 => 2,
+                32..=126 => 1,
+                _ => 4,
+            };
+            assert_eq!(cells, expected, "byte {byte}");
+            assert_eq!(firstc, if byte < 128 { i32::from(byte) } else { -1 });
+            let mut output = [0u8; 32];
+            schar_get(&mut output, sc);
+            assert_eq!(output[0], if byte < 128 { byte } else { 0 });
+        }
+
+        for (input, expected, firstc, cells) in [
+            (c"\x7f\xcc\x80", &b"\x7f"[..], 0x7f, 2),
+            (c"\xc2\x7f", &b""[..], -1, 4),
+            (c"\xc2\x80\xcc", &b"\xc2\x80"[..], 0x80, 4),
+            (c"\xc2\x80\xcc\x81", &b"\xc2\x80"[..], 0x80, 4),
+            (c"\xe2\x83\x90", &b" \xe2\x83\x90"[..], 0x20d0, 1),
+            (c"\xc2\xbc\xcc\x81\xcc", &b"\xc2\xbc\xcc\x81"[..], 0xbc, 1),
+            (
+                c")\xcc\x80\xcc\x81\xcc\x82\xc2\x80",
+                &b")\xcc\x80\xcc\x81\xcc\x82"[..],
+                0x29,
+                1,
+            ),
+            (
+                c"\xf4\x80\x80\x80\xe1\xaa\xb0\xcc\x81",
+                &b"\xf4\x80\x80\x80\xe1\xaa\xb0\xcc\x81"[..],
+                0x100000,
+                1,
+            ),
+        ] {
+            let (sc, actual_firstc, actual_cells) = crate::grid::unittest_schar_from_cluster(input);
+            let mut output = [0u8; 32];
+            schar_get(&mut output, sc);
+            assert_eq!((actual_firstc, actual_cells), (firstc, cells));
+            assert_eq!(
+                CStr::from_bytes_until_nul(&output).unwrap().to_bytes(),
+                expected
+            );
         }
     }
 }

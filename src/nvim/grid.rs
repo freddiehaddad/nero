@@ -7,8 +7,8 @@ use crate::decoration::{VirtTextChunk, decor_check_invalid_glyphs, next_virt_tex
 use crate::globals::*;
 use crate::highlight::{hl_apply_winblend, hl_combine_attr};
 use crate::mbyte::{
-    mb_string2cells, utf_char2bytes, utf_char2len, utf_cluster_info_len, utf_cp_bounds,
-    utf_ptr2_str_char_info_len, utf_ptr2cells, utf_slice2char, utf_slice2len,
+    utf_char2bytes, utf_char2len, utf_cluster_info, utf_cluster_info_len, utf_cp_bounds,
+    utf_ptr2_str_char_info_len, utf_slice2_str_char_info, utf_slice2char, utf_slice2len,
 };
 use crate::msgpack_rpc::packer::ObjHandle;
 use crate::option_vars::*;
@@ -1469,18 +1469,17 @@ fn grid_draw_bordertext(
         };
         let mut text = text_cstr;
         if overflow > 0 {
-            let cells = mb_string2cells(text_cstr.to_bytes()) as i32;
-            if overflow >= cells {
-                overflow -= cells;
+            let text_bytes = text_cstr.to_bytes();
+            let mut ci = utf_slice2_str_char_info(text_bytes);
+            while !ci.ptr.is_empty() && overflow > 0 {
+                let cli = utf_cluster_info(ci);
+                overflow -= cli.cells;
+                ci = cli.next;
+            }
+            if ci.ptr.is_empty() {
                 continue;
             }
-            let text_bytes = text_cstr.to_bytes();
-            let mut off = 0usize;
-            while off < text_bytes.len() && overflow > 0 {
-                overflow -= utf_ptr2cells(&text_bytes[off..]);
-                off += crate::mbyte::utfc_slice2len(&text_bytes[off..]).max(1);
-            }
-            text = &text_cstr[off.min(text_bytes.len())..];
+            text = &text_cstr[ci.offset_from(text_bytes)..];
         }
         if attr == -1 {
             attr = default_attr;
@@ -1686,15 +1685,15 @@ pub fn schar_from_cluster(ci: StrCharInfo<'_>, cli: ClusterInfo<'_>) -> Schar {
 }
 
 #[cfg(test)]
-pub fn unittest_schar_from_cluster(buf: &std::ffi::CStr, firstc: &mut i32) -> Schar {
+pub fn unittest_schar_from_cluster(buf: &std::ffi::CStr) -> (Schar, i32, i32) {
     let ci = crate::mbyte::utf_slice2_str_char_info(buf.to_bytes());
     let cli = crate::mbyte::utf_cluster_info(ci);
-    *firstc = ci.chr.value;
-    if ci.chr.value >= 0 {
+    let sc = if ci.chr.value >= 0 {
         schar_from_cluster(ci, cli)
     } else {
         0
-    }
+    };
+    (sc, ci.chr.value, cli.cells)
 }
 
 #[cfg(test)]

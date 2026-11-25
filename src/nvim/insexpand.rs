@@ -16,7 +16,7 @@ use crate::change::{
 };
 use crate::charset::{
     ascii_iswhite, ascii_iswhite_or_nul, getwhitecols, str_foldcase, vim_is_idc, vim_isfilec,
-    vim_isprintc, vim_iswordc, vim_iswordp, vim_strsize,
+    vim_isprintc, vim_iswordc, vim_iswordp,
 };
 use crate::cmdexpand::{
     CTRL_N, CTRL_P, EXPAND_FILES, EXPAND_LUA, EXPAND_NOTHING, EXPAND_OK, EXPAND_UNSUCCESSFUL,
@@ -72,8 +72,9 @@ use crate::keycodes::{
 };
 use crate::lua::executor::nlua_expand_pat;
 use crate::mbyte::{
-    mb_get_class, mb_islower, mb_isupper, mb_ptr2char_adv, mb_tolower, mb_toupper, ptr2cells,
-    utf_char2bytes, utf_char2len, utf_ptr2char, utf_ptr2len, utf_slice2char, utfc_ptr2len,
+    mb_get_class, mb_islower, mb_isupper, mb_ptr2char_adv, mb_string2cells, mb_tolower, mb_toupper,
+    ptr2cells, utf_char2bytes, utf_char2len, utf_ptr2char, utf_ptr2len, utf_slice2char,
+    utfc_ptr2len,
 };
 use crate::memline::{dec, ml_delete, ml_get, ml_get_len};
 use crate::message::{
@@ -5714,7 +5715,7 @@ fn ins_compl_show_filename() {
         screen_state().columns_global.get()
     } else {
         screen_state().sc_col.get()
-    }) - vim_strsize(lead.to_bytes())
+    }) - mb_string2cells(lead.to_bytes())
         - 2;
     if space <= 0 {
         return;

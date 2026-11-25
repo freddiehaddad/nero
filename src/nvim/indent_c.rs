@@ -6,7 +6,7 @@ use crate::change::{
 };
 use crate::charset::{
     NUL, ascii_isdigit, ascii_iswhite, getdigits_int, getwhitecols_curline, vim_is_idc,
-    vim_iswordc, vim_iswordp, vim_strsize,
+    vim_iswordc, vim_iswordp,
 };
 use crate::cursor::{Colnr, CursorPos, Linenr, Lpos, get_cursor_line_ptr, lt};
 use crate::eval::typval::{EvalFuncData, K_CALLBACK_NONE_CONST, TypVal, tv_get_lnum};
@@ -14,7 +14,7 @@ use crate::globals::*;
 use crate::indent::{fixthisline, get_expr_indent, get_indent, get_indent_lnum, get_sw_value};
 use crate::keycodes::get_special_key_code;
 use crate::math::trim_to_int;
-use crate::mbyte::mb_strnicmp;
+use crate::mbyte::{mb_string2cells, mb_strnicmp};
 use crate::option::copy_option_part;
 use crate::option_vars::*;
 use crate::plines::getvcol;
@@ -1602,8 +1602,8 @@ pub fn get_c_indent() -> i32 {
                             if start_off != 0 {
                                 amount += start_off;
                             } else if start_align == i32::from(COM_RIGHT) {
-                                amount += vim_strsize(&lead_start[..lead_start_len])
-                                    - vim_strsize(&lead_middle[..lead_middle_len]);
+                                amount += mb_string2cells(&lead_start[..lead_start_len])
+                                    - mb_string2cells(&lead_middle[..lead_middle_len]);
                             }
                             break;
                         }
@@ -1614,8 +1614,8 @@ pub fn get_c_indent() -> i32 {
                             if off != 0 {
                                 amount += off;
                             } else if align == i32::from(COM_RIGHT) {
-                                amount += vim_strsize(&lead_start[..lead_start_len])
-                                    - vim_strsize(&lead_middle[..lead_middle_len]);
+                                amount += mb_string2cells(&lead_start[..lead_start_len])
+                                    - mb_string2cells(&lead_middle[..lead_middle_len]);
                             }
                             done = true;
                             break;

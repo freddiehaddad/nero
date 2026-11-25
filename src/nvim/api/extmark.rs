@@ -1582,7 +1582,7 @@ pub fn parse_virt_text(
             },
             untab,
         );
-        w += mb_string2cells(text_cstr.as_bytes()) as i32;
+        w += mb_string2cells(text_cstr.as_bytes());
 
         virt_text.push(VirtTextChunk {
             text: Some(crate::option_vars::RcCStr::from_cstring(text_cstr)),

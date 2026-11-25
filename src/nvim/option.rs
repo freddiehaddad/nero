@@ -21,7 +21,7 @@ use crate::change::{HLF_W, save_file_ff};
 use crate::charset::vim_isfilec;
 use crate::charset::{
     EOL_MAC, ascii_isalnum, ascii_iswhite, buf_init_isk_chartab, init_isf_chartab,
-    init_isi_chartab, is_special, trans_characters, transchar, vim_str2nr, vim_strsize,
+    init_isi_chartab, is_special, trans_characters, transchar, vim_str2nr,
 };
 use crate::cmdexpand::{
     Cmdidx, EXPAND_BOOL_SETTINGS, EXPAND_DIRECTORIES, EXPAND_FILES, EXPAND_FILETYPE, EXPAND_KEYMAP,
@@ -87,7 +87,7 @@ use crate::log::logmsg;
 use crate::highlight::HlAttrs;
 use crate::lua::executor::{api_free_luaref, api_new_luaref, nlua_funcref_str, nlua_set_sctx};
 use crate::mapping::{langmap_init, put_escstr};
-use crate::mbyte::enc_locale;
+use crate::mbyte::{enc_locale, mb_string2cells};
 use crate::mcursor::{K_OPT_FOLLOW, mc_ins_replay_can_join};
 use crate::memfile::mf_close_file;
 use crate::memline::{ml_open_file, ml_open_files};
@@ -6114,7 +6114,9 @@ fn showoptions(all: bool, opt_flags: i32) {
                     1
                 } else {
                     let formatted = optval_fmt(opt_idx, opt_flags);
-                    (opt.fullname.to_bytes().len() as i32) + vim_strsize(formatted.as_bytes()) + 1
+                    (opt.fullname.to_bytes().len() as i32)
+                        + mb_string2cells(formatted.as_bytes())
+                        + 1
                 };
                 if (len <= INC - GAP && run == 1) || (len > INC - GAP && run == 2) {
                     items.push(opt);

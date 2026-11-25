@@ -4,7 +4,7 @@
 use crate::autocmd::{
     DOCMD_NOWAIT, DOCMD_REPEAT, DOCMD_VERBOSE, EVENT_FUNCUNDEFINED, PROF_YES, apply_autocmds,
 };
-use crate::charset::{NUL, ascii_isalnum, ascii_islower, ascii_iswhite, getdigits, vim_strsize};
+use crate::charset::{NUL, ascii_isalnum, ascii_islower, ascii_iswhite, getdigits};
 use crate::cmdexpand::{Cmdidx, EXPAND_USER_FUNC, K_UICMDLINE};
 use crate::cursor::Linenr;
 use crate::debugger::{dbg_breakpoint, dbg_find_breakpoint, has_profiling};
@@ -49,6 +49,7 @@ use crate::lua::converter::{LUA_NOREF, LuaRef};
 use crate::lua::executor::{
     api_free_luaref, nlua_call_vlua, nlua_exec_typval_callable, nlua_set_sctx,
 };
+use crate::mbyte::mb_string2cells;
 use crate::memory::{bytes_to_cstring, entered_free_all_mem};
 use crate::message::{
     emsg, iemsg, internal_error, message_filtered, msg_clr_eos, msg_ext_set_kind, msg_outnum,
@@ -1658,7 +1659,7 @@ pub fn call_user_func(
                         encode_tv2string(arg_tv, None)
                     };
                     let mut buf = [0u8; MSG_BUF_LEN];
-                    let s = if vim_strsize(tf.as_bytes()) > MSG_BUF_CLEN {
+                    let s = if mb_string2cells(tf.as_bytes()) > MSG_BUF_CLEN {
                         trunc_string(Some(tf.as_bytes()), &mut buf, MSG_BUF_CLEN);
                         crate::memory::bytes_as_cstr(&buf)
                     } else {
@@ -1807,7 +1808,7 @@ pub fn call_user_func(
                 let _emsg_off = msg_state().suppress_emsg();
                 encode_tv2string(rettv, None)
             };
-            let s = if vim_strsize(tf.as_bytes()) > MSG_BUF_CLEN {
+            let s = if mb_string2cells(tf.as_bytes()) > MSG_BUF_CLEN {
                 trunc_string(Some(tf.as_bytes()), &mut buf, MSG_BUF_CLEN);
                 crate::memory::bytes_as_cstr(&buf)
             } else {

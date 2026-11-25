@@ -1,7 +1,6 @@
 //! Command-line history (`src/nvim/cmdhist.c`).
 #![forbid(unsafe_code)]
 
-use crate::charset::vim_strsize;
 use crate::errors::{E_TRAILING_ARG, E_VAL_TOO_LARGE};
 use crate::eval::typval::{
     EvalFuncData, TypVal, VarType, tv_get_number, tv_get_number_chk, tv_get_string_buf,
@@ -11,6 +10,7 @@ use crate::ex_cmds::check_secure;
 use crate::ex_docmd::{CMOD_KEEPPATTERNS, Exarg};
 use crate::ex_getln::{get_cmdline_firstc, get_list_range};
 use crate::globals::*;
+use crate::mbyte::mb_string2cells;
 use crate::message::{
     message_filtered, msg, msg_ext_set_kind, msg_outtrans, msg_putchar, msg_puts_title, semsg,
     trunc_string,
@@ -710,7 +710,8 @@ pub fn ex_history(eap: &mut Exarg) {
                     let prefix_bytes = prefix.as_bytes();
                     let len = prefix_bytes.len();
                     iobuf[..len].copy_from_slice(prefix_bytes);
-                    if vim_strsize(entry_cstr.to_bytes()) > screen_state().columns_global.get() - 10
+                    if mb_string2cells(entry_cstr.to_bytes())
+                        > screen_state().columns_global.get() - 10
                     {
                         trunc_string(
                             Some(entry_cstr.to_bytes()),

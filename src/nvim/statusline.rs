@@ -10,7 +10,6 @@ use crate::buffer::{
 };
 use crate::charset::{
     EOL_MAC, ascii_isdigit, getdigits_int, skipdigits_slice, trans_characters, transstr_buf,
-    vim_strnsize, vim_strsize,
 };
 use crate::context::ctx_saved_curwin;
 use crate::cursor::{Colnr, Linenr};
@@ -31,7 +30,7 @@ use crate::grid::{
 use crate::highlight::{hl_attr, hl_combine_attr, win_hl_attr};
 use crate::highlight_group::{syn_id2attr, syn_name2id_len};
 use crate::keycodes::NL;
-use crate::mbyte::{ptr2cells, utfc_ptr2len};
+use crate::mbyte::{mb_string2cells, mb_string2cells_len, ptr2cells, utfc_ptr2len};
 use crate::memline::ml_find_line_or_offset;
 use crate::message::HLF_MSG;
 use crate::message::msg_clr_eos;
@@ -444,7 +443,7 @@ pub fn stl_fill_click_defs(
         };
         let end_off = rec_off.min(buf_bytes.len());
         let chunk = &buf_bytes[prev_off.min(end_off)..end_off];
-        len += vim_strnsize(chunk, chunk.len() as i32);
+        len += mb_string2cells_len(chunk);
         debug_assert!(len <= width);
         while col < len {
             click_defs[col as usize] = cur_click_def.clone();
@@ -1105,7 +1104,7 @@ pub fn draw_tabline() {
 
                 shorten_dir(&mut name_buff);
                 let name_cstr = crate::memory::bytes_as_cstr(&name_buff);
-                let mut len = vim_strsize(name_cstr.to_bytes());
+                let mut len = mb_string2cells(name_cstr.to_bytes());
                 let mut p_cstr: &CStr = name_cstr;
                 while len > room {
                     let b = p_cstr.to_bytes();
@@ -1290,7 +1289,7 @@ fn stl_truncate(
     }
 
     if *width
-        - vim_strsize(crate::memory::bytes_until_nul(
+        - mb_string2cells(crate::memory::bytes_until_nul(
             &out_buf[trunc_idx.min(out_buf.len())..],
         ))
         >= maxwid
@@ -1695,9 +1694,8 @@ pub fn build_stl_str_hl_slice(
             }
 
             let start_idx = stl_items!()[gidx as usize].start_off;
+            let mut group_len = mb_string2cells_len(&out_buf[start_idx.min(out_idx)..out_idx]);
             out_buf[out_idx] = 0;
-
-            let mut group_len = vim_strsize(&out_buf[start_idx.min(out_idx)..out_idx]);
 
             if curitem > gidx + 1 && stl_items!()[gidx as usize].minwid == 0 {
                 let mut group_start_userhl = 0;
@@ -2427,7 +2425,7 @@ pub fn build_stl_str_hl_slice(
                 prevchar_isflag = true;
             }
 
-            let mut l = vim_strsize(crate::memory::bytes_until_nul(&s_buf[t_idx..]));
+            let mut l = mb_string2cells(crate::memory::bytes_until_nul(&s_buf[t_idx..]));
             if l > 0 {
                 prevchar_isitem = true;
             }
@@ -2591,7 +2589,7 @@ pub fn build_stl_str_hl_slice(
     }
     out_buf[out_idx] = 0;
 
-    let mut width = vim_strsize(&out_buf[..out_idx]);
+    let mut width = mb_string2cells(&out_buf[..out_idx]);
     if maxwidth > 0 && width > maxwidth && (stcp.is_none() || width > MAX_STCWIDTH) {
         stl_truncate(
             &mut width,

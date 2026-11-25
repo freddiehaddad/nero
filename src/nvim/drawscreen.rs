@@ -7,7 +7,7 @@ use crate::buffer::{
     maketitle,
 };
 use crate::change::{changed_lines_invalidate_win, changed_topline_skipcol};
-use crate::charset::{vim_isprintc, vim_strsize};
+use crate::charset::vim_isprintc;
 use crate::cmdexpand::{K_UICMDLINE, cmdline_pum_display};
 use crate::context::ctx_saved_curwin;
 use crate::cursor::{Colnr, CursorPos, Linenr};
@@ -44,6 +44,7 @@ use crate::input::char_avail;
 use crate::insexpand::ins_compl_show_pum;
 use crate::marktree::{DECOR_PRIORITY_BASE, K_MTMETA_SIGN_TEXT};
 use crate::r#match::{init_search_hl, prepare_search_hl};
+use crate::mbyte::mb_string2cells;
 use crate::memline::ml_get_buf_len;
 use crate::message::{
     msg_check_for_delay, msg_clr_cmdline, msg_clr_eos, msg_ext_flush_showmode, msg_ext_ui_flush,
@@ -1252,13 +1253,13 @@ pub fn showmode() -> i32 {
                         - 3
                 };
                 if let Some(ref extra) = edit_state().edit_submode_extra.get() {
-                    length -= vim_strsize(extra.as_bytes());
+                    length -= mb_string2cells(extra.as_bytes());
                 }
                 if length > 0 {
                     if let Some(pre) = edit_state().edit_submode_pre.get() {
-                        length -= vim_strsize(pre.to_bytes());
+                        length -= mb_string2cells(pre.to_bytes());
                     }
-                    if length - vim_strsize(submode.to_bytes()) > 0 {
+                    if length - mb_string2cells(submode.to_bytes()) > 0 {
                         if let Some(pre) = edit_state().edit_submode_pre.get() {
                             msg_puts_hl(pre, hl_id, false);
                         }

@@ -16,7 +16,7 @@ use crate::buffer::{
 };
 use crate::buffer_updates::buf_updates_send_changes;
 use crate::change::{K_OPT_VE_FLAG_ONEMORE, SIN_NOMARK, changed_bytes, changed_lines, del_chars};
-use crate::charset::{ascii_iswhite, getdigits_int, transchar, vim_strsize};
+use crate::charset::{ascii_iswhite, getdigits_int, transchar};
 use crate::clipboard::{adjust_clipboard_name, get_clipboard, set_clipboard};
 use crate::cmdexpand::CTRL_P;
 use crate::cursor::{
@@ -56,7 +56,7 @@ use crate::keycodes::{
 use crate::mapping::{REMAP_NONE, REMAP_YES};
 use crate::mark::mark_adjust;
 use crate::mbyte::{
-    mb_charlen, mb_string2cells_len, mb_tolower, ptr2cells, utf_cluster_info,
+    mb_charlen, mb_string2cells, mb_string2cells_len, mb_tolower, ptr2cells, utf_cluster_info,
     utf_slice2_str_char_info, utfc_ptr2len,
 };
 use crate::mcursor::mc_ins_cascading;
@@ -510,13 +510,12 @@ pub fn op_reg_set_previous(name: u8) -> bool {
 
 pub fn update_yankreg_width(reg: &mut Yankreg) {
     if reg.y_type == MotionType::MtBlockWise {
-        let mut maxlen: usize = 0;
+        let mut maxlen = 0;
         for item in reg.y_array.iter() {
             let rowlen = mb_string2cells_len(item.as_bytes());
             maxlen = maxlen.max(rowlen);
         }
-        assert!(maxlen <= i32::MAX as usize);
-        reg.y_width = reg.y_width.max((maxlen as Colnr) - 1);
+        reg.y_width = reg.y_width.max(maxlen - 1);
     }
 }
 
@@ -2776,14 +2775,14 @@ fn str_to_reg(
     y_ptr.y_array_mut().reserve(newlines);
     y_ptr.y_allocated = true;
 
-    let mut maxlen: usize = 0;
+    let mut maxlen = 0;
 
     if let Some(list) = str_list {
         for item in list {
             let s = item.as_ref();
             y_ptr.y_array_mut().push(cstr_to_string(Some(s)));
             if yank_type == MotionType::MtBlockWise {
-                let charlen = vim_strsize(s.to_bytes()) as usize;
+                let charlen = mb_string2cells(s.to_bytes());
                 maxlen = maxlen.max(charlen);
             }
         }
@@ -2837,11 +2836,7 @@ fn str_to_reg(
     y_ptr.additional_data = None;
     y_ptr.timestamp = os_realtime() as u64;
     if yank_type == MotionType::MtBlockWise {
-        y_ptr.y_width = if blocklen == -1 {
-            (maxlen as Colnr) - 1
-        } else {
-            blocklen
-        };
+        y_ptr.y_width = if blocklen == -1 { maxlen - 1 } else { blocklen };
     } else {
         y_ptr.y_width = 0;
     }

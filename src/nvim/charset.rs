@@ -5,8 +5,7 @@ use crate::buffer::FileBuf;
 use crate::globals::*;
 use crate::mbyte::{
     UTF8LEN_TAB, mb_islower, mb_isupper, mb_tolower, utf_char2cells, utf_char2len, utf_char2slice,
-    utf_class_tab, utf_cluster_info, utf_printable, utf_slice2_str_char_info, utf_slice2char,
-    utf_slice2len, utfc_slice2len,
+    utf_class_tab, utf_printable, utf_slice2char, utf_slice2len, utfc_slice2len,
 };
 use crate::memory::bytes_to_cstring;
 use crate::option::{get_fileformat, skip_to_option_part_slice};
@@ -18,7 +17,6 @@ use std::ffi::{CStr, CString};
 use crate::change::TAB;
 use crate::eval::typval::Varnumber;
 use crate::keycodes::CAR;
-use crate::regexp::MAXCOL;
 pub type Uvarnumber = u64;
 
 pub(crate) const NUL: RawCChar = 0;
@@ -657,28 +655,6 @@ pub fn char2cells(c: i32) -> i32 {
         return utf_char2cells(c);
     }
     ascii2cells(c)
-}
-
-pub fn vim_strsize(s: &[u8]) -> i32 {
-    vim_strnsize(s, MAXCOL)
-}
-
-pub fn vim_strnsize(s: &[u8], mut len: i32) -> i32 {
-    let s_bytes = crate::memory::bytes_until_nul(s);
-    let max_len = (len.max(0) as usize).min(s_bytes.len());
-    let slice = &s_bytes[..max_len];
-    if slice.is_empty() {
-        return 0;
-    }
-    let mut size: i32 = 0;
-    let mut ci = utf_slice2_str_char_info(slice);
-    while !ci.ptr.is_empty() && len > 0 {
-        let cli = utf_cluster_info(ci);
-        size += cli.cells;
-        len -= (ci.ptr.len() - cli.next.ptr.len()) as i32;
-        ci = cli.next;
-    }
-    size
 }
 
 pub fn vim_is_idc(c: i32) -> bool {
@@ -1467,17 +1443,5 @@ mod tests {
             Some(171),
             Some(b'x' as i32),
         );
-    }
-
-    #[test]
-    fn vim_strsize_and_strnsize_accept_byte_slices() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let buf = b"hello\x01world";
-        assert_eq!(vim_strsize(&buf[..5]), 5);
-        assert_eq!(vim_strsize(&buf[..6]), 7);
-        assert_eq!(vim_strnsize(buf, 5), 5);
-        assert_eq!(vim_strnsize(buf, 6), 7);
     }
 }

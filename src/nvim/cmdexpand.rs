@@ -11,7 +11,7 @@ use crate::autocmd::{
 use crate::buffer::{K_UIMESSAGES, expand_bufnames};
 use crate::charset::{
     CTRL_V_CONST, ascii_isdigit, ascii_isspace, ascii_iswhite, backslash_halve_save, rem_backslash,
-    transchar, transchar_byte, vim_isfilec_or_wc, vim_strsize,
+    transchar, transchar_byte, vim_isfilec_or_wc,
 };
 use crate::cmdhist::get_history_arg;
 use crate::cursor::{CursorPos, ltoreq};
@@ -54,7 +54,7 @@ use crate::lua::executor::{
     K_RET_OBJECT, nlua_call_user_expand_func, nlua_exec, nlua_expand_get_matches, nlua_expand_pat,
 };
 use crate::mapping::{expand_mappings, set_context_in_map_cmd};
-use crate::mbyte::{mb_tolower, utf_ptr2char, utfc_ptr2len};
+use crate::mbyte::{mb_string2cells, mb_tolower, utf_ptr2char, utfc_ptr2len};
 use crate::memline::ml_get_len;
 use crate::memory::bytes_to_cstring;
 use crate::menu::{get_menu_name, get_menu_names, menu_is_separator, set_context_in_menu_cmd};
@@ -2997,9 +2997,9 @@ pub fn showmatches(
             {
                 let mut name_buff = [0u8; MAXPATHL];
                 home_replace(None, Some(match_i.as_c_str()), &mut name_buff, true);
-                vim_strsize(crate::memory::bytes_until_nul(&name_buff))
+                mb_string2cells(crate::memory::bytes_until_nul(&name_buff))
             } else {
-                vim_strsize(show_match(matches, i, showtail).to_bytes())
+                mb_string2cells(show_match(matches, i, showtail).to_bytes())
             };
             maxlen = maxlen.max(len);
         }

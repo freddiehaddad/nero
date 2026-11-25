@@ -9,7 +9,7 @@ use crate::api::private::validate::{Array, ErrorType, NvimString};
 use crate::api::win_config::{K_UIMULTIGRID, WIN_CONFIG_INIT, parse_winborder};
 use crate::autocmd::{block_autocmds, unblock_autocmds};
 use crate::buffer::{bt_nofile, buf_clear, first_win_in_tab};
-use crate::charset::{transstr, vim_strsize};
+use crate::charset::transstr;
 use crate::cmdexpand::{
     K_UICMDLINE, K_UIPOPUPMENU_CONST, K_UIWILDMENU_CONST, cmdline_compl_is_fuzzy,
     cmdline_compl_pattern,
@@ -227,19 +227,19 @@ fn pum_compute_size() {
     let size = (PUM.with(|s| s.size.get()).max(0) as usize).min(items.len());
     for item in &items[..size] {
         if let Some(ref text) = item.pum_text {
-            let w = vim_strsize(text.as_bytes());
+            let w = mb_string2cells(text.as_bytes());
             if PUM.with(|s| s.base_width.get()) < w {
                 PUM.with(|s| s.base_width.set(w));
             }
         }
         if let Some(ref kind) = item.pum_kind {
-            let w = vim_strsize(kind.as_bytes()) + 1;
+            let w = mb_string2cells(kind.as_bytes()) + 1;
             if PUM.with(|s| s.kind_width.get()) < w {
                 PUM.with(|s| s.kind_width.set(w));
             }
         }
         if let Some(ref extra) = item.pum_extra {
-            let w = vim_strsize(extra.as_bytes()) + 1;
+            let w = mb_string2cells(extra.as_bytes()) + 1;
             if PUM.with(|s| s.extra_width.get()) < w {
                 PUM.with(|s| s.extra_width.set(w));
             }
@@ -698,7 +698,7 @@ fn pum_compute_text_attrs(
         match_positions.as_ref()?;
     }
 
-    let mut attrs = vec![0; vim_strsize(text_cstr.to_bytes()) as usize];
+    let mut attrs = vec![0; mb_string2cells(text_cstr.to_bytes()) as usize];
     let mut rem_bytes = text_cstr.to_bytes();
     let mut cell_idx: usize = 0;
     let mut char_pos: u32 = 0;
@@ -1051,7 +1051,7 @@ pub fn pum_redraw() {
                         let mut rt_bytes = reverse_text(st_slice).into_bytes_with_nul();
                         let mut rt_idx = 0usize;
                         let mut cells =
-                            mb_string2cells(&rt_bytes[..rt_bytes.len().saturating_sub(1)]) as i32;
+                            mb_string2cells(&rt_bytes[..rt_bytes.len().saturating_sub(1)]);
                         let pad = if next_isempty { 0 } else { 2 };
                         if width_limit - totwidth < cells + pad {
                             need_fcs_trunc = true;
@@ -1089,7 +1089,7 @@ pub fn pum_redraw() {
                         grid_col -= width;
                     } else {
                         let mut cells =
-                            mb_string2cells(&st_bytes[..st_bytes.len().saturating_sub(1)]) as i32;
+                            mb_string2cells(&st_bytes[..st_bytes.len().saturating_sub(1)]);
                         let pad = if next_isempty { 0 } else { 2 };
                         if width_limit - totwidth < cells + pad {
                             need_fcs_trunc = true;

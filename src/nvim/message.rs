@@ -9,7 +9,7 @@ use crate::api::vim::{HLF_N, HlMessage, MessageData};
 use crate::autocmd::{AUGROUP_ALL, EVENT_PROGRESS, HLF_8, HLF_T, apply_autocmds_group, has_event};
 use crate::charset::{
     ascii_iswhite, ascii2cells, char2cells, is_special, to_special, transchar_buf,
-    transchar_byte_buf, vim_isprintc, vim_strsize,
+    transchar_byte_buf, vim_isprintc,
 };
 use crate::dialog::{clone_confirm_buttons, clone_confirm_msg, has_confirm_msg, prompt_for_input};
 use crate::drawscreen::{
@@ -51,8 +51,8 @@ use crate::keycodes::{
 use crate::log::{LOGLVL_DBG, LOGLVL_INF, log_get_stderr, logmsg};
 use crate::main_init::input_unanswerable;
 use crate::mbyte::{
-    UTF8LEN_TAB, mb_string2cells_len, mb_unescape, utf_char2bytes, utf_char2cells, utf_ptr2cells,
-    utf_ptr2char, utf_ptr2len, utf_slice2char, utfc_ptr2len, utfc_ptr2len_len,
+    UTF8LEN_TAB, mb_string2cells, mb_string2cells_len, mb_unescape, utf_char2bytes, utf_char2cells,
+    utf_ptr2cells, utf_ptr2char, utf_ptr2len, utf_slice2char, utfc_ptr2len, utfc_ptr2len_len,
 };
 use crate::mouse::{MOUSE_SETPOS, jump_to_mouse, setmouse};
 use crate::msgpack_rpc::packer::Integer;
@@ -1018,7 +1018,7 @@ pub fn msg_keep(s_in: &std::ffi::CStr, hl_id: i32, keep: bool, multiline: bool) 
 
         if keep
             && retval
-            && vim_strsize(s.to_bytes())
+            && mb_string2cells(s.to_bytes())
                 < (screen_state().rows_global.get() - cmdline_state().cmdline_row.get() - 1)
                     * screen_state().columns_global.get()
                     + screen_state().sc_col.get()
@@ -1047,7 +1047,7 @@ pub fn msg_strtrunc(s: &std::ffi::CStr, force: i32) -> Option<std::ffi::CString>
             && !ui_has(K_UIMESSAGES))
             || force != 0
         {
-            let len = vim_strsize(s.to_bytes());
+            let len = mb_string2cells(s.to_bytes());
             let room = if msg_state().msg_scrolled.get() != 0 {
                 // Use all the columns.
                 (screen_state().rows_global.get() - msg_state().msg_row.get())
@@ -1561,7 +1561,7 @@ pub fn msg_may_trunc(force: bool, s: &mut [u8]) -> &std::ffi::CStr {
         - 1;
     let mut off = 0usize;
     if room > 0 && (force || shortmess(K_SHM_TRUNC)) && slen - room > 0 {
-        let mut size = vim_strsize(crate::memory::bytes_until_nul(s));
+        let mut size = mb_string2cells(crate::memory::bytes_until_nul(s));
 
         // There may be room anyway when there are multibyte chars.
         if size <= room {
@@ -2170,7 +2170,7 @@ pub fn wait_return(redraw: i32) {
     msg_state().lines_left.set(-1);
     reset_last_sourcing();
     if msg_state().keep_msg.get().as_ref().is_some_and(|km| {
-        vim_strsize(km.as_bytes())
+        mb_string2cells(km.as_bytes())
             >= (screen_state().rows_global.get() - cmdline_state().cmdline_row.get() - 1)
                 * screen_state().columns_global.get()
                 + screen_state().sc_col.get()
@@ -2568,7 +2568,7 @@ pub fn msg_outtrans_special(strstart: &[u8], from: bool, maxlen: i32) -> i32 {
             text =
                 SpecialKeyBuf::from_cstr(&transchar_byte_buf(None, i32::from(text.to_bytes()[0])));
         }
-        let len = vim_strsize(text.to_bytes());
+        let len = mb_string2cells(text.to_bytes());
         if maxlen > 0 && retval + len >= maxlen {
             break;
         }
@@ -3050,7 +3050,7 @@ fn msg_puts_display(str_in: &[u8], maxlen: i32, hl_id: i32, recurse: i32) {
             } else {
                 str_slice
             };
-            let col = mb_string2cells_len(tail) as i32;
+            let col = mb_string2cells_len(tail);
             msg_state().msg_col.set(
                 (if lastline_idx.is_some() {
                     0

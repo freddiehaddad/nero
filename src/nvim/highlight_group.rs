@@ -11,7 +11,7 @@ use crate::api::win_config::UIExtension;
 use crate::autocmd::{EVENT_COLORSCHEME, EVENT_COLORSCHEMEPRE, apply_autocmds};
 use crate::buffer::K_UIMESSAGES;
 use crate::change::HLF_W;
-use crate::charset::{ascii_iswhite, getdigits_int, vim_isprintc, vim_strsize};
+use crate::charset::{ascii_iswhite, getdigits_int, vim_isprintc};
 use crate::cmdexpand::{EXPAND_HIGHLIGHT, EXPAND_NOTHING, HLF_D};
 use crate::cursor_shape::cursor_mode_uses_syn_id;
 use crate::decoration::NS;
@@ -37,7 +37,7 @@ use crate::highlight::{
 };
 use crate::lua::converter::Boolean;
 use crate::lua::executor::nlua_set_sctx;
-use crate::mbyte::{mb_stricmp, mb_strnicmp};
+use crate::mbyte::{mb_stricmp, mb_string2cells, mb_strnicmp};
 use crate::message::{
     emsg, message_filtered, msg_advance, msg_clr_eos, msg_ext_set_kind, msg_outtrans, msg_putchar,
     msg_puts_hl, msg_source, semsg,
@@ -1895,7 +1895,7 @@ fn highlight_list_arg(
 
     syn_list_header(
         didh,
-        vim_strsize(ts_cstr.to_bytes()) + name.to_bytes().len() as i32 + 1,
+        mb_string2cells(ts_cstr.to_bytes()) + name.to_bytes().len() as i32 + 1,
         id,
         false,
     );

@@ -1288,7 +1288,7 @@ fn handle_inline_virtual_text(wlv: &mut Winlinevars, v: isize, selected: bool) {
             wlv.n_attr = n_attr;
             if wlv.skip_cells > 0 {
                 let virt_text_width =
-                    mb_string2cells(wlv.p_extra().map_or(&[][..], std::ffi::CStr::to_bytes)) as i32;
+                    mb_string2cells(wlv.p_extra().map_or(&[][..], std::ffi::CStr::to_bytes));
                 if virt_text_width > wlv.skip_cells {
                     let mut skip_cells_remaining = wlv.skip_cells;
                     while skip_cells_remaining > 0 {

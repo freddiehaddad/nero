@@ -17,9 +17,9 @@ use crate::eval::typval::{
 use crate::ex_docmd::find_cmdline_var;
 use crate::math::{xisinf, xisnan};
 use crate::mbyte::{
-    mb_cptr2char_adv, mb_ptr2char_adv, mb_string2cells, mb_tolower, mb_toupper, utf_char2slice,
+    mb_cptr2char_adv, mb_ptr2char_adv, mb_tolower, mb_toupper, utf_char2slice, utf_cluster_info,
     utf_head_off_slice, utf_ptr2cells, utf_ptr2char, utf_ptr2len, utf_slice2_char_info,
-    utf_slice2char, utf_slice2len, utfc_ptr2len, utfc_slice2len,
+    utf_slice2_str_char_info, utf_slice2char, utf_slice2len, utfc_ptr2len, utfc_slice2len,
 };
 use crate::message::{emsg, semsg};
 use crate::option::{csh_like_shell, fish_like_shell};
@@ -2834,7 +2834,15 @@ pub fn f_strdisplaywidth(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: Eval
 
 pub fn f_strwidth(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFuncData) {
     let s = tv_get_string(&argvars[0]);
-    rettv.value = crate::eval::typval::TvValue::Number(mb_string2cells(s.to_bytes()) as Varnumber);
+    let mut width = 0;
+    let mut ci = utf_slice2_str_char_info(s.to_bytes());
+    while !ci.ptr.is_empty() {
+        let cli = utf_cluster_info(ci);
+        // Unlike display width, strwidth() counts controls and invalid bytes as one cell.
+        width += Varnumber::from(if ci.chr.value < 0x80 { 1 } else { cli.cells });
+        ci = cli.next;
+    }
+    rettv.value = crate::eval::typval::TvValue::Number(width);
 }
 
 pub fn f_strcharpart(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFuncData) {
