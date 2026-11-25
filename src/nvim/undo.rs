@@ -1250,6 +1250,9 @@ fn uhp_table_find(uhp_table: &[(UHeader, [i32; 4])], seq: i32) -> i32 {
     -1
 }
 
+/// Checks that the headers in `uhp_table` form the tree that u_blockfree() frees and undo/redo
+/// relinks (see u_check_tree()): from `oldhead` every header is reached exactly once through
+/// uh_prev or uh_alt_next, and its uh_next and uh_alt_prev link back.
 fn undo_tree_valid(
     uhp_table: &mut [(UHeader, [i32; 4])],
     oldhead: Option<usize>,
@@ -1266,41 +1269,42 @@ fn undo_tree_valid(
     }
 
     let mut stack = Vec::with_capacity(uhp_table.len());
+    let mark = undo_st(|st| {
+        let m = st.lastmark.get() + 1;
+        st.lastmark.set(m);
+        m
+    });
     let mut count = 0usize;
     let mut ok = true;
 
-    uhp_table[old_idx].0.uh_walk = 1;
+    uhp_table[old_idx].0.uh_walk = mark;
     stack.push(old_idx);
     while ok && let Some(uhp_idx) = stack.pop() {
         count += 1;
         let uhp = &uhp_table[uhp_idx].0;
-        let alt_next = uhp.uh_alt_next;
-        let alt_prev = uhp.uh_alt_prev;
-        let prev = uhp.uh_prev;
-        if alt_next.is_some_and(|an| uhp_table[an].0.uh_alt_prev != Some(uhp_idx))
-            || alt_prev.is_some_and(|ap| uhp_table[ap].0.uh_alt_next != Some(uhp_idx))
-        {
-            ok = false;
-        }
-
-        for next_opt in [prev, alt_next] {
+        // Child and alternate, with their expected uh_next and uh_alt_prev back-links.
+        let next = [
+            (uhp.uh_prev, Some(uhp_idx), None),
+            (uhp.uh_alt_next, uhp.uh_next, Some(uhp_idx)),
+        ];
+        for (next_opt, exp_uh_next, exp_uh_alt_prev) in next {
             if !ok {
                 break;
             }
             let Some(next_idx) = next_opt else {
                 continue;
             };
-            if uhp_table[next_idx].0.uh_walk != 0 {
+            let next_uhp = &mut uhp_table[next_idx].0;
+            if next_uhp.uh_walk == mark // Reached twice.
+                || next_uhp.uh_next != exp_uh_next
+                || next_uhp.uh_alt_prev != exp_uh_alt_prev
+            {
                 ok = false;
             } else {
-                uhp_table[next_idx].0.uh_walk = 1;
+                next_uhp.uh_walk = mark;
                 stack.push(next_idx);
             }
         }
-    }
-
-    for (uhp, _) in &mut *uhp_table {
-        uhp.uh_walk = 0;
     }
 
     ok && count == uhp_table.len()
