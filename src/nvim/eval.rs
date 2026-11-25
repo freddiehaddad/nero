@@ -237,6 +237,8 @@ pub(crate) struct EvalModuleState {
     callback_depth: std::cell::Cell<i32>,
     current_copy_id: std::cell::Cell<i32>,
     eval7_recurse: std::cell::Cell<i32>,
+    /// Active curly-braces expression checks in `eval_dict()`.
+    curly_expr_check_depth: std::cell::Cell<u32>,
     var_item_copy_recurse: std::cell::Cell<i32>,
     pub(super) provider_call_nesting: std::cell::Cell<i32>,
 }
@@ -250,6 +252,7 @@ impl EvalModuleState {
             callback_depth: std::cell::Cell::new(0),
             current_copy_id: std::cell::Cell::new(0),
             eval7_recurse: std::cell::Cell::new(0),
+            curly_expr_check_depth: std::cell::Cell::new(0),
             var_item_copy_recurse: std::cell::Cell::new(0),
             provider_call_nesting: std::cell::Cell::new(0),
         }
@@ -4471,6 +4474,29 @@ fn get_literal_key(arg: &mut &[u8], tv: &mut TypVal) -> bool {
     true
 }
 
+/// Counts a curly-braces expression check in `eval_dict()` for its scope.
+#[must_use = "if unused, the check depth will be decremented immediately"]
+struct CurlyExprCheckGuard;
+
+impl CurlyExprCheckGuard {
+    fn enter() -> Self {
+        EVAL_STATE.with(|s| {
+            s.curly_expr_check_depth
+                .set(s.curly_expr_check_depth.get() + 1);
+        });
+        Self
+    }
+}
+
+impl Drop for CurlyExprCheckGuard {
+    fn drop(&mut self) {
+        EVAL_STATE.with(|s| {
+            s.curly_expr_check_depth
+                .set(s.curly_expr_check_depth.get() - 1);
+        });
+    }
+}
+
 /// Allocate a variable for a Dictionary and fill it from "*arg".
 fn eval_dict(
     arg: &mut &[u8],
@@ -4487,12 +4513,27 @@ fn eval_dict(
     let mut curly_expr = crate::charset::skipwhite_slice(arg_bytes.get(1..).unwrap_or(&[]));
     let mut buf = [0u8; NUMBUFLEN];
 
-    if curly_expr.first().copied().unwrap_or(0) != b'}'
-        && !literal
-        && eval1(&mut curly_expr, &mut tv, None)
-        && crate::charset::skipwhite_slice(curly_expr).first() == Some(&b'}')
-    {
-        return None;
+    // First check if it's not a curly-braces expression: {expr}.
+    // Must do this without evaluating, otherwise a function may be called
+    // twice.  Unfortunately this means we need to call eval1() twice for the
+    // first item.
+    // When this is already a recursive check, do not parse a failed check.
+    // The outer check will report the error.
+    // "{}" is an empty Dictionary.
+    // "#{abc}" is never a curly-braces expression.
+    if curly_expr.first().copied().unwrap_or(0) != b'}' && !literal {
+        let in_curly_expr_check = EVAL_STATE.with(|s| s.curly_expr_check_depth.get() > 0);
+        let curly_ok = {
+            let _check = CurlyExprCheckGuard::enter();
+            eval1(&mut curly_expr, &mut tv, None)
+        };
+
+        if !curly_ok && in_curly_expr_check {
+            return Some(false);
+        }
+        if curly_ok && crate::charset::skipwhite_slice(curly_expr).first() == Some(&b'}') {
+            return None;
+        }
     }
 
     let mut d = crate::eval::typval::DictId::NULL;
