@@ -2606,6 +2606,7 @@ fn win_update(wp: &WinInfoInfo) {
                 lnum = wp.w_topline.get();
                 wp.w_lines_valid.set(0);
                 wp.w_valid.set(wp.w_valid.get() & (!VALID_WCOL));
+                search_state().with_screen_search_hl_mut(|shl| init_search_hl(wp, shl));
                 screen_state().with_decor_state_mut(|ds| decor_redraw_reset(wp, ds));
                 decor_providers_invoke_win(wp);
                 continue;
@@ -2708,6 +2709,7 @@ fn win_update(wp: &WinInfoInfo) {
                         lnum = wp.w_topline.get();
                         wp.w_lines_valid.set(0);
                         wp.w_valid.set(wp.w_valid.get() & (!VALID_WCOL));
+                        search_state().with_screen_search_hl_mut(|shl| init_search_hl(wp, shl));
                         screen_state().with_decor_state_mut(|ds| decor_redraw_reset(wp, ds));
                         decor_providers_invoke_win(wp);
                         continue 'statuscol_retry;
