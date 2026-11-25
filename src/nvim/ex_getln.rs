@@ -1739,7 +1739,8 @@ fn command_line_wildchar_complete(s: &mut CommandLineState) -> i32 {
         {
             if wim_longest {
                 let found_longest_prefix = get_cmdline_info().cmdpos.get() != cmdpos_before;
-                let show_menu = opt_vars().p_wmnu.get() && wim_full;
+                let show_menu =
+                    opt_vars().p_wmnu.get() && (wim_full || wim_noselect || wim_noinsert);
                 if wim_list || show_menu {
                     with_ccline_xpc(|xpc| {
                         showmatches(xpc, show_menu, wim_list, K_OPT_WIM_FLAG_NOSELECT as i32);
