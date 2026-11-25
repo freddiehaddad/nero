@@ -40,7 +40,6 @@ struct DebuggerState {
     debug_greedy: std::cell::Cell<bool>,
     last_cmd: std::cell::Cell<i32>,
     last_breakp: std::cell::Cell<i32>,
-    has_expr_breakpoint: std::cell::Cell<bool>,
     debug_skipped: std::cell::Cell<bool>,
     debug_breakpoint_lnum: std::cell::Cell<i32>,
     debug_oldval: std::cell::RefCell<Option<CString>>,
@@ -57,7 +56,6 @@ impl DebuggerState {
             debug_greedy: std::cell::Cell::new(false),
             last_cmd: std::cell::Cell::new(0),
             last_breakp: std::cell::Cell::new(0),
-            has_expr_breakpoint: std::cell::Cell::new(false),
             debug_skipped: std::cell::Cell::new(false),
             debug_breakpoint_lnum: std::cell::Cell::new(0),
             debug_oldval: std::cell::RefCell::new(None),
@@ -632,7 +630,6 @@ pub fn ex_breakadd(eap: &mut Exarg) {
                 st.prof_ga.borrow_mut().push(bp);
             } else {
                 st.dbg_breakp.borrow_mut().push(bp);
-                st.has_expr_breakpoint.set(true);
             }
         });
         exc_state()
@@ -645,17 +642,6 @@ pub fn ex_breakadd(eap: &mut Exarg) {
 pub fn ex_debuggreedy(eap: &mut Exarg) {
     let greedy = eap.addr_count == 0 || eap.line2 != 0;
     DBG_STATE.with(|st| st.debug_greedy.set(greedy));
-}
-
-fn update_has_expr_breakpoint() {
-    DBG_STATE.with(|st| {
-        let has = st
-            .dbg_breakp
-            .borrow()
-            .iter()
-            .any(|bp| bp.dbg_type == DBG_EXPR);
-        st.has_expr_breakpoint.set(has);
-    });
 }
 
 /// `:breakdel` and `:profdel` command (`ex_breakdel`).
@@ -742,10 +728,6 @@ pub fn ex_breakdel(eap: &mut Exarg) {
         if !del_all {
             break;
         }
-    }
-
-    if !is_prof {
-        update_has_expr_breakpoint();
     }
 }
 

@@ -144,8 +144,6 @@ impl Default for StlClickDefinition {
 }
 
 struct MouseModuleState {
-    orig_topline: std::cell::Cell<Linenr>,
-    orig_topfill: std::cell::Cell<i32>,
     got_click: std::cell::Cell<bool>,
     dragwin: crate::globals::CloneCell<crate::globals::WinPtr>,
     in_tab_line: std::cell::Cell<bool>,
@@ -166,8 +164,6 @@ struct MouseModuleState {
 impl MouseModuleState {
     const fn new() -> Self {
         Self {
-            orig_topline: std::cell::Cell::new(0),
-            orig_topfill: std::cell::Cell::new(0),
             got_click: std::cell::Cell::new(false),
             dragwin: crate::globals::CloneCell::new(crate::globals::WinPtr::NULL),
             in_tab_line: std::cell::Cell::new(false),
@@ -1628,9 +1624,7 @@ pub fn jump_to_mouse(mut flags: i32, inclusive: Option<&mut bool>, which_button:
             if mouse_st(|st| st.dragwin.get().is_null()) || (flags & MOUSE_RELEASED) != 0 {
                 win_enter(&wp, true);
             }
-            if curwin() != old_curwin {
-                set_mouse_topline(&curwin());
-            }
+
             if mouse_st(|st| st.status_line_offset.get()) != 0 {
                 if curwin() == old_curwin {
                     return IN_STATUS_LINE;
@@ -2132,13 +2126,6 @@ pub fn vcol2col(wp: &WinInfoInfo, lnum: Linenr, vcol: Colnr, coladdp: Option<&mu
 pub fn setmouse() {
     ui_cursor_shape();
     ui_check_mouse();
-}
-
-fn set_mouse_topline(wp: &WinInfoInfo) {
-    mouse_st(|st| {
-        st.orig_topline.set(wp.w_topline.get());
-        st.orig_topfill.set(wp.w_topfill.get());
-    });
 }
 
 /// Return length of line "lnum" for horizontal scrolling.

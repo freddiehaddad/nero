@@ -406,7 +406,6 @@ pub struct Spellvars {
 }
 
 struct DrawscreenState {
-    redraw_popupmenu: std::cell::Cell<bool>,
     msg_grid_invalid: std::cell::Cell<bool>,
     resizing_autocmd: std::cell::Cell<bool>,
     conceal_cursor_used: std::cell::Cell<bool>,
@@ -420,7 +419,6 @@ struct DrawscreenState {
 impl DrawscreenState {
     const fn new() -> Self {
         Self {
-            redraw_popupmenu: std::cell::Cell::new(false),
             msg_grid_invalid: std::cell::Cell::new(false),
             resizing_autocmd: std::cell::Cell::new(false),
             conceal_cursor_used: std::cell::Cell::new(false),
@@ -593,7 +591,6 @@ pub fn screenclear() {
     cmdline_state().cmdline_was_last_drawn.set(false);
     cmdline_state().redraw_cmdline.set(true);
     workspace_state().redraw_tabline.set(true);
-    ds_st(|st| st.redraw_popupmenu.set(true));
     pum_invalidate();
 
     for wp in for_all_windows_ptr() {
@@ -740,7 +737,6 @@ pub fn screen_resize(mut width: i32, mut height: i32) {
                 do_check_scrollbind(true);
             }
             if (edit_state().state_global.get() & MODE_CMDLINE) != 0 {
-                ds_st(|st| st.redraw_popupmenu.set(false));
                 update_screen();
                 redrawcmdline();
                 if pum_drawn() {
@@ -749,7 +745,6 @@ pub fn screen_resize(mut width: i32, mut height: i32) {
             } else {
                 update_topline(&curwin());
                 if pum_drawn() {
-                    ds_st(|st| st.redraw_popupmenu.set(false));
                     ins_compl_show_pum();
                 }
                 update_screen();
