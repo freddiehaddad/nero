@@ -327,7 +327,7 @@ impl Default for Funcdict {
 }
 
 #[derive(Clone)]
-pub struct Funcexe {
+pub struct Funcexe<'a> {
     pub fe_fill_submatch: bool,
     pub fe_firstline: Linenr,
     pub fe_lastline: Linenr,
@@ -335,11 +335,12 @@ pub struct Funcexe {
     pub fe_evaluate: bool,
     pub fe_partial: crate::eval::typval::PartialId,
     pub fe_selfdict: DictId,
-    pub fe_basetv: Option<TypVal>,
+    /// The base of `base->method()`, which the caller owns and clears.
+    pub fe_basetv: Option<&'a TypVal>,
     pub fe_found_var: bool,
 }
 
-impl Funcexe {
+impl Funcexe<'_> {
     pub const fn new() -> Self {
         Self {
             fe_fill_submatch: false,
@@ -360,7 +361,7 @@ impl Funcexe {
     }
 }
 
-impl Default for Funcexe {
+impl Default for Funcexe<'_> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -2185,7 +2186,7 @@ pub fn call_func(
         if is_luafunc(partial.opt()) {
             if len > 0 {
                 error = FCERR_NONE;
-                if let Some(ref basetv) = funcexe.fe_basetv {
+                if let Some(basetv) = funcexe.fe_basetv {
                     if use_argv {
                         for i in (0..argcount as usize).rev() {
                             argv[i + 1] = std::mem::take(&mut argv[i]);
@@ -2245,7 +2246,7 @@ pub fn call_func(
                         );
                     }
 
-                    if let Some(ref basetv) = funcexe.fe_basetv {
+                    if let Some(basetv) = funcexe.fe_basetv {
                         if use_argv {
                             for i in (0..argcount as usize).rev() {
                                 argv[i + 1] = std::mem::take(&mut argv[i]);
@@ -2271,7 +2272,7 @@ pub fn call_func(
                     );
                 }
             }
-        } else if let Some(ref basetv) = funcexe.fe_basetv {
+        } else if let Some(basetv) = funcexe.fe_basetv {
             let active_argv: &[TypVal] = if use_argv { &argv } else { argvars_in };
             let argvars_slice = if argcount <= 0 {
                 &[]

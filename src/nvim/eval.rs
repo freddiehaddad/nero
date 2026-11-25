@@ -1964,7 +1964,7 @@ fn eval_func(
     name_len: i32,
     rettv: &mut TypVal,
     flags: i32,
-    basetv: Option<&mut TypVal>,
+    basetv: Option<&TypVal>,
 ) -> bool {
     let evaluate = (flags & EVAL_EVALUATE) != 0;
     let mut len = name_len;
@@ -1996,7 +1996,7 @@ fn eval_func(
         fe_evaluate: evaluate,
         fe_partial: partial,
         fe_selfdict: crate::eval::typval::DictId::NULL,
-        fe_basetv: basetv.map(std::mem::take),
+        fe_basetv: basetv,
         fe_found_var: found_var,
     };
     let mut ret = get_func_tv(s_slice, len, &mut *rettv, arg, evalarg, &mut funcexe);
@@ -2933,7 +2933,7 @@ fn call_func_rettv(
     rettv: &mut TypVal,
     evaluate: bool,
     selfdict: Option<&TvDict>,
-    basetv: Option<&mut TypVal>,
+    basetv: Option<&TypVal>,
     lua_funcname: Option<&[u8]>,
 ) -> bool {
     let mut pt = crate::eval::typval::PartialId::NULL;
@@ -2973,7 +2973,7 @@ fn call_func_rettv(
         fe_evaluate: evaluate,
         fe_partial: pt.clone(),
         fe_selfdict: crate::eval::typval::DictId::from(selfdict),
-        fe_basetv: basetv.map(std::mem::take),
+        fe_basetv: basetv,
         fe_found_var: false,
     };
     let ret = get_func_tv(
@@ -3024,15 +3024,7 @@ fn eval_lambda(
         tv_clear(rettv);
         false
     } else {
-        call_func_rettv(
-            arg,
-            evalarg,
-            &mut *rettv,
-            evaluate,
-            None,
-            Some(&mut base),
-            None,
-        )
+        call_func_rettv(arg, evalarg, &mut *rettv, evaluate, None, Some(&base), None)
     };
 
     if evaluate {
@@ -3171,7 +3163,7 @@ fn eval_method<'a>(
                     &mut *rettv,
                     evaluate,
                     None,
-                    Some(&mut base),
+                    Some(&base),
                     lua_funcname,
                 );
             } else {
@@ -3182,7 +3174,7 @@ fn eval_method<'a>(
                     len,
                     &mut *rettv,
                     if evaluate { EVAL_EVALUATE } else { 0 },
-                    Some(&mut base),
+                    Some(&base),
                 );
             }
         }
@@ -7158,5 +7150,49 @@ mod tests {
             eval_to_number(&b"g:ut_sub_dict.key_EXTRA"[..17], false),
             456
         );
+    }
+
+    #[test]
+    fn test_method_call_releases_its_base() {
+        let _guard = crate::globals::TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _editor = crate::main_init::test_editor();
+
+        fn eval_and_clear(expr: &[u8]) {
+            let mut rettv = tv_initial_value();
+            let mut evalarg = Evalarg {
+                eval_flags: EVAL_EVALUATE,
+            };
+            assert!(eval0(expr, &mut rettv, None, &mut evalarg));
+            tv_clear(&mut rettv);
+        }
+
+        // A base that only the call holds is freed when the call returns.
+        let lists = crate::eval::gc::gc_lists_len();
+        let dicts = crate::eval::gc::gc_dicts_len();
+        for expr in [
+            &b"range(3)->len()"[..],
+            b"{'a': 1}->len()",
+            b"[1, 2]->get(0)",
+            b"[1, 2]->{l -> len(l)}()",
+        ] {
+            eval_and_clear(expr);
+        }
+        assert_eq!(crate::eval::gc::gc_lists_len(), lists);
+        assert_eq!(crate::eval::gc::gc_dicts_len(), dicts);
+
+        // A base held by a variable keeps only the variable's reference.
+        let mut list_tv = tv_initial_value();
+        let mut evalarg = Evalarg {
+            eval_flags: EVAL_EVALUATE,
+        };
+        assert!(eval0(b"[1, 2, 3]", &mut list_tv, None, &mut evalarg));
+        let list = list_tv.value.list();
+        set_var_const(b"g:ut_method_base", &mut list_tv, false, false);
+        let refcount = list.lv_refcount.get();
+        eval_and_clear(b"g:ut_method_base->len()");
+        eval_and_clear(b"g:ut_method_base->{l -> len(l)}()");
+        assert_eq!(list.lv_refcount.get(), refcount);
     }
 }
