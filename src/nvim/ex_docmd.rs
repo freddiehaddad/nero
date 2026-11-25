@@ -10432,8 +10432,11 @@ fn ex_connect(eap: &mut Exarg) {
         let _ = emsg(gettext(E_NOUI));
         return;
     }
-    // Abort if this is the last UI and a buffer has unsaved changes.
-    if ui_active() == 1 && check_changed_any(false, false) {
+    // Abort if the last UI is not detachable and a buffer has unsaved changes.
+    if ui_active() == 1
+        && find_channel(screen_state().current_ui.get()).is_some_and(|c| !c.detach.get())
+        && check_changed_any(false, false)
+    {
         return;
     }
 
@@ -10522,7 +10525,9 @@ fn ex_connect(eap: &mut Exarg) {
         }
     }
 
-    let stop_server = !is_ssh && ui_active() == 1;
+    let stop_server = !is_ssh
+        && ui_active() == 1
+        && find_channel(screen_state().current_ui.get()).is_some_and(|c| !c.detach.get());
 
     let connect_res = remote_ui_connect(screen_state().current_ui.get(), addr.as_bytes());
     tv_clear(&mut ssh_rettv);
