@@ -34,9 +34,9 @@ use crate::cursor_shape::{SHAPE_CURSOR, parse_shape_opt};
 use crate::decoration_provider::with_decor_provider_mut;
 use crate::diff::{K_OPT_DIFF, K_OPT_FOLDMETHOD, diff_buf_adjust};
 use crate::drawscreen::{
-    UPD_CLEAR, UPD_NOT_VALID, UPD_SOME_VALID, check_screensize, comp_col, redraw_all_later,
-    redraw_buf_later, redraw_buf_status_later, redraw_later, screen_resize, showmode,
-    status_redraw_all, status_redraw_curbuf,
+    UPD_CLEAR, UPD_NOT_VALID, UPD_SOME_VALID, comp_col, redraw_all_later, redraw_buf_later,
+    redraw_buf_status_later, redraw_later, screen_resize, showmode, status_redraw_all,
+    status_redraw_curbuf,
 };
 use crate::errors::*;
 use crate::eval::encode::encode_tv2string;
@@ -2676,11 +2676,10 @@ pub fn did_set_cmdheight<'a>(args: &mut Optset<'a>) -> Option<&'a CStr> {
         ));
     }
 
-    if (opt_vars().p_ch.get() != old_value
+    if opt_vars().p_ch.get() != old_value
         || OptInt::from(
             tabline_height() + global_stl_height() + crate::globals::topframe().fr_height.get(),
-        ) != OptInt::from(screen_state().rows_global.get()) - opt_vars().p_ch.get())
-        && screen_state().full_screen.get()
+        ) != OptInt::from(screen_state().rows_global.get()) - opt_vars().p_ch.get()
     {
         command_height();
     }
@@ -2834,26 +2833,11 @@ pub fn did_set_lines_or_columns<'a>(args: &mut Optset<'a>) -> Option<&'a CStr> {
         if screen_state().updating_screen.get() {
             let oldval = integer_obj(args.os_oldval.as_integer().expect("integer Object"));
             set_option_varp(args.os_idx, args.os_varp.clone(), oldval);
-        } else if screen_state().full_screen.get() {
+        } else {
             screen_resize(
                 opt_vars().p_columns.get() as i32,
                 opt_vars().p_lines.get() as i32,
             );
-        } else {
-            screen_state()
-                .rows_global
-                .set(opt_vars().p_lines.get() as i32);
-            screen_state()
-                .columns_global
-                .set(opt_vars().p_columns.get() as i32);
-            check_screensize();
-            let new_row = (OptInt::from(screen_state().rows_global.get())
-                - opt_vars().p_ch.get().max(1)) as i32;
-            if cmdline_state().cmdline_row.get() > new_row
-                && OptInt::from(screen_state().rows_global.get()) > opt_vars().p_ch.get()
-            {
-                cmdline_state().cmdline_row.set(new_row);
-            }
         }
         if opt_vars().p_window.get() >= OptInt::from(screen_state().rows_global.get())
             || !option_was_set(K_OPT_WINDOW)
@@ -2864,9 +2848,7 @@ pub fn did_set_lines_or_columns<'a>(args: &mut Optset<'a>) -> Option<&'a CStr> {
         }
     }
 
-    if opt_vars().p_sj.get() >= OptInt::from(screen_state().rows_global.get())
-        && screen_state().full_screen.get()
-    {
+    if opt_vars().p_sj.get() >= OptInt::from(screen_state().rows_global.get()) {
         opt_vars()
             .p_sj
             .set(OptInt::from(screen_state().rows_global.get() / 2));
@@ -3376,14 +3358,14 @@ fn check_num_option_bounds<'a>(
     match opt_idx {
         K_OPT_LINES => {
             let min_r = min_rows_for_all_tabpages();
-            if *newval < OptInt::from(min_r) && screen_state().full_screen.get() {
+            if *newval < OptInt::from(min_r) {
                 errmsg = opt_error_int(errbuf, c"E593: Need at least %d lines", min_r);
                 *newval = OptInt::from(min_r);
             }
             *newval = (*newval).min(OptInt::from(i32::MAX));
         }
         K_OPT_COLUMNS => {
-            if *newval < OptInt::from(MIN_COLUMNS) && screen_state().full_screen.get() {
+            if *newval < OptInt::from(MIN_COLUMNS) {
                 errmsg = opt_error_int(errbuf, c"E594: Need at least %d columns", MIN_COLUMNS);
                 *newval = OptInt::from(MIN_COLUMNS);
             }
@@ -3393,18 +3375,15 @@ fn check_num_option_bounds<'a>(
             *newval = (*newval).clamp(0, 100);
         }
         K_OPT_SCROLLJUMP => {
-            if (*newval < -100 || *newval >= OptInt::from(screen_state().rows_global.get()))
-                && screen_state().full_screen.get()
-            {
+            if *newval < -100 || *newval >= OptInt::from(screen_state().rows_global.get()) {
                 errmsg = Some(E_SCROLL);
                 *newval = 1;
             }
         }
         K_OPT_SCROLL
-            if (*newval <= 0
+            if *newval <= 0
                 || (*newval > OptInt::from(win.w_view_height.get())
-                    && win.w_view_height.get() > 0))
-                && screen_state().full_screen.get() =>
+                    && win.w_view_height.get() > 0) =>
         {
             if *newval != 0 {
                 errmsg = Some(E_SCROLL);
@@ -3496,7 +3475,7 @@ fn validate_num_option<'a>(
             }
         }
         K_OPT_SCROLLOFF => {
-            if value < 0 && screen_state().full_screen.get() {
+            if value < 0 {
                 return Some(E_POSITIVE);
             }
         }
@@ -3506,7 +3485,7 @@ fn validate_num_option<'a>(
             }
         }
         K_OPT_SIDESCROLLOFF => {
-            if value < 0 && screen_state().full_screen.get() {
+            if value < 0 {
                 return Some(E_POSITIVE);
             }
         }

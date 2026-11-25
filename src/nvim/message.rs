@@ -2343,7 +2343,7 @@ pub fn msg_start() {
             .set(screen_state().rows_global.get() - 1);
     }
 
-    if msg_state().msg_scroll.get() == 0 && screen_state().full_screen.get() {
+    if msg_state().msg_scroll.get() == 0 {
         msg_state().msg_row.set(cmdline_state().cmdline_row.get());
         msg_state().msg_col.set(0);
     } else if (msg_state().msg_didout.get() || opt_vars().p_ch.get() == 0) && !ui_has(K_UIMESSAGES)

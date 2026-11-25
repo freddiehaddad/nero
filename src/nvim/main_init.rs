@@ -549,10 +549,6 @@ fn nvim_main_inner(mut argv: Vec<std::ffi::CString>) -> i32 {
 
     crate::log::log_get_stdout().set_unbuffered();
 
-    screen_state()
-        .full_screen
-        .set(!cmdline_state().silent_mode.get());
-
     win_init_size();
     if params.diff_mode != 0 {
         diff_win_options(&firstwin(), false);

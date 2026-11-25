@@ -751,9 +751,6 @@ pub fn ui_mouse_has(mode: i32) -> bool {
 }
 
 pub fn ui_cursor_shape_no_check_conceal() {
-    if !screen_state().full_screen.get() {
-        return;
-    }
     let new_mode_idx = cursor_get_mode_idx();
     ui_state(|st| {
         if new_mode_idx != st.ui_mode_idx.get() {

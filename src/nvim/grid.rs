@@ -608,9 +608,7 @@ pub fn screengrid_line_start(grid: &ScreenGrid, row: i32, col: i32) {
         assert!(maxcol as usize <= linebuf_size);
     });
 
-    if screen_state().full_screen.get()
-        && (opt_vars().rdb_flags.get() & K_OPT_RDB_FLAG_INVALID) != 0
-    {
+    if (opt_vars().rdb_flags.get() & K_OPT_RDB_FLAG_INVALID) != 0 {
         assert!(linebuf_size > 0);
         screen_state().with_linebuf_mut(|lb| {
             lb.chars.fill(u32::MAX);

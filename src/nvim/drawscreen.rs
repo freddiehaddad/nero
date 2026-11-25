@@ -82,7 +82,6 @@ pub struct ScreenGlobalState {
     pub include_none: std::cell::Cell<i32>,
     pub include_default: std::cell::Cell<i32>,
     pub include_link: std::cell::Cell<i32>,
-    pub full_screen: std::cell::Cell<bool>,
     pub need_maketitle: std::cell::Cell<bool>,
     pub ru_col: std::cell::Cell<i32>,
     pub ru_wid: std::cell::Cell<i32>,
@@ -138,7 +137,6 @@ impl ScreenGlobalState {
             include_none: std::cell::Cell::new(0),
             include_default: std::cell::Cell::new(0),
             include_link: std::cell::Cell::new(0),
-            full_screen: std::cell::Cell::new(false),
             need_maketitle: std::cell::Cell::new(true),
             ru_col: std::cell::Cell::new(0),
             ru_wid: std::cell::Cell::new(0),
@@ -651,9 +649,16 @@ pub fn screen_resize(mut width: i32, mut height: i32) {
 
     screen_state().resizing_screen.set(true);
 
+    // Limit Rows and Columns to avoid an overflow in Rows * Columns.
+    // need room for one window and command line
+    height = height.max(min_rows_for_all_tabpages()).min(1000);
+    width = width
+        .max(MIN_COLUMNS)
+        .max(min_cols_for_all_tabpages())
+        .min(10000);
     screen_state().rows_global.set(height);
     screen_state().columns_global.set(width);
-    check_screensize();
+
     if !ui_has(K_UIMESSAGES) {
         let max_p_ch = OptInt::from(screen_state().rows_global.get() - min_rows(&curtab()) + 1);
         if opt_vars().p_ch.get() > 0 && opt_vars().p_ch.get() > max_p_ch {
@@ -669,8 +674,7 @@ pub fn screen_resize(mut width: i32, mut height: i32) {
             }
         }
     }
-    height = screen_state().rows_global.get();
-    width = screen_state().columns_global.get();
+
     opt_vars()
         .p_lines
         .set(OptInt::from(screen_state().rows_global.get()));
@@ -759,24 +763,6 @@ pub fn screen_resize(mut width: i32, mut height: i32) {
         }
     }
     screen_state().resizing_screen.set(false);
-}
-
-pub fn check_screensize() {
-    screen_state().rows_global.set(
-        screen_state()
-            .rows_global
-            .get()
-            .max(min_rows_for_all_tabpages())
-            .min(1000),
-    );
-    screen_state().columns_global.set(
-        screen_state()
-            .columns_global
-            .get()
-            .max(MIN_COLUMNS)
-            .max(min_cols_for_all_tabpages())
-            .min(10000),
-    );
 }
 
 pub fn redrawing() -> bool {
