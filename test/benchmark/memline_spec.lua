@@ -41,6 +41,64 @@ describe('memline perf', function()
     end
   end
 
+  it('loads a file and inserts into separate loaded chunks', function()
+    local count = 500000
+    local path = t.tmpname()
+    local file = assert(io.open(path, 'wb'))
+    for i = 1, count do
+      file:write(('%08d item\n'):format(i))
+    end
+    assert(file:close())
+
+    local result = n.exec_lua(function(input, line_count)
+      vim.o.verbose = 0
+      vim.o.swapfile = false
+      vim.bo.undofile = false
+      collectgarbage('collect')
+      local initial_rss = vim.uv.resident_set_memory()
+      local start = vim.uv.hrtime()
+      vim.cmd.edit(vim.fn.fnameescape(input))
+      local load_ms = (vim.uv.hrtime() - start) / 1e6
+      assert(vim.api.nvim_buf_line_count(0) == line_count)
+      collectgarbage('collect')
+      local rss_growth = vim.uv.resident_set_memory() - initial_rss
+
+      start = vim.uv.hrtime()
+      local edits = 0
+      for row = line_count - 200, 200, -800 do
+        vim.api.nvim_buf_set_lines(0, row, row, true, { 'inserted' })
+        edits = edits + 1
+      end
+      local insert_ms = (vim.uv.hrtime() - start) / 1e6
+      assert(vim.api.nvim_buf_line_count(0) == line_count + edits)
+      assert(vim.fn.line2byte(line_count + edits + 1) == line_count * 14 + edits * 9 + 1)
+      collectgarbage('collect')
+      return {
+        load_ms = load_ms,
+        insert_ms = insert_ms,
+        rss_growth = rss_growth,
+        edited_rss_growth = vim.uv.resident_set_memory() - initial_rss,
+        edits = edits,
+      }
+    end, path, count)
+    print(
+      ('\nmemline file load (%d lines): %.2f ms, %.2f MiB RSS growth'):format(
+        count,
+        result.load_ms,
+        result.rss_growth / 1048576
+      )
+    )
+    print(
+      ('memline first inserts (%d): %.2f ms, %.2f MiB total RSS growth'):format(
+        result.edits,
+        result.insert_ms,
+        result.edited_rss_growth / 1048576
+      )
+    )
+    n.command('bwipeout!')
+    os.remove(path)
+  end)
+
   it('pastes the whole buffer at the top', function()
     bench('paste whole buffer', 'silent %yank', 'silent normal! ggP')
   end)

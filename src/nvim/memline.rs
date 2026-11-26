@@ -497,7 +497,11 @@ mod chunks {
                 }
                 return Ok(());
             }
-            let (c, index, first) = if lnum == 0 {
+            // File reads insert before the original final line, even at a chunk boundary.
+            let (c, index, first) = if lnum == line_count - 1 {
+                let len = self.list[last].lines.len();
+                (last, len - 1, line_count - len as Linenr + 1)
+            } else if lnum == 0 {
                 (0, 0, 1)
             } else {
                 let Some(pos) = self.locate(lnum) else {
@@ -507,6 +511,17 @@ mod chunks {
             };
             let size = entry.size();
             let ch = &mut self.list[c];
+            if lnum == line_count - 1 && ch.lines.len() >= MLCS_MINL as usize {
+                let tail = ch.lines.pop().expect("last chunk is nonempty");
+                let delta = size - tail.size();
+                ch.totalsize += delta;
+                ch.lines.push(entry);
+                ch.swap_blocks.clear();
+                self.count(c, Count::new(0, delta));
+                self.push_chunk(tail);
+                self.cur.set(ChunkStart { chunk: c, first });
+                return Ok(());
+            }
             ch.totalsize += size;
             ch.lines.insert(index, entry);
             ch.swap_blocks.clear();
@@ -888,6 +903,47 @@ mod chunks {
             for lnum in (1..=37 * MLCS_MINL).rev() {
                 let line = chunks.line(lnum).expect("line is stored");
                 assert_eq!(line.text().to_bytes(), lnum.to_string().as_bytes());
+            }
+        }
+
+        #[test]
+        fn file_load_shape_keeps_capacity_bounded() {
+            for tail_text in ["", "marked final line"] {
+                for count in [
+                    MLCS_MINL - 1,
+                    MLCS_MINL,
+                    MLCS_MINL + 1,
+                    MLCS_MAXL - 1,
+                    MLCS_MAXL,
+                    MLCS_MAXL + 1,
+                    8 * MLCS_MINL + 37,
+                ] {
+                    let tail = LineEntry::new(RcCStr::from_bytes(tail_text.as_bytes()), true);
+                    let mut chunks = Chunks::with_line(tail);
+                    let mut model = vec![(tail_text.to_owned(), true)];
+                    let mut rng = Rng(0x9e37_79b9);
+                    for after in 0..count {
+                        let text = format!("line {after}");
+                        let marked = after % 11 == 0;
+                        let line = LineEntry::new(RcCStr::from_bytes(text.as_bytes()), marked);
+                        assert!(chunks.insert_after(after, line).is_ok());
+                        model.insert(after as usize, (text, marked));
+                        if after % MLCS_MINL == 0 {
+                            assert_matches(&chunks, &model, &mut rng);
+                        }
+                    }
+                    assert_matches(&chunks, &model, &mut rng);
+                    let tail = chunks.remove(count + 1).expect("final line is stored");
+                    assert_eq!(tail.text().to_bytes(), tail_text.as_bytes());
+                    assert!(tail.marked);
+                    model.pop();
+                    assert_matches(&chunks, &model, &mut rng);
+                    let capacity: usize = chunks.list.iter().map(|ch| ch.lines.capacity()).sum();
+                    assert!(
+                        capacity <= model.len() + MLCS_MINL as usize,
+                        "{count} loaded lines retain capacity for {capacity} entries"
+                    );
+                }
             }
         }
 

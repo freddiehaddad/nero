@@ -143,6 +143,16 @@ Consumers copy names when they need independent storage. The ownership change re
 
 The FFI-free lifetime package imports the production scan adapter with a controlled native driver. Miri checks its request/entry ownership under both borrowing models; native unit and functional cases separately exercise real libuv and filesystem behavior.
 
+## Packed File-Load Storage
+
+The file reader inserts each line before the buffer's original trailing empty line and removes that placeholder when loading finishes. This is a logical append, but not an append at the storage end. Treating it as a general middle insertion grew each chunk's vector to 800 slots before splitting it into 400-line chunks, leaving unused capacity in completed chunks.
+
+`Chunks::insert_after` instead routes the before-final-line gap to the last chunk, including at a chunk boundary. At the 400-entry packing target it moves the complete final `LineEntry` into a new chunk and puts the incoming entry in the vacated slot. This works for nonempty and marked final lines too; it does not change the reader or infer a placeholder from empty text.
+
+Ownership stays with `Vec<LineEntry>` and the existing shared text handles. Moving entries preserves text and marks without raw pointers or new unsafe code. The chunk methods maintain line and byte counts, cached lookup positions, and swap snapshots; undo, callbacks, and on-disk swap serialization retain their existing contracts.
+
+After sequential loading and placeholder removal, `N` lines retain at most `N + MLCS_MINL` entry slots. This saves capacity rather than eliminating per-line allocations. Later inserts can require vector growth sooner, so `test/benchmark/memline_spec.lua` measures loading and first edits separately. Compare both memory and runtime against unchanged release binaries rather than assuming tighter storage improves every operation.
+
 ## Single-Source API Object Variants
 
 The API value representation is now one `Object` enum. The former structure stored an independently writable `ObjectType` beside an already-tagged payload enum, allowing safe Rust to construct contradictory values. Defaulting payload accessors could then silently serialize a string-tagged integer as an empty string, for example. Variant construction and matching remove that representational failure mode rather than checking that two tags agree at runtime.
