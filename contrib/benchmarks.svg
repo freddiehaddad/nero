@@ -110,7 +110,7 @@
   <rect class="frame" x="8" y="8" width="944" height="1078" rx="10"/>
 
   <!-- Header -->
-  <text class="title" x="28" y="38">Head-to-Head Editor Benchmarks: Nero vs. Neovim (neovim@d9a842e291)</text>
+  <text class="title" x="28" y="38">Head-to-Head Editor Benchmarks: Nero vs. Neovim (neovim@13e296265a)</text>
   <text class="subtitle" x="28" y="58">Release build execution time (shorter bars = faster; badges show Nero speedup over Neovim).</text>
 
   <!-- Legend -->
@@ -131,26 +131,26 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d1" x="362" y="5" width="51" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b1" x="421" y="14">5.7 ms</text>
+    <rect class="bar d1" x="362" y="5" width="56" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b1" x="426" y="14">6.7 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
     <rect class="bar d1" x="362" y="21" width="39" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b1" x="409" y="30">4.3 ms</text>
+    <text class="val-cl b1" x="409" y="30">4.7 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d1" x="362" y="37" width="285" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b1" x="655" y="46">31.2 ms</text>
+    <rect class="bar d1" x="362" y="37" width="284" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b1" x="654" y="46">33.7 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d1" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b1" x="755" y="62">42.1 ms</text>
+    <text class="val-cw b1" x="755" y="62">45.6 ms</text>
 
     <rect class="badge-neutral b1" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-neutral b1" x="873" y="24">Linux: 0.76x</text>
+    <text class="badge-label-neutral b1" x="873" y="24">Linux: 0.70x</text>
     <rect class="badge-win b1" x="814" y="38" width="118" height="24" rx="12"/>
     <text class="badge-label-win b1" x="873" y="54">Windows: 1.35x</text>
   </g>
@@ -162,28 +162,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d2" x="362" y="5" width="202" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b2" x="572" y="14">13.5 s</text>
+    <rect class="bar d2" x="362" y="5" width="190" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b2" x="560" y="14">13.0 s</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d2" x="362" y="21" width="323" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b2" x="693" y="30">21.6 s</text>
+    <rect class="bar d2" x="362" y="21" width="295" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b2" x="665" y="30">20.2 s</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d2" x="362" y="37" width="206" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b2" x="576" y="46">13.8 s</text>
+    <rect class="bar d2" x="362" y="37" width="202" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b2" x="572" y="46">13.8 s</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d2" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b2" x="755" y="62">25.7 s</text>
+    <text class="val-cw b2" x="755" y="62">26.3 s</text>
 
     <rect class="badge-win b2" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b2" x="873" y="24">Linux: 1.60x</text>
+    <text class="badge-label-win b2" x="873" y="24">Linux: 1.55x</text>
     <rect class="badge-win b2" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b2" x="873" y="54">Windows: 1.87x</text>
+    <text class="badge-label-win b2" x="873" y="54">Windows: 1.91x</text>
   </g>
   <line class="divider" x1="28" y1="256" x2="932" y2="256"/>
   <!-- Row 3: Long UTF-8 Line Layout -->
@@ -193,28 +193,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d3" x="362" y="5" width="297" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b3" x="667" y="14">81.1 µs</text>
+    <rect class="bar d3" x="362" y="5" width="253" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b3" x="623" y="14">70.6 µs</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d3" x="362" y="21" width="362" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b3" x="732" y="30">99.0 µs</text>
+    <rect class="bar d3" x="362" y="21" width="329" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b3" x="699" y="30">92.0 µs</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d3" x="362" y="37" width="282" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b3" x="652" y="46">77.1 µs</text>
+    <rect class="bar d3" x="362" y="37" width="283" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b3" x="653" y="46">78.9 µs</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d3" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b3" x="755" y="62">105.3 µs</text>
+    <text class="val-cw b3" x="755" y="62">107.5 µs</text>
 
     <rect class="badge-win b3" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b3" x="873" y="24">Linux: 1.22x</text>
+    <text class="badge-label-win b3" x="873" y="24">Linux: 1.30x</text>
     <rect class="badge-win b3" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b3" x="873" y="54">Windows: 1.37x</text>
+    <text class="badge-label-win b3" x="873" y="54">Windows: 1.36x</text>
   </g>
   <line class="divider" x1="28" y1="338" x2="932" y2="338"/>
   <!-- Row 4: Multi-Core Buffer Search -->
@@ -224,28 +224,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d4" x="362" y="5" width="97" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b4" x="467" y="14">26.8 ms</text>
+    <rect class="bar d4" x="362" y="5" width="88" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b4" x="458" y="14">25.0 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d4" x="362" y="21" width="352" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b4" x="722" y="30">97.7 ms</text>
+    <rect class="bar d4" x="362" y="21" width="345" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b4" x="715" y="30">98.5 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
     <rect class="bar d4" x="362" y="37" width="74" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b4" x="444" y="46">20.6 ms</text>
+    <text class="val-rw b4" x="444" y="46">21.0 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d4" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b4" x="755" y="62">106.9 ms</text>
+    <text class="val-cw b4" x="755" y="62">109.9 ms</text>
 
     <rect class="badge-win b4" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b4" x="873" y="24">Linux: 3.65x</text>
+    <text class="badge-label-win b4" x="873" y="24">Linux: 3.94x</text>
     <rect class="badge-win b4" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b4" x="873" y="54">Windows: 5.20x</text>
+    <text class="badge-label-win b4" x="873" y="54">Windows: 5.23x</text>
   </g>
   <line class="divider" x1="28" y1="420" x2="932" y2="420"/>
   <!-- Row 5: Fuzzy File Finder -->
@@ -255,28 +255,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d5" x="362" y="5" width="200" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b5" x="570" y="14">7.5 ms</text>
+    <rect class="bar d5" x="362" y="5" width="199" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b5" x="569" y="14">8.4 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d5" x="362" y="21" width="276" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b5" x="646" y="30">10.4 ms</text>
+    <rect class="bar d5" x="362" y="21" width="254" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b5" x="624" y="30">10.8 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d5" x="362" y="37" width="246" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b5" x="616" y="46">9.2 ms</text>
+    <rect class="bar d5" x="362" y="37" width="241" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b5" x="611" y="46">10.2 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d5" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b5" x="755" y="62">14.5 ms</text>
+    <text class="val-cw b5" x="755" y="62">16.3 ms</text>
 
     <rect class="badge-win b5" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b5" x="873" y="24">Linux: 1.38x</text>
+    <text class="badge-label-win b5" x="873" y="24">Linux: 1.28x</text>
     <rect class="badge-win b5" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b5" x="873" y="54">Windows: 1.57x</text>
+    <text class="badge-label-win b5" x="873" y="54">Windows: 1.60x</text>
   </g>
   <line class="divider" x1="28" y1="502" x2="932" y2="502"/>
   <!-- Row 6: Side-by-Side Diff Alignment -->
@@ -286,28 +286,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d6" x="362" y="5" width="115" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b6" x="485" y="14">169.1 ms</text>
+    <rect class="bar d6" x="362" y="5" width="119" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b6" x="489" y="14">181.3 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d6" x="362" y="21" width="352" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b6" x="722" y="30">516.2 ms</text>
+    <rect class="bar d6" x="362" y="21" width="347" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b6" x="717" y="30">529.0 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d6" x="362" y="37" width="78" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b6" x="448" y="46">114.4 ms</text>
+    <rect class="bar d6" x="362" y="37" width="81" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b6" x="451" y="46">123.1 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d6" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b6" x="755" y="62">564.8 ms</text>
+    <text class="val-cw b6" x="755" y="62">586.4 ms</text>
 
     <rect class="badge-win b6" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b6" x="873" y="24">Linux: 3.05x</text>
+    <text class="badge-label-win b6" x="873" y="24">Linux: 2.92x</text>
     <rect class="badge-win b6" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b6" x="873" y="54">Windows: 4.94x</text>
+    <text class="badge-label-win b6" x="873" y="54">Windows: 4.76x</text>
   </g>
   <line class="divider" x1="28" y1="584" x2="932" y2="584"/>
   <!-- Row 7: Regex Search (Backtracking) -->
@@ -317,28 +317,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d7" x="362" y="5" width="153" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b7" x="523" y="14">1.9 ms</text>
+    <rect class="bar d7" x="362" y="5" width="125" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b7" x="495" y="14">1.6 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d7" x="362" y="21" width="189" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b7" x="559" y="30">2.3 ms</text>
+    <rect class="bar d7" x="362" y="21" width="173" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b7" x="543" y="30">2.3 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d7" x="362" y="37" width="195" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b7" x="565" y="46">2.4 ms</text>
+    <rect class="bar d7" x="362" y="37" width="171" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b7" x="541" y="46">2.2 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d7" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b7" x="755" y="62">4.7 ms</text>
+    <text class="val-cw b7" x="755" y="62">5.0 ms</text>
 
     <rect class="badge-win b7" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b7" x="873" y="24">Linux: 1.24x</text>
+    <text class="badge-label-win b7" x="873" y="24">Linux: 1.38x</text>
     <rect class="badge-win b7" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b7" x="873" y="54">Windows: 1.98x</text>
+    <text class="badge-label-win b7" x="873" y="54">Windows: 2.25x</text>
   </g>
   <line class="divider" x1="28" y1="666" x2="932" y2="666"/>
   <!-- Row 8: Virtual Text Cursor Motion -->
@@ -348,28 +348,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d8" x="362" y="5" width="219" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b8" x="589" y="14">38.1 µs</text>
+    <rect class="bar d8" x="362" y="5" width="253" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b8" x="623" y="14">44.3 µs</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d8" x="362" y="21" width="362" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b8" x="732" y="30">63.1 µs</text>
+    <rect class="bar d8" x="362" y="21" width="348" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b8" x="718" y="30">60.8 µs</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d8" x="362" y="37" width="292" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b8" x="662" y="46">50.8 µs</text>
+    <rect class="bar d8" x="362" y="37" width="310" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b8" x="680" y="46">54.2 µs</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d8" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b8" x="755" y="62">67.1 µs</text>
+    <text class="val-cw b8" x="755" y="62">67.3 µs</text>
 
     <rect class="badge-win b8" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b8" x="873" y="24">Linux: 1.65x</text>
+    <text class="badge-label-win b8" x="873" y="24">Linux: 1.37x</text>
     <rect class="badge-win b8" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b8" x="873" y="54">Windows: 1.32x</text>
+    <text class="badge-label-win b8" x="873" y="54">Windows: 1.24x</text>
   </g>
   <line class="divider" x1="28" y1="748" x2="932" y2="748"/>
   <!-- Row 9: Treesitter Fold Navigation -->
@@ -379,28 +379,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d9" x="362" y="5" width="217" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b9" x="587" y="14">7.2 ms</text>
+    <rect class="bar d9" x="362" y="5" width="204" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b9" x="574" y="14">7.4 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d9" x="362" y="21" width="167" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b9" x="537" y="30">5.6 ms</text>
+    <rect class="bar d9" x="362" y="21" width="151" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b9" x="521" y="30">5.5 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d9" x="362" y="37" width="220" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b9" x="590" y="46">7.3 ms</text>
+    <rect class="bar d9" x="362" y="37" width="210" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b9" x="580" y="46">7.6 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d9" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b9" x="755" y="62">12.9 ms</text>
+    <text class="val-cw b9" x="755" y="62">14.0 ms</text>
 
     <rect class="badge-neutral b9" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-neutral b9" x="873" y="24">Linux: 0.77x</text>
+    <text class="badge-label-neutral b9" x="873" y="24">Linux: 0.74x</text>
     <rect class="badge-win b9" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b9" x="873" y="54">Windows: 1.76x</text>
+    <text class="badge-label-win b9" x="873" y="54">Windows: 1.83x</text>
   </g>
   <line class="divider" x1="28" y1="830" x2="932" y2="830"/>
   <!-- Row 10: Full-Screen Syntax Redraw -->
@@ -410,28 +410,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d10" x="362" y="5" width="363" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b10" x="733" y="14">14.9 ms</text>
+    <rect class="bar d10" x="362" y="5" width="353" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b10" x="723" y="14">15.7 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d10" x="362" y="21" width="354" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b10" x="724" y="30">14.5 ms</text>
+    <rect class="bar d10" x="362" y="21" width="335" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b10" x="705" y="30">14.9 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
     <rect class="bar d10" x="362" y="37" width="385" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b10" x="755" y="46">15.8 ms</text>
+    <text class="val-rw b10" x="755" y="46">17.1 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
-    <rect class="bar d10" x="362" y="53" width="380" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b10" x="750" y="62">15.6 ms</text>
+    <rect class="bar d10" x="362" y="53" width="360" height="11" rx="3" fill="url(#cWinBar)"/>
+    <text class="val-cw b10" x="730" y="62">16.0 ms</text>
 
     <rect class="badge-neutral b10" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-neutral b10" x="873" y="24">Linux: 0.97x</text>
+    <text class="badge-label-neutral b10" x="873" y="24">Linux: 0.95x</text>
     <rect class="badge-neutral b10" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-neutral b10" x="873" y="54">Windows: 0.99x</text>
+    <text class="badge-label-neutral b10" x="873" y="54">Windows: 0.94x</text>
   </g>
   <line class="divider" x1="28" y1="912" x2="932" y2="912"/>
   <!-- Row 11: Autocommand Event Hooks -->
@@ -441,28 +441,28 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d11" x="362" y="5" width="170" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b11" x="540" y="14">51.5 ms</text>
+    <rect class="bar d11" x="362" y="5" width="186" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b11" x="556" y="14">52.9 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d11" x="362" y="21" width="284" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b11" x="654" y="30">86.0 ms</text>
+    <rect class="bar d11" x="362" y="21" width="311" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b11" x="681" y="30">88.3 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d11" x="362" y="37" width="219" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b11" x="589" y="46">66.1 ms</text>
+    <rect class="bar d11" x="362" y="37" width="245" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b11" x="615" y="46">69.5 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d11" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b11" x="755" y="62">116.4 ms</text>
+    <text class="val-cw b11" x="755" y="62">109.3 ms</text>
 
     <rect class="badge-win b11" x="814" y="8" width="118" height="24" rx="12"/>
     <text class="badge-label-win b11" x="873" y="24">Linux: 1.67x</text>
     <rect class="badge-win b11" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b11" x="873" y="54">Windows: 1.76x</text>
+    <text class="badge-label-win b11" x="873" y="54">Windows: 1.57x</text>
   </g>
   <line class="divider" x1="28" y1="994" x2="932" y2="994"/>
   <!-- Row 12: Editor Option Updates -->
@@ -472,27 +472,27 @@
 
     <text class="row-tag" x="352" y="15">Nero / Linux</text>
     <rect class="track" x="362" y="5" width="385" height="11" rx="3"/>
-    <rect class="bar d12" x="362" y="5" width="212" height="11" rx="3" fill="url(#rustLinuxBar)"/>
-    <text class="val-rl b12" x="582" y="14">118.0 ms</text>
+    <rect class="bar d12" x="362" y="5" width="201" height="11" rx="3" fill="url(#rustLinuxBar)"/>
+    <text class="val-rl b12" x="571" y="14">116.0 ms</text>
 
     <text class="row-tag" x="352" y="31">Neovim / Linux</text>
     <rect class="track" x="362" y="21" width="385" height="11" rx="3"/>
-    <rect class="bar d12" x="362" y="21" width="248" height="11" rx="3" fill="url(#cLinuxBar)"/>
-    <text class="val-cl b12" x="618" y="30">138.0 ms</text>
+    <rect class="bar d12" x="362" y="21" width="239" height="11" rx="3" fill="url(#cLinuxBar)"/>
+    <text class="val-cl b12" x="609" y="30">138.0 ms</text>
 
     <text class="row-tag" x="352" y="47">Nero / Windows</text>
     <rect class="track" x="362" y="37" width="385" height="11" rx="3"/>
-    <rect class="bar d12" x="362" y="37" width="260" height="11" rx="3" fill="url(#rustWinBar)"/>
-    <text class="val-rw b12" x="630" y="46">144.0 ms</text>
+    <rect class="bar d12" x="362" y="37" width="250" height="11" rx="3" fill="url(#rustWinBar)"/>
+    <text class="val-rw b12" x="620" y="46">144.0 ms</text>
 
     <text class="row-tag" x="352" y="63">Neovim / Windows</text>
     <rect class="track" x="362" y="53" width="385" height="11" rx="3"/>
     <rect class="bar d12" x="362" y="53" width="385" height="11" rx="3" fill="url(#cWinBar)"/>
-    <text class="val-cw b12" x="755" y="62">214.0 ms</text>
+    <text class="val-cw b12" x="755" y="62">222.0 ms</text>
 
     <rect class="badge-win b12" x="814" y="8" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b12" x="873" y="24">Linux: 1.17x</text>
+    <text class="badge-label-win b12" x="873" y="24">Linux: 1.19x</text>
     <rect class="badge-win b12" x="814" y="38" width="118" height="24" rx="12"/>
-    <text class="badge-label-win b12" x="873" y="54">Windows: 1.49x</text>
+    <text class="badge-label-win b12" x="873" y="54">Windows: 1.54x</text>
   </g>
 </svg>

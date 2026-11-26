@@ -26,7 +26,7 @@ It is a drop-in replacement for upstream Neovim, not a from-scratch rewrite with
 
 ## Performance
 
-Measured head-to-head against release builds of [`neovim/neovim@d9a842e291`](https://github.com/neovim/neovim/commit/d9a842e291) on the same hardware across **Linux** (GCC vs. `rustc`) and **Windows** (MSVC vs. `rustc`), reporting the median of 3 interleaved runs:
+Measured head-to-head against release builds of [`neovim/neovim@13e296265a`](https://github.com/neovim/neovim/commit/13e296265a) on the same hardware across **Linux** (GCC vs. `rustc`) and **Windows** (MSVC vs. `rustc`), reporting the median of 3 interleaved runs:
 
 <p align="center">
   <img src="contrib/benchmarks.svg" width="100%" alt="Performance comparison between Nero and Neovim on Linux and Windows">
