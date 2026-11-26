@@ -5474,9 +5474,6 @@ mod tests {
 
     #[test]
     fn ml_try_mark_global_and_vimgrep_parallel_deterministic() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         let saved_curbuf = workspace_state().curbuf.get();
         let buf = FileBuf::new_rc();

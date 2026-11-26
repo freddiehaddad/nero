@@ -305,9 +305,6 @@ mod tests {
             RAW_FIRED.set(true);
         }
 
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let _editor = crate::main_init::test_editor();
         let timer = UvRawTimer::new();
         timer.init(main_loop());
@@ -320,9 +317,6 @@ mod tests {
 
     #[test]
     fn dropping_wait_guard_requests_native_close() {
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let _editor = crate::main_init::test_editor();
         let guard = WaitTimer::start(main_loop(), 60000);
         let watcher = guard.0.clone();
@@ -334,9 +328,6 @@ mod tests {
 
     #[test]
     fn cancelled_close_notification_releases_the_vim_timer() {
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let _editor = crate::main_init::test_editor();
         let id = crate::eval::timer_start(60000, 1, crate::eval::typval::Callback::NONE);
         let timer = crate::eval::find_timer_by_nr(id as i64).unwrap();
@@ -352,9 +343,6 @@ mod tests {
 
     #[test]
     fn editor_shutdown_releases_stopped_timer_registry_owners() {
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let weak = {
             let _editor = crate::main_init::test_editor();
             let id = crate::eval::timer_start(60000, -1, crate::eval::typval::Callback::NONE);

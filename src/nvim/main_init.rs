@@ -2572,6 +2572,7 @@ fn check_swap_exists_action() {
 #[must_use]
 pub(crate) struct TestEditorGuard {
     loop_: &'static crate::event::r#loop::Loop,
+    _global_lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -2588,6 +2589,7 @@ impl Drop for TestEditorGuard {
 }
 
 #[cfg(test)]
+/// Hold process-global test state exclusively through initialization and native teardown.
 pub(crate) fn test_editor() -> TestEditorGuard {
     thread_local! {
         static THREAD_VARS_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2596,6 +2598,9 @@ pub(crate) fn test_editor() -> TestEditorGuard {
         !THREAD_VARS_INIT.replace(true),
         "one editor fixture per test thread"
     );
+    let global_lock = crate::globals::TEST_GLOBAL_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     {
         event_init();
         exc_state().headless_mode.set(true);
@@ -2620,12 +2625,26 @@ pub(crate) fn test_editor() -> TestEditorGuard {
     }
     TestEditorGuard {
         loop_: crate::event::r#loop::main_loop(),
+        _global_lock: global_lock,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_fixture_owns_global_lock() {
+        let editor = test_editor();
+        assert!(matches!(
+            crate::globals::TEST_GLOBAL_LOCK.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(editor);
+        let _lock = crate::globals::TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+    }
 
     #[test]
     fn get_number_arg_and_init_params_work() {
@@ -2647,9 +2666,6 @@ mod tests {
 
     #[test]
     fn command_line_scan_parses_flags_commands_and_lua_args() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = test_editor();
         let c_args: Vec<std::ffi::CString> = [
             "nvim",

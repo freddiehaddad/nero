@@ -4317,9 +4317,6 @@ mod tests {
 
     #[test]
     fn nfa_regprog_is_send_sync_and_matches_concurrently_across_threads() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let prog = vim_regcomp(b"^\\s*fn\\s\\+\\(\\w\\+\\)_item_[0-9]\\+$", RE_MAGIC).unwrap();

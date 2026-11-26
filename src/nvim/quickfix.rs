@@ -7583,9 +7583,6 @@ mod tests {
 
     #[test]
     fn qf_bufnew_autocmd_reentrancy_does_not_panic() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         msg_state().msg_silent.set(msg_state().msg_silent.get() + 1);
         qf_init_stack();

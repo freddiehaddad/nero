@@ -4561,9 +4561,6 @@ mod tests {
 
     #[test]
     fn frees_a_stack_that_a_match_grew() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let mut rm = Regmatch::new();

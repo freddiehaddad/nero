@@ -498,9 +498,6 @@ mod tests {
 
     #[test]
     fn cached_clock_tracks_native_loop_storage() {
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let _editor = crate::main_init::test_editor();
         let loop_ = main_loop();
         let before = unsafe { uv_now(loop_.uv_ptr()) };
@@ -559,9 +556,6 @@ mod tests {
 
     #[test]
     fn signal_owner_survives_moves_and_can_stop_and_restart() {
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let _editor = crate::main_init::test_editor();
         let loop_ = main_loop();
         let initial_handles = loop_.owned_handles.borrow().len();
@@ -579,9 +573,6 @@ mod tests {
 
     #[test]
     fn signal_owner_can_outlive_native_loop_shutdown() {
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let editor = crate::main_init::test_editor();
         let loop_ = main_loop();
         let watcher =
@@ -607,9 +598,6 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         const SIGUSR2: i32 = 31;
 
-        let _lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let _editor = crate::main_init::test_editor();
         let loop_ = main_loop();
         let events = multiqueue_new(None);

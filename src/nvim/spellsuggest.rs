@@ -3381,9 +3381,6 @@ mod tests {
 
     #[test]
     fn spell_edit_score_3col_stack_dp_handles_all_edit_operations() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         // Exact match, insertion, deletion, substitution, case-fold, and adjacent swap (cols[c_prev2])

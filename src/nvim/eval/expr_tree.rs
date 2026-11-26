@@ -640,9 +640,6 @@ mod tests {
 
     #[test]
     fn test_trees_match_eval0() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         for cmd in [
             &b"let g:n = 7"[..],
@@ -671,9 +668,6 @@ mod tests {
 
     #[test]
     fn test_parse_stops_where_eval1_does() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         for (text, rest) in [
             (&b"1 + 2 | echo"[..], &b"| echo"[..]),
@@ -688,9 +682,6 @@ mod tests {
 
     #[test]
     fn test_parse_leaves_other_syntax_to_eval0() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         for text in [
             &b"len(g:l)"[..],

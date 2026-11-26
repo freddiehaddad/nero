@@ -5786,9 +5786,6 @@ mod tests {
 
     #[test]
     fn test_tv_list_operations() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         {
             let _editor = crate::main_init::test_editor();
             crate::globals::msg_state()
@@ -5892,9 +5889,6 @@ mod tests {
 
     #[test]
     fn test_tv_dict_operations() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         {
             let _editor = crate::main_init::test_editor();
             crate::globals::msg_state()
@@ -5960,9 +5954,6 @@ mod tests {
 
     #[test]
     fn test_tv2bool_and_typval_getters_locks_and_checks() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         {
             let _editor = crate::main_init::test_editor();
             crate::globals::msg_state()
@@ -6081,9 +6072,6 @@ mod tests {
 
     #[test]
     fn tv_clear_consumes_a_copy_id_only_for_containers() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let mut cases: Vec<(TypVal, bool)> = [
@@ -6130,9 +6118,6 @@ mod tests {
 
     #[test]
     fn deep_list_copy_reuses_copies_only_for_the_same_copy_id() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         fn item_lists(l: &TvList) -> (ListId, ListId) {

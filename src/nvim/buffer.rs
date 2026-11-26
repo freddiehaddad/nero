@@ -5560,9 +5560,6 @@ mod tests {
 
     #[test]
     fn buf_valid_and_buflist_findpat_work() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         {
             let _editor = crate::main_init::test_editor();
             let _skip_emsg = msg_state().skip_emsg();

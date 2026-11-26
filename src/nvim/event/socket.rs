@@ -666,14 +666,8 @@ mod tests {
         multiqueue_process_events,
     };
 
-    fn editor() -> (
-        std::sync::MutexGuard<'static, ()>,
-        crate::main_init::TestEditorGuard,
-    ) {
-        let lock = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        (lock, crate::main_init::test_editor())
+    fn editor() -> crate::main_init::TestEditorGuard {
+        crate::main_init::test_editor()
     }
 
     #[test]
@@ -686,7 +680,7 @@ mod tests {
 
     #[test]
     fn initialized_listener_survives_owner_moves_and_closes_on_drop() {
-        let (_lock, _editor) = editor();
+        let _editor = editor();
         let watcher = socket_watcher_init(main_loop(), c"127.0.0.1:0", MultiQueue::NULL).unwrap();
         let handle = watcher.handle.clone();
         let pointer = handle.as_ptr();
@@ -701,7 +695,7 @@ mod tests {
 
     #[test]
     fn unstarted_listener_drop_completes_native_close() {
-        let (_lock, _editor) = editor();
+        let _editor = editor();
         let watcher = socket_watcher_init(main_loop(), c"127.0.0.1:0", MultiQueue::NULL).unwrap();
         let handle = watcher.handle.clone();
         assert!(watcher.tcp_addrinfo.is_some());
@@ -712,7 +706,7 @@ mod tests {
 
     #[test]
     fn queued_connections_survive_close_and_can_be_dispatched_or_cancelled() {
-        let (_lock, _editor) = editor();
+        let _editor = editor();
         for cancel in [false, true] {
             let events = multiqueue_new(None);
             let mut watcher = socket_watcher_init(main_loop(), c"127.0.0.1:0", events).unwrap();
@@ -750,7 +744,7 @@ mod tests {
 
     #[test]
     fn failed_bind_closes_only_the_failed_listener() {
-        let (_lock, _editor) = editor();
+        let _editor = editor();
         let mut listener =
             socket_watcher_init(main_loop(), c"127.0.0.1:0", MultiQueue::NULL).unwrap();
         assert_eq!(socket_watcher_start(&mut listener, 8), 0);
@@ -775,7 +769,7 @@ mod tests {
             }
         }
 
-        let (_lock, _editor) = editor();
+        let _editor = editor();
         let path = SocketPath(std::env::temp_dir().join(format!(
             "nvim-listener-{}-{}",
             std::process::id(),
@@ -796,7 +790,7 @@ mod tests {
 
     #[test]
     fn loop_shutdown_closes_a_listener_before_its_owner_is_dropped() {
-        let (_lock, editor) = editor();
+        let editor = editor();
         let mut watcher =
             socket_watcher_init(main_loop(), c"127.0.0.1:0", MultiQueue::NULL).unwrap();
         assert_eq!(socket_watcher_start(&mut watcher, 8), 0);

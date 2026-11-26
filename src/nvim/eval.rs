@@ -7072,9 +7072,6 @@ mod tests {
 
     #[test]
     fn test_null_typval_from_unexistent_env_and_null_vimvars() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let mut rettv = tv_initial_value();
@@ -7104,9 +7101,6 @@ mod tests {
 
     #[test]
     fn test_eval_and_vars_respect_non_nul_subslice_bounds() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let mut rettv = tv_initial_value();
@@ -7209,9 +7203,6 @@ mod tests {
 
     #[test]
     fn test_method_call_releases_its_base() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         fn eval_and_clear(expr: &[u8]) {

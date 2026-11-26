@@ -1219,9 +1219,6 @@ mod tests {
 
     #[test]
     fn fuzzy_match_slice_positions_and_tiebreak() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         let mut score = 0;
         let mut pos = [0u32; FUZZY_MATCH_MAX_LEN];
@@ -1237,9 +1234,6 @@ mod tests {
 
     #[test]
     fn fuzzy_match_slice_parallel_threads_deterministic() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let candidates: Vec<String> = (0..400)
@@ -1302,9 +1296,6 @@ mod tests {
 
     #[test]
     fn fuzzy_match_in_list_parallel_over_2048_candidates_preserves_order() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
 
         let in_list = tv_list_alloc(2500);

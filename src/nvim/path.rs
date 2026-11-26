@@ -2323,9 +2323,6 @@ mod tests {
 
     #[test]
     fn path_equal_fullname_full_dir_name_and_guess_exepath() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         {
             init_progpath();

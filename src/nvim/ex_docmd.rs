@@ -13062,9 +13062,6 @@ mod tests {
         assert_eq!(modifier_len(b"verticalextra"), 0);
         assert_eq!(skip_cmd_arg(&b"foo\\ bar baz"[..8], false), b"");
 
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         assert_eq!(cmd_exists(&b"editextra"[..4]), 2);
         assert_eq!(cmd_exists(b"editextra"), 0);

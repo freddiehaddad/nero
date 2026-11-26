@@ -906,9 +906,6 @@ mod tests {
     /// which `compile()` leaves its lines to `do_one_cmd()`.
     #[test]
     fn test_compiles_each_statement() {
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _editor = crate::main_init::test_editor();
         for line in [
             "let x = 1",

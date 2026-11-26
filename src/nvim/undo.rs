@@ -3173,9 +3173,6 @@ mod tests {
         use crate::os::fs::{MAXPATHL, os_dirname};
         use std::ffi::CString;
 
-        let _guard = crate::globals::TEST_GLOBAL_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         {
             let _editor = crate::main_init::test_editor();
             let _skip_emsg = msg_state().skip_emsg();
