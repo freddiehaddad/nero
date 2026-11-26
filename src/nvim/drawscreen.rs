@@ -1713,6 +1713,13 @@ fn draw_sep_connectors_win(wp: &WinInfoInfo) {
     }
 }
 
+/// Reset per-redraw decoration and search-highlight state.
+fn win_redr_init(wp: &WinInfoInfo) {
+    screen_state().with_decor_state_mut(|ds| decor_redraw_reset(wp, ds));
+    decor_providers_invoke_win(wp);
+    search_state().with_screen_search_hl_mut(|shl| init_search_hl(wp, shl));
+}
+
 fn win_update(wp: &WinInfoInfo) {
     if wp.w_grid.target.get() == crate::grid::GridTarget::Default
         && wp.w_wincol.get() >= screen_state().columns_global.get()
@@ -1763,8 +1770,7 @@ fn win_update(wp: &WinInfoInfo) {
 
     screen_state().clear_win_extmarks();
 
-    screen_state().with_decor_state_mut(|ds| decor_redraw_reset(wp, ds));
-    decor_providers_invoke_win(wp);
+    win_redr_init(wp);
 
     if let Some(term) = buf.terminal.get().opt()
         && terminal_suspended(term)
@@ -1806,8 +1812,6 @@ fn win_update(wp: &WinInfoInfo) {
 
     validate_virtcol(wp);
     type_ = wp.w_redr_type.get();
-
-    search_state().with_screen_search_hl_mut(|shl| init_search_hl(wp, shl));
 
     if wp.w_skipcol.get() > 0 && wp.w_view_width.get() > win_col_off(wp) {
         let mut w: i32 = 0;
@@ -2606,9 +2610,7 @@ fn win_update(wp: &WinInfoInfo) {
                 lnum = wp.w_topline.get();
                 wp.w_lines_valid.set(0);
                 wp.w_valid.set(wp.w_valid.get() & (!VALID_WCOL));
-                search_state().with_screen_search_hl_mut(|shl| init_search_hl(wp, shl));
-                screen_state().with_decor_state_mut(|ds| decor_redraw_reset(wp, ds));
-                decor_providers_invoke_win(wp);
+                win_redr_init(wp);
                 continue;
             }
 
@@ -2709,9 +2711,7 @@ fn win_update(wp: &WinInfoInfo) {
                         lnum = wp.w_topline.get();
                         wp.w_lines_valid.set(0);
                         wp.w_valid.set(wp.w_valid.get() & (!VALID_WCOL));
-                        search_state().with_screen_search_hl_mut(|shl| init_search_hl(wp, shl));
-                        screen_state().with_decor_state_mut(|ds| decor_redraw_reset(wp, ds));
-                        decor_providers_invoke_win(wp);
+                        win_redr_init(wp);
                         continue 'statuscol_retry;
                     }
                 }
