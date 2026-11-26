@@ -16,7 +16,7 @@ use crate::event::stream::{Stream, StreamInternalData, stream_init, stream_may_c
 use crate::globals::*;
 use crate::main_init::{os_exit, preserve_exit};
 use crate::memory::ARENA_BLOCK_SIZE;
-use crate::os::proc::os_proc_tree_kill;
+use crate::os::proc::{KillOutcome, ProcessError, ProcessId, ProcessSignal, os_proc_tree_kill};
 use crate::os::pty_proc::{
     pty_proc_close, pty_proc_close_master, pty_proc_flush_master, pty_proc_spawn, pty_proc_teardown,
 };
@@ -28,7 +28,7 @@ use std::rc::Rc;
 const KILL_TIMEOUT_MS: u64 = 2000;
 
 use crate::channel::{K_PROC_TYPE_PTY, K_PROC_TYPE_UV};
-use crate::os::signal::{SIGHUP, SIGINT, SIGKILL, SIGTERM};
+use crate::os::signal::SIGHUP;
 
 #[derive(Clone)]
 pub struct Proc(Rc<ProcState>);
@@ -323,6 +323,49 @@ pub fn proc_wait(proc_: &Proc, ms: i32, events: Option<MultiQueue>) -> i32 {
     proc_.status.get()
 }
 
+fn proc_kill_tree(
+    proc_: &Proc,
+    signal: ProcessSignal,
+) -> Result<Option<KillOutcome>, ProcessError> {
+    #[cfg(windows)]
+    if proc_.closed.get() || !proc_.is_spawned() || proc_.status.get() >= 0 {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    let pid = match proc_.r#type.get() {
+        K_PROC_TYPE_UV => {
+            let Some(pid) = crate::event::libuv_proc::libuv_proc_active_pid(proc_)? else {
+                return Ok(None);
+            };
+            pid
+        }
+        K_PROC_TYPE_PTY if proc_.proc_handle.get().is_null() => return Ok(None),
+        _ => ProcessId::try_from(i64::from(proc_.pid.get()))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+    };
+    #[cfg(not(windows))]
+    let pid = ProcessId::try_from(i64::from(proc_.pid.get()))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+    // This traversal does not poll the loop: the original native owner cannot
+    // close between validating the root and opening our own process handle.
+    let result = os_proc_tree_kill(pid, signal).map(Some);
+    #[cfg(windows)]
+    if let Err(error) = &result {
+        crate::log::logmsg!(
+            crate::log::LOGLVL_ERR,
+            None,
+            Some(c"proc_kill_tree"),
+            line!() as i32,
+            false,
+            c"Failed to stop process tree %u: %s",
+            pid.get(),
+            error.to_string().as_bytes(),
+        );
+    }
+    result
+}
+
 pub fn proc_stop(proc_: &Proc) {
     if proc_.closed.get() || proc_.status.get() >= 0 || proc_.stopped_time.get() != 0 {
         return;
@@ -331,12 +374,12 @@ pub fn proc_stop(proc_: &Proc) {
     match proc_.r#type.get() {
         K_PROC_TYPE_UV => {
             let signal = if !cfg!(windows) && proc_.interrupt.get() {
-                SIGINT
+                ProcessSignal::Interrupt
             } else {
-                SIGTERM
+                ProcessSignal::Terminate
             };
-            proc_.exit_signal.set(signal as u8);
-            os_proc_tree_kill(proc_.pid.get(), signal);
+            proc_.exit_signal.set(signal.as_raw() as u8);
+            let _ = proc_kill_tree(proc_, signal);
         }
         K_PROC_TYPE_PTY => {
             proc_.exit_signal.set(SIGHUP as u8);
@@ -364,11 +407,13 @@ unsafe extern "C" fn children_kill_cb(_handle: *mut uv_timer_t) {
         if (proc_.r#type.get() != K_PROC_TYPE_PTY && !proc_.interrupt.get())
             || proc_.stopped_time.get() == u64::MAX
         {
-            proc_.exit_signal.set(SIGKILL as u8);
-            os_proc_tree_kill(proc_.pid.get(), SIGKILL);
+            proc_.exit_signal.set(ProcessSignal::Kill.as_raw() as u8);
+            let _ = proc_kill_tree(&proc_, ProcessSignal::Kill);
         } else {
-            proc_.exit_signal.set(SIGTERM as u8);
-            os_proc_tree_kill(proc_.pid.get(), SIGTERM);
+            proc_
+                .exit_signal
+                .set(ProcessSignal::Terminate.as_raw() as u8);
+            let _ = proc_kill_tree(&proc_, ProcessSignal::Terminate);
             proc_.stopped_time.set(u64::MAX);
             unsafe {
                 uv_timer_start(

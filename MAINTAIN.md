@@ -85,10 +85,11 @@ After porting upstream commits:
 
 ### 4. Intentional differences from upstream
 
-Nero fixes an upstream bug only with the maintainer's approval (see [AGENTS.md](./AGENTS.md#upstream-bugs)). Each row names its regression test; the current ones are in `test/functional/editor/regexp_spec.lua`, `test/functional/editor/sort_order_spec.lua` and `test/functional/editor/virtualedit_spec.lua`. Link the upstream report once one is filed.
+Nero fixes an upstream bug only with the maintainer's approval (see [AGENTS.md](./AGENTS.md#upstream-bugs)). Each row names its regression test. Link the upstream report once one is filed.
 
 | Nero | Upstream | Code | Regression test | Upstream report |
 |---|---|---|---|---|
+| Windows child queries and tree termination distinguish process generations and retain termination handles. | Matches parent PIDs without checking whether the parent still exists or its PID was reused; can report or target unrelated processes. | `os/proc.rs`, `os/proc_tree.rs`, `os/proc_windows.rs` | `api/proc_spec.lua`: `does not report children of an exited parent`, `stops an owned tree without stopping a sibling`; `event-lifetimes/tests/processes.rs` | Not reported |
 | The NFA engine always tries a `\@>` atom. | Skips it when an equal state is already queued, so it misses matches. | `regexp_nfa.rs`: `NFA_START_PATTERN` | `finds matches after \@> in both engines` | Not reported |
 | The NFA engine continues after a `\@>` atom whose match spans lines. | Continues at the atom's end column on the wrong line, so a buffer search misses the match. | `regexp_nfa.rs`: `NFA_START_PATTERN`, `NFA_SKIP`, `skip_len()` | `finds matches after a \@> that spans lines in both engines` | vim/vim#3651 |
 | NFA alternatives keep their priority order. | A state queued by a later alternative blocks the same state from an earlier one. | `regexp_nfa.rs`: `addstate_here()` | `prefers the first matching alternative in both engines` | Not reported |

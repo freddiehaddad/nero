@@ -21,6 +21,27 @@ const UV_PROCESS_WINDOWS_HIDE: u32 = 1 << 4;
 
 #[allow(non_camel_case_types)]
 pub type uv_process_t = c_void;
+#[cfg(windows)]
+unsafe extern "C" {
+    fn uv_is_active(handle: *const uv_handle_t) -> i32;
+}
+
+#[cfg(windows)]
+pub(super) fn libuv_proc_active_pid(
+    proc_: &Proc,
+) -> Result<Option<crate::os::proc::ProcessId>, crate::os::proc::ProcessError> {
+    if !proc_.uv.is_active() || unsafe { uv_is_active(proc_.uv.as_ptr()) } == 0 {
+        return Ok(None);
+    }
+    // libuv closes the process HANDLE before marking its native handle inactive.
+    // Until the next loop tick, an active native owner keeps this PID reserved.
+    crate::os::proc::ProcessId::try_from(i64::from(unsafe {
+        uv_process_get_pid(proc_.uv.as_ptr())
+    }))
+    .map(Some)
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 #[allow(non_camel_case_types)]
 type uv_exit_cb =
     Option<unsafe extern "C" fn(handle: *mut uv_process_t, exit_status: i64, term_signal: i32)>;
@@ -278,4 +299,58 @@ unsafe extern "C" fn exit_cb(handle: *mut uv_process_t, status: i64, term_signal
         status as i32
     });
     crate::event::proc::on_proc_exit(&proc_);
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::event::r#loop::{UV_RUN_NOWAIT, UV_RUN_ONCE, uv_run};
+    use crate::event::multiqueue::{
+        MultiQueue, multiqueue_free, multiqueue_new, multiqueue_process_events,
+    };
+
+    struct ProcessFixture {
+        proc: Proc,
+        events: MultiQueue,
+    }
+
+    impl Drop for ProcessFixture {
+        fn drop(&mut self) {
+            if !self.proc.uv.is_uninitialized() {
+                libuv_proc_close(&self.proc);
+                while !self.proc.uv.is_closed() {
+                    unsafe { uv_run(main_loop().uv_ptr(), UV_RUN_NOWAIT) };
+                }
+            }
+            multiqueue_process_events(self.events);
+            multiqueue_free(self.events);
+        }
+    }
+
+    #[test]
+    fn exited_native_process_is_not_reopened_as_an_interrupted_job() {
+        let _editor = crate::main_init::test_editor();
+        let proc = Proc::new();
+        let events = multiqueue_new(None);
+        let fixture = ProcessFixture { proc, events };
+        fixture.proc.events.set(events);
+        fixture.proc.status.set(-1);
+        fixture.proc.argv.set(vec![
+            c"cmd.exe".into(),
+            c"/d".into(),
+            c"/c".into(),
+            c"exit 0".into(),
+        ]);
+        assert_eq!(
+            crate::event::proc::proc_spawn(&fixture.proc, false, false, false),
+            0
+        );
+        assert!(libuv_proc_active_pid(&fixture.proc).unwrap().is_some());
+        while fixture.proc.status.get() < 0 {
+            unsafe { uv_run(main_loop().uv_ptr(), UV_RUN_ONCE) };
+        }
+        assert!(fixture.proc.uv.is_active());
+        fixture.proc.status.set(-2);
+        assert!(libuv_proc_active_pid(&fixture.proc).unwrap().is_none());
+    }
 }

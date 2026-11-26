@@ -1,4 +1,9 @@
 //! OS process inspection and process-tree termination (`src/nvim/os/proc.c`).
+pub use super::proc_tree::{KillOutcome, ProcessError, ProcessId, ProcessSignal};
+#[cfg(windows)]
+use super::proc_tree::{ProcessDriver, child_identities, os_proc_tree_kill_rec};
+#[cfg(windows)]
+use super::proc_windows::NativeProcesses;
 #[cfg(windows)]
 use crate::eval::funcs::PROCESS_ALL_ACCESS;
 use crate::event::r#loop::uv_kill;
@@ -17,8 +22,15 @@ const UV_ESRCH: i32 = -4040;
 #[cfg(not(target_os = "windows"))]
 const UV_ESRCH: i32 = -3;
 
-const SIGTERM_NUM: i32 = 15;
-const SIGKILL_NUM: i32 = 9;
+impl ProcessSignal {
+    pub fn as_raw(self) -> i32 {
+        match self {
+            Self::Interrupt => crate::os::signal::SIGINT,
+            Self::Terminate => crate::os::signal::SIGTERM,
+            Self::Kill => crate::os::signal::SIGKILL,
+        }
+    }
+}
 
 #[cfg(target_os = "windows")]
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
@@ -66,9 +78,7 @@ impl Default for ProcessEntry32 {
 }
 
 #[cfg(target_os = "windows")]
-use crate::os::os_win_console::{
-    CloseHandle, DebugBreakProcess, GetProcessId, OpenProcess, TerminateProcess,
-};
+use crate::os::os_win_console::{CloseHandle, DebugBreakProcess, OpenProcess};
 
 pub fn os_debugbreak(pid: i32) -> bool {
     #[cfg(windows)]
@@ -95,180 +105,135 @@ unsafe extern "system" {
     fn Process32Next(h_snapshot: *mut c_void, lppe: *mut ProcessEntry32) -> i32;
 }
 
-#[cfg(target_os = "windows")]
-fn os_proc_tree_kill_rec(proc_handle_addr: usize, sig: i32) -> bool {
-    let proc_handle: *mut c_void = proc_handle_addr as *mut c_void;
-    if proc_handle.is_null() {
-        return false;
-    }
-    let pid = unsafe { GetProcessId(proc_handle) };
-    if pid != 0 {
-        let h = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if h != INVALID_HANDLE_VALUE {
-            let mut pe = ProcessEntry32::new();
-            if unsafe { Process32First(h, &mut pe) != 0 } {
-                loop {
-                    if pe.th32_parent_process_id == pid {
-                        let ph = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pe.th32_process_id) };
-                        if !ph.is_null() {
-                            unsafe {
-                                os_proc_tree_kill_rec(ph as usize, sig);
-                                CloseHandle(ph);
-                            }
-                        }
-                    }
-                    if unsafe { Process32Next(h, &mut pe) == 0 } {
-                        break;
-                    }
-                }
-            }
-            unsafe {
-                CloseHandle(h);
-            }
-        }
-    }
-    unsafe { TerminateProcess(proc_handle, sig as u32) != 0 }
-}
-
 /// Kill process `pid` and its process group / descendants (`os_proc_tree_kill`).
-pub fn os_proc_tree_kill(pid: i32, sig: i32) -> bool {
-    assert!(sig == crate::os::signal::SIGINT || sig == SIGTERM_NUM || sig == SIGKILL_NUM);
+pub fn os_proc_tree_kill(
+    pid: ProcessId,
+    signal: ProcessSignal,
+) -> Result<KillOutcome, ProcessError> {
     #[cfg(target_os = "windows")]
     {
-        if pid > 0 {
-            unsafe {
-                let h = OpenProcess(PROCESS_ALL_ACCESS, 0, pid as u32);
-                let ok = os_proc_tree_kill_rec(h as usize, sig);
-                if !h.is_null() {
-                    CloseHandle(h);
-                }
-                return ok;
-            }
-        }
-        false
+        let Some(root) = NativeProcesses.open(pid, super::proc_tree::ProcessAccess::Terminate)?
+        else {
+            return Ok(KillOutcome::AlreadyExited);
+        };
+        os_proc_tree_kill_rec(&NativeProcesses, root, signal)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        if pid == 0 {
-            return false;
+        match unsafe { uv_kill(-(pid.get() as i32), signal.as_raw()) } {
+            0 => Ok(KillOutcome::Requested),
+            UV_ESRCH => Ok(KillOutcome::AlreadyExited),
+            error => Err(std::io::Error::from_raw_os_error(-error)),
         }
-        unsafe { uv_kill(-pid, sig) == 0 }
     }
 }
 
 /// Get the immediate child PIDs of `ppid` (`os_proc_children`).
-pub fn os_proc_children(ppid: i32) -> Result<Vec<i32>, i32> {
-    if ppid < 0 {
-        return Err(2);
-    }
-
-    #[allow(unused_mut)]
-    let mut temp: Vec<i32> = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    unsafe {
-        let h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if h == INVALID_HANDLE_VALUE {
-            return Err(2);
-        }
-        let mut pe = ProcessEntry32::new();
-        if Process32First(h, &mut pe) == 0 {
-            CloseHandle(h);
-            return Err(2);
-        }
-        loop {
-            if pe.th32_parent_process_id == ppid as u32 {
-                temp.push(pe.th32_process_id as i32);
-            }
-            if Process32Next(h, &mut pe) == 0 {
-                break;
-            }
-        }
-        CloseHandle(h);
-    }
-
-    #[cfg(target_os = "macos")]
-    unsafe {
-        unsafe extern "C" {
-            fn sysctl(
-                name: *mut i32,
-                namelen: u32,
-                oldp: *mut std::ffi::c_void,
-                oldlenp: *mut usize,
-                newp: *mut std::ffi::c_void,
-                newlen: usize,
-            ) -> i32;
-        }
-        const CTL_KERN: i32 = 1;
-        const KERN_PROC: i32 = 14;
-        const KERN_PROC_ALL: i32 = 0;
-        const KINFO_PROC_SIZE: usize = 648;
-        const KP_PID_OFFSET: usize = 40;
-        const KP_PPID_OFFSET: usize = 560;
-
-        let mut name = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
-        let mut len: usize = 0;
-        if sysctl(
-            name.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        ) != 0
-        {
-            return Err(2);
-        }
-
-        let mut buf = vec![0u8; len];
-        if sysctl(
-            name.as_mut_ptr(),
-            3,
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        ) != 0
-        {
-            return Err(2);
-        }
-
-        let mut exists = false;
-        let p_count = len / KINFO_PROC_SIZE;
-        for i in 0..p_count {
-            let entry = &buf[i * KINFO_PROC_SIZE..(i + 1) * KINFO_PROC_SIZE];
-            let pid =
-                i32::from_ne_bytes(entry[KP_PID_OFFSET..KP_PID_OFFSET + 4].try_into().unwrap());
-            let parent_pid = i32::from_ne_bytes(
-                entry[KP_PPID_OFFSET..KP_PPID_OFFSET + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            exists = exists || pid == ppid;
-            if parent_pid == ppid {
-                temp.push(pid);
-            }
-        }
-        if !exists {
-            return Err(1);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
+pub fn os_proc_children(parent: ProcessId) -> Result<Option<Vec<ProcessId>>, ProcessError> {
+    #[cfg(windows)]
     {
-        let path = format!("/proc/{ppid}/task/{ppid}/children");
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            return Err(2);
+        let snapshot = NativeProcesses.snapshot()?;
+        let Some(parent) = snapshot.iter().find(|row| row.identity.pid == parent) else {
+            return Ok(None);
         };
-        for tok in contents.split_ascii_whitespace() {
-            if let Ok(match_pid) = tok.parse::<i32>() {
-                temp.push(match_pid);
-            }
-        }
+        Ok(Some(
+            child_identities(&snapshot, parent.identity)
+                .map(|child| child.pid)
+                .collect(),
+        ))
     }
 
-    Ok(temp)
+    #[cfg(not(windows))]
+    {
+        let ppid = parent.get() as i32;
+        #[allow(unused_mut)]
+        let mut temp = Vec::new();
+
+        #[cfg(target_os = "macos")]
+        unsafe {
+            unsafe extern "C" {
+                fn sysctl(
+                    name: *mut i32,
+                    namelen: u32,
+                    oldp: *mut std::ffi::c_void,
+                    oldlenp: *mut usize,
+                    newp: *mut std::ffi::c_void,
+                    newlen: usize,
+                ) -> i32;
+            }
+            const CTL_KERN: i32 = 1;
+            const KERN_PROC: i32 = 14;
+            const KERN_PROC_ALL: i32 = 0;
+            const KINFO_PROC_SIZE: usize = 648;
+            const KP_PID_OFFSET: usize = 40;
+            const KP_PPID_OFFSET: usize = 560;
+
+            let mut name = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
+            let mut len: usize = 0;
+            if sysctl(
+                name.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let mut buf = vec![0u8; len];
+            if sysctl(
+                name.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let mut exists = false;
+            let p_count = len / KINFO_PROC_SIZE;
+            for i in 0..p_count {
+                let entry = &buf[i * KINFO_PROC_SIZE..(i + 1) * KINFO_PROC_SIZE];
+                let pid =
+                    i32::from_ne_bytes(entry[KP_PID_OFFSET..KP_PID_OFFSET + 4].try_into().unwrap());
+                let parent_pid = i32::from_ne_bytes(
+                    entry[KP_PPID_OFFSET..KP_PPID_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                exists = exists || pid == ppid;
+                if parent_pid == ppid
+                    && let Ok(pid) = ProcessId::try_from(i64::from(pid))
+                {
+                    temp.push(pid);
+                }
+            }
+            if !exists {
+                return Ok(None);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/proc/{ppid}/task/{ppid}/children");
+            let contents = std::fs::read_to_string(&path)?;
+            for tok in contents.split_ascii_whitespace() {
+                if let Ok(match_pid) = tok.parse::<i64>()
+                    && let Ok(match_pid) = ProcessId::try_from(match_pid)
+                {
+                    temp.push(match_pid);
+                }
+            }
+        }
+
+        Ok(Some(temp))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -343,7 +308,10 @@ mod tests {
 
     #[test]
     fn negative_ppid_returns_error_and_running_checks_pid() {
-        assert_eq!(os_proc_children(-1), Err(2));
+        assert_eq!(
+            ProcessId::try_from(-1),
+            Err(crate::os::proc_tree::InvalidProcessId)
+        );
         assert!(os_proc_running(std::process::id() as i32));
         assert!(!os_proc_running(i32::MAX));
     }

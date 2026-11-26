@@ -94,7 +94,7 @@ use crate::option::{
 use crate::option_vars::*;
 use crate::optionstr::check_stl_option;
 use crate::os::input::{input_blocking, input_enqueue, input_enqueue_mouse, input_enqueue_raw};
-use crate::os::proc::os_proc_children;
+use crate::os::proc::{ProcessId, os_proc_children};
 use crate::popupmenu::{pum_ext_select_item, pum_set_info};
 use crate::register::{
     PUT_CURSEND, do_put, finish_yankreg_from_object, prepare_yankreg_from_object,
@@ -2236,36 +2236,47 @@ pub fn nvim_list_uis() -> Array {
 /// @return Array of child process ids, empty if process not found.
 // DLLEXPORT Array nvim_get_proc_children(Integer pid, Arena *arena, Error *err) FUNC_API_SINCE(4);
 pub fn nvim_get_proc_children(pid: Integer) -> Result<Array, Error> {
-    validate_int(pid > 0 && pid <= Integer::from(i32::MAX), c"pid", pid)?;
+    let process_id = ProcessId::try_from(pid)
+        .map_err(|_| api_error!(ErrorType::ErrorTypeValidation, c"Invalid 'pid': %lld", pid,))?;
 
-    match os_proc_children(pid as i32) {
-        Err(rv) => {
-            let mut a_items = [integer_obj(pid)];
-            let a = Array::from_slice(&mut a_items[..1]);
-            let o = nlua_exec(
-                static_cstr_as_string(c"return vim._os_proc_children(...)"),
-                None,
-                a,
-                K_RET_OBJECT,
-            )?;
-            if let Object::Array(array) = o {
-                Ok(array)
-            } else {
-                Err(api_error!(
-                    ErrorType::ErrorTypeException,
-                    c"Failed to get process children. pid=%lld error=%d",
-                    pid,
-                    rv,
-                ))
-            }
-        }
-        Ok(children) => {
+    let fallback_code = match os_proc_children(process_id) {
+        Ok(Some(children)) => {
             let mut rvobj = Array::with_capacity(children.len());
             for child_pid in children {
-                add_c(&mut rvobj, integer_obj(Integer::from(child_pid)));
+                add_c(&mut rvobj, integer_obj(Integer::from(child_pid.get())));
             }
-            Ok(rvobj)
+            return Ok(rvobj);
         }
+        Ok(None) if cfg!(windows) => return Ok(Array::new()),
+        Err(error) if cfg!(windows) => {
+            return Err(api_error!(
+                ErrorType::ErrorTypeException,
+                c"Failed to get process children. pid=%lld error=%s",
+                pid,
+                error.to_string().as_bytes(),
+            ));
+        }
+        // Preserve the existing non-Windows fallback and its diagnostic codes.
+        Ok(None) => 1,
+        Err(_) => 2,
+    };
+    let mut a_items = [integer_obj(pid)];
+    let a = Array::from_slice(&mut a_items[..1]);
+    let o = nlua_exec(
+        static_cstr_as_string(c"return vim._os_proc_children(...)"),
+        None,
+        a,
+        K_RET_OBJECT,
+    )?;
+    if let Object::Array(array) = o {
+        Ok(array)
+    } else {
+        Err(api_error!(
+            ErrorType::ErrorTypeException,
+            c"Failed to get process children. pid=%lld error=%d",
+            pid,
+            fallback_code,
+        ))
     }
 }
 

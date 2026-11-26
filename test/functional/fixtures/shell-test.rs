@@ -2,7 +2,9 @@
 
 use std::env;
 use std::io::{self, BufRead, Read, Write};
+use std::net::TcpStream;
 use std::process;
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
@@ -56,6 +58,43 @@ fn help() {
     );
     println!("  shell-test EXIT {{code}}");
     println!("    Exits immediately with exit code \"{{code}}\".");
+    println!("  shell-test PROCESS_TREE ADDRESS DEPTH");
+    println!("    Announces each process over TCP and waits for the connection to close.");
+    println!("  shell-test ORPHAN ADDRESS");
+    println!("    Starts a TCP-controlled child, prints its PID, and exits on stdin input.");
+}
+
+fn process_tree_fixture(address: &str, depth: u32) -> io::Result<()> {
+    let mut control = TcpStream::connect(address)?;
+    let _child = if depth > 0 {
+        Some(
+            process::Command::new(env::current_exe()?)
+                .args(["PROCESS_TREE", address, &(depth - 1).to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        )
+    } else {
+        None
+    };
+    writeln!(control, "{}", process::id())?;
+    io::copy(&mut control, &mut io::sink())?;
+    Ok(())
+}
+
+fn orphan_fixture(address: &str) -> io::Result<()> {
+    let child = process::Command::new(env::current_exe()?)
+        .args(["PROCESS_TREE", address, "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    println!("{}", child.id());
+    io::stdout().flush()?;
+    io::stdin().read_exact(&mut [0])?;
+    drop(child);
+    Ok(())
 }
 
 fn sscanf_int(s: &str) -> Option<i32> {
@@ -95,6 +134,29 @@ fn run(args: &[String]) -> i32 {
 
     if args.len() >= 2 {
         match args[1].as_str() {
+            "PROCESS_TREE" => {
+                let (Some(address), Some(depth)) = (
+                    args.get(2),
+                    args.get(3).and_then(|depth| depth.parse::<u32>().ok()),
+                ) else {
+                    eprintln!("PROCESS_TREE expects an address and depth");
+                    return 4;
+                };
+                if let Err(error) = process_tree_fixture(address, depth) {
+                    eprintln!("{error}");
+                    return 1;
+                }
+            }
+            "ORPHAN" => {
+                let Some(address) = args.get(2) else {
+                    eprintln!("ORPHAN expects an address");
+                    return 4;
+                };
+                if let Err(error) = orphan_fixture(address) {
+                    eprintln!("{error}");
+                    return 1;
+                }
+            }
             "CLIPBOARD_COPY" => {
                 let Some(path) = args.get(2) else { return 4 };
                 let mut bytes = Vec::new();

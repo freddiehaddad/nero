@@ -14,6 +14,13 @@ pub mod lang;
 pub mod os_win_console;
 #[allow(unsafe_code)]
 pub mod proc;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod proc_tree;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod proc_windows;
+#[cfg(windows)]
+mod proc_windows_data;
 #[allow(unsafe_code)]
 pub mod pty_conpty_win;
 #[allow(unsafe_code)]
