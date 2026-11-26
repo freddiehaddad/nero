@@ -3415,8 +3415,15 @@ pub fn with_ml_get_buf_mut_slice<R>(
     lnum: Linenr,
     f: impl FnOnce(&mut [u8]) -> R,
 ) -> R {
-    if !ml_load_line(buf, lnum, true) || buf.b_ml.ml_line_textlen.get() <= 1 {
+    if !ml_load_line(buf, lnum, true) {
         return f(&mut []);
+    }
+    if buf.b_ml.ml_line_textlen.get() <= 1 {
+        let rv = f(&mut []);
+        buf.b_ml
+            .ml_flags
+            .set(buf.b_ml.ml_flags.get() & !ML_LINE_INPLACE);
+        return rv;
     }
     assert!(buf.b_ml.ml_line_textlen.get() > 0);
     let len = (buf.b_ml.ml_line_textlen.get() - 1) as usize;
@@ -3430,6 +3437,9 @@ pub fn with_ml_get_buf_mut_slice<R>(
     };
     buf.b_ml.ml_line_textlen.set(new_textlen);
     buf.b_ml.ml_line_cstr.set(None);
+    buf.b_ml
+        .ml_flags
+        .set(buf.b_ml.ml_flags.get() & !ML_LINE_INPLACE);
     rv
 }
 
@@ -5372,6 +5382,8 @@ mod tests {
         with_ml_get_buf_mut_slice(&buf, 500, |s| {
             s[0..3].copy_from_slice(b"MOD");
         });
+        assert_ne!(buf.b_ml.ml_flags.get() & ML_LINE_DIRTY, 0);
+        assert_eq!(buf.b_ml.ml_flags.get() & ML_LINE_INPLACE, 0);
         with_ml_buf_line(&buf, 500, |bytes| {
             assert_eq!(bytes, b"MOD-0500");
         });
@@ -5381,15 +5393,27 @@ mod tests {
         with_ml_get_buf_mut_slice(&buf, 500, |s| {
             s[5] = 0;
         });
+        assert_ne!(buf.b_ml.ml_flags.get() & ML_LINE_DIRTY, 0);
+        assert_eq!(buf.b_ml.ml_flags.get() & ML_LINE_INPLACE, 0);
         assert_eq!(ml_get_buf_len(&buf, 500), 5);
         with_ml_buf_line(&buf, 500, |bytes| {
             assert_eq!(bytes, b"MOD-0");
         });
+        assert_eq!(ml_get_buf(&buf, 500).to_bytes(), b"MOD-0");
         buf.b_ml.delete_dirty_line_bytes(&buf, 3, 2, 1, 5, 3);
         assert_eq!(ml_get_buf_len(&buf, 500), 3);
         with_ml_buf_line(&buf, 500, |bytes| {
             assert_eq!(bytes, b"MOD");
         });
+        with_ml_get_buf_mut_slice(&buf, 500, |s| {
+            s[0] = 0;
+        });
+        assert_eq!(ml_get_buf_len(&buf, 500), 0);
+        with_ml_get_buf_mut_slice(&buf, 500, |s| {
+            assert!(s.is_empty());
+        });
+        assert_ne!(buf.b_ml.ml_flags.get() & ML_LINE_DIRTY, 0);
+        assert_eq!(buf.b_ml.ml_flags.get() & ML_LINE_INPLACE, 0);
 
         // Verify byte-offset round-trip (line -> offset -> line) across all chunks
         // in both unix and dos fileformats.
