@@ -116,9 +116,7 @@ fn filter_map_dict(
         }
 
         let prev_lock = d.dv_lock.get();
-        if prev_lock == VAR_UNLOCKED {
-            d.dv_lock.set(VAR_LOCKED);
-        }
+        d.dv_lock.set(VAR_FIXED);
         hash_lock(&d.dv_hashtab);
 
         let mut todo = d.dv_hashtab.ht_used.get();

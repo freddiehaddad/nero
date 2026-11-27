@@ -24,7 +24,7 @@ use std::ffi::{CStr, CString};
 const K_SHM_INTRO: i32 = b'I' as i32;
 
 static VIM_VERSIONS: [i32; 5] = [801, 802, 900, 901, 902];
-static NUM_PATCHES: [usize; 5] = [2409, 4050, 1650, 1730, 906];
+static NUM_PATCHES: [usize; 5] = [2409, 4050, 1650, 1730, 907];
 #[rustfmt::skip]
 static PATCHES_801: &[i32] = &[
     2424, 2423, 2422, 2421, 2420, 2419, 2418, 2417, 2416, 2415, 2414, 2413, 2412, 2411, 2410, 2409,
@@ -3250,6 +3250,8 @@ static PATCHES_901: &[i32] = &[
 ];
 #[rustfmt::skip]
 static PATCHES_902: &[i32] = &[
+    1368,
+    // 1343-1367
     1342,
     // 1341
     1340,

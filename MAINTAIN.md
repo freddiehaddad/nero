@@ -17,7 +17,7 @@ Syncing with Upstream (`neovim/neovim`)
 
 This repository tracks upstream [`neovim/neovim`](https://github.com/neovim/neovim) to stay 100% feature-, runtime-, and bugfix-compatible. Compatibility means upstream's intended behavior: the upstream bugs Nero fixes are listed in [Intentional differences from upstream](#4-intentional-differences-from-upstream).
 
-* **Last synced upstream commit**: `ffbd283ed5` (`master`)
+* **Last synced upstream commit**: `8cf55994e9` (`master`)
 
 ### 1. Inspecting new upstream commits
 
