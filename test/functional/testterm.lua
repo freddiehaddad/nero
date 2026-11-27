@@ -113,8 +113,9 @@ local default_command = { testprg('tty-test') }
 ---@param cols? integer Create screen with this many columns (default: 50)
 ---@param env? table Environment set on the `cmd` job.
 ---@param screen_opts? table Options for `Screen.new()`.
+---@param job_opts? table Additional options for `jobstart()`.
 ---@return test.functional.ui.screen # Screen attached to the global (not child) Nvim session.
-function M.setup_screen(extra_rows, cmd, cols, env, screen_opts)
+function M.setup_screen(extra_rows, cmd, cols, env, screen_opts, job_opts)
   extra_rows = extra_rows and extra_rows or 0
   cmd = cmd and cmd or default_command
   cols = cols and cols or 50
@@ -151,7 +152,10 @@ function M.setup_screen(extra_rows, cmd, cols, env, screen_opts)
   })
 
   api.nvim_command('enew')
-  api.nvim_call_function('jobstart', { cmd, { term = true, env = (env and env or nil) } })
+  job_opts = job_opts or {}
+  job_opts.term = true
+  job_opts.env = env or nil
+  api.nvim_call_function('jobstart', { cmd, job_opts })
   api.nvim_input('<CR>')
   local vim_errmsg = api.nvim_eval('v:errmsg')
   if vim_errmsg and '' ~= vim_errmsg then
@@ -209,7 +213,7 @@ function M.setup_child_nvim(args, opts)
   -- Child servers need the socket dir set by runner.lua.
   env.XDG_RUNTIME_DIR = env.XDG_RUNTIME_DIR or os.getenv('XDG_RUNTIME_DIR')
 
-  return M.setup_screen(opts.extra_rows, argv, opts.cols, env)
+  return M.setup_screen(opts.extra_rows, argv, opts.cols, env, nil, opts.job_opts)
 end
 
 --- FIXME: On Windows spaces at the end of a screen line may have wrong attrs.

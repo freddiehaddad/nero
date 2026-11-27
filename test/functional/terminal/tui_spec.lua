@@ -4068,6 +4068,12 @@ describe('TUI FocusGained/FocusLost', function()
 
   before_each(function()
     clear()
+    n.exec([[
+      let g:tui_focus_output = ''
+      function! TuiFocusOutput(job, data, event) abort
+        let g:tui_focus_output .= join(a:data, "\n")
+      endfunction
+    ]])
     local child_server = new_pipename()
     screen = tt.setup_child_nvim({
       '--listen',
@@ -4080,7 +4086,10 @@ describe('TUI FocusGained/FocusLost', function()
       'colorscheme vim',
       '--cmd',
       'set noswapfile noshowcmd noruler background=dark',
-    }, { env = env_notermguicolors })
+    }, {
+      env = vim.tbl_extend('force', env_notermguicolors, { TERM = 'rxvt' }),
+      job_opts = { on_stdout = 'TuiFocusOutput' },
+    })
 
     screen:expect([[
       ^                                                  |
@@ -4093,34 +4102,72 @@ describe('TUI FocusGained/FocusLost', function()
     child_session:request(
       'nvim_exec2',
       [[
-      autocmd FocusGained * echo 'gained'
-      autocmd FocusLost * echo 'lost'
+      let g:focus_events = []
+      autocmd FocusGained * call add(g:focus_events, 'gained') | echo 'gained'
+      autocmd FocusLost * call add(g:focus_events, 'lost') | echo 'lost'
     ]],
       {}
     )
-    feed_data('\034\016') -- CTRL-\ CTRL-N
+    -- rxvt emits an OSC after enabling focus reporting, unlike ConPTY's
+    -- earlier focus-enable sequence.
+    retry(nil, 3000, function()
+      eq(
+        true,
+        exec_lua(function()
+          return vim.g.tui_focus_output:find('\027]777;focus;on\007', 1, true) ~= nil
+        end)
+      )
+    end)
+  end)
+
+  it('receives the first focus-gained event', function()
+    feed_data('\027[I')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      gained                                            |
+      {5:-- TERMINAL --}                                    |
+    ]])
+  end)
+
+  it('receives a focus-lost then focus-gained transition', function()
+    feed_data('\027[O')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      lost                                              |
+      {5:-- TERMINAL --}                                    |
+    ]])
+    feed_data('\027[I')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      gained                                            |
+      {5:-- TERMINAL --}                                    |
+    ]])
   end)
 
   it('in normal-mode', function()
-    retry(2, 3 * screen.timeout, function()
-      feed_data('\027[I')
-      screen:expect([[
-        ^                                                  |
-        {100:~                                                 }|*3
-        {3:[No Name]                                         }|
-        gained                                            |
-        {5:-- TERMINAL --}                                    |
-      ]])
+    feed_data('\027[I')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      gained                                            |
+      {5:-- TERMINAL --}                                    |
+    ]])
 
-      feed_data('\027[O')
-      screen:expect([[
-        ^                                                  |
-        {100:~                                                 }|*3
-        {3:[No Name]                                         }|
-        lost                                              |
-        {5:-- TERMINAL --}                                    |
-      ]])
-    end)
+    feed_data('\027[O')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      lost                                              |
+      {5:-- TERMINAL --}                                    |
+    ]])
   end)
 
   it('in insert-mode', function()
@@ -4133,24 +4180,22 @@ describe('TUI FocusGained/FocusLost', function()
       :set noshowmode                                   |
       {5:-- TERMINAL --}                                    |
     ]])
-    retry(2, 3 * screen.timeout, function()
-      feed_data('\027[I')
-      screen:expect([[
-        ^                                                  |
-        {100:~                                                 }|*3
-        {3:[No Name]                                         }|
-        gained                                            |
-        {5:-- TERMINAL --}                                    |
-      ]])
-      feed_data('\027[O')
-      screen:expect([[
-        ^                                                  |
-        {100:~                                                 }|*3
-        {3:[No Name]                                         }|
-        lost                                              |
-        {5:-- TERMINAL --}                                    |
-      ]])
-    end)
+    feed_data('\027[I')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      gained                                            |
+      {5:-- TERMINAL --}                                    |
+    ]])
+    feed_data('\027[O')
+    screen:expect([[
+      ^                                                  |
+      {100:~                                                 }|*3
+      {3:[No Name]                                         }|
+      lost                                              |
+      {5:-- TERMINAL --}                                    |
+    ]])
   end)
 
   -- During cmdline-mode we ignore :echo invoked by timers/events.
@@ -4166,6 +4211,10 @@ describe('TUI FocusGained/FocusLost', function()
       {5:-- TERMINAL --}                                    |
     ]])
     feed_data('\027[O')
+    retry(nil, 3000, function()
+      local status, events = child_session:request('nvim_eval', 'g:focus_events')
+      eq({ true, { 'gained', 'lost' } }, { status, events })
+    end)
     screen:expect_unchanged()
   end)
 
@@ -4182,19 +4231,20 @@ describe('TUI FocusGained/FocusLost', function()
     ]],
       {}
     )
-    retry(2, 3 * screen.timeout, function()
-      -- Enter cmdline-mode.
-      feed_data(':')
-      screen:sleep(1)
-      -- Send focus lost/gained termcodes.
-      feed_data('\027[O')
-      feed_data('\027[I')
-      screen:sleep(1)
-      -- Exit cmdline-mode. Redraws from timers/events are blocked during
-      -- cmdline-mode, so the buffer won't be updated until we exit cmdline-mode.
-      feed_data('\n')
-      screen:expect { any = 'lost' .. (' '):rep(46) .. '|\ngained' }
+    feed_data(':')
+    retry(nil, 3000, function()
+      local status, mode = child_session:request('nvim_get_mode')
+      eq({ true, 'c' }, { status, mode.mode })
     end)
+    feed_data('\027[O')
+    feed_data('\027[I')
+    retry(nil, 3000, function()
+      local status, lines = child_session:request('nvim_buf_get_lines', 0, 0, -1, false)
+      eq({ true, { '', 'lost', 'gained' } }, { status, lines })
+    end)
+    -- Redraws from events are blocked until cmdline-mode is exited.
+    feed_data('\n')
+    screen:expect { any = 'lost' .. (' '):rep(46) .. '|\ngained' }
   end)
 
   it('in terminal-mode', function()
@@ -4213,27 +4263,25 @@ describe('TUI FocusGained/FocusLost', function()
       {5:-- TERMINAL --}                                    |
     ]])
 
-    retry(2, 3 * screen.timeout, function()
-      feed_data('\027[I')
-      screen:expect([[
-        ^ready $ zia                                       |
-                                                          |
-        [Process exited 0]                                |
-                                                          |*2
-        gained                                            |
-        {5:-- TERMINAL --}                                    |
-      ]])
+    feed_data('\027[I')
+    screen:expect([[
+      ^ready $ zia                                       |
+                                                        |
+      [Process exited 0]                                |
+                                                        |*2
+      gained                                            |
+      {5:-- TERMINAL --}                                    |
+    ]])
 
-      feed_data('\027[O')
-      screen:expect([[
-        ^ready $ zia                                       |
-                                                          |
-        [Process exited 0]                                |
-                                                          |*2
-        lost                                              |
-        {5:-- TERMINAL --}                                    |
-      ]])
-    end)
+    feed_data('\027[O')
+    screen:expect([[
+      ^ready $ zia                                       |
+                                                        |
+      [Process exited 0]                                |
+                                                        |*2
+      lost                                              |
+      {5:-- TERMINAL --}                                    |
+    ]])
   end)
 
   it('in hit-enter prompt', function()
@@ -4248,18 +4296,16 @@ describe('TUI FocusGained/FocusLost', function()
       {102:Press ENTER or type command to continue}^           |
       {5:-- TERMINAL --}                                    |
     ]])
-    retry(2, 3 * screen.timeout, function()
-      feed_data('\027[I')
-      screen:expect([[
-        msg2                                              |
-        msg3                                              |
-        msg4                                              |
-        msg5                                              |
-        gained                                            |
-        {102:Press ENTER or type command to continue}^           |
-        {5:-- TERMINAL --}                                    |
-      ]])
-    end)
+    feed_data('\027[I')
+    screen:expect([[
+      msg2                                              |
+      msg3                                              |
+      msg4                                              |
+      msg5                                              |
+      gained                                            |
+      {102:Press ENTER or type command to continue}^           |
+      {5:-- TERMINAL --}                                    |
+    ]])
   end)
 end)
 
