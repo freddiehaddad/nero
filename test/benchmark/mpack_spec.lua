@@ -37,5 +37,22 @@ describe('vim.mpack perf', function()
         ('\nmpack %d MiB string: encode %.3f ms, decode %.3f ms'):format(mib, result[1], result[2])
       )
     end)
+
+    it(('msgpackdump a %d MiB string'):format(mib), function()
+      local elapsed = n.exec_lua(function(size)
+        vim.cmd(('let g:_mpack_bench = repeat("abcdefgh", %d)'):format(size * 128 * 1024))
+        local times = {}
+        for i = 1, 5 do
+          collectgarbage('collect')
+          local start = vim.uv.hrtime()
+          vim.cmd([[let g:_mpack_dump = msgpackdump([g:_mpack_bench], 'B')]])
+          times[i] = (vim.uv.hrtime() - start) / 1e6
+        end
+        assert(vim.fn.eval('msgpackparse(g:_mpack_dump)[0] ==# g:_mpack_bench') == 1)
+        table.sort(times)
+        return times[3]
+      end, mib)
+      print(('\nmsgpackdump %d MiB string: %.3f ms'):format(mib, elapsed))
+    end)
   end
 end)

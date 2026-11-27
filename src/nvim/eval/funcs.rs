@@ -5447,9 +5447,7 @@ pub fn f_msgpackdump(argvars: &mut [TypVal], rettv: &mut TypVal, _fptr: EvalFunc
     if argvars[1].var_type() != VarType::VarUnknown && tv_get_string(&argvars[1]).to_bytes() == b"B"
     {
         let b = tv_blob_alloc_ret(rettv);
-        if !data.is_empty() {
-            b.bv_ga.borrow_mut().extend_from_slice(&data);
-        }
+        *b.bv_ga.borrow_mut() = data;
     } else {
         encode_list_write(
             Some(&tv_list_alloc_ret(rettv, K_LIST_LEN_MAY_KNOW_CONST)),

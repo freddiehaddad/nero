@@ -20,8 +20,8 @@ use crate::mbyte::{utf_char2len, utf_printable, utf_slice2char, utf_slice2len};
 use crate::memory::bytes_to_cstring;
 use crate::message::{emsg, internal_error, semsg};
 use crate::msgpack_rpc::packer::{
-    PackerBuffer, mpack_array, mpack_bin, mpack_bool, mpack_check_buffer, mpack_ext, mpack_float8,
-    mpack_integer, mpack_map, mpack_nil, mpack_str, mpack_uint64,
+    PackerBuffer, mpack_array, mpack_bin, mpack_bin_bytes, mpack_bool, mpack_check_buffer,
+    mpack_ext, mpack_float8, mpack_integer, mpack_map, mpack_nil, mpack_str_bytes, mpack_uint64,
 };
 use crate::regexp::NUMBUFLEN;
 use crate::strings::format_to_buf_safelen;
@@ -690,8 +690,7 @@ impl EncodeBackend<'_> {
                 mode: TextEncodeMode::Json,
             } => convert_to_json_string(gap, buf),
             Self::Msgpack { packer } => {
-                let s = buf.map_or_else(NvimString::new, NvimString::from_bytes);
-                mpack_bin(s, packer);
+                mpack_bin_bytes(buf.unwrap_or_default(), packer);
                 true
             }
         }
@@ -702,8 +701,7 @@ impl EncodeBackend<'_> {
         match self {
             Self::Text { .. } => self.conv_string(buf),
             Self::Msgpack { packer } => {
-                let s = buf.map_or_else(NvimString::new, NvimString::from_bytes);
-                mpack_str(s, packer);
+                mpack_str_bytes(buf.unwrap_or_default(), packer);
                 true
             }
         }

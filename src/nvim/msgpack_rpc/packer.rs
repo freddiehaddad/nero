@@ -250,7 +250,12 @@ pub fn mpack_str(str_val: NvimString, packer: &mut PackerBuffer) {
 
 /// Pack a msgpack binary blob into `packer` (`mpack_bin`).
 pub fn mpack_bin(str_val: NvimString, packer: &mut PackerBuffer) {
-    let len = str_val.size;
+    mpack_bin_bytes(str_val.slice(str_val.size), packer);
+}
+
+/// Pack a msgpack binary slice into `packer`.
+pub fn mpack_bin_bytes(slice: &[u8], packer: &mut PackerBuffer) {
+    let len = slice.len();
     if len < 0xff {
         mpack_w(packer, 0xc4);
         mpack_w(packer, len as u8);
@@ -263,12 +268,19 @@ pub fn mpack_bin(str_val: NvimString, packer: &mut PackerBuffer) {
     } else {
         std::process::abort();
     }
-    let slice = str_val.slice(len);
     mpack_raw(slice, packer);
 }
 
 /// Write raw `bytes` into `packer`, flushing as needed (`mpack_raw`).
 pub fn mpack_raw(bytes: &[u8], packer: &mut PackerBuffer) {
+    if matches!(packer.anydata, PackerData::StringBuffer) && bytes.len() > mpack_remaining(packer) {
+        packer.owned_buf.truncate(packer.pos);
+        packer.owned_buf.extend_from_slice(bytes);
+        packer.pos = packer.owned_buf.len();
+        packer.owned_buf.resize(packer.pos + 2 * MPACK_ITEM_SIZE, 0);
+        return;
+    }
+
     let len = bytes.len();
     let mut pos = 0usize;
     while pos < len {
@@ -513,5 +525,19 @@ mod tests {
             slice,
             &[0xe0, 0xd0, 0xdf, 42, 0xa5, b'h', b'e', b'l', b'l', b'o']
         );
+    }
+
+    #[test]
+    fn string_buffer_grows_for_large_binary_and_following_values() {
+        let payload: Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+        let mut packer = packer_string_buffer();
+        mpack_bin_bytes(&payload, &mut packer);
+        mpack_str_bytes(b"end", &mut packer);
+        mpack_bool(&mut packer, true);
+
+        let mut expected = vec![0xc5, 0x10, 0x01];
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(b"\xa3end\xc3");
+        assert_eq!(packer_take_string(&mut packer), expected);
     }
 }
