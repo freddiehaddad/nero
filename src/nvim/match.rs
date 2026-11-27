@@ -558,7 +558,7 @@ fn next_search_hl(
         if let Some(prev) = searched_from
             && matchcol <= prev
         {
-            let line_slice = crate::memline::ml_get_buf_slice(shl_buf.borrow(), lnum);
+            let line_slice = crate::memline::ml_get_buf_slice(&win.buf(), lnum);
             if (prev as usize) >= line_slice.len() {
                 with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
                 break;

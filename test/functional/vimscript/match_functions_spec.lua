@@ -147,6 +147,56 @@ describe('matchaddpos()', function()
     )
   end)
 
+  describe('while the window is drawn', function()
+    local function add_match_while_drawing(from)
+      local screen = Screen.new(40, 5)
+      fn.setline(1, { 'abcdef', 'ghijkl' })
+      command('hi PreProc guifg=Red')
+      n.exec_lua(function(from_)
+        local added = false
+        local function add()
+          if not added then
+            added = true
+            vim.fn.matchaddpos('PreProc', { { 2, 1, 3 } }, 3, 4)
+          end
+          return ''
+        end
+        if from_ == 'on_line' then
+          vim.api.nvim_set_decoration_provider(vim.api.nvim_create_namespace('test'), {
+            on_line = add,
+          })
+        else
+          _G.AddMatch = add
+          vim.o.statuscolumn = '%!v:lua.AddMatch()'
+        end
+      end, from)
+      command('redraw!')
+      n.assert_alive()
+      expect_match({ 2, 1, 3 })
+      command('redraw!')
+      screen:expect(
+        [[
+        ^abcdef                                  |
+        {1:ghi}jkl                                  |
+        {2:~                                       }|*2
+                                                |
+      ]],
+        {
+          [1] = { foreground = Screen.colors.Red },
+          [2] = { bold = true, foreground = Screen.colors.Blue1 },
+        }
+      )
+    end
+
+    it('works from a decoration provider', function()
+      add_match_while_drawing('on_line')
+    end)
+
+    it("works from 'statuscolumn'", function()
+      add_match_while_drawing('statuscolumn')
+    end)
+  end)
+
   it('reentrant on_lines callback can call getmatches/matchadd/vartabstop safely', function()
     n.exec_lua(function()
       vim.api.nvim_buf_set_lines(0, 0, -1, false, { '  first line', '  second line' })
