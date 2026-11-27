@@ -464,14 +464,14 @@ pub fn readfile(
             let old_b_ffname = curbuf()
                 .ffname_opt()
                 .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut());
-            let old_b_fname = curbuf()
-                .fname_opt()
-                .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut());
+            // A temporary CWD change may replace the short name without renaming the buffer.
+            let old_b_fname = curbuf().fname_opt();
+            let old_b_fname_ptr = old_b_fname.as_deref().map_or(ptr::null(), CStr::as_ptr);
             let fname_ptr = fname.map_or(ptr::null(), CStr::as_ptr);
             let sfname_ptr = sfname.map_or(ptr::null(), CStr::as_ptr);
             let using_b_ffname =
                 fname_ptr == old_b_ffname.cast() || sfname_ptr == old_b_ffname.cast();
-            let using_b_fname = fname_ptr == old_b_fname.cast() || sfname_ptr == old_b_fname.cast();
+            let using_b_fname = fname_ptr == old_b_fname_ptr || sfname_ptr == old_b_fname_ptr;
 
             msg_state().need_fileinfo.set(false);
 
@@ -701,10 +701,7 @@ pub fn readfile(
                                         .ffname_opt()
                                         .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut()))
                             || (using_b_fname
-                                && old_b_fname
-                                    != curbuf()
-                                        .fname_opt()
-                                        .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut()))
+                                && old_b_fname.as_deref() != curbuf().fname_opt().as_deref())
                         {
                             emsg(tr(E_AUCHANGEDBUF));
                             break 'theend;
@@ -791,10 +788,7 @@ pub fn readfile(
                                     .ffname_opt()
                                     .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut()))
                         || (using_b_fname
-                            && old_b_fname
-                                != curbuf()
-                                    .fname_opt()
-                                    .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut())))
+                            && old_b_fname.as_deref() != curbuf().fname_opt().as_deref()))
                 {
                     emsg(tr(E_AUCHANGEDBUF));
                     if !read_buffer {
@@ -940,10 +934,7 @@ pub fn readfile(
                                     .ffname_opt()
                                     .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut()))
                         || (using_b_fname
-                            && old_b_fname
-                                != curbuf()
-                                    .fname_opt()
-                                    .map_or(ptr::null_mut(), |s| s.as_ptr().cast_mut()))
+                            && old_b_fname.as_deref() != curbuf().fname_opt().as_deref())
                         || {
                             fd = os_open(fname.unwrap_or(c""), O_RDONLY, 0);
                             fd < 0

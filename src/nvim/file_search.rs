@@ -4,7 +4,9 @@
 
 use crate::api::private::helpers::{api_clear_string, cbuf_to_string, copy_string, cstr_to_string};
 use crate::api::private::validate::NvimString;
-use crate::autocmd::{EVENT_DIRCHANGED, EVENT_DIRCHANGEDPRE, apply_autocmds, has_event};
+use crate::autocmd::{
+    EVENT_DIRCHANGED, EVENT_DIRCHANGEDPRE, apply_autocmds, has_event, is_autocmd_blocked,
+};
 use crate::charset::{
     NUL, getdigits, getdigits_int32, getdigits_long, skipwhite_slice, vim_isfilec,
 };
@@ -1508,7 +1510,10 @@ pub fn do_autocmd_dirchanged(new_dir: &std::ffi::CStr, scope: CdScope, cause: Cd
             EVENT_DIRCHANGED
         };
 
-        if RECURSIVE.load(std::sync::atomic::Ordering::Relaxed) || !has_event(event) {
+        if RECURSIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || !has_event(event)
+            || is_autocmd_blocked()
+        {
             return;
         }
 

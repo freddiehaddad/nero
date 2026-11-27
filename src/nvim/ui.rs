@@ -42,7 +42,7 @@ use crate::message::{
 use crate::msgpack_rpc::packer::{Integer, ObjHandle};
 use crate::option::{K_OPT_CMDHEIGHT, set_option_value, ui_refresh_options};
 use crate::option_vars::*;
-use crate::os::fs::os_cwd;
+use crate::os::fs::os_dirname_cstr;
 use crate::os::time::{os_hrtime, os_sleep};
 use crate::strings::gettext;
 use crate::ui_compositor::{
@@ -81,7 +81,6 @@ use crate::decoration_provider::CB_MAX_ERROR;
 use crate::log::LOGLVL_DBG;
 use crate::mouse::K_MOUSE_VISUAL;
 use crate::msgpack_rpc::channel::RemoteUI;
-use crate::os::fs::MAXPATHL;
 use crate::state::{
     MODE_ASKMORE, MODE_CMDLINE, MODE_EXTERNCMD, MODE_HITRETURN, MODE_INSERT, MODE_SETWSIZE,
 };
@@ -114,6 +113,7 @@ struct UiState {
     has_mouse: std::cell::Cell<bool>,
     pending_has_mouse: std::cell::Cell<Option<bool>>,
     pending_default_colors: std::cell::Cell<bool>,
+    cwd: std::cell::RefCell<Option<std::ffi::CString>>,
     beep_count: std::cell::Cell<i32>,
     beep_start_time: std::cell::Cell<u64>,
     ui_flush_was_busy: std::cell::Cell<bool>,
@@ -142,6 +142,7 @@ impl UiState {
             has_mouse: std::cell::Cell::new(false),
             pending_has_mouse: std::cell::Cell::new(None),
             pending_default_colors: std::cell::Cell::new(false),
+            cwd: std::cell::RefCell::new(None),
             beep_count: std::cell::Cell::new(0),
             beep_start_time: std::cell::Cell::new(0),
             ui_flush_was_busy: std::cell::Cell::new(false),
@@ -181,6 +182,7 @@ pub fn ui_free_all_mem() {
     ui_state(|st| {
         st.ui_event_cbs.borrow_mut().clear();
         *st.uis.borrow_mut() = Vec::new();
+        *st.cwd.borrow_mut() = None;
     });
 
     if let Some(events) = screen_state().resize_events.get().opt() {
@@ -449,10 +451,7 @@ pub fn ui_attach_impl(ui_rc: &std::rc::Rc<std::cell::RefCell<RemoteUI>>, chanid:
     ui_refresh_options();
     resettitle();
 
-    let mut cwd: [u8; MAXPATHL] = [0; MAXPATHL];
-    if let Some(cwd_bytes) = os_cwd(&mut cwd) {
-        ui_call_chdir(NvimString::from_bytes(cwd_bytes));
-    }
+    ui_state(|st| *st.cwd.borrow_mut() = None);
 
     let ui_ext = ui_rc.borrow().ui_ext;
     for (i, &ext_val) in ui_ext
@@ -664,6 +663,21 @@ pub fn ui_flush() {
         let enabled = !opt_vars().p_guicursor.is_empty();
         ui_call_mode_info_set(enabled, style);
         ui_state(|st| st.pending_mode_info_update.set(false));
+    }
+
+    if let Some(cwd) = os_dirname_cstr() {
+        let changed = ui_state(|st| {
+            let mut last_cwd = st.cwd.borrow_mut();
+            if last_cwd.as_deref() == Some(cwd.as_c_str()) {
+                false
+            } else {
+                *last_cwd = Some(cwd.clone());
+                true
+            }
+        });
+        if changed {
+            ui_call_chdir(cstr_as_string(Some(&cwd)));
+        }
     }
 
     let cursor_obscured = ui_cursor_is_behind_floatwin();

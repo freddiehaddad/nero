@@ -1,6 +1,5 @@
 //! Filesystem access and libuv file operations (`src/nvim/os/fs.c`).
 
-use crate::api::private::helpers::cstr_as_string;
 use crate::errors::*;
 
 #[cfg(windows)]
@@ -29,7 +28,6 @@ use crate::path::{path_next_component, path_tail, vim_ispathsep_nocolon};
 use crate::strings::gettext;
 #[cfg(unix)]
 use crate::strings::strerror;
-use crate::ui::ui_call_chdir;
 use std::ffi::{CStr, c_void};
 use std::ptr;
 
@@ -1261,24 +1259,13 @@ pub fn os_chdir(path: &CStr) -> i32 {
         let _ = smsg!(0, c"chdir(%s)", path);
         verbose_leave();
     }
-    let err = unsafe { uv_chdir(path.as_ptr()) };
-    if err == 0 {
-        ui_call_chdir(cstr_as_string(Some(path)));
-    }
-    err
+    unsafe { uv_chdir(path.as_ptr()) }
 }
 
 /// Guess the libuv handle type (`UV_TTY`, `UV_FILE`, `UV_NAMED_PIPE`, `UV_TCP`, etc.) for `fd`.
 #[inline]
 pub fn os_guess_handle(fd: i32) -> i32 {
     unsafe { crate::event::r#loop::uv_guess_handle(fd) }
-}
-
-/// Get the current working directory into `buf` without NUL-termination (`uv_cwd`).
-#[inline]
-pub fn os_cwd(buf: &mut [u8]) -> Option<&[u8]> {
-    let mut len = buf.len();
-    (unsafe { uv_cwd(buf.as_mut_ptr().cast(), &mut len) } == 0).then(|| &buf[..len])
 }
 
 /// Get the name of current directory.

@@ -55,7 +55,9 @@ use crate::os::fs::{
 use crate::os::fs::{os_chown, os_fchown, os_file_settime, os_fsetperm, s_isdir, s_isreg};
 use crate::os::input::os_breakcheck;
 use crate::os::time::os_hrtime;
-use crate::path::{K_PATH_CMP_LITERAL, after_pathsep, path_equal, path_tail};
+use crate::path::{
+    K_PATH_CMP_LITERAL, after_pathsep, path_equal, path_tail, path_try_shorten_fname,
+};
 use crate::sha256::ContextSha256;
 use crate::strings::{format_to_buf, format_to_buf_add, gettext};
 use crate::ui::{ui_busy_start, ui_busy_stop, ui_flush};
@@ -357,6 +359,20 @@ struct BufWriteNames {
     buf_fname_s: bool,
 }
 
+fn autocmd_write_name<'a>(
+    ctx: &CtxSwitch,
+    name: Option<&'a CStr>,
+    full: Option<&'a CStr>,
+) -> Option<&'a CStr> {
+    if ctx.cs_entered_dir.is_some()
+        && let Some(full) = full
+        && let Some(short) = path_try_shorten_fname(Some(full.to_bytes()))
+    {
+        return Some(&full[full.to_bytes().len() - short.len()..]);
+    }
+    name
+}
+
 fn buf_write_do_autocmds(
     bufref: &mut Bufref,
     names: &mut BufWriteNames,
@@ -383,7 +399,7 @@ fn buf_write_do_autocmds(
     let _ = ctx_switch(&mut aco, None, None, buf.opt(), 0);
     set_bufref(bufref, buf.opt());
 
-    let sfname_opt = names.sfname.as_deref();
+    let sfname_opt = autocmd_write_name(&aco, names.sfname.as_deref(), names.ffname.as_deref());
     if append {
         did_cmd = apply_autocmds_exarg(
             EVENT_FILEAPPENDCMD,
@@ -579,6 +595,7 @@ fn buf_write_do_autocmds(
 fn buf_write_do_post_autocmds(
     buf: &FileBuf,
     fname: Option<&CStr>,
+    ffname: Option<&CStr>,
     eap: Option<&Exarg>,
     append: bool,
     filtering: bool,
@@ -590,7 +607,7 @@ fn buf_write_do_post_autocmds(
 
     let _ = ctx_switch(&mut aco, None, None, Some(buf), 0);
 
-    let fname_opt = fname;
+    let fname_opt = autocmd_write_name(&aco, fname, ffname);
     if append {
         let _ = apply_autocmds_exarg(
             EVENT_FILEAPPENDPOST,
@@ -2101,7 +2118,16 @@ pub fn buf_write(
     }
 
     if !should_abort(retval) {
-        buf_write_do_post_autocmds(buf, fname, eap, append, filtering, reset_changed, whole);
+        buf_write_do_post_autocmds(
+            buf,
+            fname,
+            ffname,
+            eap,
+            append,
+            filtering,
+            reset_changed,
+            whole,
+        );
         if aborting() {
             retval = false;
         }

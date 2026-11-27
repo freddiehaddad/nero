@@ -12,7 +12,8 @@ use crate::api::private::validate::{Array, Dict, Error, ErrorType, NvimString, O
 use crate::api::vimscript::{KeyDictExecOpts, exec_impl};
 use crate::autocmd::{block_autocmds, unblock_autocmds};
 use crate::buffer::{
-    BCO_ENTER, BCO_NOHELP, FileBuf, MAXLNUM, bt_prompt, bufref_valid, do_autochdir, set_bufref,
+    BCO_ENTER, BCO_NOHELP, FileBuf, K_CD_CAUSE_BUFFER, MAXLNUM, bt_prompt, bufref_valid,
+    do_autochdir, set_bufref,
 };
 use crate::cursor::{Colnr, CursorPos, check_cursor, check_pos, equalpos};
 use crate::eval::encode::encode_vim_list_to_buf;
@@ -31,6 +32,7 @@ use crate::normal::Visualinfo;
 use crate::option::buf_copy_options;
 use crate::option_vars::*;
 use crate::os::fs::{os_chdir, os_dirname_cstr};
+use crate::path::{K_PATH_CMP_LITERAL, path_equal};
 use crate::register::{Yankreg, get_y_register};
 use crate::shada::{
     K_SHA_DA_FORCEIT, K_SHA_DA_NANOS, K_SHA_DA_NO_HISTORY, K_SHA_DA_NO_OPT, K_SHA_DA_WANT_INFO,
@@ -75,6 +77,7 @@ pub struct CtxSwitch {
     pub cs_tp_localdir: Option<std::ffi::CString>,
     pub cs_globaldir: Option<std::ffi::CString>,
     pub cs_cwd: Option<std::ffi::CString>,
+    pub cs_entered_dir: Option<std::ffi::CString>,
     pub cs_apply_acd: bool,
 }
 
@@ -102,6 +105,7 @@ impl CtxSwitch {
             cs_tp_localdir: None,
             cs_globaldir: None,
             cs_cwd: None,
+            cs_entered_dir: None,
             cs_apply_acd: false,
         }
     }
@@ -558,7 +562,9 @@ pub fn ctx_from_dict(dict: Dict, ctx: &mut Context) -> Result<CtxStateFlags, Err
 
 fn ctx_win_dirs_save(cs: &mut CtxSwitch, cw_win: &WinInfoInfo, buf: &FileBuf) {
     cw_win.w_localdir.set(None);
-    cs.cs_b_localdir = buf.b_localdir.take();
+    if (cs.cs_flags & K_CTX_KEEP_DIRS) != 0 {
+        cs.cs_b_localdir = buf.b_localdir.get();
+    }
     cs.cs_tp_localdir = curtab().tp_localdir.replace(None);
     cs.cs_globaldir = workspace_state().globaldir.take();
 }
@@ -598,11 +604,25 @@ fn ctx_localdirs_restore(
         cs.cs_tp_localdir = None;
     }
 
-    if cwp.is_some() && (did_chdir || cwp.unwrap().w_localdir.get().is_some()) {
-        update_cwd(K_CD_CAUSE_WINDOW);
+    if let Some(cwp) = cwp {
+        if let Some(cwd) = cs.cs_cwd.as_deref()
+            && (!did_chdir || ctx_in_entered_dir(cs))
+        {
+            os_chdir(cwd);
+            shorten_fnames(true);
+        }
+        cs.cs_cwd = None;
+        cs.cs_entered_dir = None;
+        if did_chdir || cwp.w_localdir.get().is_some() {
+            update_cwd(K_CD_CAUSE_WINDOW);
+        }
     }
 
-    if !(persist && cs.cs_globaldir.is_none() && workspace_state().globaldir.get().is_some()) {
+    if !(persist
+        && did_chdir
+        && cs.cs_globaldir.is_none()
+        && workspace_state().globaldir.get().is_some())
+    {
         workspace_state().globaldir.set(cs.cs_globaldir.take());
     }
 }
@@ -654,12 +674,44 @@ fn ctx_dirs_restore(cs: &mut CtxSwitch) {
     if cs.cs_apply_acd {
         do_autochdir();
     } else if let Some(ref cs_cwd) = cs.cs_cwd
-        && ((cs.cs_flags & K_CTX_KEEP_DIRS) != 0 || !CTX_STATE.with(|st| st.ctx_did_chdir.get()))
+        && ((cs.cs_flags & K_CTX_KEEP_DIRS) != 0
+            || !CTX_STATE.with(|st| st.ctx_did_chdir.get())
+            || ctx_in_entered_dir(cs))
     {
         os_chdir(cs_cwd);
         shorten_fnames(true);
     }
     cs.cs_cwd = None;
+    cs.cs_entered_dir = None;
+}
+
+fn ctx_bufcwd_enter(cs: &mut CtxSwitch) {
+    let Some(localdir) = curbuf().b_localdir.get() else {
+        return;
+    };
+    let Some(cwd) = os_dirname_cstr() else {
+        return;
+    };
+    if path_equal(localdir.as_bytes(), cwd.as_bytes(), K_PATH_CMP_LITERAL) {
+        return;
+    }
+    if cs.cs_ctxwin_idx < 0 && (cs.cs_flags & (K_CTX_KEEP_CWD | K_CTX_KEEP_DIRS)) == 0 {
+        cs.cs_globaldir = workspace_state().globaldir.get();
+    }
+    if cs.cs_cwd.is_none() {
+        cs.cs_cwd = Some(cwd);
+    }
+    cs.cs_entered_dir = Some(localdir);
+    block_autocmds();
+    update_cwd(K_CD_CAUSE_BUFFER);
+    unblock_autocmds();
+}
+
+fn ctx_in_entered_dir(cs: &CtxSwitch) -> bool {
+    cs.cs_entered_dir.as_deref().is_some_and(|entered| {
+        os_dirname_cstr()
+            .is_some_and(|cwd| path_equal(entered.to_bytes(), cwd.as_bytes(), K_PATH_CMP_LITERAL))
+    })
 }
 
 pub fn ctx_did_chdir() {
@@ -828,6 +880,9 @@ pub fn ctx_switch(
     workspace_state().curbuf.set(curwin().w_buffer.get());
     cs.cs_new_curwin = curwin().handle;
     set_bufref(&mut cs.cs_new_curbuf, workspace_state().curbuf.get().opt());
+    if !buf.is_null() && !opt_vars().p_acd.get() {
+        ctx_bufcwd_enter(cs);
+    }
 
     if cs.cs_mode == K_CTX_SWITCH_BUF && cs.cs_new_curwin != cs.cs_curwin {
         CTX_STATE.with(|st| {

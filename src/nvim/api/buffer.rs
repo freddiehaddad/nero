@@ -39,6 +39,7 @@ use crate::r#move::{changed_cline_bef_curs, invalidate_botline_win, update_topli
 use crate::msgpack_rpc::packer::Integer;
 use crate::ops::get_region_bytecount;
 use crate::option_vars::*;
+use crate::path::fix_fname;
 use crate::undo::{u_save_buf, with_uhp};
 use crate::window::{VALID_BOTLINE_AP, WinInfoInfo};
 
@@ -1292,9 +1293,18 @@ pub fn nvim_buf_set_name(buf: Buffer, name: NvimString) -> Result<(), Error> {
             opt_vars().p_acd.set(false);
         }
 
+        let ffname = name
+            .as_opt_cstr()
+            .filter(|name| !name.is_empty())
+            .and_then(|name| fix_fname(Some(name.to_bytes())));
         let mut aco: CtxSwitch = CtxSwitch::new();
         ctx_switch(&mut aco, None, None, Some(&b), 0);
-        ren_ret = rename_buffer(name.as_opt_cstr());
+        let name = if aco.cs_entered_dir.is_some() {
+            ffname.as_deref().or(name.as_opt_cstr())
+        } else {
+            name.as_opt_cstr()
+        };
+        ren_ret = rename_buffer(name);
         ctx_restore(&mut aco);
 
         if !is_curbuf {
