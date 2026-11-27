@@ -3,9 +3,39 @@ local t = require('test.testutil')
 local Screen = require('test.functional.ui.screen')
 local describe, it, before_each = t.describe, t.it, t.before_each
 local exec_lua = n.exec_lua
+local bench = n.bench
 
 describe('decor perf', function()
   before_each(n.clear)
+
+  it('opens a window far down a concealed buffer', function()
+    Screen.new(80, 24)
+    exec_lua(function()
+      local lines = {}
+      for i = 1, 5000 do
+        lines[i] = 'line ' .. i
+      end
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+      vim.wo.conceallevel = 2
+      _G.viewport_conceal_calls = 0
+      vim.api.nvim_set_decoration_provider(vim.api.nvim_create_namespace('viewport-bench'), {
+        _on_conceal_line = function()
+          _G.viewport_conceal_calls = _G.viewport_conceal_calls + 1
+        end,
+      })
+      vim.cmd.redraw()
+    end)
+    bench(
+      [[
+      vim.cmd('tab split')
+      vim.api.nvim_win_set_cursor(0, { 5000, 0 })
+      vim.cmd.redraw()
+      vim.cmd.tabclose()
+      ]],
+      { n = 20, warmup = 2, unit = 'ms', label = 'new viewport at line 5000' }
+    )
+    print('conceal callbacks: ' .. exec_lua('return _G.viewport_conceal_calls'))
+  end)
 
   it('can handle long lines', function()
     Screen.new(100, 101)

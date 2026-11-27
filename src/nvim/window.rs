@@ -2251,69 +2251,88 @@ pub fn ui_ext_win_position(wp: &WinInfoInfo, validate: bool) {
     }
 }
 
+/// Measure at most a viewport; count more distant lines approximately.
+fn win_viewport_scroll_delta(wp: &WinInfoInfo, line_count: Linenr) -> i64 {
+    let cur_topline = wp.w_topline.get().min(line_count);
+    let cur_botline = wp.w_botline.get().min(line_count);
+    let max = i64::from(wp.w_view_height.get());
+    let mut delta: i64 = 0;
+    let mut last_topline = wp.w_viewport_last_topline.get();
+    let mut last_botline = wp.w_viewport_last_botline.get();
+    let mut last_topfill = wp.w_viewport_last_topfill.get();
+    let mut last_skipcol = i64::from(wp.w_viewport_last_skipcol.get());
+    if last_topline > line_count {
+        delta -= i64::from(last_topline - line_count);
+        last_topline = line_count;
+        last_topfill = 0;
+        last_skipcol = i64::from(MAXCOL);
+    }
+    last_botline = last_botline.min(line_count);
+    if cur_topline < last_topline
+        || (cur_topline == last_topline && i64::from(wp.w_skipcol.get()) < last_skipcol)
+    {
+        let mut vcole = last_skipcol;
+        let mut lnume = last_topline;
+        if last_topline > 0 && cur_botline < last_topline {
+            delta -= i64::from(last_topline - cur_botline);
+            lnume = cur_botline;
+            vcole = 0;
+        }
+        let lnum_end = lnume;
+        let height = win_text_height(
+            wp,
+            cur_topline,
+            i64::from(wp.w_skipcol.get()),
+            &mut lnume,
+            &mut vcole,
+            None,
+            max,
+            true,
+        );
+        delta -= height
+            + if height >= max {
+                i64::from((lnum_end - lnume - 1).max(0))
+            } else {
+                0
+            };
+    } else if cur_topline > last_topline
+        || (cur_topline == last_topline && i64::from(wp.w_skipcol.get()) > last_skipcol)
+    {
+        let mut vcole = i64::from(wp.w_skipcol.get());
+        let mut lnume = cur_topline;
+        if last_botline > 0 && cur_topline > last_botline {
+            delta += i64::from(cur_topline - last_botline);
+            lnume = last_botline;
+            vcole = 0;
+        }
+        let lnum_end = lnume;
+        let height = win_text_height(
+            wp,
+            last_topline,
+            last_skipcol,
+            &mut lnume,
+            &mut vcole,
+            None,
+            max,
+            true,
+        );
+        delta += height
+            + if height >= max {
+                i64::from((lnum_end - lnume - 1).max(0))
+            } else {
+                0
+            };
+    }
+    delta + i64::from(last_topfill) - i64::from(wp.w_topfill.get())
+}
+
 pub fn ui_ext_win_viewport(wp: &WinInfoInfo) {
     if (wp == curwin() || ui_has(K_UIMULTIGRID))
         && wp.w_viewport_invalid.get()
         && wp.w_redr_type.get() == 0
     {
         let line_count = wp.buf().b_ml.ml_line_count.get();
-        let cur_topline = wp.w_topline.get().min(line_count);
-        let cur_botline = wp.w_botline.get().min(line_count);
-        let mut delta: i64 = 0;
-        let mut last_topline = wp.w_viewport_last_topline.get();
-        let mut last_botline = wp.w_viewport_last_botline.get();
-        let mut last_topfill = wp.w_viewport_last_topfill.get();
-        let mut last_skipcol = i64::from(wp.w_viewport_last_skipcol.get());
-        if last_topline > line_count {
-            delta -= i64::from(last_topline - line_count);
-            last_topline = line_count;
-            last_topfill = 0;
-            last_skipcol = i64::from(MAXCOL);
-        }
-        last_botline = last_botline.min(line_count);
-        if cur_topline < last_topline
-            || (cur_topline == last_topline && i64::from(wp.w_skipcol.get()) < last_skipcol)
-        {
-            let mut vcole = last_skipcol;
-            let mut lnume = last_topline;
-            if last_topline > 0 && cur_botline < last_topline {
-                delta -= i64::from(last_topline - cur_botline);
-                lnume = cur_botline;
-                vcole = 0;
-            }
-            delta -= win_text_height(
-                wp,
-                cur_topline,
-                i64::from(wp.w_skipcol.get()),
-                &mut lnume,
-                &mut vcole,
-                None,
-                i64::MAX,
-                true,
-            );
-        } else if cur_topline > last_topline
-            || (cur_topline == last_topline && i64::from(wp.w_skipcol.get()) > last_skipcol)
-        {
-            let mut vcole = i64::from(wp.w_skipcol.get());
-            let mut lnume = cur_topline;
-            if last_botline > 0 && cur_topline > last_botline {
-                delta += i64::from(cur_topline - last_botline);
-                lnume = last_botline;
-                vcole = 0;
-            }
-            delta += win_text_height(
-                wp,
-                last_topline,
-                last_skipcol,
-                &mut lnume,
-                &mut vcole,
-                None,
-                i64::MAX,
-                true,
-            );
-        }
-        delta += i64::from(last_topfill);
-        delta -= i64::from(wp.w_topfill.get());
+        let delta = win_viewport_scroll_delta(wp, line_count);
         let mut ev_botline = wp.w_botline.get();
         if ev_botline == line_count + 1 && wp.w_empty_rows.get() == 0 {
             ev_botline = line_count;
