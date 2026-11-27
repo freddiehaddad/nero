@@ -1270,12 +1270,16 @@ pub fn runtime_search_path_validate() {
         return;
     }
     if !RT_STATE.with(|s| s.runtime_search_path_valid.get()) {
+        let unowned =
+            RUNTIME_SEARCH_PATH.with(|cell| std::rc::Rc::strong_count(&cell.borrow()) == 1);
+        if unowned {
+            // Flush before rebuilding: a UI callback that re-enters while the
+            // path is still invalid would otherwise rebuild it again.
+            msg_ext_ui_flush();
+        }
         let new_path = std::rc::Rc::new(runtime_search_path_build());
         let old_path =
             RUNTIME_SEARCH_PATH.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new_path));
-        if std::rc::Rc::strong_count(&old_path) == 1 {
-            msg_ext_ui_flush();
-        }
         drop(old_path);
         RT_STATE.with(|s| s.runtime_search_path_valid.set(true));
         update_runtime_search_path_thread(true);

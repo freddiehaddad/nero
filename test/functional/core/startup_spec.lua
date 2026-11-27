@@ -1948,6 +1948,30 @@ describe('runtime:', function()
     }, { term = true, env = { VIMRUNTIME = os.getenv('VIMRUNTIME') } })
     screen:expect({ any = 'syntax', none = 'Process exited 1' })
   end)
+
+  it('does not rebuild search_path for each UI callback', function()
+    t.skip(is_os('win'), 'expanding $FOO in runtimepath does not use the shell')
+    clear()
+    local screen = Screen.new()
+    local shell_log = 'Xsearch_path_shell.log'
+    write_file('Xsearch_path_shell.sh', ('echo >> %s\nexec sh "$@"\n'):format(shell_log))
+    finally(function()
+      os.remove('Xsearch_path_shell.sh')
+      os.remove(shell_log)
+    end)
+    fn.jobstart({
+      nvim_prog,
+      '--clean',
+      '--cmd',
+      'set shell=sh\\ Xsearch_path_shell.sh',
+      '+lua require("vim._core.ui2").enable()',
+      '+set rtp+=$FOO | set syntax',
+    }, { term = true, env = { VIMRUNTIME = os.getenv('VIMRUNTIME') } })
+    screen:expect({ any = 'syntax', none = 'Process exited' })
+    -- Each build expands $FOO with the shell.
+    local _, builds = read_file(shell_log):gsub('\n', '')
+    ok(builds >= 1 and builds <= 2, '1 or 2 search_path builds', builds)
+  end)
 end)
 
 describe('user session', function()
