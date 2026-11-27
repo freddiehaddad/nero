@@ -46,7 +46,6 @@ pub(crate) const K_CPO_SEARCH: i32 = b'c' as i32;
 pub struct SynMatch {
     /// The last match found, which may continue in the lines after `lnum`.
     pub rm: Regmmatch,
-    pub buf: crate::globals::BufPtr,
     /// The line where the match in `rm` starts, or 0 when there is none.
     pub lnum: Linenr,
     pub attr: i32,
@@ -63,7 +62,6 @@ impl SynMatch {
     pub const fn new() -> Self {
         Self {
             rm: Regmmatch::new(),
-            buf: crate::globals::BufPtr::NULL,
             lnum: 0,
             attr: 0,
             attr_cur: 0,
@@ -347,7 +345,6 @@ fn get_match(wp: &WinInfoInfo, id: i32) -> Option<(i32, Option<std::ffi::CString
 
 /// Init for calling `prepare_search_hl()` (`init_search_hl`).
 pub fn init_search_hl(wp: &WinInfoInfo, search_hl: &mut SynMatch) {
-    let buf = wp.w_buffer.get();
     wp.with_match_head_mut(|matches| {
         for cur in matches {
             cur.mit_hl.rm = cur.mit_match.clone();
@@ -356,13 +353,11 @@ pub fn init_search_hl(wp: &WinInfoInfo, search_hl: &mut SynMatch) {
             } else {
                 syn_id2attr(cur.mit_hlg_id)
             };
-            cur.mit_hl.buf = buf.clone();
             cur.mit_hl.lnum = 0;
             cur.mit_hl.first_lnum = 0;
             cur.mit_hl.tm = profile_setlimit(opt_vars().p_rdt.get());
         }
     });
-    search_hl.buf = wp.w_buffer.get();
     search_hl.lnum = 0;
     search_hl.first_lnum = 0;
     search_hl.attr = win_hl_attr(wp, HLF_L as i32);
@@ -526,13 +521,10 @@ fn next_search_hl(
     }
 
     let mut searched_from: Option<Colnr> = None;
-    loop {
-        let Some((shl_tm, held, shl_buf)) = with_shl(win, search_hl, match_key, |shl| {
-            let held = (shl.lnum != 0).then(|| (shl.rm.match_start(), shl.rm.match_end()));
-            (shl.tm, held, shl.buf.clone())
-        }) else {
-            break;
-        };
+    while let Some((shl_tm, held)) = with_shl(win, search_hl, match_key, |shl| {
+        let held = (shl.lnum != 0).then(|| (shl.rm.match_start(), shl.rm.match_end()));
+        (shl.tm, held)
+    }) {
         if profile_passed_limit(shl_tm) {
             with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
             break;
@@ -544,7 +536,7 @@ fn next_search_hl(
                     || (end.lnum == 0 && end.col <= start.col) =>
             {
                 matchcol = start.col;
-                let line_slice = crate::memline::ml_get_buf_slice(shl_buf.borrow(), lnum);
+                let line_slice = crate::memline::ml_get_buf_slice(&win.buf(), lnum);
                 if (matchcol as usize) >= line_slice.len() {
                     with_shl_mut(win, search_hl, match_key, |shl| shl.lnum = 0);
                     break;
@@ -575,15 +567,15 @@ fn next_search_hl(
             with_shl(win, search_hl, match_key, |shl| !shl.rm.regprog.is_null()).unwrap_or(false);
         if has_regprog {
             let mut timed_out: i32 = 0;
-            let Some((mut rm, shl_buf, shl_tm)) = with_shl_mut(win, search_hl, match_key, |shl| {
-                (std::mem::take(&mut shl.rm), shl.buf.clone(), shl.tm)
+            let Some((mut rm, shl_tm)) = with_shl_mut(win, search_hl, match_key, |shl| {
+                (std::mem::take(&mut shl.rm), shl.tm)
             }) else {
                 break;
             };
             nmatched = vim_regexec_multi(
                 &mut rm,
                 Some(win),
-                &shl_buf,
+                &win.buf(),
                 lnum,
                 matchcol,
                 Some(shl_tm),

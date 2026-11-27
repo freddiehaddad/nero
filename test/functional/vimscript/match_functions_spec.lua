@@ -192,6 +192,11 @@ describe('matchaddpos()', function()
       add_match_while_drawing('on_line')
     end)
 
+    it('works from a decoration provider without "c" in cpoptions', function()
+      command('set cpoptions-=c')
+      add_match_while_drawing('on_line')
+    end)
+
     it("works from 'statuscolumn'", function()
       add_match_while_drawing('statuscolumn')
     end)
