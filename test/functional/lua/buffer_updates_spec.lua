@@ -194,6 +194,12 @@ describe('lua: nvim_buf_attach on_lines', function()
     check_events { { 'test2', 'detach', 1 } }
   end
 
+  it('does not send on_lines when deleting an empty buffer', function()
+    local check_events = setup_eventcheck(false, false, { '' })
+    command 'delete'
+    check_events {}
+  end)
+
   it('works', function()
     check(false)
   end)
@@ -1591,7 +1597,7 @@ describe('lua: nvim_buf_attach on_bytes', function()
     end)
 
     it('delete in completely empty buffer', function()
-      local check_events = setup_eventcheck(verify, nil)
+      local check_events = setup_eventcheck(verify, { '' })
 
       command 'delete'
       check_events {}

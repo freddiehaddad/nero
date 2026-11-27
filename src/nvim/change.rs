@@ -5,7 +5,7 @@
 use crate::autocmd::{EVENT_FILECHANGEDRO, apply_autocmds, aucmd_defer_modified};
 use crate::buffer::{
     BF_NEVERLOADED, BF_NEW, FileBuf, K_UIMESSAGES, MAXLNUM, bt_dontwrite, bt_prompt,
-    buf_inc_changedtick, buf_meta_total,
+    buf_inc_changedtick, buf_is_empty, buf_meta_total,
 };
 use crate::buffer_updates::buf_updates_send_changes;
 use crate::charset::{ascii_isdigit, ascii_iswhite, getdigits_int, getwhitecols_curline};
@@ -1926,7 +1926,7 @@ pub fn truncate_line(fixpos: i32) {
 pub fn del_lines(nlines: Linenr, undo: bool) {
     let first = curwin().w_cursor.get().lnum;
 
-    if nlines <= 0 {
+    if nlines <= 0 || buf_is_empty(&curbuf()) {
         return;
     }
 
