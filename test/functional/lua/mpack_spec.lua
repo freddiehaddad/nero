@@ -128,4 +128,32 @@ describe('lua vim.mpack', function()
       end)
     )
   end)
+
+  it('decodes fragmented binary and extension values', function()
+    eq(
+      true,
+      exec_lua(function()
+        local payload = 'a\000\255b'
+        local wire = string.char(0x92, 0xc4, #payload)
+          .. payload
+          .. string.char(0xc7, 3, 42)
+          .. 'xyz'
+        for split = 1, #wire - 1 do
+          local unpack = vim.mpack.Unpacker({
+            ext = {
+              [42] = function(tag, bytes)
+                return { tag, vim.mpack.decode(vim.mpack.encode(bytes)) }
+              end,
+            },
+          })
+          local partial, next_pos = unpack(wire:sub(1, split))
+          assert(partial == nil and next_pos == split + 1)
+          local value, final_pos = unpack(wire:sub(split + 1))
+          assert(final_pos == #wire - split + 1)
+          assert(value[1] == payload and value[2][1] == 42 and value[2][2] == 'xyz')
+        end
+        return true
+      end)
+    )
+  end)
 end)

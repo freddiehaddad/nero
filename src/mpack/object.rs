@@ -299,7 +299,7 @@ pub fn mpack_parse<C: ?Sized>(
         }
 
         loop {
-            status = mpack_parse_tok(parser, ctx, tok.clone(), enter_cb, exit_cb);
+            status = mpack_parse_tok(parser, ctx, std::mem::take(&mut tok), enter_cb, exit_cb);
             if parser.status == MPACK_EXCEPTION {
                 return MPACK_EXCEPTION;
             }
