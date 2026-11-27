@@ -367,10 +367,7 @@ const REQUIRED_ENV_VARS: &[&CStr] = &[];
 pub(crate) const PROCESS_ALL_ACCESS: u32 = 0x001F0FFF;
 const fn compute_build_has_flags() -> u32 {
     let mut flags = 0u32;
-    if match option_env!("NVIM_HAVE_UNIBILIUM") {
-        Some(s) => !s.is_empty() && s.as_bytes()[0] != b'0',
-        None => true,
-    } {
+    if cfg!(nvim_have_unibilium) {
         flags |= 1 << 1;
     }
     if cfg!(target_os = "linux") {

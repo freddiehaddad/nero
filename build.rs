@@ -421,14 +421,22 @@ fn main() {
         };
         println!("cargo:rustc-env=NVIM_BUILD_TYPE=Build type: {bt}");
     }
+    let have_unibilium = !matches!(
+        env::var("NVIM_HAVE_UNIBILIUM").as_deref(),
+        Ok("0" | "false" | "FALSE" | "OFF" | "off")
+    );
+    println!("cargo::rustc-check-cfg=cfg(nvim_have_unibilium)");
+    if have_unibilium {
+        println!("cargo:rustc-cfg=nvim_have_unibilium");
+    }
     if env::var("NVIM_VERSION_CFLAGS").is_err() && profile != "release" {
-        let unibilium = match env::var("NVIM_HAVE_UNIBILIUM").as_deref() {
-            Ok("0" | "false" | "OFF" | "off") => "0",
-            _ => "1",
+        // Like upstream, list the definition only when it is enabled.
+        let defines = if have_unibilium {
+            " -DHAVE_UNIBILIUM"
+        } else {
+            ""
         };
-        println!(
-            "cargo:rustc-env=NVIM_VERSION_CFLAGS=Compilation: cargo -DHAVE_UNIBILIUM={unibilium}"
-        );
+        println!("cargo:rustc-env=NVIM_VERSION_CFLAGS=Compilation: cargo{defines}");
     }
 
     let deps_prefix = env::var("DEPS_PREFIX")
