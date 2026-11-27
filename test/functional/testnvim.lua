@@ -455,6 +455,29 @@ function M.check_close(noblock)
   session = nil
 end
 
+function M.quit_wait(timeout_ms)
+  assert(session)
+  local process = session._rpc_stream._stream
+  session:notify('nvim_command', 'qa!')
+  process:read_start()
+  local exited = vim.wait(timeout_ms, function()
+    return process.status ~= nil
+  end)
+  if not exited then
+    if process._proc and not process._proc:is_closing() then
+      process._proc:kill('sigkill')
+    end
+    vim.wait(2000, function()
+      return process.status ~= nil
+    end)
+  end
+  M.check_close(true)
+  if not exited then
+    error(('editor did not exit within %d ms'):format(timeout_ms))
+  end
+  return process.status, process.signal
+end
+
 local function close_extra_sessions(test_id, noblock)
   for s in pairs(sessions) do
     if s ~= session and (test_id == nil or (s.data and s.data.test_id == test_id)) then

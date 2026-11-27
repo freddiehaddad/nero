@@ -182,6 +182,7 @@ describe('memory usage', function()
     local upper = load_adjust((after.max + (after.last - before.last)) * upper_multiplier / 10)
     check_result({ before = before, after = after, last = last }, pcall(ok, lower < last.last))
     check_result({ before = before, after = after, last = last }, pcall(ok, last.last < upper))
+    eq(0, n.quit_wait(30000))
   end)
 
   it('releases memory when closing windows when folds exist', function()
