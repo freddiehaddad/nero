@@ -1,0 +1,211 @@
+# carton snapshot format: version 1.0
+DISTRIBUTIONS
+  Class-Accessor-0.51
+    pathname: K/KA/KASEI/Class-Accessor-0.51.tar.gz
+    provides:
+      Class::Accessor 0.51
+      Class::Accessor::Fast 0.51
+      Class::Accessor::Faster 0.51
+    requirements:
+      ExtUtils::MakeMaker 0
+      base 1.01
+  Eval-Safe-0.02
+    pathname: M/MA/MATHIAS/Eval-Safe/Eval-Safe-0.02.tar.gz
+    provides:
+      Eval::Safe 0.02
+    requirements:
+  Future-0.54
+    pathname: P/PE/PEVANS/Future-0.54.tar.gz
+    provides:
+      Future 0.54
+      Future::Exception 0.54
+      Future::Mutex 0.54
+      Future::PP 0.54
+      Future::Utils 0.54
+      Test::Future 0.54
+      Test::Future::Deferred 0.54
+    requirements:
+      Carp 1.25
+      List::Util 1.29
+      Module::Build 0.4004
+      Test::Builder::Module 0
+      Time::HiRes 0
+      perl 5.020
+  IO-Async-0.805
+    pathname: P/PE/PEVANS/IO-Async-0.805.tar.gz
+    provides:
+      Future::IO::Impl::IOAsync 0.805
+      IO::Async 0.805
+      IO::Async::Channel 0.805
+      IO::Async::Debug 0.805
+      IO::Async::File 0.805
+      IO::Async::FileStream 0.805
+      IO::Async::Function 0.805
+      IO::Async::Future 0.805
+      IO::Async::Handle 0.805
+      IO::Async::Internals::ChildManager 0.805
+      IO::Async::Internals::FunctionWorker 0.805
+      IO::Async::Listener 0.805
+      IO::Async::Loop 0.805
+      IO::Async::Loop::Poll 0.805
+      IO::Async::Loop::Select 0.805
+      IO::Async::LoopTests 0.805
+      IO::Async::Metrics 0.805
+      IO::Async::Notifier 0.805
+      IO::Async::OS 0.805
+      IO::Async::OS::MSWin32 0.805
+      IO::Async::OS::cygwin 0.805
+      IO::Async::OS::linux 0.805
+      IO::Async::PID 0.805
+      IO::Async::Process 0.805
+      IO::Async::Protocol 0.805
+      IO::Async::Protocol::LineStream 0.805
+      IO::Async::Protocol::Stream 0.805
+      IO::Async::Resolver 0.805
+      IO::Async::Routine 0.805
+      IO::Async::Signal 0.805
+      IO::Async::Socket 0.805
+      IO::Async::Stream 0.805
+      IO::Async::Test 0.805
+      IO::Async::Timer 0.805
+      IO::Async::Timer::Absolute 0.805
+      IO::Async::Timer::Countdown 0.805
+      IO::Async::Timer::Periodic 0.805
+    requirements:
+      Exporter 5.57
+      File::stat 0
+      Future 0.44
+      Future::Utils 0.18
+      IO::Poll 0
+      List::Util 0
+      Module::Build 0.4004
+      Socket 2.007
+      Storable 0
+      Struct::Dumb 0
+      Time::HiRes 0
+      perl 5.014
+  Module-Build-0.4234
+    pathname: L/LE/LEONT/Module-Build-0.4234.tar.gz
+    provides:
+      Module::Build 0.4234
+      Module::Build::Base 0.4234
+      Module::Build::Compat 0.4234
+      Module::Build::Config 0.4234
+      Module::Build::Cookbook 0.4234
+      Module::Build::Dumper 0.4234
+      Module::Build::Notes 0.4234
+      Module::Build::PPMMaker 0.4234
+      Module::Build::Platform::Default 0.4234
+      Module::Build::Platform::MacOS 0.4234
+      Module::Build::Platform::Unix 0.4234
+      Module::Build::Platform::VMS 0.4234
+      Module::Build::Platform::VOS 0.4234
+      Module::Build::Platform::Windows 0.4234
+      Module::Build::Platform::aix 0.4234
+      Module::Build::Platform::cygwin 0.4234
+      Module::Build::Platform::darwin 0.4234
+      Module::Build::Platform::os2 0.4234
+      Module::Build::PodParser 0.4234
+    requirements:
+      CPAN::Meta 2.142060
+      Cwd 0
+      Data::Dumper 0
+      ExtUtils::CBuilder 0.27
+      ExtUtils::Install 0
+      ExtUtils::Manifest 0
+      ExtUtils::Mkbootstrap 0
+      ExtUtils::ParseXS 2.21
+      File::Basename 0
+      File::Compare 0
+      File::Copy 0
+      File::Find 0
+      File::Path 0
+      File::Spec 0.82
+      Getopt::Long 0
+      Module::Metadata 1.000002
+      Perl::OSType 1
+      TAP::Harness 3.29
+      Text::Abbrev 0
+      Text::ParseWords 0
+      perl 5.006001
+      version 0.87
+  MsgPack-Raw-0.06
+    pathname: J/JA/JACQUESG/MsgPack-Raw-0.06.tar.gz
+    provides:
+      MsgPack::Raw 0.06
+      MsgPack::Raw::Bool 0.06
+      MsgPack::Raw::Ext 0.06
+      MsgPack::Raw::Packer 0.06
+      MsgPack::Raw::Unpacker 0.06
+    requirements:
+      ExtUtils::MakeMaker 6.63_03
+      XSLoader 0
+      overload 0
+      perl 5.008
+      strict 0
+      warnings 0
+  Neovim-Ext-0.06
+    pathname: J/JA/JACQUESG/Neovim-Ext-0.06.tar.gz
+    provides:
+      Neovim::Ext 0.06
+      Neovim::Ext::Buffer 0.06
+      Neovim::Ext::Buffers 0.06
+      Neovim::Ext::Common 0.06
+      Neovim::Ext::Current 0.06
+      Neovim::Ext::ErrorResponse 0.06
+      Neovim::Ext::Funcs 0.06
+      Neovim::Ext::LuaFuncs 0.06
+      Neovim::Ext::MsgPack::RPC 0.06
+      Neovim::Ext::MsgPack::RPC::AsyncSession 0.06
+      Neovim::Ext::MsgPack::RPC::EventLoop 0.06
+      Neovim::Ext::MsgPack::RPC::Response 0.06
+      Neovim::Ext::MsgPack::RPC::Session 0.06
+      Neovim::Ext::MsgPack::RPC::Stream 0.06
+      Neovim::Ext::Plugin 0.06
+      Neovim::Ext::Plugin::Host 0.06
+      Neovim::Ext::Plugin::ScriptHost 0.06
+      Neovim::Ext::Range 0.06
+      Neovim::Ext::Remote 0.06
+      Neovim::Ext::RemoteApi 0.06
+      Neovim::Ext::RemoteMap 0.06
+      Neovim::Ext::RemoteSequence 0.06
+      Neovim::Ext::Tabpage 0.06
+      Neovim::Ext::Tie::Stream 0.06
+      Neovim::Ext::VIMCompat 0.06
+      Neovim::Ext::VIMCompat::Buffer 0.06
+      Neovim::Ext::VIMCompat::Window 0.06
+      Neovim::Ext::Window 0.06
+    requirements:
+      Attribute::Handlers 0
+      Carp 0
+      Class::Accessor 0.34
+      Eval::Safe 0.02
+      Exporter 0
+      ExtUtils::MakeMaker 6.63_03
+      IO::Async 0.74
+      IO::Async::Loop 0
+      IO::Async::Signal 0
+      IO::Async::Stream 0
+      IO::Handle 0
+      IO::Socket::INET 0
+      IO::Socket::UNIX 0
+      IPC::Open3 0
+      List::Util 0
+      MsgPack::Raw 0.01
+      Scalar::Util 0
+      Socket 0
+      Tie::Array 0
+      Tie::Hash 0
+      Time::HiRes 0
+      base 0
+      overload 0
+      perl 5.022
+      strict 0
+      warnings 0
+  Struct-Dumb-0.16
+    pathname: P/PE/PEVANS/Struct-Dumb-0.16.tar.gz
+    provides:
+      Struct::Dumb 0.16
+    requirements:
+      Module::Build 0.4004
+      perl 5.014

@@ -267,8 +267,13 @@ jobs:
     env:
       # The setup action adds this to PATH for neovim-ruby-host.
       BIN_DIR: ${{ github.workspace }}/.deps/bin
-      # Install and load Ruby gems from the dependency cache.
+      # Install and load locked Ruby gems from the dependency cache.
       GEM_HOME: ${{ github.workspace }}/.deps/ruby
+      BUNDLE_GEMFILE: ${{ github.workspace }}/.github/ci/provider/Gemfile
+      BUNDLE_PATH: ${{ github.workspace }}/.deps/ruby
+      BUNDLE_FROZEN: 'true'
+      NPM_CONFIG_PREFIX: ${{ github.workspace }}/.deps/node
+      NODE_PATH: ${{ github.workspace }}/.deps/node/lib/node_modules
       NVIM_TEST_INTEG: ${{ matrix.build.flavor == 'release' && '1' || '0' }}
       # Add cached provider dependencies to Perl's module search path.
       PERL5LIB: ${{ github.workspace }}/.deps/perl5/lib/perl5
@@ -286,10 +291,14 @@ jobs:
 
       - name: Set up interpreter packages
         run: |
-          echo "Install neovim RubyGem."
-          gem install --no-document --bindir "$BIN_DIR" --conservative --pre neovim
+          bundle install
+          bundle binstubs neovim --path "$BIN_DIR" --force
 
-          cpanm -n -L .deps/perl5 --skip-satisfied Neovim::Ext || cat "$HOME/.cpanm/build.log"
+          (
+            cd .github/ci/provider
+            PERL_CARTON_MIRROR=https://cpan.metacpan.org \
+              carton install --deployment --path "$GITHUB_WORKSPACE/.deps/perl5"
+          )
           perl -W -e 'use Neovim::Ext; print $Neovim::Ext::VERSION'
 
       - name: List runtime files
@@ -377,6 +386,9 @@ jobs:
           - { test: functionaltest, shard: "2/3" }
           - { test: functionaltest, shard: "3/3" }
           - { test: oldtest, shard: "" }
+    env:
+      NPM_CONFIG_PREFIX: ${{ github.workspace }}/.deps/node
+      NODE_PATH: ${{ github.workspace }}/.deps/node/node_modules
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -396,15 +408,21 @@ jobs:
           # Ensure that the "win32" feature is set.
           & target\nvim-build\bin\nero.exe -u NONE --headless -c 'exe !has(\"win32\").\"cq\"'
 
-          python -m pip install pynvim
+          python -m pip install --require-hashes -r .github\ci\provider\requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -c "import pynvim; print(str(pynvim))"
 
           node --version
           npm.cmd --version
 
-          npm.cmd install -g neovim
-          Get-Command -CommandType Application neovim-node-host.cmd
-          npm.cmd link neovim
+          New-Item -ItemType Directory -Force $env:NPM_CONFIG_PREFIX | Out-Null
+          Copy-Item .github\ci\provider\package.json,.github\ci\provider\package-lock.json $env:NPM_CONFIG_PREFIX
+          npm.cmd ci --prefix $env:NPM_CONFIG_PREFIX --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "$env:NPM_CONFIG_PREFIX\node_modules\.bin\neovim-node-host.cmd")) {
+            throw 'neovim-node-host.cmd was not installed'
+          }
+          "$env:NPM_CONFIG_PREFIX\node_modules\.bin" >> $env:GITHUB_PATH
 
       - if: ${{ matrix.test == 'functionaltest' && matrix.shard == '1/3' }}
         name: unittest

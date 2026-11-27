@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "neovim": "5.5.0"
+  }
+}
