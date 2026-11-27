@@ -553,8 +553,10 @@ pub fn ui_line(
     ui_may_set_default_colors();
 
     let off = grid.line_offset.borrow()[row as usize] + startcol as usize;
-    let chars_slice = grid.chars.borrow()[off..].to_vec();
-    let attrs_slice = grid.attrs.borrow()[off..].to_vec();
+    let end = off + (endcol - startcol) as usize;
+    // Copy only the drawn cells so no grid borrow is held across UI callbacks.
+    let chars_slice = grid.chars.borrow()[off..end].to_vec();
+    let attrs_slice = grid.attrs.borrow()[off..end].to_vec();
     ui_call_raw_line(
         Integer::from(grid.handle.get()),
         Integer::from(row),

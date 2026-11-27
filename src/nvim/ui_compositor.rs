@@ -449,8 +449,9 @@ fn compose_line(row: Integer, mut startcol: Integer, mut endcol: Integer, mut fl
     let mut grid: Option<crate::grid::GridRef> = None;
     let line_off =
         screen_state().default_grid.line_offset.borrow()[row as usize] + (startcol as usize);
-    let bg_line = screen_state().default_grid.chars.borrow()[line_off..].to_vec();
-    let bg_attrs = screen_state().default_grid.attrs.borrow()[line_off..].to_vec();
+    let line_end = line_off + (endcol - startcol) as usize;
+    let bg_line = screen_state().default_grid.chars.borrow()[line_off..line_end].to_vec();
+    let bg_attrs = screen_state().default_grid.attrs.borrow()[line_off..line_end].to_vec();
     let (msg_sep_row, msg_sep_char, chk_width, chk_height) = with_comp(|c| {
         (
             c.msg_sep_row.get(),
