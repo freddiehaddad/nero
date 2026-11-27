@@ -344,9 +344,7 @@ fn filter_map_list(
         set_vim_var_nr(VV_KEY, 0);
 
         let prev_lock = tv_list_locked(l);
-        if prev_lock == VAR_UNLOCKED {
-            tv_list_set_lock(l, VAR_LOCKED);
-        }
+        tv_list_set_lock(l, VAR_FIXED);
 
         let mut idx: i64 = 0;
         let mut li = tv_list_first(l);
