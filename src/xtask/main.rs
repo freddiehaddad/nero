@@ -733,6 +733,7 @@ fn run_lua_tests(
     nvim_bin: &Path,
     test_type: &str,
     extra_args: &[String],
+    expected_terminfo: Option<bool>,
 ) {
     let shard = env::var("TEST_SHARD")
         .ok()
@@ -796,6 +797,12 @@ fn run_lua_tests(
             .env_remove("TMUX")
             .env_remove("SSH_CONNECTION")
             .env_remove("NoDefaultCurrentDirectoryInExePath");
+        if let Some(expected) = expected_terminfo {
+            cmd.env(
+                "NVIM_TEST_EXPECT_TERMINFO",
+                if expected { "1" } else { "0" },
+            );
+        }
         if !cfg!(target_os = "windows") {
             cmd.env("SHELL", "sh");
         } else if let Ok(path) = env::var("PATH") {
@@ -1870,6 +1877,12 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::SUCCESS;
             }
+            let expected_terminfo = custom_nvim_bin.is_none().then(|| {
+                !matches!(
+                    env::var("NVIM_HAVE_UNIBILIUM").as_deref(),
+                    Ok("0" | "false" | "FALSE" | "off" | "OFF")
+                )
+            });
             let nvim_bin = if let Some(bin) = custom_nvim_bin.clone() {
                 fs::create_dir_all(&build_dir).unwrap();
                 let canon = fs::canonicalize(&bin).unwrap_or(bin);
@@ -1886,7 +1899,14 @@ fn main() -> ExitCode {
                 "functionaltest" => "functional",
                 _ => "benchmark",
             };
-            run_lua_tests(&root, &build_dir, &nvim_bin, test_type, &extra_args);
+            run_lua_tests(
+                &root,
+                &build_dir,
+                &nvim_bin,
+                test_type,
+                &extra_args,
+                expected_terminfo,
+            );
         }
         "oldtest" => {
             let profile_dir = build_cargo_bins(&root, release, prefer_lua);

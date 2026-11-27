@@ -66,11 +66,18 @@ describe('has()', function()
   end)
 
   it('"terminfo"', function()
+    local expected = os.getenv('NVIM_TEST_EXPECT_TERMINFO')
+    if expected then
+      eq(tonumber(expected), fn.has('terminfo'))
+    end
     local version = n.exec_capture('verbose version')
     local compilation_string = version:match('Compilation: (.*)')
     -- zig builds currently show only TODO for the compilation string
     if not compilation_string or compilation_string:match('TODO') then
-      pending('no compilation string present')
+      if not expected then
+        pending('no compilation string or expected terminfo setting present')
+      end
+      return
     end
     -- Looks like "HAVE_UNIBILIUM ", "HAVE_UNIBILIUM=1", "HAVE_UNIBILIUM off", ….
     -- Capture group returns the "1"/"off"/….
