@@ -286,7 +286,7 @@ pub fn mpack_rpc_request(
         if status == MPACK_NOMEM {
             break;
         }
-        let write_status = mpack_write(&mut session.writer, buf, &tok);
+        let write_status = mpack_write(&mut session.writer, buf, std::mem::take(&mut tok));
         if write_status != 0 {
             status = write_status;
         }
@@ -301,7 +301,7 @@ pub fn mpack_rpc_reply(session: &mut MpackRpcSession, buf: &mut &mut [u8], id: M
         if session.writer.plen == 0 {
             status = mpack_rpc_reply_tok(session, &mut tok, id);
         }
-        let write_status = mpack_write(&mut session.writer, buf, &tok);
+        let write_status = mpack_write(&mut session.writer, buf, std::mem::take(&mut tok));
         if write_status != 0 {
             status = write_status;
         }
@@ -316,7 +316,7 @@ pub fn mpack_rpc_notify(session: &mut MpackRpcSession, buf: &mut &mut [u8]) -> i
         if session.writer.plen == 0 {
             status = mpack_rpc_notify_tok(session, &mut tok);
         }
-        let write_status = mpack_write(&mut session.writer, buf, &tok);
+        let write_status = mpack_write(&mut session.writer, buf, std::mem::take(&mut tok));
         if write_status != 0 {
             status = write_status;
         }

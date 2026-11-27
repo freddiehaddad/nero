@@ -9,11 +9,11 @@ pub mod rpc;
 #[cfg(test)]
 mod tests {
     use crate::mpack::conv::{
-        mpack_pack_boolean, mpack_pack_number, mpack_unpack_boolean, mpack_unpack_number,
-        mpack_unpack_sint, mpack_unpack_uint,
+        mpack_pack_boolean, mpack_pack_chunk, mpack_pack_number, mpack_pack_str,
+        mpack_unpack_boolean, mpack_unpack_number, mpack_unpack_sint, mpack_unpack_uint,
     };
     use crate::mpack::mpack_core::{
-        MPACK_OK, MpackTokbuf, MpackToken, mpack_read, mpack_tokbuf_init, mpack_write,
+        MPACK_EOF, MPACK_OK, MpackTokbuf, MpackToken, mpack_read, mpack_tokbuf_init, mpack_write,
     };
 
     #[test]
@@ -37,7 +37,7 @@ mod tests {
         let mut wslice = &mut wbuf[..];
         let mut wtb = MpackTokbuf::new();
         mpack_tokbuf_init(&mut wtb);
-        assert_eq!(mpack_write(&mut wtb, &mut wslice, &tu), MPACK_OK);
+        assert_eq!(mpack_write(&mut wtb, &mut wslice, tu), MPACK_OK);
 
         let written = 32 - wslice.len();
         let mut rslice = &wbuf[..written];
@@ -66,5 +66,45 @@ mod tests {
         assert_eq!(s.slots.len(), 2);
         crate::mpack::rpc::mpack_rpc_session_grow(&mut s);
         assert_eq!(s.slots.len(), 4);
+    }
+
+    fn write_through(tokbuf: &mut MpackTokbuf, tok: MpackToken, step: usize, out: &mut Vec<u8>) {
+        let mut tok = Some(tok);
+        loop {
+            let mut buf = vec![0u8; step];
+            let mut slice = &mut buf[..];
+            let status = mpack_write(tokbuf, &mut slice, tok.take().unwrap_or_default());
+            let written = step - slice.len();
+            out.extend_from_slice(&buf[..written]);
+            if status == MPACK_OK {
+                return;
+            }
+            assert_eq!(status, MPACK_EOF);
+        }
+    }
+
+    #[test]
+    fn mpack_write_resumes_chunks_through_small_buffers() {
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        for step in [1, 3, 512] {
+            let mut tokbuf = MpackTokbuf::new();
+            let mut out = Vec::new();
+            write_through(
+                &mut tokbuf,
+                mpack_pack_str(payload.len() as u32),
+                step,
+                &mut out,
+            );
+            write_through(&mut tokbuf, mpack_pack_chunk(&payload), step, &mut out);
+            write_through(&mut tokbuf, mpack_pack_number(7.0), step, &mut out);
+
+            let mut expected = vec![0xdb];
+            expected.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            expected.extend_from_slice(&payload);
+            expected.push(7);
+            assert_eq!(out, expected, "buffer size {step}");
+            assert_eq!(tokbuf.plen, 0);
+            assert!(tokbuf.pending_tok.data.chunk_bytes().is_empty());
+        }
     }
 }

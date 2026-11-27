@@ -152,6 +152,14 @@ fn write_slice_adv(buf: &mut &mut [u8], src: &[u8]) {
     *buf = &mut out[src.len()..];
 }
 
+/// Writes as much of `bytes` as fits in `buf` and returns the count written.
+#[inline]
+fn write_chunk(buf: &mut &mut [u8], bytes: &[u8]) -> usize {
+    let count = bytes.len().min(buf.len());
+    write_slice_adv(buf, &bytes[..count]);
+    count
+}
+
 #[inline]
 const fn tlen(val: u8, range_start: u8) -> MpackUint32 {
     1u32 << (val - range_start)
@@ -258,36 +266,39 @@ pub fn mpack_read(tokbuf: &mut MpackTokbuf, buf: &mut &[u8], tok: &mut MpackToke
     MPACK_OK
 }
 
-pub fn mpack_write(tokbuf: &mut MpackTokbuf, buf: &mut &mut [u8], t: &MpackToken) -> i32 {
-    let tok = if tokbuf.plen != 0 {
-        tokbuf.pending_tok.clone()
-    } else {
-        t.clone()
-    };
+/// Writes `tok` to `buf`, or resumes the token left pending by a previous
+/// call that returned `MPACK_EOF`, in which case `tok` is ignored.
+///
+/// A partially written token is moved into `tokbuf`, so resuming a large
+/// chunk costs only the bytes written by that call.
+pub fn mpack_write(tokbuf: &mut MpackTokbuf, buf: &mut &mut [u8], tok: MpackToken) -> i32 {
     debug_assert!(!buf.is_empty());
 
-    if tok.r#type == MpackTokenChunk {
-        if tokbuf.plen == 0 {
-            tokbuf.ppos = 0;
+    if tokbuf.plen != 0 {
+        if tokbuf.pending_tok.r#type != MpackTokenChunk {
+            return mpack_wpending(buf, tokbuf);
         }
-        let written = tokbuf.ppos;
-        let total = tok.length as usize;
-        let pending = total - written;
-        let count = pending.min(buf.len());
-        let chunk = &tok.data.chunk_bytes()[written..written + count];
-        write_slice_adv(buf, chunk);
-        tokbuf.ppos += count;
-        tokbuf.plen = if count == pending { 0 } else { total };
-        if count == pending {
-            return MPACK_OK;
-        } else {
-            tokbuf.pending_tok = tok;
+        let total = tokbuf.pending_tok.length as usize;
+        let rest = &tokbuf.pending_tok.data.chunk_bytes()[tokbuf.ppos..total];
+        tokbuf.ppos += write_chunk(buf, rest);
+        if tokbuf.ppos < total {
             return MPACK_EOF;
         }
+        tokbuf.plen = 0;
+        tokbuf.pending_tok = MpackToken::new();
+        return MPACK_OK;
     }
 
-    if tokbuf.plen != 0 {
-        return mpack_wpending(buf, tokbuf);
+    if tok.r#type == MpackTokenChunk {
+        let total = tok.length as usize;
+        let count = write_chunk(buf, &tok.data.chunk_bytes()[..total]);
+        if count == total {
+            return MPACK_OK;
+        }
+        tokbuf.ppos = count;
+        tokbuf.plen = total;
+        tokbuf.pending_tok = tok;
+        return MPACK_EOF;
     }
 
     if buf.len() < MPACK_MAX_TOKEN_LEN {

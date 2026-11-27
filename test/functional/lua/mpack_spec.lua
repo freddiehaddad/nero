@@ -115,4 +115,17 @@ describe('lua vim.mpack', function()
       eq(expected_header, result:sub(2, 2), 'dict key length ' .. len .. ' should use fixstr')
     end
   end)
+
+  it('round-trips strings larger than the packer buffer', function()
+    eq(
+      { true, true, true },
+      exec_lua(function()
+        local s = ('0123456789abcdef'):rep(256 * 1024) .. 'tail'
+        local packed = vim.mpack.encode({ s, 1, s })
+        local decoded = vim.mpack.decode(packed)
+        local packer_out = vim.mpack.Packer()({ s, 1, s })
+        return { decoded[1] == s and decoded[3] == s, decoded[2] == 1, packer_out == packed }
+      end)
+    )
+  end)
 end)

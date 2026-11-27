@@ -346,7 +346,7 @@ pub fn mpack_unparse<C: ?Sized>(
         }
 
         if parser.exiting != 0 {
-            let write_status = mpack_write(&mut parser.tokbuf, buf, &tok);
+            let write_status = mpack_write(&mut parser.tokbuf, buf, tok);
             if write_status != 0 {
                 status = write_status;
             }
