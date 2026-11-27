@@ -146,6 +146,16 @@ local function assert_harness_passes(suite_dir, extra_args)
 end
 
 describe('test harness', function()
+  it('records process close time with a fresh monotonic clock', function()
+    local ProcStream = require('test.client.uv_stream').ProcStream
+    local stream = setmetatable({}, ProcStream)
+    local before = uv.hrtime()
+    stream:close(nil, true)
+    local after = uv.hrtime()
+
+    t.ok(stream._closed >= before and stream._closed <= after)
+  end)
+
   it('restores package.preload between files', function()
     local suite_dir = write_suite({
       ['one_spec.lua'] = [[

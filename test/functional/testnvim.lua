@@ -530,13 +530,12 @@ function M.new_session(keep, ...)
     n_processes = n_processes - 1
     local delta = 0
     if closed then
-      uv.update_time() -- Update cached value of uv.now() (libuv: uv_now()).
-      delta = uv.now() - closed
+      delta = math.floor((uv.hrtime() - closed) / 1e6)
     end
     if delta > 500 then
       print(
-        ('\nNvim session %s took %d milliseconds to exit\n'):format(test_id, delta)
-          .. 'This indicates a likely problem with the test even if it passed!'
+        ('\nNvim session %s exit was observed after %d milliseconds\n'):format(test_id, delta)
+          .. 'This may reflect delayed event-loop delivery or a problem with the test.'
       )
       io.stdout:flush()
     end

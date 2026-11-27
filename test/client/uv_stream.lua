@@ -195,7 +195,7 @@ ProcStream.__index = ProcStream
 --- @param env string[]?
 --- @param io_extra uv.uv_pipe_t?
 --- @param on_exit fun(closed: integer?)? Called after the child process exits.
---- `closed` is the timestamp (uv.now()) when close() was called, or nil if it wasn't.
+--- `closed` is the monotonic timestamp (uv.hrtime()) when close() was called, or nil if it wasn't.
 --- @param forward_stderr boolean? Forward child process stderr, otherwise collect it.
 --- @return test.ProcStream
 function ProcStream.spawn(argv, env, io_extra, on_exit, forward_stderr)
@@ -301,7 +301,7 @@ function ProcStream:close(signal, noblock)
   if self._closed then
     return
   end
-  self._closed = uv.now()
+  self._closed = uv.hrtime()
   self:read_stop()
   close_handle(self._child_stdin)
   close_handle(self._child_stdout)
