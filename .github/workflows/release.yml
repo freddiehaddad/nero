@@ -28,8 +28,10 @@ jobs:
         id: build_nightly
       - name: Export build information
         id: build
+        env:
+          APPIMAGE_TAG: ${{ steps.build_release.outputs.appimage_tag || steps.build_nightly.outputs.appimage_tag }}
         run: |
-          printf "appimage_tag=${{ steps.build_release.outputs.appimage_tag || steps.build_nightly.outputs.appimage_tag }}\n" >> $GITHUB_OUTPUT
+          printf 'appimage_tag=%s\n' "$APPIMAGE_TAG" >> "$GITHUB_OUTPUT"
 
   linux:
     needs: setup
