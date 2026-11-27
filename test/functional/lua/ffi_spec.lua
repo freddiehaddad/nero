@@ -8,6 +8,34 @@ local clear = n.clear
 
 before_each(clear)
 
+describe('LuaJIT FFI', function()
+  it('retains variable-length allocations across JIT side exits', function()
+    if not exec_lua("return pcall(require, 'ffi')") then
+      pending('N/A: missing LuaJIT FFI')
+    end
+
+    eq(
+      50,
+      exec_lua(function()
+        local ffi = require('ffi')
+        local values = {}
+        for i = 1, 300 do
+          local value = ffi.new('int32_t[?]', 32)
+          value[0] = i
+          if i > 250 then
+            values[#values + 1] = value
+          end
+        end
+        for i, value in ipairs(values) do
+          assert(ffi.sizeof(value) == 128)
+          assert(value[0] == i + 250)
+        end
+        return #values
+      end)
+    )
+  end)
+end)
+
 describe('ffi.cdef', function()
   it('can use Neovim core functions', function()
     if not exec_lua("return pcall(require, 'ffi')") then
