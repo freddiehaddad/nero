@@ -6020,10 +6020,19 @@ pub fn get_option_value_for(
 ) -> Result<Object, Error> {
     let mut ctx = OptSavedCtx::None;
 
-    let switched = switch_option_context(&mut ctx, scope, from)?;
+    // Reading buffer options needs only curbuf, not a directory-changing context switch.
+    let switched =
+        scope != K_OPT_SCOPE_BUF && switch_option_context(&mut ctx, scope, from.clone())?;
+    let save_curbuf = workspace_state().curbuf.get();
+    if scope == K_OPT_SCOPE_BUF
+        && let OptTarget::Buf(buf) = from
+    {
+        workspace_state().curbuf.set(buf);
+    }
 
     let retv = get_option_value(opt_idx, opt_flags);
 
+    workspace_state().curbuf.set(save_curbuf);
     if switched {
         restore_option_context(&mut ctx, scope);
     }

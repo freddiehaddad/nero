@@ -53,4 +53,17 @@ describe('option set perf', function()
       label = 'nvim_set_option_value(listchars, {..})',
     })
   end)
+
+  it('reads an option of a hidden buffer with :bcd', function()
+    n.exec_lua(function()
+      _G.option_bench_buf = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_call(_G.option_bench_buf, function()
+        vim.cmd.bcd(vim.uv.cwd() .. '/src')
+      end)
+    end)
+    bench([[local _ = vim.bo[_G.option_bench_buf].textwidth]], {
+      n = trials,
+      label = 'vim.bo[hidden].textwidth with :bcd',
+    })
+  end)
 end)
