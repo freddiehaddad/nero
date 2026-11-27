@@ -530,7 +530,7 @@ describe('startup', function()
       os.remove('Xtest_startup_ttyout')
     end)
     -- Running in :terminal
-    fn.jobstart(
+    local job = fn.jobstart(
       (
         [["%s" -u NONE -i NONE --cmd "%s"]]
         .. [[ -c "call writefile([has('ttyin'), has('ttyout')], 'Xtest_startup_ttyout')"]]
@@ -550,6 +550,7 @@ describe('startup', function()
         read_file('Xtest_startup_ttyout')
       )
     end)
+    eq({ 0 }, fn.jobwait({ job }, 5000))
   end)
 
   it('input from pipe: has("ttyin")==0 has("ttyout")==1', function()
