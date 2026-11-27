@@ -42,7 +42,7 @@ use crate::message::{
 use crate::msgpack_rpc::packer::{Integer, ObjHandle};
 use crate::option::{K_OPT_CMDHEIGHT, set_option_value, ui_refresh_options};
 use crate::option_vars::*;
-use crate::os::fs::os_dirname_cstr;
+use crate::os::fs::{MAXPATHL, os_dirname};
 use crate::os::time::{os_hrtime, os_sleep};
 use crate::strings::gettext;
 use crate::ui_compositor::{
@@ -665,18 +665,20 @@ pub fn ui_flush() {
         ui_state(|st| st.pending_mode_info_update.set(false));
     }
 
-    if let Some(cwd) = os_dirname_cstr() {
+    let mut cwd = [0u8; MAXPATHL];
+    if os_dirname(&mut cwd) {
+        let cwd = crate::memory::bytes_as_cstr(&cwd);
         let changed = ui_state(|st| {
             let mut last_cwd = st.cwd.borrow_mut();
-            if last_cwd.as_deref() == Some(cwd.as_c_str()) {
+            if last_cwd.as_deref() == Some(cwd) {
                 false
             } else {
-                *last_cwd = Some(cwd.clone());
+                *last_cwd = Some(cwd.to_owned());
                 true
             }
         });
         if changed {
-            ui_call_chdir(cstr_as_string(Some(&cwd)));
+            ui_call_chdir(cstr_as_string(Some(cwd)));
         }
     }
 

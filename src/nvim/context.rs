@@ -31,7 +31,7 @@ use crate::msgpack_rpc::packer::ObjHandle;
 use crate::normal::Visualinfo;
 use crate::option::buf_copy_options;
 use crate::option_vars::*;
-use crate::os::fs::{os_chdir, os_dirname_cstr};
+use crate::os::fs::{MAXPATHL, os_chdir, os_dirname, os_dirname_cstr};
 use crate::path::{K_PATH_CMP_LITERAL, path_equal};
 use crate::register::{Yankreg, get_y_register};
 use crate::shada::{
@@ -689,17 +689,19 @@ fn ctx_bufcwd_enter(cs: &mut CtxSwitch) {
     let Some(localdir) = curbuf().b_localdir.get() else {
         return;
     };
-    let Some(cwd) = os_dirname_cstr() else {
+    let mut cwd = [0u8; MAXPATHL];
+    if !os_dirname(&mut cwd) {
         return;
-    };
-    if path_equal(localdir.as_bytes(), cwd.as_bytes(), K_PATH_CMP_LITERAL) {
+    }
+    let cwd = crate::memory::bytes_as_cstr(&cwd);
+    if path_equal(localdir.as_bytes(), cwd.to_bytes(), K_PATH_CMP_LITERAL) {
         return;
     }
     if cs.cs_ctxwin_idx < 0 && (cs.cs_flags & (K_CTX_KEEP_CWD | K_CTX_KEEP_DIRS)) == 0 {
         cs.cs_globaldir = workspace_state().globaldir.get();
     }
     if cs.cs_cwd.is_none() {
-        cs.cs_cwd = Some(cwd);
+        cs.cs_cwd = Some(cwd.to_owned());
     }
     cs.cs_entered_dir = Some(localdir);
     block_autocmds();
@@ -708,10 +710,16 @@ fn ctx_bufcwd_enter(cs: &mut CtxSwitch) {
 }
 
 fn ctx_in_entered_dir(cs: &CtxSwitch) -> bool {
-    cs.cs_entered_dir.as_deref().is_some_and(|entered| {
-        os_dirname_cstr()
-            .is_some_and(|cwd| path_equal(entered.to_bytes(), cwd.as_bytes(), K_PATH_CMP_LITERAL))
-    })
+    let Some(entered) = cs.cs_entered_dir.as_deref() else {
+        return false;
+    };
+    let mut cwd = [0u8; MAXPATHL];
+    os_dirname(&mut cwd)
+        && path_equal(
+            entered.to_bytes(),
+            crate::memory::bytes_as_cstr(&cwd).to_bytes(),
+            K_PATH_CMP_LITERAL,
+        )
 }
 
 pub fn ctx_did_chdir() {
