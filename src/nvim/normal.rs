@@ -167,7 +167,7 @@ impl EditGlobalState {
                 revins_chars: std::cell::Cell::new(0),
                 revins_legal: std::cell::Cell::new(0),
                 revins_scol: std::cell::Cell::new(0),
-                dont_sync_undo: std::cell::Cell::new(crate::extmark::K_NONE),
+                dont_sync_undo: std::cell::Cell::new(crate::extmark::K_FALSE),
                 o_lnum: std::cell::Cell::new(0),
             },
             orig_line_count: std::cell::Cell::new(0),
