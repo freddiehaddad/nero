@@ -552,7 +552,22 @@ describe('Signs', function()
       call setline(1, range(1, 4))
       call nvim_buf_set_extmark(0, nvim_create_namespace(''), 1, 0, {'sign_text':'S1'})
     ]])
+    screen:expect([[
+      {7:  }^1                                                  |
+      {7:S1}2                                                  |
+      {7:  }3                                                  |
+      {7:  }4                                                  |
+      {1:~                                                    }|*9
+                                                           |
+    ]])
     exec('norm 2Gdd')
+    screen:expect([[
+      {7:  }1                                                  |
+      {7:S1}^3                                                  |
+      {7:  }4                                                  |
+      {1:~                                                    }|*10
+                                                           |
+    ]])
     exec('silent undo')
     -- Nvim: undo restores the cursor to where "2Gdd" started (|restore-undo-cursor|).
     screen:expect([[

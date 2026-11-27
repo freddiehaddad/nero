@@ -4046,6 +4046,7 @@ describe('extmark decorations', function()
 
   it('redraws extmark that starts and ends outside the screen', function()
     local lines = vim.split(('1'):rep(20), '', { plain = true })
+    lines[15] = '2'
     api.nvim_buf_set_lines(0, 0, -1, true, lines)
     api.nvim_buf_set_extmark(0, ns, 0, 0, { hl_group = 'ErrorMsg', end_row = 19, end_col = 0 })
     screen:expect({
@@ -4060,7 +4061,8 @@ describe('extmark decorations', function()
     screen:expect({
       grid = [[
         {4:^1}                                                 |
-        {4:1}                                                 |*13
+        {4:1}                                                 |*12
+        {4:2}                                                 |
                                                           |
       ]],
     })

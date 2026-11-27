@@ -48,8 +48,9 @@ describe('conceal-aware wrapping (#14409)', function()
   end
 
   --- Waits until the top rows of the screen show `rows`, ignoring highlights and the cursor.
-  local function expect_rows(rows)
+  local function expect_rows(rows, unchanged)
     screen0:expect({
+      unchanged = unchanged,
       condition = function()
         local lines = screen0:render(false, {})
         local actual = {}
@@ -255,7 +256,12 @@ describe('conceal-aware wrapping (#14409)', function()
     eq(1, api.nvim_win_text_height(0, { start_row = 0, end_row = 0 }).all)
     feed('A')
     eq(1, fn.winline())
-    expect_rows({ ('a'):rep(20), 'END' })
+    screen0:expect([[
+      aaaaaaaaaaaaaaaaaaa^a|
+      END                 |
+      {1:~                   }|*3
+      {5:-- INSERT --}        |
+    ]])
     feed('<Esc>')
 
     local inline = api.nvim_buf_set_extmark(0, ns, 0, 160, {
@@ -269,7 +275,7 @@ describe('conceal-aware wrapping (#14409)', function()
       virt_text = { { 'II' } },
       virt_text_pos = 'inline',
     })
-    expect_rows({ ('a'):rep(20), 'II', 'END' })
+    expect_rows({ ('a'):rep(20), 'II', 'END' }, true)
     command('set list listchars=eol:$')
     expect_rows({ ('a'):rep(20), 'II$', 'END$' })
     api.nvim_buf_set_extmark(0, ns, 0, 0, {
@@ -408,11 +414,21 @@ describe('conceal-aware wrapping (#14409)', function()
       { ('a'):rep(19) .. '\tZ', 19, 20, '界', ('a'):rep(19) .. '>', '界Z' },
       { ('a'):rep(19) .. '界Z', 19, 22, 'X', ('a'):rep(19) .. 'X', 'Z' },
     }) do
-      command(('set conceallevel=%d'):format(case.level or 2))
-      api.nvim_buf_clear_namespace(0, ns, 0, -1)
-      api.nvim_buf_set_lines(0, 0, -1, true, { case[1], 'NEXT' })
-      api.nvim_buf_set_extmark(0, ns, 0, case[2], { end_col = case[3], conceal = case[4] })
-      api.nvim_win_set_cursor(0, { 2, 0 })
+      exec_lua(function(namespace)
+        vim.api.nvim_buf_clear_namespace(0, namespace, 0, -1)
+        vim.api.nvim_buf_set_lines(0, 0, -1, true, { 'READY' })
+        vim.api.nvim_win_set_cursor(0, { 1, 0 })
+      end, ns)
+      expect_rows({ 'READY', '~' })
+      exec_lua(function(namespace, text, col, end_col, replacement, level)
+        vim.wo.conceallevel = level
+        vim.api.nvim_buf_set_lines(0, 0, -1, true, { text, 'NEXT' })
+        vim.api.nvim_buf_set_extmark(0, namespace, 0, col, {
+          end_col = end_col,
+          conceal = replacement,
+        })
+        vim.api.nvim_win_set_cursor(0, { 2, 0 })
+      end, ns, case[1], case[2], case[3], case[4], case.level or 2)
       local height = case[6] and 2 or 1
       eq(height, api.nvim_win_text_height(0, { start_row = 0, end_row = 0 }).all)
       expect_rows(case[6] and { case[5], case[6], 'NEXT' } or { case[5], 'NEXT' })

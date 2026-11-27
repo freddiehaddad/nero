@@ -32,11 +32,20 @@ describe('Ex mode', function()
     eq({ 'line1', 'inserted', 'line2', 'line3' }, fn.getline(1, '$'))
     eq('visual', fn.histget('cmd', -1))
     eq("put ='inserted'", fn.histget('cmd', -2))
+    local function expect_normal_screen()
+      screen:expect({
+        condition = function()
+          t.not_matches('%[Ex mode%]', table.concat(screen:render(false, {}), '\n'))
+        end,
+      })
+    end
+    expect_normal_screen()
     -- Ex mode can be re-entered (the "[Ex mode]" buffer name is not duplicated).
     feed('1q:')
     screen:expect({ any = vim.pesc('{3:[Ex mode]') })
     feed('visual<CR>')
     eq('n', fn.mode(1))
+    expect_normal_screen()
     -- ":exmode" (but not ":ex", which is ":edit") also enters Ex mode.
     eq('ex', fn.fullcommand('ex'))
     eq('exmode', fn.fullcommand('exm'))

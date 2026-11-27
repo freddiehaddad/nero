@@ -256,17 +256,19 @@ describe('ext_hlstate detailed highlights', function()
 
     tt.feed_termcode('[A')
     tt.feed_termcode('[2C')
+    tt.feed_termcode('[4C')
+    tt.feed_data('!')
     if is_os('win') then
       screen:expect([[
         ^tty ready                               |
-        x {6:y}{5: z}                                   |
+        x {6:y}{5: z !}                                 |
                                                 |*5
         {7:                                        }|
       ]])
     else
       screen:expect([[
         ^tty ready                               |
-        x {2:y }{3:z}                                   |
+        x {2:y }{3:z} {3:!}                                 |
                                                 |*5
         {7:                                        }|
       ]])

@@ -495,8 +495,12 @@ static int foldLevel(linenr_T lnum)
     end)
 
     it('remains valid after the client re-attaches.', function()
+      screen:expect({ any = vim.pesc('{7:-}// foldLevel() {{{2') })
       exec_lua(function()
         vim.lsp.buf_detach_client(bufnr, client_id)
+      end)
+      screen:expect({ any = vim.pesc('{7: }// foldLevel() {{{2') })
+      exec_lua(function()
         vim.lsp.buf_attach_client(bufnr, client_id)
       end)
       screen:expect({

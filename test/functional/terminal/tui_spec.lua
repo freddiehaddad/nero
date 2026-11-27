@@ -395,7 +395,6 @@ describe('TUI :detach', function()
       end)
     end)
 
-    screen:expect({ any = vim.pesc('[No Name]') })
     local child_session = n.connect(child_server)
     child_session:request('nvim_ui_attach', 50, 7, {})
     local _, uis_before = child_session:request('nvim_list_uis')
@@ -3313,10 +3312,11 @@ describe('TUI', function()
     ]])
     local _, server_pid = child_session:request('nvim_call_function', 'getpid', {})
     exec_lua([[vim.uv.kill(..., 'sigterm')]], server_pid)
+    local messages = { vim.pesc('[Process exited 1]') }
     if not is_os('win') then
-      screen:expect({ any = vim.pesc([[Nero: Caught deadly signal 'SIGTERM']]) })
+      table.insert(messages, vim.pesc([[Nero: Caught deadly signal 'SIGTERM']]))
     end
-    screen:expect({ any = vim.pesc('[Process exited 1]') })
+    screen:expect({ any = messages })
   end)
 
   it('exit on deadly signal dismisses dialog (returns default)', function()

@@ -2429,6 +2429,7 @@ describe('multicursor', function()
         cursors({ 'aa bb', 'cc dd', 'ee ff' }, 'Qj')
         feed('viw<Esc>')
         feed('jQk') -- Cursor on line 3: no area.
+        screen:expect({ any = '2×' })
         feed(keys) -- Not Normal-mode "o" there. #42821
         screen:expect({ any = '1×' }) -- Dropped by the preview already.
         feed('d')

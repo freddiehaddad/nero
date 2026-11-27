@@ -335,13 +335,16 @@ describe('highlight', function()
 
     -- Non-blinking block cursor with blinkon0 does not affect Visual highlighting either. #8983
     command('set guicursor=a:block-blinkon175')
-    screen:expect([[
+    screen:expect({
+      unchanged = true,
+      grid = [[
         line1 foo{17:^ bar}       │  line1 foo{17: bar}       |
       abcdefghijklmnopqrs   │abcdefghijklmnopqrs   |
       ABCDEFGHIJKLMNOPQRS   │ABCDEFGHIJKLMNOPQRS   |
       {3:[No Name] [+]          }{2:[No Name] [+]         }|
       {5:-- VISUAL --}                                 |
-    ]])
+    ]],
+    })
 
     command('set selection=exclusive')
     screen:expect([[
