@@ -3854,7 +3854,7 @@ fn ins_tab() -> bool {
                 if is_vreplace {
                     saved_line_vec[fpos.col as usize] = b'\t';
                 } else {
-                    crate::memline::with_ml_get_buf_mut_slice(&curbuf(), fpos.lnum, |s| {
+                    crate::memline::with_ml_get_buf_scratch_slice(&curbuf(), fpos.lnum, |s| {
                         s[fpos.col as usize] = b'\t';
                     });
                 }

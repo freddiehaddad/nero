@@ -633,6 +633,16 @@ pub fn with_cursor_line_mut_slice<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
     )
 }
 
+/// Mutate cursor-line bytes without counting the previous contents as deleted text.
+#[inline]
+pub fn with_cursor_line_scratch_slice<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    crate::memline::with_ml_get_buf_scratch_slice(
+        &crate::globals::curbuf(),
+        curwin().w_cursor.get().lnum,
+        f,
+    )
+}
+
 /// Return the bytes (excluding the NUL) starting at the cursor position.
 #[inline]
 pub fn get_cursor_pos_slice() -> crate::option_vars::RcSlice {

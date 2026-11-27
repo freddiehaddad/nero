@@ -3347,7 +3347,7 @@ pub fn with_ml_buf_line<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce(&[u8]) ->
     if let Some(cstr) = stored_line(buf, lnum) {
         return f(cstr.to_bytes());
     }
-    if !ml_load_line(buf, lnum, false) {
+    if !ml_load_line(buf, lnum, LineAccess::Read) {
         return f(&[]);
     }
     buf.b_ml.with_current_line_slice(|s| {
@@ -3366,7 +3366,7 @@ pub fn with_ml_buf_bytes_with_nul<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce
     if let Some(cstr) = stored_line(buf, lnum) {
         return f(cstr.to_bytes_with_nul());
     }
-    if !ml_load_line(buf, lnum, false) {
+    if !ml_load_line(buf, lnum, LineAccess::Read) {
         return f(b"\0");
     }
     buf.b_ml.with_current_line_slice(|s| {
@@ -3382,12 +3382,12 @@ pub fn with_ml_buf_bytes_with_nul<R>(buf: &FileBuf, lnum: Linenr, f: impl FnOnce
 
 /// Return a reference to a (read-only copy of a) line in `curbuf`.
 pub fn ml_get(lnum: Linenr) -> crate::option_vars::RcCStr {
-    ml_get_buf_impl(&curbuf(), lnum, false)
+    ml_get_buf_impl(&curbuf(), lnum)
 }
 
 /// Return a reference to a (read-only copy of a) line in `buf`.
 pub fn ml_get_buf(buf: &FileBuf, lnum: Linenr) -> crate::option_vars::RcCStr {
-    ml_get_buf_impl(buf, lnum, false)
+    ml_get_buf_impl(buf, lnum)
 }
 
 /// Return the bytes (excluding NUL) of a line in `curbuf`.
@@ -3415,7 +3415,26 @@ pub fn with_ml_get_buf_mut_slice<R>(
     lnum: Linenr,
     f: impl FnOnce(&mut [u8]) -> R,
 ) -> R {
-    if !ml_load_line(buf, lnum, true) {
+    with_ml_get_buf_mut_slice_mode(buf, lnum, LineAccess::Edit, f)
+}
+
+/// Mutate line bytes without counting the previous contents as deleted text.
+#[inline(always)]
+pub fn with_ml_get_buf_scratch_slice<R>(
+    buf: &FileBuf,
+    lnum: Linenr,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    with_ml_get_buf_mut_slice_mode(buf, lnum, LineAccess::Scratch, f)
+}
+
+fn with_ml_get_buf_mut_slice_mode<R>(
+    buf: &FileBuf,
+    lnum: Linenr,
+    access: LineAccess,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    if !ml_load_line(buf, lnum, access) {
         return f(&mut []);
     }
     if buf.b_ml.ml_line_textlen.get() <= 1 {
@@ -3475,7 +3494,7 @@ pub fn ml_get_buf_len(buf: &FileBuf, lnum: Linenr) -> Colnr {
             return len as Colnr;
         }
     }
-    if !ml_load_line(buf, lnum, false) {
+    if !ml_load_line(buf, lnum, LineAccess::Read) {
         return 0;
     }
     (buf.b_ml.ml_line_textlen.get() - 1).max(0)
@@ -3522,7 +3541,14 @@ pub fn gchar_pos(pos: &mut CursorPos) -> i32 {
     })
 }
 
-fn ml_load_line(buf: &FileBuf, mut lnum: Linenr, will_change: bool) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineAccess {
+    Read,
+    Edit,
+    Scratch,
+}
+
+fn ml_load_line(buf: &FileBuf, mut lnum: Linenr, access: LineAccess) -> bool {
     if buf.b_ml.ml_mfp.borrow().is_none() {
         buf.b_ml.ml_line_textlen.set(1);
         buf.b_ml.ml_line_lnum.set(0);
@@ -3586,7 +3612,7 @@ fn ml_load_line(buf: &FileBuf, mut lnum: Linenr, will_change: bool) -> bool {
             .ml_flags
             .set(buf.b_ml.ml_flags.get() & (!(ML_LINE_DIRTY | ML_LINE_INPLACE)));
     }
-    if will_change {
+    if access != LineAccess::Read {
         let deleted_len = buf
             .b_ml
             .with_current_line_slice(|s| crate::memory::bytes_until_nul(s).len());
@@ -3602,7 +3628,7 @@ fn ml_load_line(buf: &FileBuf, mut lnum: Linenr, will_change: bool) -> bool {
             .ml_flags
             .set(buf.b_ml.ml_flags.get() | (ML_LINE_DIRTY | ML_LINE_INPLACE));
         buf.b_ml.mark_swap_dirty();
-        if edit_state().inhibit_delete_count.get() == 0 {
+        if access == LineAccess::Edit && edit_state().inhibit_delete_count.get() == 0 {
             buf.deleted_bytes
                 .set(buf.deleted_bytes.get() + (deleted_len + 1));
             buf.deleted_bytes2
@@ -3621,11 +3647,11 @@ fn ml_load_line(buf: &FileBuf, mut lnum: Linenr, will_change: bool) -> bool {
     true
 }
 
-fn ml_get_buf_impl(buf: &FileBuf, lnum: Linenr, will_change: bool) -> crate::option_vars::RcCStr {
-    if !ml_load_line(buf, lnum, will_change) {
+fn ml_get_buf_impl(buf: &FileBuf, lnum: Linenr) -> crate::option_vars::RcCStr {
+    if !ml_load_line(buf, lnum, LineAccess::Read) {
         return crate::option_vars::RcCStr::EMPTY;
     }
-    if !will_change && let Some(cstr) = buf.b_ml.ml_line_cstr.get() {
+    if let Some(cstr) = buf.b_ml.ml_line_cstr.get() {
         return cstr;
     }
 
@@ -3638,9 +3664,7 @@ fn ml_get_buf_impl(buf: &FileBuf, lnum: Linenr, will_change: bool) -> crate::opt
         };
         crate::option_vars::RcCStr::from_cstr(cs)
     });
-    if !will_change {
-        buf.b_ml.ml_line_cstr.set(Some(cstr.clone()));
-    }
+    buf.b_ml.ml_line_cstr.set(Some(cstr.clone()));
     cstr
 }
 
@@ -5248,6 +5272,35 @@ mod tests {
         let buf = FileBuf::new();
         assert_eq!(ml_get_buf_slice(&buf, 1), b"");
         assert_eq!(ml_get_buf_len(&buf, 1), 0);
+    }
+
+    #[test]
+    fn scratch_mutation_does_not_count_deleted_bytes() {
+        let _guard = crate::globals::TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_curbuf = workspace_state().curbuf.get();
+        let buf = FileBuf::new_rc();
+        buf.b_p_swf.set(false);
+        workspace_state()
+            .curbuf
+            .set(crate::globals::BufPtr::from(buf.clone()));
+
+        assert!(ml_open(&buf));
+        assert!(ml_replace_buf(&buf, 1, b"line", true, false));
+        buf.deleted_bytes.set(0);
+        buf.deleted_bytes2.set(0);
+
+        with_ml_get_buf_scratch_slice(&buf, 1, |s| s[0] = b'L');
+        assert_eq!(buf.deleted_bytes.get(), 0);
+        assert_eq!(buf.deleted_bytes2.get(), 0);
+
+        with_ml_get_buf_mut_slice(&buf, 1, |s| s[0] = b'l');
+        assert_eq!(buf.deleted_bytes.get(), 5);
+        assert_eq!(buf.deleted_bytes2.get(), 5);
+
+        ml_close(&buf, 1);
+        workspace_state().curbuf.set(saved_curbuf);
     }
 
     #[test]

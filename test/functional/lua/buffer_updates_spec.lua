@@ -560,6 +560,44 @@ describe('lua: nvim_buf_attach on_bytes', function()
     return check_events
   end
 
+  local function expect_followup_delete_bytes(lines, setup, keys, expected)
+    setup_eventcheck(false, lines)
+    exec_lua([[
+      vim.api.nvim_buf_attach(0, false, {
+        on_lines = function(_, _, _, _, _, _, old_byte_size)
+          vim.g.test_old_byte_size = old_byte_size
+        end,
+      })
+    ]])
+    setup()
+    feed(keys)
+    exec_lua('return get_events(...)')
+
+    api.nvim_set_var('test_old_byte_size', -1)
+    feed('dd')
+    local events = exec_lua('return get_events(...)')
+    eq(expected, events[1][10])
+    eq(expected, api.nvim_get_var('test_old_byte_size'))
+  end
+
+  it('does not count tab conversion as deleted bytes', function()
+    expect_followup_delete_bytes({ '    abc' }, function()
+      command('setlocal softtabstop=4 noexpandtab')
+    end, 'A<Tab><Esc>', 9)
+  end)
+
+  it('does not count cindent probes as deleted bytes', function()
+    expect_followup_delete_bytes({ 'a:' }, function()
+      command('setlocal cindent')
+    end, 'A:<Esc>', 4)
+  end)
+
+  it('does not count r<Tab> conversion as deleted bytes', function()
+    expect_followup_delete_bytes({ 'ab' }, function()
+      command('setlocal tabstop=1')
+    end, 'r<Tab>', 10)
+  end)
+
   -- Yes, we can do both
   local function do_both(verify)
     it('single and multiple join', function()
