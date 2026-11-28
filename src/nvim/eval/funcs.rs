@@ -5535,21 +5535,27 @@ fn msgpackparse_unpack_list(list: Option<&TvList>, ret_list: &TvList) {
 }
 
 fn msgpackparse_unpack_blob(blob: Option<&TvBlob>, ret_list: &TvList) {
-    let len = tv_blob_len(blob);
-    if len == 0 {
+    let Some(blob) = blob else {
         return;
-    }
-
-    let bv = blob.unwrap().bv_ga.borrow().clone();
-    let mut parse_slice = &bv[..len as usize];
-    while !parse_slice.is_empty() {
-        let mut tv = tv_initial_value();
-        let status = unpack_typval(&mut parse_slice, &mut tv);
-        if status != MPACK_OK {
-            emsg_mpack_error(status);
-            return;
+    };
+    // Decoding only allocates new values; it runs no code that could
+    // access the blob, so the input can stay borrowed while parsing.
+    let status = {
+        let bytes = blob.bv_ga.borrow();
+        let mut parse_slice = bytes.as_slice();
+        let mut status = MPACK_OK;
+        while !parse_slice.is_empty() {
+            let mut tv = tv_initial_value();
+            status = unpack_typval(&mut parse_slice, &mut tv);
+            if status != MPACK_OK {
+                break;
+            }
+            tv_list_append_owned_tv(ret_list, tv);
         }
-        tv_list_append_owned_tv(ret_list, tv);
+        status
+    };
+    if status != MPACK_OK {
+        emsg_mpack_error(status);
     }
 }
 
