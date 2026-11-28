@@ -848,7 +848,7 @@ endfunc
 func Test_v_argv()
   let out = system(GetVimCommand() . ' -es -V1 -X arg1 --cmd "echo v:argv" --cmd q')
   let list = split(out, "', '")
-  call assert_match('vim', list[0])
+  call assert_equal(fnamemodify(v:progpath, ':t'), fnamemodify(list[0][2:], ':t'))
   let idx = index(list, 'arg1')
   call assert_true(idx > 2)
   call assert_equal(['arg1', '--cmd', 'echo v:argv', '--cmd', 'q'']'], list[idx:])
