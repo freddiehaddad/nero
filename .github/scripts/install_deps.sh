@@ -33,7 +33,7 @@ if [[ $OS == Linux ]]; then
   sudo apt-get install -y build-essential curl gettext
 
   if [[ -n $TEST ]]; then
-    sudo apt-get install -y locales-all carton attr libattr1-dev fish gdb inotify-tools xdg-utils
+    sudo apt-get install -y locales-all carton ruby ruby-dev ruby-bundler attr libattr1-dev fish gdb inotify-tools xdg-utils
 
     # Use default CC to avoid compilation problems when installing Python modules
     install_python_provider
