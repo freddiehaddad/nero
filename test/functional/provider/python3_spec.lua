@@ -57,6 +57,15 @@ describe('python3 provider', function()
     eq({ 100, 0 }, eval('g:set_by_python3'))
   end)
 
+  it('round-trips MessagePack timestamps near the epoch in a western timezone', function()
+    clear({ env = { TZ = 'PST8PDT' } })
+    eq(1, eval('has("python3")'))
+    for _, timestamp in ipairs({ 0, 10, 100000, 1000000000, 1700000000 }) do
+      local formatted = fn['msgpack#strftime']('%Y-%m-%dT%H:%M:%S', timestamp)
+      eq(timestamp, fn['msgpack#strptime']('%Y-%m-%dT%H:%M:%S', formatted))
+    end
+  end)
+
   it('does not truncate error message <1 MB', function()
     -- XXX: Python limits the error name to 200 chars, so this test is
     -- mostly bogus.

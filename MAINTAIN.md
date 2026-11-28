@@ -89,6 +89,7 @@ Nero fixes an upstream bug only with the maintainer's approval (see [AGENTS.md](
 
 | Nero | Upstream | Code | Regression test | Upstream report |
 |---|---|---|---|---|
+| Python-backed `msgpack#strptime()` converts local epoch times on Windows. | Treats them as UTC when `datetime.timestamp()` rejects a pre-1970 local date. | `runtime/autoload/msgpack.vim` | `round-trips MessagePack timestamps near the epoch in a western timezone` | Not reported |
 | Streaming MessagePack restores token state when the parser grows. | Rewinds the input without restoring token state, corrupting nested strings and extensions. | `mpack/object.rs`: `mpack_parse()` | `preserves streamed tokens when the unpacker grows` | Not reported |
 | Windows child queries and tree termination distinguish process generations and retain termination handles. | Matches parent PIDs without checking whether the parent still exists or its PID was reused; can report or target unrelated processes. | `os/proc.rs`, `os/proc_tree.rs`, `os/proc_windows.rs` | `api/proc_spec.lua`: `does not report children of an exited parent`, `stops an owned tree without stopping a sibling`; `event-lifetimes/tests/processes.rs` | Not reported |
 | The NFA engine always tries a `\@>` atom. | Skips it when an equal state is already queued, so it misses matches. | `regexp_nfa.rs`: `NFA_START_PATTERN` | `finds matches after \@> in both engines` | Not reported |
