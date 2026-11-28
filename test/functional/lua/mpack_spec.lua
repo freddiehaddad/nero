@@ -161,7 +161,8 @@ describe('lua vim.mpack', function()
     eq(
       true,
       exec_lua(function()
-        local values = { '', 'abc', ('x'):rep(100) .. '\000', { 'a\000', '', 'b' }, ('y'):rep(70000) }
+        local values =
+          { '', 'abc', ('x'):rep(100) .. '\000', { 'a\000', '', 'b' }, ('y'):rep(70000) }
         local unpack = vim.mpack.Unpacker()
         for _, v in ipairs(values) do
           local wire = vim.mpack.encode(v)
