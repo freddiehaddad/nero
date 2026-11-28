@@ -188,6 +188,9 @@ impl NvimString {
         }
     }
 
+    /// Longest string stored inline rather than in an owned allocation.
+    pub const INLINE_CAP: usize = NVIM_STRING_INLINE_CAP;
+
     #[inline]
     pub fn zeroed(size: usize) -> Self {
         if size <= NVIM_STRING_INLINE_CAP {

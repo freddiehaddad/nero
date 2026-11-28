@@ -205,19 +205,35 @@ pub fn mpack_tokbuf_init(tokbuf: &mut MpackTokbuf) {
     tokbuf.passthrough = 0;
 }
 
+/// Borrows the next part of a pending string, binary, or extension payload
+/// from `buf`.
+///
+/// Returns `None` when no payload is pending or `buf` is empty.
+pub fn mpack_read_chunk<'a>(tokbuf: &mut MpackTokbuf, buf: &mut &'a [u8]) -> Option<&'a [u8]> {
+    if tokbuf.passthrough == 0 || buf.is_empty() {
+        return None;
+    }
+    let (chunk, rest) = buf.split_at(buf.len().min(tokbuf.passthrough as usize));
+    tokbuf.passthrough -= chunk.len() as MpackUint32;
+    *buf = rest;
+    Some(chunk)
+}
+
+/// Reads the next token from `buf` into `tok`.
+///
+/// A chunk token's bytes are consumed but not copied into `tok`; use
+/// `mpack_read_chunk` to borrow them instead.
 pub fn mpack_read(tokbuf: &mut MpackTokbuf, buf: &mut &[u8], tok: &mut MpackToken) -> i32 {
+    if let Some(chunk) = mpack_read_chunk(tokbuf, buf) {
+        *tok = MpackToken {
+            r#type: MpackTokenChunk,
+            length: chunk.len() as MpackUint32,
+            data: MpackTokenData::new(),
+        };
+        return MPACK_OK;
+    }
     if buf.is_empty() {
         return MPACK_EOF;
-    }
-
-    if tokbuf.passthrough != 0 {
-        let len = (buf.len().min(tokbuf.passthrough as usize)) as MpackUint32;
-        tok.r#type = MpackTokenChunk;
-        tok.data = MpackTokenData::Chunk(buf[..len as usize].to_vec());
-        tok.length = len;
-        tokbuf.passthrough -= len;
-        *buf = &buf[len as usize..];
-        return MPACK_OK;
     }
 
     let initial_ppos = tokbuf.ppos;

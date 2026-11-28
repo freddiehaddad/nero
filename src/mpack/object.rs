@@ -3,7 +3,7 @@
 
 use crate::mpack::mpack_core::{
     MPACK_EOF, MPACK_ERROR, MPACK_OK, MpackSintmax, MpackTokbuf, MpackToken, MpackTokenChunk,
-    MpackTokenMap, MpackUint32, mpack_read, mpack_tokbuf_init, mpack_write,
+    MpackTokenMap, MpackUint32, mpack_read, mpack_read_chunk, mpack_tokbuf_init, mpack_write,
 };
 
 pub const MPACK_MAX_OBJECT_DEPTH: usize = 32;
@@ -62,10 +62,10 @@ impl MpackData {
     }
 
     #[inline]
-    pub fn owned_bytes_mut(&mut self) -> &mut [u8] {
+    pub fn owned_bytes_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            Self::OwnedBytes(v) => v.as_mut_slice(),
-            _ => &mut [],
+            Self::OwnedBytes(v) => v,
+            _ => unreachable!("node does not own bytes"),
         }
     }
 
@@ -163,6 +163,10 @@ impl MpackParser {
 
 pub type MpackWalkCb<C> = Option<fn(w: &mut MpackParser, ctx: &mut C, node_idx: usize)>;
 
+/// Receives a chunk node's payload bytes, borrowed from the parser's input.
+pub type MpackChunkCb<C> =
+    Option<fn(w: &mut MpackParser, ctx: &mut C, node_idx: usize, chunk: &[u8])>;
+
 pub fn mpack_parser_init(parser: &mut MpackParser, capacity: MpackUint32) {
     mpack_tokbuf_init(&mut parser.tokbuf);
     parser.data = MpackData::Null;
@@ -188,11 +192,17 @@ pub fn mpack_parser_grow(p: &mut MpackParser) {
     p.capacity = new_capacity;
 }
 
+/// Enters `tok`, or exits finished nodes if the previous call entered one.
+///
+/// `chunk` holds the payload when `tok` is a chunk read from the input; it
+/// goes to `chunk_cb` instead of `enter_cb`.
 pub fn mpack_parse_tok<C: ?Sized>(
     parser: &mut MpackParser,
     ctx: &mut C,
     tok: MpackToken,
+    chunk: Option<&[u8]>,
     enter_cb: MpackWalkCb<C>,
+    chunk_cb: MpackChunkCb<C>,
     exit_cb: MpackWalkCb<C>,
 ) -> i32 {
     if parser.status == MPACK_EXCEPTION {
@@ -205,8 +215,14 @@ pub fn mpack_parse_tok<C: ?Sized>(
         }
         let n_idx = mpack_parser_push(parser);
         parser.items[n_idx].tok = tok;
-        if let Some(cb) = enter_cb {
-            cb(parser, ctx, n_idx);
+        match (chunk, chunk_cb) {
+            (Some(bytes), Some(cb)) => cb(parser, ctx, n_idx, bytes),
+            (Some(_), None) => {}
+            (None, _) => {
+                if let Some(cb) = enter_cb {
+                    cb(parser, ctx, n_idx);
+                }
+            }
         }
         if parser.status == MPACK_EXCEPTION {
             return MPACK_EXCEPTION;
@@ -279,6 +295,7 @@ pub fn mpack_parse<C: ?Sized>(
     ctx: &mut C,
     buf: &mut &[u8],
     enter_cb: MpackWalkCb<C>,
+    chunk_cb: MpackChunkCb<C>,
     exit_cb: MpackWalkCb<C>,
 ) -> i32 {
     let mut status = MPACK_EOF;
@@ -291,16 +308,30 @@ pub fn mpack_parse<C: ?Sized>(
         let buf_save = *buf;
         let tokbuf_save = mpack_parser_full(parser).then(|| parser.tokbuf.clone());
 
-        status = mpack_read(&mut parser.tokbuf, buf, &mut tok);
-        if status == MPACK_EOF {
-            continue;
-        } else if status == MPACK_ERROR {
-            *buf = buf_save;
-            break;
+        let mut chunk = mpack_read_chunk(&mut parser.tokbuf, buf);
+        if let Some(bytes) = chunk {
+            tok.r#type = MpackTokenChunk;
+            tok.length = bytes.len() as MpackUint32;
+        } else {
+            status = mpack_read(&mut parser.tokbuf, buf, &mut tok);
+            if status == MPACK_EOF {
+                continue;
+            } else if status == MPACK_ERROR {
+                *buf = buf_save;
+                break;
+            }
         }
 
         loop {
-            status = mpack_parse_tok(parser, ctx, std::mem::take(&mut tok), enter_cb, exit_cb);
+            status = mpack_parse_tok(
+                parser,
+                ctx,
+                std::mem::take(&mut tok),
+                chunk.take(),
+                enter_cb,
+                chunk_cb,
+                exit_cb,
+            );
             if parser.status == MPACK_EXCEPTION {
                 return MPACK_EXCEPTION;
             }

@@ -822,6 +822,20 @@ describe('API', function()
       eq('xy', api.nvim_execute_lua('return xx(...)', { 'x', 'y' }))
     end)
 
+    it('receives strings at inline and read-buffer boundaries', function()
+      local values = {
+        '',
+        ('a'):rep(22),
+        ('b'):rep(23),
+        'c\000d' .. ('e'):rep(30),
+        ('f'):rep(30) .. '\000',
+        ('g'):rep(300000),
+      }
+      for _, s in ipairs(values) do
+        eq({ #s, s }, api.nvim_exec_lua('return { #..., ... }', { s }))
+      end
+    end)
+
     it('reports errors', function()
       eq([['=' expected near '+']], pcall_err(api.nvim_exec_lua, 'a+*b', {}))
       eq([[unexpected symbol near '1']], pcall_err(api.nvim_exec_lua, '1+2', {}))

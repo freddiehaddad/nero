@@ -469,6 +469,29 @@ describe('msgpackparse() function', function()
     eq(1, eval('g:parsed[0]._TYPE is v:msgpack_types.map'))
   end)
 
+  it('restores STR and BIN values at inline and read-buffer boundaries', function()
+    local function str16(s)
+      return '\218' .. string.char(math.floor(#s / 256), #s % 256) .. s
+    end
+    local values = { '', ('a'):rep(21), ('b'):rep(22), 'c\000d' }
+    local wire = '\160' .. '\181' .. values[2] .. '\182' .. values[3] .. '\163' .. values[4]
+    -- A readfile()-style list is parsed in 4096-byte pieces.
+    for _, len in ipairs({ 4095, 4096, 4097, 9000 }) do
+      values[#values + 1] = ('e'):rep(len)
+      wire = wire .. str16(values[#values])
+    end
+    values[#values + 1] = ('f'):rep(5000) .. '\000'
+    wire = wire .. str16(values[#values])
+    values[#values + 1] = ('g'):rep(5000)
+    wire = wire .. '\197\019\136' .. values[#values]
+    local list = vim.split(wire, '\n', { plain = true })
+    for i, item in ipairs(list) do
+      list[i] = item:gsub('%z', '\n')
+    end
+    parse_eq(values, list)
+    eq({ 1, 1, 1, 10, 1, 1, 1, 1, 10, 1 }, eval('map(copy(g:parsed), "type(v:val)")'))
+  end)
+
   it('msgpackparse(systemlist(...)) does not segfault. #3135', function()
     local cmd = "sort(keys(msgpackparse(systemlist('" .. n.nvim_prog .. " --api-info'))[0]))"
     eval(cmd)

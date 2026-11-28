@@ -8,9 +8,10 @@ use crate::api::private::validate::{
 };
 use crate::lua::converter::{Boolean, FieldHashfn};
 use crate::mpack::mpack_core::{
-    MPACK_OK, MpackTokbuf, MpackToken, MpackTokenType, mpack_read, mpack_rtoken, mpack_tokbuf_init,
+    MPACK_OK, MpackTokbuf, MpackToken, MpackTokenType, mpack_read, mpack_read_chunk, mpack_rtoken,
+    mpack_tokbuf_init,
 };
-use crate::mpack::object::{MpackParser, mpack_parse, mpack_parser_init};
+use crate::mpack::object::{MpackData, MpackParser, mpack_parse, mpack_parser_init};
 use crate::msgpack_rpc::packer::{EXT_OBJECT_TYPE_SHIFT, Integer};
 use crate::ui_client::{
     UIClientHandler, handle_ui_client_redraw, ui_client_event_grid_line,
@@ -97,124 +98,134 @@ struct ApiParseCtx<'a> {
     ext_buf: &'a mut [u8; MAX_EXT_LEN],
 }
 
-fn api_parse_enter(parser: &mut MpackParser, p: &mut ApiParseCtx<'_>, node_idx: usize) {
-    let (node, mut parent) = parser.node_and_parent_mut(node_idx);
-    if let Some(parent) = parent.as_deref_mut() {
-        match parent.tok.r#type {
-            MpackTokenType::MpackTokenArray | MpackTokenType::MpackTokenMap => {}
-            MpackTokenType::MpackTokenStr
-            | MpackTokenType::MpackTokenBin
-            | MpackTokenType::MpackTokenExt => {
-                assert_eq!(node.tok.r#type, MpackTokenType::MpackTokenChunk);
-            }
-            _ => std::process::abort(),
-        }
+fn api_parse_enter(parser: &mut MpackParser, _p: &mut ApiParseCtx<'_>, node_idx: usize) {
+    let (node, parent) = parser.node_and_parent_mut(node_idx);
+    if let Some(parent) = parent
+        && !matches!(
+            parent.tok.r#type,
+            MpackTokenType::MpackTokenArray | MpackTokenType::MpackTokenMap
+        )
+    {
+        // Strings and extensions contain only chunks, which bypass `enter`.
+        std::process::abort();
     }
 
     match node.tok.r#type {
         MpackTokenType::MpackTokenNil => {
-            node.data[0] = crate::mpack::object::MpackData::Object(nil_obj());
+            node.data[0] = MpackData::Object(nil_obj());
         }
         MpackTokenType::MpackTokenBoolean => {
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::Boolean(
-                mpack_unpack_boolean(&node.tok),
-            ));
+            node.data[0] = MpackData::Object(Object::Boolean(mpack_unpack_boolean(&node.tok)));
         }
         MpackTokenType::MpackTokenSint => {
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::Integer(
-                mpack_unpack_sint(&node.tok),
-            ));
+            node.data[0] = MpackData::Object(Object::Integer(mpack_unpack_sint(&node.tok)));
         }
         MpackTokenType::MpackTokenUint => {
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::Integer(
-                mpack_unpack_uint(&node.tok) as Integer,
-            ));
+            node.data[0] =
+                MpackData::Object(Object::Integer(mpack_unpack_uint(&node.tok) as Integer));
         }
         MpackTokenType::MpackTokenFloat => {
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::Float(
-                mpack_unpack_float_fast(&node.tok),
-            ));
+            node.data[0] = MpackData::Object(Object::Float(mpack_unpack_float_fast(&node.tok)));
         }
         MpackTokenType::MpackTokenBin | MpackTokenType::MpackTokenStr => {
             let len = node.tok.length as usize;
-            let s = NvimString::zeroed(len);
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::String(s));
+            node.data[0] = if len <= NvimString::INLINE_CAP {
+                MpackData::Object(Object::String(NvimString::zeroed(len)))
+            } else {
+                // Assemble longer strings without zero-filling them first.
+                MpackData::OwnedBytes(Vec::new())
+            };
         }
         MpackTokenType::MpackTokenExt => {
-            node.data[0] = crate::mpack::object::MpackData::Object(nil_obj());
+            node.data[0] = MpackData::Object(nil_obj());
         }
         MpackTokenType::MpackTokenChunk => {
-            let parent = parent.unwrap();
-            let chunk_len = node.tok.length as usize;
-            if parent.tok.r#type == MpackTokenType::MpackTokenStr
-                || parent.tok.r#type == MpackTokenType::MpackTokenBin
-            {
-                let pos = parent.pos;
-                let Object::String(string) = parent.data[0].object_mut() else {
-                    unreachable!("string chunks require a string parent");
-                };
-                let data = string.as_bytes_with_nul_mut();
-                if chunk_len > 0 {
-                    data[pos..pos + chunk_len].copy_from_slice(node.tok.data.chunk_bytes());
-                }
-            } else {
-                let res = parent.data[0].object_mut();
-                let endlen = parent.pos + chunk_len;
-                if endlen > MAX_EXT_LEN {
-                    *res = nil_obj();
-                    return;
-                }
-                if chunk_len > 0 {
-                    p.ext_buf[parent.pos..endlen].copy_from_slice(node.tok.data.chunk_bytes());
-                }
-                if endlen < (parent.tok.length as usize) {
-                    return;
-                }
-                let mut buf = &p.ext_buf[..parent.tok.length as usize];
-                let mut ext_tok = MpackToken::new();
-                let status = mpack_rtoken(&mut buf, &mut ext_tok);
-                if status != 0 || ext_tok.r#type != MpackTokenType::MpackTokenUint {
-                    *res = nil_obj();
-                    return;
-                }
-                let ext_type = parent.tok.data.ext_type();
-                if (0..=EXT_OBJECT_TYPE_MAX).contains(&ext_type)
-                    && let Some(obj_type) = ObjectType::from_raw(ext_type + EXT_OBJECT_TYPE_SHIFT)
-                {
-                    let handle = mpack_unpack_uint(&ext_tok) as i64;
-                    *res = match obj_type {
-                        ObjectType::ObjectTypeBuffer => Object::Buffer(handle),
-                        ObjectType::ObjectTypeWindow => Object::Window(handle),
-                        ObjectType::ObjectTypeTabpage => Object::Tabpage(handle),
-                        _ => unreachable!("validated handle extension type"),
-                    };
-                } else {
-                    *res = nil_obj();
-                }
-            }
+            unreachable!("chunks are passed to api_parse_chunk")
         }
         MpackTokenType::MpackTokenArray => {
             let len = node.tok.length as usize;
             let mut arr = Array::with_capacity(len);
             arr.size = len;
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::Array(arr));
+            node.data[0] = MpackData::Object(Object::Array(arr));
         }
         MpackTokenType::MpackTokenMap => {
             let len = node.tok.length as usize;
             let mut dict = Dict::with_capacity(len);
             dict.size = len;
-            node.data[0] = crate::mpack::object::MpackData::Object(Object::Dict(dict));
+            node.data[0] = MpackData::Object(Object::Dict(dict));
         }
         MpackTokenType::MpackTokenNone => std::process::abort(),
     }
 }
 
+fn api_parse_chunk(
+    parser: &mut MpackParser,
+    p: &mut ApiParseCtx<'_>,
+    node_idx: usize,
+    chunk: &[u8],
+) {
+    let (_, parent) = parser.node_and_parent_mut(node_idx);
+    let parent = parent.expect("chunks belong to a payload");
+    let pos = parent.pos;
+    let total = parent.tok.length as usize;
+    match &mut parent.data[0] {
+        MpackData::OwnedBytes(bytes) => {
+            debug_assert_eq!(bytes.len(), pos);
+            // Reserve the terminator `api_parse_exit` adds.
+            bytes.reserve_exact(total + 1 - bytes.len());
+            bytes.extend_from_slice(chunk);
+        }
+        MpackData::Object(Object::String(string)) => {
+            string.as_bytes_with_nul_mut()[pos..pos + chunk.len()].copy_from_slice(chunk);
+        }
+        MpackData::Object(res) => {
+            debug_assert_eq!(parent.tok.r#type, MpackTokenType::MpackTokenExt);
+            let endlen = pos + chunk.len();
+            if endlen > MAX_EXT_LEN {
+                *res = nil_obj();
+                return;
+            }
+            p.ext_buf[pos..endlen].copy_from_slice(chunk);
+            if endlen < total {
+                return;
+            }
+            let mut buf = &p.ext_buf[..total];
+            let mut ext_tok = MpackToken::new();
+            let status = mpack_rtoken(&mut buf, &mut ext_tok);
+            if status != 0 || ext_tok.r#type != MpackTokenType::MpackTokenUint {
+                *res = nil_obj();
+                return;
+            }
+            let ext_type = parent.tok.data.ext_type();
+            if (0..=EXT_OBJECT_TYPE_MAX).contains(&ext_type)
+                && let Some(obj_type) = ObjectType::from_raw(ext_type + EXT_OBJECT_TYPE_SHIFT)
+            {
+                let handle = mpack_unpack_uint(&ext_tok) as i64;
+                *res = match obj_type {
+                    ObjectType::ObjectTypeBuffer => Object::Buffer(handle),
+                    ObjectType::ObjectTypeWindow => Object::Window(handle),
+                    ObjectType::ObjectTypeTabpage => Object::Tabpage(handle),
+                    _ => unreachable!("validated handle extension type"),
+                };
+            } else {
+                *res = nil_obj();
+            }
+        }
+        _ => unreachable!("chunks belong to a string or extension"),
+    }
+}
 fn api_parse_exit(parser: &mut MpackParser, p: &mut ApiParseCtx<'_>, node_idx: usize) {
     let (node, parent) = parser.node_and_parent_mut(node_idx);
     if node.tok.r#type == MpackTokenType::MpackTokenChunk {
         return;
     }
-    let obj = node.data[0].take_object();
+    let obj = match std::mem::take(&mut node.data[0]) {
+        MpackData::OwnedBytes(mut bytes) => {
+            bytes.push(0);
+            Object::String(NvimString::from_vec_with_nul(bytes))
+        }
+        mut data => data.take_object(),
+    };
     if let Some(parent) = parent {
         match parent.tok.r#type {
             MpackTokenType::MpackTokenArray => {
@@ -264,6 +275,7 @@ pub fn unpack(mut bytes: &[u8]) -> Result<Object, Error> {
             &mut ctx,
             &mut bytes,
             Some(api_parse_enter),
+            Some(api_parse_chunk),
             Some(api_parse_exit),
         )
     };
@@ -400,21 +412,14 @@ pub fn unpacker_parse_header(p: &mut Unpacker, read_buf: &mut &[u8]) -> bool {
                 }
                 if result == 0 {
                     p.method_name_len = tok.length as usize;
-                    if p.method_name_len > 0 {
-                        result = mpack_read(&mut p.reader, &mut buf, &mut tok);
-                        if result == 0 {
-                            assert_eq!(tok.r#type, MpackTokenType::MpackTokenChunk);
-                        }
-                    }
-                    if result == 0 && (tok.length as usize) < p.method_name_len {
-                        result = MPACK_EOF;
-                    }
-                    if result == 0 {
-                        let name_bytes = if tok.length != 0 {
-                            tok.data.chunk_bytes()
-                        } else {
-                            &[]
-                        };
+                    let name_bytes: Option<&[u8]> = if p.method_name_len > 0 {
+                        // A partial name waits for the rest of the header.
+                        mpack_read_chunk(&mut p.reader, &mut buf)
+                            .filter(|name| name.len() == p.method_name_len)
+                    } else {
+                        Some(&[])
+                    };
+                    if let Some(name_bytes) = name_bytes {
                         match msgpack_rpc_get_handler_for(name_bytes) {
                             Ok(h) => p.handler = h,
                             Err(e) => {
@@ -427,6 +432,8 @@ pub fn unpacker_parse_header(p: &mut Unpacker, read_buf: &mut &[u8]) -> bool {
                                 };
                             }
                         }
+                    } else {
+                        result = MPACK_EOF;
                     }
                 }
             }
@@ -507,6 +514,7 @@ pub fn unpacker_advance(p: &mut Unpacker, read_buf: &mut &[u8]) -> bool {
                     &mut ctx,
                     read_buf,
                     Some(api_parse_enter),
+                    Some(api_parse_chunk),
                     Some(api_parse_exit),
                 )
             };
@@ -786,7 +794,14 @@ pub fn unpack_uint_or_sint(tok: MpackToken) -> Option<Integer> {
 pub fn unpack_skip(buf: &mut &[u8]) -> i32 {
     let mut parser = MpackParser::new(0);
     mpack_parser_init(&mut parser, 0);
-    mpack_parse(&mut parser, &mut (), buf, Some(parse_nop), Some(parse_nop))
+    mpack_parse(
+        &mut parser,
+        &mut (),
+        buf,
+        Some(parse_nop),
+        None,
+        Some(parse_nop),
+    )
 }
 
 /// Append raw msgpack key-value bytes to `AdditionalDataBuilder` (`push_additional_data`).
@@ -937,5 +952,29 @@ mod tests {
         unpacker_init(&mut unpacker);
         let mut read_buf2 = payload2;
         assert!(unpacker_advance(&mut unpacker, &mut read_buf2));
+    }
+
+    #[test]
+    fn unpacker_waits_for_a_split_method_name() {
+        let payload: &[u8] = b"\x94\x00\x07\xa9nvim_eval\x91\xa11";
+        for split in 1..payload.len() {
+            let mut unpacker = Unpacker::new();
+            unpacker_init(&mut unpacker);
+            let mut read_buf = &payload[..split];
+            assert!(!unpacker_advance(&mut unpacker, &mut read_buf));
+            let consumed = split - read_buf.len();
+            let mut read_buf = &payload[consumed..];
+            assert!(
+                unpacker_advance(&mut unpacker, &mut read_buf),
+                "split {split}"
+            );
+            assert!(read_buf.is_empty());
+            assert_eq!(unpacker.request_id, 7);
+            assert_eq!(unpacker.handler.name, c"nvim_eval");
+            let Object::Array(args) = &unpacker.result else {
+                panic!("split {split}: arguments are not an array");
+            };
+            assert!(matches!(&args[0], Object::String(s) if s.as_bytes() == b"1"));
+        }
     }
 }

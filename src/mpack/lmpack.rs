@@ -58,7 +58,15 @@ struct LmpackUnpackerCtx {
     ext: i32,
     unpacking: i32,
     mtdict: i32,
-    string_buffer: Vec<u8>,
+    payload: StringPayload,
+}
+
+/// Payload of the string, binary, or extension value being unpacked.
+enum StringPayload {
+    /// Bytes assembled from the value's chunks.
+    Assembling(Vec<u8>),
+    /// The value arrived in one chunk and was pushed onto the Lua stack.
+    Pushed,
 }
 
 #[repr(C)]
@@ -223,7 +231,7 @@ extern "C-unwind" fn lmpack_unpacker_new(l: *mut lua_State) -> i32 {
                 ext: LUA_NOREF,
                 unpacking: 0,
                 mtdict: 0,
-                string_buffer: Vec::new(),
+                payload: StringPayload::Assembling(Vec::new()),
             },
         },
     );
@@ -265,7 +273,7 @@ extern "C-unwind" fn lmpack_unpacker_delete(l: *mut lua_State) -> i32 {
 
 fn lmpack_parse_enter(parser: &mut MpackParser, unpacker: &mut LmpackUnpackerCtx, node_idx: usize) {
     let l = unpacker.lstate;
-    let (node, parent) = parser.node_and_parent_mut(node_idx);
+    let node = &mut parser.items[node_idx];
 
     match node.tok.r#type {
         MpackTokenNil => {
@@ -277,15 +285,8 @@ fn lmpack_parse_enter(parser: &mut MpackParser, unpacker: &mut LmpackUnpackerCtx
         MpackTokenUint | MpackTokenSint | MpackTokenFloat => {
             lua_pushnumber_safe(l, mpack_unpack_number(&node.tok));
         }
-        MpackTokenChunk => {
-            let parent = parent.unwrap();
-            let chunk = node.tok.data.chunk_bytes();
-            let pos = parent.pos;
-            unpacker.string_buffer[pos..pos + chunk.len()].copy_from_slice(chunk);
-        }
         MpackTokenBin | MpackTokenStr | MpackTokenExt => {
-            unpacker.string_buffer.clear();
-            unpacker.string_buffer.resize(node.tok.length as usize, 0);
+            unpacker.payload = StringPayload::Assembling(Vec::new());
         }
         MpackTokenArray | MpackTokenMap => {
             lua_newtable(l);
@@ -298,14 +299,35 @@ fn lmpack_parse_enter(parser: &mut MpackParser, unpacker: &mut LmpackUnpackerCtx
     }
 }
 
+fn lmpack_parse_chunk(
+    parser: &mut MpackParser,
+    unpacker: &mut LmpackUnpackerCtx,
+    node_idx: usize,
+    chunk: &[u8],
+) {
+    let (_, parent) = parser.node_and_parent_mut(node_idx);
+    let total = parent.expect("chunks belong to a payload").tok.length as usize;
+    if chunk.len() == total {
+        // Push a value that arrived whole directly from the input.
+        lua_push_bytes(unpacker.lstate, chunk);
+        unpacker.payload = StringPayload::Pushed;
+    } else if let StringPayload::Assembling(bytes) = &mut unpacker.payload {
+        bytes.reserve_exact(total - bytes.len());
+        bytes.extend_from_slice(chunk);
+    }
+}
+
 fn lmpack_parse_exit(parser: &mut MpackParser, unpacker: &mut LmpackUnpackerCtx, node_idx: usize) {
     let l = unpacker.lstate;
     let (node, parent) = parser.node_and_parent_mut(node_idx);
 
     match node.tok.r#type {
         MpackTokenBin | MpackTokenStr | MpackTokenExt => {
-            lua_push_bytes(l, &unpacker.string_buffer[..node.tok.length as usize]);
-            unpacker.string_buffer.clear();
+            let payload =
+                std::mem::replace(&mut unpacker.payload, StringPayload::Assembling(Vec::new()));
+            if let StringPayload::Assembling(bytes) = payload {
+                lua_push_bytes(l, &bytes);
+            }
             if node.tok.r#type == MpackTokenExt && unpacker.ext != LUA_NOREF {
                 lmpack_geti(l, unpacker.reg, unpacker.ext);
                 lua_rawgeti_safe(l, -1, node.tok.data.ext_type());
@@ -380,6 +402,7 @@ fn lmpack_unpacker_unpack_str(
             &mut unpacker.ctx,
             buf,
             Some(lmpack_parse_enter),
+            Some(lmpack_parse_chunk),
             Some(lmpack_parse_exit),
         );
         unpacker.ctx.unpacking = 0;
@@ -988,7 +1011,7 @@ extern "C-unwind" fn lmpack_unpack(l: *mut lua_State) -> i32 {
             ext: LUA_NOREF,
             unpacking: 0,
             mtdict: 0,
-            string_buffer: Vec::new(),
+            payload: StringPayload::Assembling(Vec::new()),
         },
     };
     mpack_parser_init(&mut unpacker.parser, 0);
@@ -1001,6 +1024,7 @@ extern "C-unwind" fn lmpack_unpack(l: *mut lua_State) -> i32 {
         &mut unpacker.ctx,
         &mut buf,
         Some(lmpack_parse_enter),
+        Some(lmpack_parse_chunk),
         Some(lmpack_parse_exit),
     );
 

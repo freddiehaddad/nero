@@ -157,6 +157,30 @@ describe('lua vim.mpack', function()
     )
   end)
 
+  it('reuses an unpacker for whole and fragmented strings', function()
+    eq(
+      true,
+      exec_lua(function()
+        local values = { '', 'abc', ('x'):rep(100) .. '\000', { 'a\000', '', 'b' }, ('y'):rep(70000) }
+        local unpack = vim.mpack.Unpacker()
+        for _, v in ipairs(values) do
+          local wire = vim.mpack.encode(v)
+          local value, pos = unpack(wire)
+          assert(vim.deep_equal(value, v) and pos == #wire + 1)
+          if #wire > 1 then
+            local cut = math.floor(#wire / 2)
+            for _, piece in ipairs({ wire:sub(1, cut), wire:sub(cut + 1) }) do
+              value, pos = unpack(piece)
+              assert(pos == #piece + 1)
+            end
+            assert(vim.deep_equal(value, v))
+          end
+        end
+        return true
+      end)
+    )
+  end)
+
   it('preserves streamed tokens when the unpacker grows', function()
     eq(
       true,

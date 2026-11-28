@@ -1,6 +1,8 @@
 //! JSON and MessagePack decoding into Vimscript `TypVal` values (`src/nvim/eval/decode.c`).
 #![forbid(unsafe_code)]
 
+use std::ffi::CString;
+
 use crate::charset::vim_slice2nr;
 use crate::eval::encode::encode_list_write;
 use crate::eval::string2float;
@@ -119,6 +121,30 @@ pub fn decode_string(s: &[u8], force_blob: bool) -> TypVal {
         v_lock: VAR_UNLOCKED,
         value: TvValue::from_bytes_no_nul(s),
     }
+}
+
+/// Like `decode_string`, but takes ownership of `s` so that neither a string
+/// nor a blob needs to copy it.
+pub fn decode_string_owned(s: Vec<u8>, force_blob: bool) -> TypVal {
+    let blob_bytes = if force_blob {
+        s
+    } else {
+        match CString::new(s) {
+            Ok(text) => {
+                return TypVal {
+                    v_lock: VAR_UNLOCKED,
+                    value: TvValue::from_cstring(text),
+                };
+            }
+            Err(error) => error.into_vec(),
+        }
+    };
+    let mut tv = TypVal {
+        v_lock: VAR_UNLOCKED,
+        value: TvValue::Unknown,
+    };
+    *tv_blob_alloc_ret(&mut tv).bv_ga.borrow_mut() = blob_bytes;
+    tv
 }
 
 fn json_decoder_pop(
@@ -959,31 +985,23 @@ fn write_target_tv(
 }
 
 fn typval_parse_enter(parser: &mut MpackParser, root_tv: &mut TypVal, node_idx: usize) {
-    let mut target = MpackData::Null;
-    let (node, mut parent) = parser.node_and_parent_mut(node_idx);
-    if let Some(parent) = parent.as_deref_mut() {
-        match parent.tok.r#type {
+    let (node, parent) = parser.node_and_parent_mut(node_idx);
+    let target = match parent {
+        Some(parent) => match parent.tok.r#type {
             MpackTokenType::MpackTokenArray => {
                 let list = parent.data[1].list();
                 let li = crate::eval::typval::tv_list_item_alloc();
                 crate::eval::typval::tv_list_append(list, &li);
-                target = MpackData::ListItem(li);
+                MpackData::ListItem(li)
             }
             MpackTokenType::MpackTokenMap => {
-                let pos = parent.pos;
-                let key_visited = parent.key_visited as usize;
-                target = MpackData::MapSlot(pos, key_visited);
+                MpackData::MapSlot(parent.pos, parent.key_visited as usize)
             }
-            MpackTokenType::MpackTokenStr
-            | MpackTokenType::MpackTokenBin
-            | MpackTokenType::MpackTokenExt => {
-                assert_eq!(node.tok.r#type, MpackTokenType::MpackTokenChunk);
-            }
+            // Strings and extensions contain only chunks, which bypass `enter`.
             _ => std::process::abort(),
-        }
-    } else {
-        target = MpackData::RootTypval;
-    }
+        },
+        None => MpackData::RootTypval,
+    };
 
     node.data[0] = target.clone();
     node.data[1] = MpackData::Null;
@@ -1050,18 +1068,9 @@ fn typval_parse_enter(parser: &mut MpackParser, root_tv: &mut TypVal, node_idx: 
         MpackTokenType::MpackTokenBin
         | MpackTokenType::MpackTokenStr
         | MpackTokenType::MpackTokenExt => {
-            node.data[1] = MpackData::OwnedBytes(vec![0u8; node.tok.length as usize]);
+            node.data[1] = MpackData::OwnedBytes(Vec::new());
         }
-        MpackTokenType::MpackTokenChunk => {
-            let parent = parent.unwrap();
-            let pos = parent.pos;
-            let data = parent.data[1].owned_bytes_mut();
-            let len = node.tok.length as usize;
-            if len > 0 {
-                let chunk = node.tok.data.chunk_bytes();
-                data[pos..(pos + len)].copy_from_slice(chunk);
-            }
-        }
+        MpackTokenType::MpackTokenChunk => unreachable!("chunks are passed to typval_parse_chunk"),
         MpackTokenType::MpackTokenArray => {
             let list = tv_list_alloc(node.tok.length as isize);
             tv_list_ref(Some(&list));
@@ -1103,6 +1112,22 @@ pub fn typval_parser_error_free(p: &mut MpackParser) {
     }
 }
 
+fn typval_parse_chunk(
+    parser: &mut MpackParser,
+    _root_tv: &mut TypVal,
+    node_idx: usize,
+    chunk: &[u8],
+) {
+    let (_, parent) = parser.node_and_parent_mut(node_idx);
+    let parent = parent.expect("chunks belong to a payload");
+    let total = parent.tok.length as usize;
+    let data = parent.data[1].owned_bytes_mut();
+    debug_assert_eq!(data.len(), parent.pos);
+    // Reserve the terminator `decode_string_owned` may add.
+    data.reserve_exact(total + 1 - data.len());
+    data.extend_from_slice(chunk);
+}
+
 fn typval_parse_exit(parser: &mut MpackParser, root_tv: &mut TypVal, node_idx: usize) {
     let tok_type = parser.items[node_idx].tok.r#type;
     let tok_len = parser.items[node_idx].tok.length as usize;
@@ -1110,7 +1135,8 @@ fn typval_parse_exit(parser: &mut MpackParser, root_tv: &mut TypVal, node_idx: u
         MpackTokenType::MpackTokenBin | MpackTokenType::MpackTokenStr => {
             let target = parser.items[node_idx].data[0].clone();
             let bytes = parser.items[node_idx].data[1].take_owned_bytes();
-            let tv = decode_string(&bytes[..tok_len], false);
+            debug_assert_eq!(bytes.len(), tok_len);
+            let tv = decode_string_owned(bytes, false);
             write_target_tv(parser, root_tv, node_idx, &target, tv);
         }
         MpackTokenType::MpackTokenExt => {
@@ -1196,6 +1222,7 @@ pub fn mpack_parse_typval(parser: &mut MpackParser, ret: &mut TypVal, buf: &mut 
         ret,
         buf,
         Some(typval_parse_enter),
+        Some(typval_parse_chunk),
         Some(typval_parse_exit),
     )
 }
