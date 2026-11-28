@@ -454,13 +454,14 @@ describe(':terminal', function()
     local job = eval('b:terminal_job_id')
 
     -- Generate very wide output.
-    feed('ifor i in $(seq 1 10000); do echo -n $i; done; exit\r\n')
+    feed('ifor i in $(seq 1 10000); do echo -n $i; done\r\n')
 
     -- Make terminal big.
     screen:try_resize(5000, 5000)
     command('call jobresize(b:terminal_job_id, 5000, 5000)')
 
     assert_alive()
+    fn.chansend(job, 'exit\n')
     eq({ 0 }, fn.jobwait({ job }, 30000))
     screen:try_resize(50, 50)
     eq(0, n.quit_wait(30000))
