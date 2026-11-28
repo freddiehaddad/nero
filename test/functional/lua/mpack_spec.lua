@@ -170,7 +170,14 @@ describe('lua vim.mpack', function()
           for _, encoded in ipairs(values) do
             local wire = string.char(0x91):rep(depth) .. encoded
             for split = 1, #wire do
-              local unpack = vim.mpack.Unpacker()
+              local unpack = vim.mpack.Unpacker({
+                ext = {
+                  [42] = function(tag, bytes)
+                    assert(tag == 42)
+                    return bytes
+                  end,
+                },
+              })
               local value, pos = unpack(wire:sub(1, split))
               if split < #wire then
                 assert(value == nil and pos == split + 1)
