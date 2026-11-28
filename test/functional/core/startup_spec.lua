@@ -526,15 +526,17 @@ describe('startup', function()
       command([[set shellcmdflag=/s\ /c shellxquote=\"]])
     end
     os.remove('Xtest_startup_ttyout')
+    os.remove('Xtest_startup_pipe')
     finally(function()
       os.remove('Xtest_startup_ttyout')
+      os.remove('Xtest_startup_pipe')
     end)
-    -- Running in :terminal
+    -- BSD cat can fail with EAGAIN when writing back to the shared PTY.
     local job = fn.jobstart(
       (
         [["%s" -u NONE -i NONE --cmd "%s"]]
         .. [[ -c "call writefile([has('ttyin'), has('ttyout')], 'Xtest_startup_ttyout')"]]
-        .. [[ -c q | cat -v]]
+        .. [[ -c q | cat -v > Xtest_startup_pipe]]
       ):format(nvim_prog, nvim_set),
       {
         term = true,
