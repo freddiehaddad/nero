@@ -551,7 +551,7 @@ describe('startup', function()
       )
     end)
     local status = fn.jobwait({ job }, 5000)
-    eq({ 0 }, status, api.nvim_buf_get_lines(0, 0, -1, false))
+    eq({ 0 }, status, table.concat(api.nvim_buf_get_lines(0, 0, -1, false), '\n'))
   end)
 
   it('input from pipe: has("ttyin")==0 has("ttyout")==1', function()
