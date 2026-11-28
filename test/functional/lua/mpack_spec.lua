@@ -156,4 +156,38 @@ describe('lua vim.mpack', function()
       end)
     )
   end)
+
+  it('preserves streamed tokens when the unpacker grows', function()
+    eq(
+      true,
+      exec_lua(function()
+        local payload = 'a\000\255b'
+        local values = {
+          string.char(0xdb, 0, 0, 0, #payload) .. payload,
+          string.char(0xc7, #payload, 42) .. payload,
+        }
+        for _, depth in ipairs({ 31, 32, 63, 64 }) do
+          for _, encoded in ipairs(values) do
+            local wire = string.char(0x91):rep(depth) .. encoded
+            for split = 1, #wire do
+              local unpack = vim.mpack.Unpacker()
+              local value, pos = unpack(wire:sub(1, split))
+              if split < #wire then
+                assert(value == nil and pos == split + 1)
+                value, pos = unpack(wire:sub(split + 1))
+                assert(pos == #wire - split + 1)
+              else
+                assert(pos == #wire + 1)
+              end
+              for _ = 1, depth do
+                value = value[1]
+              end
+              assert(value == payload)
+            end
+          end
+        end
+        return true
+      end)
+    )
+  end)
 end)

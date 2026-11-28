@@ -289,6 +289,7 @@ pub fn mpack_parse<C: ?Sized>(
     while !buf.is_empty() && status != 0 {
         let mut tok = MpackToken::new();
         let buf_save = *buf;
+        let tokbuf_save = mpack_parser_full(parser).then(|| parser.tokbuf.clone());
 
         status = mpack_read(&mut parser.tokbuf, buf, &mut tok);
         if status == MPACK_EOF {
@@ -310,6 +311,9 @@ pub fn mpack_parse<C: ?Sized>(
 
         if status == MPACK_NOMEM {
             *buf = buf_save;
+            if let Some(tokbuf) = tokbuf_save {
+                parser.tokbuf = tokbuf;
+            }
             break;
         }
     }
